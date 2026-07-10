@@ -559,6 +559,199 @@ fn str_at(strs: &[u8], off: u32) -> &str {
     std::str::from_utf8(&strs[off..end]).unwrap_or("")
 }
 
+// ---------------------------------------------------------------------------
+// .BTF.ext — per-instruction metadata (func_info / line_info / core_relo)
+// ---------------------------------------------------------------------------
+
+/// CO-RE relocation kinds (`enum bpf_core_relo_kind`).
+pub mod relo_kind {
+    pub const FIELD_BYTE_OFFSET: u32 = 0;
+    pub const FIELD_BYTE_SIZE: u32 = 1;
+    pub const FIELD_EXISTS: u32 = 2;
+    pub const FIELD_SIGNED: u32 = 3;
+    pub const FIELD_LSHIFT_U64: u32 = 4;
+    pub const FIELD_RSHIFT_U64: u32 = 5;
+    pub const TYPE_ID_LOCAL: u32 = 6;
+    pub const TYPE_ID_TARGET: u32 = 7;
+    pub const TYPE_EXISTS: u32 = 8;
+    pub const TYPE_SIZE: u32 = 9;
+    pub const ENUMVAL_EXISTS: u32 = 10;
+    pub const ENUMVAL_VALUE: u32 = 11;
+    pub const TYPE_MATCHES: u32 = 12;
+
+    pub fn name(k: u32) -> &'static str {
+        match k {
+            FIELD_BYTE_OFFSET => "field_byte_offset",
+            FIELD_BYTE_SIZE => "field_byte_size",
+            FIELD_EXISTS => "field_exists",
+            FIELD_SIGNED => "field_signed",
+            FIELD_LSHIFT_U64 => "field_lshift_u64",
+            FIELD_RSHIFT_U64 => "field_rshift_u64",
+            TYPE_ID_LOCAL => "type_id_local",
+            TYPE_ID_TARGET => "type_id_target",
+            TYPE_EXISTS => "type_exists",
+            TYPE_SIZE => "type_size",
+            ENUMVAL_EXISTS => "enumval_exists",
+            ENUMVAL_VALUE => "enumval_value",
+            TYPE_MATCHES => "type_matches",
+            _ => "unknown",
+        }
+    }
+}
+
+/// One `bpf_core_relo` record. String offsets index the companion `.BTF`
+/// string section; `insn_off` is a byte offset into the section's code.
+#[derive(Debug, Clone)]
+pub struct CoreRelo {
+    pub insn_off: u32,
+    pub type_id: u32,
+    pub access_str_off: u32,
+    pub kind: u32,
+}
+
+/// One `bpf_func_info` record: the FUNC type at an instruction.
+#[derive(Debug, Clone)]
+pub struct FuncInfo {
+    pub insn_off: u32,
+    pub type_id: u32,
+}
+
+/// One `bpf_line_info` record: source location of an instruction.
+#[derive(Debug, Clone)]
+pub struct LineInfo {
+    pub insn_off: u32,
+    pub file_name_off: u32,
+    pub line_off: u32,
+    pub line_col: u32,
+}
+
+impl LineInfo {
+    pub fn line(&self) -> u32 {
+        self.line_col >> 10
+    }
+    pub fn col(&self) -> u32 {
+        self.line_col & 0x3ff
+    }
+}
+
+/// Records of one `.BTF.ext` sub-section, grouped by the ELF section they
+/// annotate (e.g. ".text", "xdp").
+#[derive(Debug, Clone)]
+pub struct ExtSec<T> {
+    /// ELF section name (resolved from the companion `.BTF` string table).
+    pub sec_name_off: u32,
+    pub recs: Vec<T>,
+}
+
+/// A parsed `.BTF.ext` section: CO-RE relocations (semantic) plus
+/// func/line info (stored for future source-level debugging).
+#[derive(Debug, Clone, Default)]
+pub struct BtfExt {
+    pub func_info: Vec<ExtSec<FuncInfo>>,
+    pub line_info: Vec<ExtSec<LineInfo>>,
+    pub core_relos: Vec<ExtSec<CoreRelo>>,
+}
+
+impl BtfExt {
+    /// Parse a raw `.BTF.ext` section payload. All string offsets inside
+    /// refer to the companion `.BTF` string table (resolve via [`Btf::str_at`]).
+    pub fn parse(le: bool, data: &[u8]) -> Result<BtfExt, String> {
+        let r = R { buf: data, le };
+        if r.u16(0)? != BTF_MAGIC {
+            return Err("bad .BTF.ext magic".into());
+        }
+        let hdr_len = r.u32(4)? as usize;
+        if hdr_len < 24 {
+            return Err(".BTF.ext header too short".into());
+        }
+        let func_off = r.u32(8)? as usize;
+        let func_len = r.u32(12)? as usize;
+        let line_off = r.u32(16)? as usize;
+        let line_len = r.u32(20)? as usize;
+        // core_relo fields exist only in the extended (hdr_len >= 32) header.
+        let (core_off, core_len) = if hdr_len >= 32 {
+            (r.u32(24)? as usize, r.u32(28)? as usize)
+        } else {
+            (0, 0)
+        };
+
+        Ok(BtfExt {
+            func_info: parse_ext_info(&r, hdr_len, func_off, func_len, 8, |r, p| {
+                Ok(FuncInfo {
+                    insn_off: r.u32(p)?,
+                    type_id: r.u32(p + 4)?,
+                })
+            })?,
+            line_info: parse_ext_info(&r, hdr_len, line_off, line_len, 16, |r, p| {
+                Ok(LineInfo {
+                    insn_off: r.u32(p)?,
+                    file_name_off: r.u32(p + 4)?,
+                    line_off: r.u32(p + 8)?,
+                    line_col: r.u32(p + 12)?,
+                })
+            })?,
+            core_relos: parse_ext_info(&r, hdr_len, core_off, core_len, 16, |r, p| {
+                Ok(CoreRelo {
+                    insn_off: r.u32(p)?,
+                    type_id: r.u32(p + 4)?,
+                    access_str_off: r.u32(p + 8)?,
+                    kind: r.u32(p + 12)?,
+                })
+            })?,
+        })
+    }
+
+    /// Total number of CO-RE relocations across all sections.
+    pub fn num_core_relos(&self) -> usize {
+        self.core_relos.iter().map(|s| s.recs.len()).sum()
+    }
+}
+
+/// Parse one `.BTF.ext` sub-section: `u32 record_size` followed by
+/// `btf_ext_info_sec { sec_name_off, num_info }` groups. `record_size` may
+/// exceed `min_rec` (newer toolchains append fields); the excess is skipped.
+fn parse_ext_info<T>(
+    r: &R,
+    hdr_len: usize,
+    off: usize,
+    len: usize,
+    min_rec: usize,
+    read: impl Fn(&R, usize) -> Result<T, String>,
+) -> Result<Vec<ExtSec<T>>, String> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let start = hdr_len + off;
+    let end = start
+        .checked_add(len)
+        .filter(|&e| e <= r.buf.len())
+        .ok_or(".BTF.ext: info section out of bounds")?;
+    let rec_size = r.u32(start)? as usize;
+    if rec_size < min_rec || !rec_size.is_multiple_of(4) {
+        return Err(format!(".BTF.ext: bad record size {rec_size}"));
+    }
+    let mut out = Vec::new();
+    let mut p = start + 4;
+    while p < end {
+        let sec_name_off = r.u32(p)?;
+        let num = r.u32(p + 4)? as usize;
+        p += 8;
+        if p + num.saturating_mul(rec_size) > end {
+            return Err(".BTF.ext: info section overruns its length".into());
+        }
+        let mut recs = Vec::with_capacity(num);
+        for _ in 0..num {
+            recs.push(read(r, p)?);
+            p += rec_size;
+        }
+        out.push(ExtSec { sec_name_off, recs });
+    }
+    if p != end {
+        return Err(".BTF.ext: info section desynchronized".into());
+    }
+    Ok(out)
+}
+
 /// The "essential name" of a type: the name with any `___flavor` suffix
 /// stripped. CO-RE candidate matching compares essential names so that
 /// `task_struct___v2` in the program matches `task_struct` in the kernel.
@@ -741,6 +934,60 @@ mod tests {
         // A FUNC_PROTO whose vlen promises more params than the section holds.
         let blob = build_btf(&[], &[(0, 13 << 24 | 3, 0, vec![0, 0])]);
         assert!(Btf::parse(true, &blob).is_err());
+    }
+
+    #[test]
+    fn btf_ext_roundtrip() {
+        // Hand-build a .BTF.ext with an oversized core_relo record size (20
+        // instead of 16) to check the skip-excess path, plus empty func/line.
+        let mut b = Vec::new();
+        b.extend_from_slice(&BTF_MAGIC.to_le_bytes());
+        b.push(1);
+        b.push(0);
+        b.extend_from_slice(&32u32.to_le_bytes()); // hdr_len
+        let core: &[u32] = &[
+            20, // record_size (16 + 4 bytes of future extension)
+            7,  // sec_name_off
+            2,  // num_info
+            0, 5, 100, 0, 0xdead, // relo 1 (+pad)
+            8, 5, 104, 2, 0xbeef, // relo 2 (+pad)
+        ];
+        let core_len = core.len() as u32 * 4;
+        for (off, len) in [(0u32, 0u32), (0, 0), (0, core_len)] {
+            b.extend_from_slice(&off.to_le_bytes());
+            b.extend_from_slice(&len.to_le_bytes());
+        }
+        for w in core {
+            b.extend_from_slice(&w.to_le_bytes());
+        }
+        let ext = BtfExt::parse(true, &b).unwrap();
+        assert!(ext.func_info.is_empty() && ext.line_info.is_empty());
+        assert_eq!(ext.num_core_relos(), 2);
+        let sec = &ext.core_relos[0];
+        assert_eq!(sec.sec_name_off, 7);
+        assert_eq!(
+            (sec.recs[0].insn_off, sec.recs[0].type_id, sec.recs[0].access_str_off, sec.recs[0].kind),
+            (0, 5, 100, relo_kind::FIELD_BYTE_OFFSET)
+        );
+        assert_eq!(
+            (sec.recs[1].insn_off, sec.recs[1].kind),
+            (8, relo_kind::FIELD_EXISTS)
+        );
+
+        // A legacy 24-byte header (no core_relo words) parses with no relos.
+        let mut old = Vec::new();
+        old.extend_from_slice(&BTF_MAGIC.to_le_bytes());
+        old.push(1);
+        old.push(0);
+        old.extend_from_slice(&24u32.to_le_bytes());
+        old.extend_from_slice(&[0u8; 16]); // func/line off+len = 0
+        let ext = BtfExt::parse(true, &old).unwrap();
+        assert_eq!(ext.num_core_relos(), 0);
+
+        // Truncated info section is an error, not a desync.
+        let mut bad = b.clone();
+        bad.truncate(bad.len() - 4);
+        assert!(BtfExt::parse(true, &bad).is_err());
     }
 
     #[test]

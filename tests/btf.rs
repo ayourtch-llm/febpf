@@ -5,7 +5,8 @@
 //! tests live in `src/btf.rs`; this file checks the parser at vmlinux scale
 //! (~150k types) against an independent implementation.
 
-use febpf::btf::{Btf, Kind};
+use febpf::btf::{relo_kind, Btf, BtfExt, Kind};
+use std::path::Path;
 use std::process::Command;
 
 const VMLINUX: &str = "/sys/kernel/btf/vmlinux";
@@ -108,5 +109,72 @@ fn vmlinux_matches_bpftool() {
                 "bitfield size: {l}"
             );
         }
+    }
+}
+
+/// Recompile a fixture when clang is available (mirrors tests/elf.rs).
+fn maybe_compile(src: &str, out: &str) {
+    if Command::new("clang").arg("--version").output().is_err() {
+        return;
+    }
+    let src_path = format!("examples/c/{src}");
+    if !Path::new(&src_path).exists() {
+        return;
+    }
+    let status = Command::new("clang")
+        .args(["-O2", "-g", "-target", "bpf", "-c", &src_path, "-o"])
+        .arg(format!("tests/{out}"))
+        .status();
+    assert!(status.map(|s| s.success()).unwrap_or(false));
+}
+
+#[test]
+fn btf_ext_of_core_probe_object() {
+    maybe_compile("core_probe.c", "core_probe.o");
+    let bytes = std::fs::read("tests/core_probe.o").expect("fixture");
+    let (btf_raw, le) = febpf::elf::read_section(&bytes, ".BTF")
+        .unwrap()
+        .expect("no .BTF");
+    let (ext_raw, _) = febpf::elf::read_section(&bytes, ".BTF.ext")
+        .unwrap()
+        .expect("no .BTF.ext");
+    let btf = Btf::parse(le, &btf_raw).unwrap();
+    let ext = BtfExt::parse(le, &ext_raw).unwrap();
+
+    // CO-RE relocations: `p->x + p->y + p->z` over preserve_access_index
+    // yields three FIELD_BYTE_OFFSET relos in .text, one per member, with
+    // access strings "0:0"/"0:1"/"0:2" rooted at struct point.
+    assert_eq!(ext.core_relos.len(), 1);
+    let sec = &ext.core_relos[0];
+    assert_eq!(btf.str_at(sec.sec_name_off), ".text");
+    let mut relos = sec.recs.clone();
+    relos.sort_by_key(|r| r.insn_off);
+    assert_eq!(relos.len(), 3);
+    let mut accesses = Vec::new();
+    for r in &relos {
+        assert_eq!(r.kind, relo_kind::FIELD_BYTE_OFFSET);
+        assert!(r.insn_off.is_multiple_of(8), "insn_off is a byte offset");
+        assert_eq!(btf.type_name(btf.resolve(r.type_id).unwrap()), "point");
+        accesses.push(btf.str_at(r.access_str_off).to_string());
+    }
+    assert_eq!(accesses, ["0:0", "0:1", "0:2"]);
+
+    // func_info: one record, at insn 0, pointing at FUNC 'probe'.
+    assert_eq!(ext.func_info.len(), 1);
+    let fi = &ext.func_info[0];
+    assert_eq!(btf.str_at(fi.sec_name_off), ".text");
+    assert_eq!(fi.recs.len(), 1);
+    assert_eq!(fi.recs[0].insn_off, 0);
+    assert_eq!(btf.type_name(fi.recs[0].type_id), "probe");
+
+    // line_info: at least one record per source statement, with a resolvable
+    // file name and 1-based line numbers.
+    assert_eq!(ext.line_info.len(), 1);
+    let li = &ext.line_info[0];
+    assert_eq!(btf.str_at(li.sec_name_off), ".text");
+    assert!(!li.recs.is_empty());
+    for rec in &li.recs {
+        assert!(btf.str_at(rec.file_name_off).ends_with("core_probe.c"));
+        assert!(rec.line() > 0 && rec.line() < 100);
     }
 }

@@ -238,13 +238,23 @@ in `src/elf.rs`, before `Vm::new` — same lifecycle stage as the existing map
   (168,815 types; all (id, name) pairs and the full task_struct member layout
   agree; parse ~56ms) in `tests/btf.rs`, plus synthetic unit tests in
   `src/btf.rs`.
-- Stage 2 (`.BTF.ext`): not started.
+- Stage 2 (`.BTF.ext`): **done** — `BtfExt` in `src/btf.rs` parses the ext
+  header (24- and 32-byte variants), `core_relo` records and, structurally,
+  `func_info`/`line_info` (per-annotated-section `ExtSec<T>` groups; oversized
+  `record_size` tolerated). `relo_kind` constants cover all 13 CO-RE kinds.
+  `elf::read_section` extracts named section payloads for standalone use.
+  Fixture `examples/c/core_probe.c` (`preserve_access_index`) → committed
+  `tests/core_probe.o`; `tests/btf.rs::btf_ext_of_core_probe_object` verifies
+  the 3 FIELD_BYTE_OFFSET relos ("0:0"/"0:1"/"0:2" on struct point in ".text"),
+  func_info (FUNC 'probe' at insn 0) and line_info against clang 21 output.
 - Stage 3 (relocation algorithm): not started.
 - Stage 4 (patching + CLI): not started.
 
-Next step (stage 2): parse `.BTF.ext` (§1.2) — a `BtfExt` type in `src/btf.rs`
-holding per-section `core_relo` records (semantic) plus `func_info`/`line_info`
-records (structural, for future source-level debugging). Ground truth already
-verified against clang 21: a `__attribute__((preserve_access_index))` struct
-access (`p->x + p->y + p->z`) yields 3 FIELD_BYTE_OFFSET relos with access
-strings "0:0"/"0:1"/"0:2" in section ".text" (see §1.2).
+Next step (stage 3): implement §2 in `src/btf.rs` (or a `core` submodule):
+access-spec parsing, local spec walk (by member index), candidate search via
+essential names, target spec walk (by member NAME, recursing into anonymous
+members), per-kind value computation (§2 step 5), ambiguity rules. API sketch:
+`pub fn calc_core_relo(local: &Btf, relo: &CoreRelo, target: &Btf) ->
+Result<ReloValue, String>` where `ReloValue { new_val: u64, orig_val: u64,
+patch: PatchKind (imm/off/imm64), validate: bool }`. Unit-test on synthetic
+BTF (shifted offsets, flavors, missing fields, ambiguous candidates).

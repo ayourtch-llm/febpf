@@ -126,8 +126,8 @@ struct Relocation {
     kind: u32,
 }
 
-/// Parse and relocate a BPF object file.
-pub fn load(bytes: &[u8]) -> Result<Object, String> {
+/// Validate the ELF64/EM_BPF header and parse the section table.
+fn parse_elf(bytes: &[u8]) -> Result<(Reader<'_>, Vec<Section>), String> {
     if bytes.len() < 64 || &bytes[0..4] != ELF_MAGIC {
         return Err("not an ELF file".into());
     }
@@ -179,6 +179,24 @@ pub fn load(bytes: &[u8]) -> Result<Object, String> {
             entsize: r.u64(base + 56)? as usize,
         });
     }
+    Ok((r, sections))
+}
+
+/// Extract a named section's payload from a BPF ELF object (e.g. `.BTF`,
+/// `.BTF.ext`). Returns `Ok(None)` if the section is absent. The second
+/// element of the pair reports the object's endianness (little = true).
+pub fn read_section(bytes: &[u8], name: &str) -> Result<Option<(Vec<u8>, bool)>, String> {
+    let (r, sections) = parse_elf(bytes)?;
+    match sections.iter().position(|s| s.name == name && s.size > 0) {
+        Some(i) => Ok(Some((section_bytes(bytes, &sections, i)?.to_vec(), r.le))),
+        None => Ok(None),
+    }
+}
+
+/// Parse and relocate a BPF object file.
+pub fn load(bytes: &[u8]) -> Result<Object, String> {
+    let (r, sections) = parse_elf(bytes)?;
+    let bytes = r.buf;
 
     // symbol table + its string table
     let symtab_idx = sections
