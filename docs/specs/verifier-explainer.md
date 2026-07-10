@@ -168,5 +168,6 @@ point; a user who wants the terse form has the first line. Affected commands:
 
 - [x] Stage 1: spec written.
 - [x] Stage 2: capture + replay (`VerifyError.trace`, path arena, replay).
-- [ ] Stage 3: rendering + CLI.
+- [x] Stage 3: rendering (`verifier::render_trace`) + cause notes + CLI
+      (`--no-explain`; shown by default in verify/analyze/run/profile/bench/debug).
 - [ ] Stage 4: tests + polish.

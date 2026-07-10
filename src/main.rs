@@ -25,6 +25,7 @@ options:
   --ctx <hex|@file>    context memory contents (hex string or file)
   --ctx-size <n>       context size in bytes (default 4096, or data length)
   --no-verify          run without verifying first (still memory-safe)
+  --no-explain         don't print the counterexample trace when rejected
   --jit                compile to native code (run/bench; x86-64 Linux)
   --strict-align       verifier: require aligned memory accesses
   --readonly-ctx       verifier: forbid stores to the context
@@ -44,6 +45,7 @@ struct Opts {
     ctx_hex: Option<String>,
     ctx_size: Option<usize>,
     no_verify: bool,
+    no_explain: bool,
     strict_align: bool,
     readonly_ctx: bool,
     iters: u64,
@@ -61,6 +63,7 @@ fn parse_args() -> Result<Opts, String> {
         ctx_hex: None,
         ctx_size: None,
         no_verify: false,
+        no_explain: false,
         strict_align: false,
         readonly_ctx: false,
         iters: 1000,
@@ -87,6 +90,7 @@ fn parse_args() -> Result<Opts, String> {
                     .map_err(|e| format!("bad --iters: {e}"))?
             }
             "--no-verify" => o.no_verify = true,
+            "--no-explain" => o.no_explain = true,
             "--jit" => o.jit = true,
             "--prog" => o.prog = Some(args.next().ok_or("--prog needs a value")?),
             "--strict-align" => o.strict_align = true,
@@ -223,8 +227,7 @@ fn run() -> Result<ExitCode, String> {
                 }
                 Err(e) => {
                     println!("verification FAILED: {e}");
-                    let pc = e.pc.min(prog.insns.len().saturating_sub(1));
-                    println!("  {pc:4}: {}", disasm::disasm_insn(&prog.insns, pc));
+                    print!("{}", explain(&prog.insns, &e, &o));
                     return Ok(ExitCode::FAILURE);
                 }
             }
@@ -270,6 +273,7 @@ fn run() -> Result<ExitCode, String> {
                 Err(e) => {
                     println!("\n== verifier ==");
                     println!("  FAILED: {e}");
+                    print!("{}", explain(&prog.insns, &e, &o));
                 }
             }
         }
@@ -285,7 +289,10 @@ fn run() -> Result<ExitCode, String> {
                 vm.insn_limit = 100_000_000;
             } else {
                 vm.verify(verifier_config(&o, ctx.len())).map_err(|e| {
-                    format!("verification failed: {e}\n(use --no-verify to run anyway)")
+                    format!(
+                        "verification failed: {e}\n{}(use --no-verify to run anyway)",
+                        explain(vm.insns(), &e, &o)
+                    )
                 })?;
             }
             if o.jit {
@@ -307,8 +314,9 @@ fn run() -> Result<ExitCode, String> {
             let mut vm = Vm::new(prog.clone())?;
             vm.echo_printk = true;
             if !o.no_verify {
-                vm.verify(verifier_config(&o, ctx.len()))
-                    .map_err(|e| format!("verification failed: {e}"))?;
+                vm.verify(verifier_config(&o, ctx.len())).map_err(|e| {
+                    format!("verification failed: {e}\n{}", explain(vm.insns(), &e, &o))
+                })?;
             } else {
                 vm.insn_limit = 100_000_000;
             }
@@ -324,7 +332,10 @@ fn run() -> Result<ExitCode, String> {
             if !o.no_verify {
                 match vm.verify(verifier_config(&o, ctx.len())) {
                     Ok(_) => println!("verifier: PASSED"),
-                    Err(e) => println!("verifier: FAILED: {e} (debugging anyway)"),
+                    Err(e) => {
+                        println!("verifier: FAILED: {e} (debugging anyway)");
+                        print!("{}", explain(vm.insns(), &e, &o));
+                    }
                 }
             }
             debug::repl(&mut vm, &mut ctx, debug::DebuggerOpts::default())
@@ -334,8 +345,9 @@ fn run() -> Result<ExitCode, String> {
             let mut ctx = make_ctx(&o)?;
             let mut vm = Vm::new(prog)?;
             if !o.no_verify {
-                vm.verify(verifier_config(&o, ctx.len()))
-                    .map_err(|e| format!("verification failed: {e}"))?;
+                vm.verify(verifier_config(&o, ctx.len())).map_err(|e| {
+                    format!("verification failed: {e}\n{}", explain(vm.insns(), &e, &o))
+                })?;
             }
             // warmup + count instructions once
             let mut m = vm.machine(&mut ctx);
@@ -375,6 +387,14 @@ fn run() -> Result<ExitCode, String> {
         other => return Err(format!("unknown command '{other}'\n\n{USAGE}")),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Render a rejection's counterexample trace, honoring --no-explain.
+fn explain(insns: &[insn::Insn], e: &verifier::VerifyError, o: &Opts) -> String {
+    if o.no_explain {
+        return String::new();
+    }
+    verifier::render_trace(insns, e)
 }
 
 fn print_verify_stats(ok: &verifier::VerifyOk) {

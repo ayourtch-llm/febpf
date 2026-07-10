@@ -16,6 +16,7 @@
 
 // div/mod arms encode eBPF defined-by-zero semantics; `checked_div` hides them.
 #![allow(clippy::manual_checked_ops)]
+use crate::disasm;
 use crate::helpers::{builtin_sig, ArgKind, HelperSig, RetKind};
 use crate::insn::*;
 use crate::maps::MapDef;
@@ -1244,10 +1245,79 @@ impl<'a> Verifier<'a> {
         })
     }
 
+    /// Registers the instruction at `pc` reads (used for cause hints).
+    fn regs_read_at(&self, pc: usize) -> Vec<u8> {
+        let ins = self.insns[pc];
+        let mut v: Vec<u8> = Vec::new();
+        match ins.class() {
+            class::ALU | class::ALU64 => {
+                if ins.op() != alu::MOV {
+                    v.push(ins.dst);
+                }
+                if ins.is_src_reg() && ins.op() != alu::NEG && ins.op() != alu::END {
+                    v.push(ins.src);
+                }
+            }
+            class::LDX => v.push(ins.src),
+            class::ST => v.push(ins.dst),
+            class::STX => {
+                v.push(ins.dst);
+                v.push(ins.src);
+            }
+            class::JMP | class::JMP32 => match ins.op() {
+                jmp::EXIT => v.push(0),
+                jmp::JA => {}
+                jmp::CALL => {
+                    if ins.src != call_kind::LOCAL {
+                        v.extend(1..=5u8);
+                    }
+                }
+                _ => {
+                    v.push(ins.dst);
+                    if ins.is_src_reg() {
+                        v.push(ins.src);
+                    }
+                }
+            },
+            _ => {} // LD (lddw): no register reads
+        }
+        v.dedup();
+        v
+    }
+
     /// Cause hints derived from the failing instruction and the abstract
     /// state right before it.
-    fn trace_notes(&self, _err_pc: usize, _pre_state: &VState) -> Vec<String> {
-        Vec::new()
+    fn trace_notes(&self, err_pc: usize, pre: &VState) -> Vec<String> {
+        let mut notes = Vec::new();
+        if err_pc >= self.insns.len() {
+            return notes;
+        }
+        let f = pre.cur();
+        for r in self.regs_read_at(err_pc) {
+            match f.regs[r as usize] {
+                RegState::Uninit => notes.push(format!(
+                    "r{r} is uninitialized: no instruction on this path writes it \
+                     before insn {err_pc}"
+                )),
+                RegState::Ptr(p) => {
+                    if let PtrKind::MapValueOrNull { map, id } = p.kind {
+                        let name = &self.maps[map as usize].name;
+                        match self.replay_null_origin.as_ref().and_then(|m| m.get(&id)) {
+                            Some((opc, helper)) => notes.push(format!(
+                                "r{r} may be NULL here: it was returned by {helper} at \
+                                 insn {opc} (map '{name}'), and this path never compares \
+                                 it against 0"
+                            )),
+                            None => notes.push(format!(
+                                "r{r} may be NULL here and is not null-checked on this path"
+                            )),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        notes
     }
 
     // -- structural pre-pass ------------------------------------------------
@@ -2404,6 +2474,47 @@ impl<'a> Verifier<'a> {
             }
         }
     }
+}
+
+/// Render a rejection's counterexample trace as annotated disassembly.
+/// Returns an empty string when the error carries no trace.
+pub fn render_trace(insns: &[Insn], err: &VerifyError) -> String {
+    let Some(t) = &err.trace else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let total = t.steps.len() + t.truncated;
+    let _ = writeln!(
+        out,
+        "counterexample path (entry -> insn {}, {} step{}):",
+        err.pc,
+        total,
+        if total == 1 { "" } else { "s" }
+    );
+    for (i, step) in t.steps.iter().enumerate() {
+        // truncation always cuts right after the fixed-size head window
+        if t.truncated > 0 && i == 8 {
+            let _ = writeln!(out, "        ... {} steps omitted ...", t.truncated);
+        }
+        let mut text = disasm::disasm_insn(insns, step.pc);
+        if let Some((taken, _)) = step.branch {
+            text.push_str(if taken { "  [taken]" } else { "  [not taken]" });
+        }
+        let is_fail = i + 1 == t.steps.len() && step.pc == err.pc;
+        let arrow = if is_fail { "->" } else { "  " };
+        if step.state.is_empty() {
+            let _ = writeln!(out, "  {arrow}{:4}: {text}", step.pc);
+        } else {
+            let _ = writeln!(out, "  {arrow}{:4}: {text:<44} ; {}", step.pc, step.state);
+        }
+        if is_fail {
+            let _ = writeln!(out, "          ^ {}", err.msg);
+        }
+    }
+    for n in &t.notes {
+        let _ = writeln!(out, "note: {n}");
+    }
+    out
 }
 
 /// Convenience wrapper: verify `insns` against `maps` with `cfg`.
