@@ -8,9 +8,10 @@
 //! - map definitions from either the legacy `maps` section
 //!   (`struct bpf_map_def`) or a minimal parse of BTF-defined `.maps`.
 //!
-//! It does not implement the full BTF type system — only the standard libbpf
-//! `.maps` idiom (`__uint`/`__type` members encoded as pointer-to-array and
-//! pointer-to-type). See `docs/specs/elf-loading.md`.
+//! BTF-defined maps are read through the full BTF type graph in
+//! [`crate::btf`], using the standard libbpf `.maps` idiom (`__uint`/`__type`
+//! members encoded as pointer-to-array and pointer-to-type).
+//! See `docs/specs/elf-loading.md`.
 
 use crate::insn::{self, Insn};
 use crate::maps::{MapDef, MapKind};
@@ -489,7 +490,7 @@ fn load_maps(
     if let Some(dotmaps_idx) = sections.iter().position(|s| s.name == ".maps") {
         if let Some(btf_idx) = sections.iter().position(|s| s.name == ".BTF") {
             let btf = section_bytes(bytes, sections, btf_idx)?;
-            return btf::load_btf_maps(r.le, btf, sections, symbols, dotmaps_idx);
+            return btf_maps::load_btf_maps(r.le, btf, sections, symbols, dotmaps_idx);
         }
     }
     // Legacy `maps` section.
@@ -623,270 +624,77 @@ fn cstr(strtab: &[u8], off: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal BTF `.maps` parsing
+// BTF `.maps` parsing (on the full type graph in `crate::btf`)
 // ---------------------------------------------------------------------------
 
-mod btf {
+mod btf_maps {
     use super::{map_kind, MapIndex, Section, Symbol};
+    use crate::btf::{Btf, Kind};
     use crate::maps::MapDef;
 
-    const BTF_MAGIC: u16 = 0xEB9F;
-    const KIND_INT: u32 = 1;
-    const KIND_PTR: u32 = 2;
-    const KIND_ARRAY: u32 = 3;
-    const KIND_STRUCT: u32 = 4;
-    const KIND_UNION: u32 = 5;
-    const KIND_ENUM: u32 = 6;
-    const KIND_FUNC_PROTO: u32 = 13;
-    const KIND_VAR: u32 = 14;
-    const KIND_DATASEC: u32 = 15;
-    const KIND_DECL_TAG: u32 = 17;
-    const KIND_ENUM64: u32 = 19;
-
-    struct B<'a> {
-        buf: &'a [u8],
-        le: bool,
-    }
-    impl B<'_> {
-        fn u32(&self, off: usize) -> Result<u32, String> {
-            let b: [u8; 4] = self
-                .buf
-                .get(off..off + 4)
-                .ok_or("truncated BTF")?
-                .try_into()
-                .unwrap();
-            Ok(if self.le {
-                u32::from_le_bytes(b)
-            } else {
-                u32::from_be_bytes(b)
-            })
-        }
-        fn u16(&self, off: usize) -> Result<u16, String> {
-            let b: [u8; 2] = self
-                .buf
-                .get(off..off + 2)
-                .ok_or("truncated BTF")?
-                .try_into()
-                .unwrap();
-            Ok(if self.le {
-                u16::from_le_bytes(b)
-            } else {
-                u16::from_be_bytes(b)
-            })
-        }
-    }
-
-    #[derive(Clone)]
-    struct BtfType {
-        name: String,
-        kind: u32,
-        vlen: u32,
-        /// size (INT/STRUCT) or referenced type id (PTR/ARRAY elem / VAR).
-        size_or_type: u32,
-        /// members (STRUCT) or secinfo (DATASEC) or array meta (ARRAY).
-        extra: Extra,
-    }
-
-    #[derive(Clone)]
-    enum Extra {
-        None,
-        Members(Vec<(String, u32)>),         // (name, type_id)
-        Array { nelems: u32 },               // ARRAY
-        Secinfo(Vec<(u32, u32, u32)>),        // (type_id, offset, size)
-    }
-
+    /// Read libbpf-style BTF map definitions out of the `.maps` DATASEC.
+    ///
+    /// Each DATASEC entry points at a `VAR` whose type is the map's anonymous
+    /// struct; `__uint(name, VAL)` members are encoded as `int (*)[VAL]`
+    /// (value = the array's nelems) and `__type(name, T)` as `T *`
+    /// (size = sizeof(T)). See `docs/specs/elf-loading.md`.
     pub(super) fn load_btf_maps(
         le: bool,
-        btf: &[u8],
+        btf_bytes: &[u8],
         _sections: &[Section],
         symbols: &[Symbol],
         dotmaps_idx: usize,
     ) -> Result<(Vec<MapDef>, MapIndex), String> {
-        let b = B { buf: btf, le };
-        if b.u16(0)? != BTF_MAGIC {
-            return Err("bad BTF magic".into());
-        }
-        // btf_header: magic(u16) version(u8) flags(u8) hdr_len(u32)
-        //             type_off(u32) type_len(u32) str_off(u32) str_len(u32)
-        let hdr_len = b.u32(4)? as usize;
-        let type_off = b.u32(8)? as usize;
-        let type_len = b.u32(12)? as usize;
-        let str_off = b.u32(16)? as usize;
-        let str_len = b.u32(20)? as usize;
-        let base = hdr_len; // section offsets are relative to end of header
-        let types_start = base + type_off;
-        let types_end = types_start + type_len;
-        let strs = btf
-            .get(base + str_off..base + str_off + str_len)
-            .ok_or("bad BTF string section")?;
+        let btf = Btf::parse(le, btf_bytes)?;
 
-        // Parse all types; ids start at 1 (0 = void).
-        let mut types = vec![BtfType {
-            name: String::new(),
-            kind: 0,
-            vlen: 0,
-            size_or_type: 0,
-            extra: Extra::None,
-        }];
-        let mut off = types_start;
-        while off < types_end {
-            let name_off = b.u32(off)? as usize;
-            let info = b.u32(off + 4)?;
-            let size_or_type = b.u32(off + 8)?;
-            let vlen = info & 0xffff;
-            let kind = (info >> 24) & 0x1f;
-            off += 12;
-            let extra = match kind {
-                KIND_STRUCT => {
-                    let mut members = Vec::with_capacity(vlen as usize);
-                    for _ in 0..vlen {
-                        let m_name = b.u32(off)? as usize;
-                        let m_type = b.u32(off + 4)?;
-                        // offset (u32) — skip
-                        members.push((super::cstr(strs, m_name), m_type));
-                        off += 12;
-                    }
-                    Extra::Members(members)
-                }
-                KIND_ARRAY => {
-                    // btf_array { type, index_type, nelems }
-                    let nelems = b.u32(off + 8)?;
-                    off += 12;
-                    Extra::Array { nelems }
-                }
-                KIND_DATASEC => {
-                    let mut info = Vec::with_capacity(vlen as usize);
-                    for _ in 0..vlen {
-                        let t = b.u32(off)?;
-                        let o = b.u32(off + 4)?;
-                        let s = b.u32(off + 8)?;
-                        info.push((t, o, s));
-                        off += 12;
-                    }
-                    Extra::Secinfo(info)
-                }
-                KIND_INT => {
-                    off += 4; // int encoding word
-                    Extra::None
-                }
-                KIND_VAR => {
-                    off += 4; // linkage word
-                    Extra::None
-                }
-                // Kinds we don't interpret but must still skip past so the
-                // next type header is read at the right offset.
-                KIND_UNION => {
-                    off += vlen as usize * 12; // btf_member[]
-                    Extra::None
-                }
-                KIND_ENUM => {
-                    off += vlen as usize * 8; // btf_enum[]
-                    Extra::None
-                }
-                KIND_FUNC_PROTO => {
-                    off += vlen as usize * 8; // btf_param[]
-                    Extra::None
-                }
-                KIND_ENUM64 => {
-                    off += vlen as usize * 12; // btf_enum64[]
-                    Extra::None
-                }
-                KIND_DECL_TAG => {
-                    off += 4; // btf_decl_tag { component_idx }
-                    Extra::None
-                }
-                // PTR, FWD, TYPEDEF, VOLATILE, CONST, RESTRICT, FUNC, FLOAT,
-                // TYPE_TAG have no trailing data.
-                _ => Extra::None,
-            };
-            types.push(BtfType {
-                name: super::cstr(strs, name_off),
-                kind,
-                vlen,
-                size_or_type,
-                extra,
-            });
-        }
-
-        let type_size = |id: u32| -> Result<u32, String> {
-            let t = types.get(id as usize).ok_or("bad BTF type id")?;
-            match t.kind {
-                KIND_INT | KIND_STRUCT => Ok(t.size_or_type),
-                KIND_PTR => Ok(8),
-                _ => Ok(t.size_or_type),
-            }
-        };
-        // For `__uint(name, VAL)` libbpf encodes VAL as `int (*)[VAL]`:
-        // member type = PTR -> ARRAY(nelems = VAL).
         let ptr_array_nelems = |id: u32| -> Result<u32, String> {
-            let ptr = types.get(id as usize).ok_or("bad member type")?;
-            if ptr.kind != KIND_PTR {
+            let Kind::Ptr { type_id } = btf.ty(btf.resolve(id)?)?.kind else {
                 return Err("expected pointer-encoded __uint member".into());
-            }
-            let arr = types
-                .get(ptr.size_or_type as usize)
-                .ok_or("bad pointee type")?;
-            match arr.extra {
-                Extra::Array { nelems } => Ok(nelems),
+            };
+            match btf.ty(btf.resolve(type_id)?)?.kind {
+                Kind::Array { nelems, .. } => Ok(nelems),
                 _ => Err("expected pointer-to-array __uint encoding".into()),
             }
         };
-        // For `__type(key, T)` the member is PTR -> T; size = sizeof(T).
         let ptr_pointee_size = |id: u32| -> Result<u32, String> {
-            let ptr = types.get(id as usize).ok_or("bad member type")?;
-            if ptr.kind != KIND_PTR {
+            let Kind::Ptr { type_id } = btf.ty(btf.resolve(id)?)?.kind else {
                 return Err("expected pointer-encoded __type member".into());
-            }
-            type_size(ptr.size_or_type)
+            };
+            btf.type_size(type_id)
         };
 
-        // Find the `.maps` DATASEC.
-        let datasec = types
-            .iter()
-            .find(|t| t.kind == KIND_DATASEC && t.name == ".maps")
-            .ok_or("no .maps DATASEC in BTF")?
-            .clone();
-        let secinfo = match &datasec.extra {
-            Extra::Secinfo(v) => v.clone(),
-            _ => unreachable!(),
-        };
+        let secinfo = btf.datasec(".maps").ok_or("no .maps DATASEC in BTF")?;
+        let mut ordered: Vec<_> = secinfo.to_vec();
+        ordered.sort_by_key(|si| si.offset);
 
         let mut maps = Vec::new();
         let mut index = Vec::new();
-        // secinfo entries are (var_type_id, offset, size); offset matches the
-        // symbol value of the map variable in the `.maps` section.
-        let mut ordered = secinfo.clone();
-        ordered.sort_by_key(|(_, o, _)| *o);
-        for (var_tid, offset, _sz) in ordered {
-            let var = types.get(var_tid as usize).ok_or("bad var type id")?;
-            if var.kind != KIND_VAR {
+        // secinfo entries point at VARs; the DATASEC offset matches the map
+        // variable's symbol value in the `.maps` section.
+        for si in &ordered {
+            let var = btf.ty(si.type_id)?;
+            let Kind::Var { type_id, .. } = var.kind else {
                 continue;
-            }
-            let map_name = var.name.clone();
-            let st = types
-                .get(var.size_or_type as usize)
-                .ok_or("map var has no struct type")?;
-            if st.kind != KIND_STRUCT {
-                return Err(format!("map '{map_name}' is not a struct"));
-            }
-            let members = match &st.extra {
-                Extra::Members(m) => m,
-                _ => unreachable!(),
             };
-            let (mut kind, mut key_size, mut value_size, mut max_entries) = (None, None, None, None);
-            for (mname, mtype) in members {
-                match mname.as_str() {
-                    "type" => kind = Some(map_kind(ptr_array_nelems(*mtype)?)?),
-                    "max_entries" => max_entries = Some(ptr_array_nelems(*mtype)?),
+            let map_name = btf.str_at(var.name_off).to_string();
+            let st_id = btf.resolve(type_id)?;
+            let Kind::Struct { members, .. } = &btf.ty(st_id)?.kind else {
+                return Err(format!("map '{map_name}' is not a struct"));
+            };
+            let (mut kind, mut key_size, mut value_size, mut max_entries) =
+                (None, None, None, None);
+            for m in members {
+                match btf.str_at(m.name_off) {
+                    "type" => kind = Some(map_kind(ptr_array_nelems(m.type_id)?)?),
+                    "max_entries" => max_entries = Some(ptr_array_nelems(m.type_id)?),
                     "map_flags" => {}
-                    "key_size" => key_size = Some(ptr_array_nelems(*mtype)?),
-                    "value_size" => value_size = Some(ptr_array_nelems(*mtype)?),
-                    "key" => key_size = Some(ptr_pointee_size(*mtype)?),
-                    "value" => value_size = Some(ptr_pointee_size(*mtype)?),
+                    "key_size" => key_size = Some(ptr_array_nelems(m.type_id)?),
+                    "value_size" => value_size = Some(ptr_array_nelems(m.type_id)?),
+                    "key" => key_size = Some(ptr_pointee_size(m.type_id)?),
+                    "value" => value_size = Some(ptr_pointee_size(m.type_id)?),
                     _ => {}
                 }
             }
-            let _ = st.vlen;
             maps.push(MapDef {
                 name: map_name.clone(),
                 kind: kind.ok_or_else(|| format!("map '{map_name}': missing type"))?,
@@ -899,14 +707,15 @@ mod btf {
                 readonly: false,
                 init: Vec::new(),
             });
-            // symbol value equals the DATASEC offset
-            let map_idx = maps.len() - 1;
-            index.push((offset as u64, dotmaps_idx as u16, map_idx));
+            index.push((si.offset as u64, dotmaps_idx as u16, maps.len() - 1));
         }
         // Map symbols may not be at DATASEC offsets in every toolchain; also
         // index by symbol order as a fallback.
         for sym in symbols.iter().filter(|s| s.shndx as usize == dotmaps_idx) {
-            if !index.iter().any(|(v, sh, _)| *v == sym.value && *sh == sym.shndx) {
+            if !index
+                .iter()
+                .any(|(v, sh, _)| *v == sym.value && *sh == sym.shndx)
+            {
                 if let Some(pos) = maps.iter().position(|m| m.name == sym.name) {
                     index.push((sym.value, sym.shndx, pos));
                 }

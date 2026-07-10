@@ -1,0 +1,754 @@
+//! BTF (BPF Type Format) parser: the full type graph.
+//!
+//! Parses a raw BTF blob — either the `.BTF` section of a `clang -target bpf`
+//! object or a standalone kernel BTF file such as `/sys/kernel/btf/vmlinux` —
+//! into a queryable type table. Every BTF kind is represented; named types are
+//! indexed by name so candidate lookup stays O(1) at vmlinux scale
+//! (~150k types). See `docs/specs/core-relocations.md` §1.1.
+
+use std::collections::HashMap;
+
+pub const BTF_MAGIC: u16 = 0xEB9F;
+
+/// BTF kind discriminants (the `info` field's bits 24-28).
+pub mod kind {
+    pub const VOID: u32 = 0;
+    pub const INT: u32 = 1;
+    pub const PTR: u32 = 2;
+    pub const ARRAY: u32 = 3;
+    pub const STRUCT: u32 = 4;
+    pub const UNION: u32 = 5;
+    pub const ENUM: u32 = 6;
+    pub const FWD: u32 = 7;
+    pub const TYPEDEF: u32 = 8;
+    pub const VOLATILE: u32 = 9;
+    pub const CONST: u32 = 10;
+    pub const RESTRICT: u32 = 11;
+    pub const FUNC: u32 = 12;
+    pub const FUNC_PROTO: u32 = 13;
+    pub const VAR: u32 = 14;
+    pub const DATASEC: u32 = 15;
+    pub const FLOAT: u32 = 16;
+    pub const DECL_TAG: u32 = 17;
+    pub const TYPE_TAG: u32 = 18;
+    pub const ENUM64: u32 = 19;
+}
+
+/// Integer encoding flags (INT's trailing word, bits 24-27).
+pub mod int_enc {
+    pub const SIGNED: u8 = 1 << 0;
+    pub const CHAR: u8 = 1 << 1;
+    pub const BOOL: u8 = 1 << 2;
+}
+
+/// A struct/union member.
+#[derive(Debug, Clone)]
+pub struct Member {
+    pub name_off: u32,
+    pub type_id: u32,
+    /// Offset of the member in bits from the start of the struct.
+    pub bit_offset: u32,
+    /// 0 for a regular member; the width in bits for a bitfield member.
+    pub bitfield_size: u8,
+}
+
+/// One enumerator (ENUM and ENUM64 are unified; values are sign- or
+/// zero-extended to 64 bits according to the enum's signedness).
+#[derive(Debug, Clone)]
+pub struct EnumVal {
+    pub name_off: u32,
+    pub value: u64,
+}
+
+/// A DATASEC entry: a variable placed in the section.
+#[derive(Debug, Clone)]
+pub struct SecInfo {
+    pub type_id: u32,
+    pub offset: u32,
+    pub size: u32,
+}
+
+/// A function prototype parameter.
+#[derive(Debug, Clone)]
+pub struct Param {
+    pub name_off: u32,
+    pub type_id: u32,
+}
+
+/// Kind-specific payload of a BTF type.
+#[derive(Debug, Clone)]
+pub enum Kind {
+    /// Type id 0.
+    Void,
+    Int {
+        size: u32,
+        /// Width in bits (may be smaller than `size * 8`).
+        bits: u8,
+        encoding: u8,
+    },
+    Ptr {
+        type_id: u32,
+    },
+    Array {
+        elem_type: u32,
+        index_type: u32,
+        nelems: u32,
+    },
+    Struct {
+        size: u32,
+        members: Vec<Member>,
+    },
+    Union {
+        size: u32,
+        members: Vec<Member>,
+    },
+    Enum {
+        size: u32,
+        signed: bool,
+        /// True when this came from ENUM64 on the wire.
+        is64: bool,
+        vals: Vec<EnumVal>,
+    },
+    Fwd {
+        is_union: bool,
+    },
+    Typedef {
+        type_id: u32,
+    },
+    Volatile {
+        type_id: u32,
+    },
+    Const {
+        type_id: u32,
+    },
+    Restrict {
+        type_id: u32,
+    },
+    Func {
+        proto_type: u32,
+        linkage: u32,
+    },
+    FuncProto {
+        ret_type: u32,
+        params: Vec<Param>,
+    },
+    Var {
+        type_id: u32,
+        linkage: u32,
+    },
+    Datasec {
+        size: u32,
+        entries: Vec<SecInfo>,
+    },
+    Float {
+        size: u32,
+    },
+    DeclTag {
+        type_id: u32,
+        component_idx: i32,
+    },
+    TypeTag {
+        type_id: u32,
+    },
+}
+
+impl Kind {
+    /// The wire discriminant (see [`kind`]).
+    pub fn discr(&self) -> u32 {
+        match self {
+            Kind::Void => kind::VOID,
+            Kind::Int { .. } => kind::INT,
+            Kind::Ptr { .. } => kind::PTR,
+            Kind::Array { .. } => kind::ARRAY,
+            Kind::Struct { .. } => kind::STRUCT,
+            Kind::Union { .. } => kind::UNION,
+            Kind::Enum { is64: false, .. } => kind::ENUM,
+            Kind::Enum { is64: true, .. } => kind::ENUM64,
+            Kind::Fwd { .. } => kind::FWD,
+            Kind::Typedef { .. } => kind::TYPEDEF,
+            Kind::Volatile { .. } => kind::VOLATILE,
+            Kind::Const { .. } => kind::CONST,
+            Kind::Restrict { .. } => kind::RESTRICT,
+            Kind::Func { .. } => kind::FUNC,
+            Kind::FuncProto { .. } => kind::FUNC_PROTO,
+            Kind::Var { .. } => kind::VAR,
+            Kind::Datasec { .. } => kind::DATASEC,
+            Kind::Float { .. } => kind::FLOAT,
+            Kind::DeclTag { .. } => kind::DECL_TAG,
+            Kind::TypeTag { .. } => kind::TYPE_TAG,
+        }
+    }
+}
+
+/// One parsed BTF type.
+#[derive(Debug, Clone)]
+pub struct Type {
+    pub name_off: u32,
+    pub kind: Kind,
+}
+
+/// A parsed BTF blob: type table + string table + name index.
+pub struct Btf {
+    types: Vec<Type>,
+    strs: Vec<u8>,
+    /// name → type ids bearing that exact name (all named kinds).
+    by_name: HashMap<String, Vec<u32>>,
+}
+
+/// Little/big-endian u32 reader over the blob.
+struct R<'a> {
+    buf: &'a [u8],
+    le: bool,
+}
+
+impl R<'_> {
+    fn u16(&self, off: usize) -> Result<u16, String> {
+        let b: [u8; 2] = self
+            .buf
+            .get(off..off + 2)
+            .ok_or("truncated BTF")?
+            .try_into()
+            .unwrap();
+        Ok(if self.le {
+            u16::from_le_bytes(b)
+        } else {
+            u16::from_be_bytes(b)
+        })
+    }
+    fn u32(&self, off: usize) -> Result<u32, String> {
+        let b: [u8; 4] = self
+            .buf
+            .get(off..off + 4)
+            .ok_or("truncated BTF")?
+            .try_into()
+            .unwrap();
+        Ok(if self.le {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        })
+    }
+}
+
+impl Btf {
+    /// Parse a raw BTF blob (a `.BTF` ELF section payload or a standalone
+    /// kernel BTF file). `le` selects the byte order.
+    pub fn parse(le: bool, data: &[u8]) -> Result<Btf, String> {
+        let r = R { buf: data, le };
+        if r.u16(0)? != BTF_MAGIC {
+            return Err("bad BTF magic".into());
+        }
+        // btf_header: magic u16, version u8, flags u8, hdr_len u32,
+        //             type_off u32, type_len u32, str_off u32, str_len u32
+        let hdr_len = r.u32(4)? as usize;
+        if hdr_len < 24 {
+            return Err("BTF header too short".into());
+        }
+        let type_off = r.u32(8)? as usize;
+        let type_len = r.u32(12)? as usize;
+        let str_off = r.u32(16)? as usize;
+        let str_len = r.u32(20)? as usize;
+        let types_start = hdr_len + type_off;
+        let types_end = types_start
+            .checked_add(type_len)
+            .filter(|&e| e <= data.len())
+            .ok_or("BTF type section out of bounds")?;
+        let strs = data
+            .get(hdr_len + str_off..hdr_len + str_off + str_len)
+            .ok_or("BTF string section out of bounds")?
+            .to_vec();
+
+        let mut types = vec![Type {
+            name_off: 0,
+            kind: Kind::Void,
+        }];
+        let mut off = types_start;
+        while off < types_end {
+            let name_off = r.u32(off)?;
+            let info = r.u32(off + 4)?;
+            let size_or_type = r.u32(off + 8)?;
+            let vlen = (info & 0xffff) as usize;
+            let k = (info >> 24) & 0x1f;
+            let kflag = info >> 31 == 1;
+            off += 12;
+            let kind = match k {
+                kind::INT => {
+                    let w = r.u32(off)?;
+                    off += 4;
+                    Kind::Int {
+                        size: size_or_type,
+                        bits: (w & 0xff) as u8,
+                        encoding: ((w >> 24) & 0xf) as u8,
+                    }
+                }
+                kind::PTR => Kind::Ptr {
+                    type_id: size_or_type,
+                },
+                kind::ARRAY => {
+                    let a = Kind::Array {
+                        elem_type: r.u32(off)?,
+                        index_type: r.u32(off + 4)?,
+                        nelems: r.u32(off + 8)?,
+                    };
+                    off += 12;
+                    a
+                }
+                kind::STRUCT | kind::UNION => {
+                    let mut members = Vec::with_capacity(vlen);
+                    for _ in 0..vlen {
+                        let m_off = r.u32(off + 8)?;
+                        let (bit_offset, bitfield_size) = if kflag {
+                            (m_off & 0x00ff_ffff, (m_off >> 24) as u8)
+                        } else {
+                            (m_off, 0)
+                        };
+                        members.push(Member {
+                            name_off: r.u32(off)?,
+                            type_id: r.u32(off + 4)?,
+                            bit_offset,
+                            bitfield_size,
+                        });
+                        off += 12;
+                    }
+                    if k == kind::STRUCT {
+                        Kind::Struct {
+                            size: size_or_type,
+                            members,
+                        }
+                    } else {
+                        Kind::Union {
+                            size: size_or_type,
+                            members,
+                        }
+                    }
+                }
+                kind::ENUM => {
+                    let mut vals = Vec::with_capacity(vlen);
+                    for _ in 0..vlen {
+                        let v = r.u32(off + 4)? as i32;
+                        vals.push(EnumVal {
+                            name_off: r.u32(off)?,
+                            // Sign-extend; unsigned 32-bit values still
+                            // round-trip through the low word.
+                            value: v as i64 as u64,
+                        });
+                        off += 8;
+                    }
+                    Kind::Enum {
+                        size: size_or_type,
+                        signed: kflag,
+                        is64: false,
+                        vals,
+                    }
+                }
+                kind::ENUM64 => {
+                    let mut vals = Vec::with_capacity(vlen);
+                    for _ in 0..vlen {
+                        let lo = r.u32(off + 4)? as u64;
+                        let hi = r.u32(off + 8)? as u64;
+                        vals.push(EnumVal {
+                            name_off: r.u32(off)?,
+                            value: lo | (hi << 32),
+                        });
+                        off += 12;
+                    }
+                    Kind::Enum {
+                        size: size_or_type,
+                        signed: kflag,
+                        is64: true,
+                        vals,
+                    }
+                }
+                kind::FWD => Kind::Fwd { is_union: kflag },
+                kind::TYPEDEF => Kind::Typedef {
+                    type_id: size_or_type,
+                },
+                kind::VOLATILE => Kind::Volatile {
+                    type_id: size_or_type,
+                },
+                kind::CONST => Kind::Const {
+                    type_id: size_or_type,
+                },
+                kind::RESTRICT => Kind::Restrict {
+                    type_id: size_or_type,
+                },
+                kind::FUNC => Kind::Func {
+                    proto_type: size_or_type,
+                    linkage: (info & 0xffff),
+                },
+                kind::FUNC_PROTO => {
+                    let mut params = Vec::with_capacity(vlen);
+                    for _ in 0..vlen {
+                        params.push(Param {
+                            name_off: r.u32(off)?,
+                            type_id: r.u32(off + 4)?,
+                        });
+                        off += 8;
+                    }
+                    Kind::FuncProto {
+                        ret_type: size_or_type,
+                        params,
+                    }
+                }
+                kind::VAR => {
+                    let linkage = r.u32(off)?;
+                    off += 4;
+                    Kind::Var {
+                        type_id: size_or_type,
+                        linkage,
+                    }
+                }
+                kind::DATASEC => {
+                    let mut entries = Vec::with_capacity(vlen);
+                    for _ in 0..vlen {
+                        entries.push(SecInfo {
+                            type_id: r.u32(off)?,
+                            offset: r.u32(off + 4)?,
+                            size: r.u32(off + 8)?,
+                        });
+                        off += 12;
+                    }
+                    Kind::Datasec {
+                        size: size_or_type,
+                        entries,
+                    }
+                }
+                kind::FLOAT => Kind::Float { size: size_or_type },
+                kind::DECL_TAG => {
+                    let idx = r.u32(off)? as i32;
+                    off += 4;
+                    Kind::DeclTag {
+                        type_id: size_or_type,
+                        component_idx: idx,
+                    }
+                }
+                kind::TYPE_TAG => Kind::TypeTag {
+                    type_id: size_or_type,
+                },
+                other => return Err(format!("unknown BTF kind {other} at offset {off}")),
+            };
+            types.push(Type { name_off, kind });
+        }
+        if off != types_end {
+            return Err("BTF type section desynchronized (trailing bytes)".into());
+        }
+
+        // Index named types for candidate lookup.
+        let mut by_name: HashMap<String, Vec<u32>> = HashMap::new();
+        for (id, t) in types.iter().enumerate().skip(1) {
+            let name = str_at(&strs, t.name_off);
+            if !name.is_empty() {
+                by_name.entry(name.to_string()).or_default().push(id as u32);
+            }
+        }
+
+        Ok(Btf {
+            types,
+            strs,
+            by_name,
+        })
+    }
+
+    /// Number of type ids (including the implicit `void` at id 0).
+    pub fn len(&self) -> usize {
+        self.types.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.types.len() <= 1
+    }
+
+    /// Look up a type by id.
+    pub fn ty(&self, id: u32) -> Result<&Type, String> {
+        self.types
+            .get(id as usize)
+            .ok_or_else(|| format!("BTF type id {id} out of range"))
+    }
+
+    /// Resolve a string-table offset.
+    pub fn str_at(&self, off: u32) -> &str {
+        str_at(&self.strs, off)
+    }
+
+    /// A type's name ("" for anonymous types).
+    pub fn type_name(&self, id: u32) -> &str {
+        match self.types.get(id as usize) {
+            Some(t) => self.str_at(t.name_off),
+            None => "",
+        }
+    }
+
+    /// Ids of all types with exactly this name.
+    pub fn ids_by_name(&self, name: &str) -> &[u32] {
+        self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Iterate `(id, type)` over all types (skipping void).
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &Type)> {
+        self.types
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(i, t)| (i as u32, t))
+    }
+
+    /// Skip modifiers (const/volatile/restrict/type_tag) and typedefs,
+    /// returning the underlying type id.
+    pub fn resolve(&self, mut id: u32) -> Result<u32, String> {
+        for _ in 0..64 {
+            match &self.ty(id)?.kind {
+                Kind::Typedef { type_id }
+                | Kind::Volatile { type_id }
+                | Kind::Const { type_id }
+                | Kind::Restrict { type_id }
+                | Kind::TypeTag { type_id } => id = *type_id,
+                _ => return Ok(id),
+            }
+        }
+        Err("BTF modifier/typedef chain too deep (cycle?)".into())
+    }
+
+    /// Byte size of a type (resolving modifiers/typedefs). Errors on types
+    /// without a size (functions, void, forward declarations).
+    pub fn type_size(&self, id: u32) -> Result<u32, String> {
+        let id = self.resolve(id)?;
+        match &self.ty(id)?.kind {
+            Kind::Int { size, .. }
+            | Kind::Struct { size, .. }
+            | Kind::Union { size, .. }
+            | Kind::Enum { size, .. }
+            | Kind::Float { size }
+            | Kind::Datasec { size, .. } => Ok(*size),
+            Kind::Ptr { .. } => Ok(8),
+            Kind::Array {
+                elem_type, nelems, ..
+            } => {
+                let e = self.type_size(*elem_type)?;
+                e.checked_mul(*nelems)
+                    .ok_or_else(|| "BTF array size overflow".into())
+            }
+            Kind::Var { type_id, .. } => self.type_size(*type_id),
+            other => Err(format!(
+                "BTF type {} (kind {}) has no size",
+                id,
+                other.discr()
+            )),
+        }
+    }
+
+    /// Find the DATASEC with the given name, if any.
+    pub fn datasec(&self, name: &str) -> Option<&[SecInfo]> {
+        self.ids_by_name(name).iter().find_map(|&id| {
+            match &self.types[id as usize].kind {
+                Kind::Datasec { entries, .. } => Some(entries.as_slice()),
+                _ => None,
+            }
+        })
+    }
+}
+
+fn str_at(strs: &[u8], off: u32) -> &str {
+    let off = off as usize;
+    if off >= strs.len() {
+        return "";
+    }
+    let end = strs[off..]
+        .iter()
+        .position(|&b| b == 0)
+        .map(|p| off + p)
+        .unwrap_or(strs.len());
+    std::str::from_utf8(&strs[off..end]).unwrap_or("")
+}
+
+/// The "essential name" of a type: the name with any `___flavor` suffix
+/// stripped. CO-RE candidate matching compares essential names so that
+/// `task_struct___v2` in the program matches `task_struct` in the kernel.
+pub fn essential_name(name: &str) -> &str {
+    match name.find("___") {
+        Some(0) | None => name,
+        Some(i) => &name[..i],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hand-assemble a BTF blob from (name, info, size_or_type, extra-words).
+    pub(crate) fn build_btf(strings: &[&str], types: &[(u32, u32, u32, Vec<u32>)]) -> Vec<u8> {
+        let mut strs = vec![0u8]; // offset 0 = ""
+        let mut offs = vec![0u32];
+        for s in strings {
+            offs.push(strs.len() as u32);
+            strs.extend_from_slice(s.as_bytes());
+            strs.push(0);
+        }
+        let _ = offs;
+        let mut tsec = Vec::new();
+        for (name_off, info, sz, extra) in types {
+            tsec.extend_from_slice(&name_off.to_le_bytes());
+            tsec.extend_from_slice(&info.to_le_bytes());
+            tsec.extend_from_slice(&sz.to_le_bytes());
+            for w in extra {
+                tsec.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&BTF_MAGIC.to_le_bytes());
+        out.push(1); // version
+        out.push(0); // flags
+        out.extend_from_slice(&24u32.to_le_bytes()); // hdr_len
+        out.extend_from_slice(&0u32.to_le_bytes()); // type_off
+        out.extend_from_slice(&(tsec.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(tsec.len() as u32).to_le_bytes()); // str_off
+        out.extend_from_slice(&(strs.len() as u32).to_le_bytes());
+        out.extend(tsec);
+        out.extend(strs);
+        out
+    }
+
+    /// String offset helper matching `build_btf`'s layout.
+    pub(crate) fn stroff(strings: &[&str], name: &str) -> u32 {
+        let mut off = 1u32;
+        for s in strings {
+            if *s == name {
+                return off;
+            }
+            off += s.len() as u32 + 1;
+        }
+        panic!("string {name} not in table");
+    }
+
+    fn info(kind: u32, vlen: u32, kflag: bool) -> u32 {
+        (kind << 24) | (vlen & 0xffff) | ((kflag as u32) << 31)
+    }
+
+    #[test]
+    fn parse_struct_graph() {
+        let strings = ["int", "x", "y", "point", "flags"];
+        let s = |n| stroff(&strings, n);
+        let blob = build_btf(
+            &strings,
+            &[
+                // [1] int, size 4, signed 32 bits
+                (
+                    s("int"),
+                    info(kind::INT, 0, false),
+                    4,
+                    vec![(1u32 << 24) | 32],
+                ),
+                // [2] struct point { int x; int y; }
+                (
+                    s("point"),
+                    info(kind::STRUCT, 2, false),
+                    8,
+                    vec![s("x"), 1, 0, s("y"), 1, 32],
+                ),
+                // [3] bitfield struct (kind_flag): flags:3 at bit 0
+                (
+                    0,
+                    info(kind::STRUCT, 1, true),
+                    4,
+                    vec![s("flags"), 1, (3u32 << 24)],
+                ),
+                // [4] ptr -> point
+                (0, info(kind::PTR, 0, false), 2, vec![]),
+                // [5] array of 10 ints
+                (0, info(kind::ARRAY, 0, false), 0, vec![1, 1, 10]),
+            ],
+        );
+        let btf = Btf::parse(true, &blob).unwrap();
+        assert_eq!(btf.len(), 6);
+        assert_eq!(btf.type_name(2), "point");
+        let Kind::Struct { size, members } = &btf.ty(2).unwrap().kind else {
+            panic!("not a struct");
+        };
+        assert_eq!(*size, 8);
+        assert_eq!(members.len(), 2);
+        assert_eq!(btf.str_at(members[1].name_off), "y");
+        assert_eq!(members[1].bit_offset, 32);
+        assert_eq!(members[1].bitfield_size, 0);
+        let Kind::Struct { members: bm, .. } = &btf.ty(3).unwrap().kind else {
+            panic!()
+        };
+        assert_eq!((bm[0].bit_offset, bm[0].bitfield_size), (0, 3));
+        assert_eq!(btf.type_size(4).unwrap(), 8); // pointer
+        assert_eq!(btf.type_size(5).unwrap(), 40); // 10 * int
+        assert_eq!(btf.ids_by_name("point"), &[2]);
+    }
+
+    #[test]
+    fn resolve_skips_modifiers() {
+        let strings = ["int", "myint"];
+        let s = |n| stroff(&strings, n);
+        let blob = build_btf(
+            &strings,
+            &[
+                (
+                    s("int"),
+                    info(kind::INT, 0, false),
+                    4,
+                    vec![(1u32 << 24) | 32],
+                ),
+                (s("myint"), info(kind::TYPEDEF, 0, false), 1, vec![]),
+                (0, info(kind::CONST, 0, false), 2, vec![]),
+                (0, info(kind::VOLATILE, 0, false), 3, vec![]),
+            ],
+        );
+        let btf = Btf::parse(true, &blob).unwrap();
+        assert_eq!(btf.resolve(4).unwrap(), 1);
+        assert_eq!(btf.type_size(4).unwrap(), 4);
+    }
+
+    #[test]
+    fn enum_and_enum64() {
+        let strings = ["A", "B", "big"];
+        let s = |n| stroff(&strings, n);
+        let blob = build_btf(
+            &strings,
+            &[
+                // [1] enum { A = -1, B = 5 } (signed)
+                (
+                    0,
+                    info(kind::ENUM, 2, true),
+                    4,
+                    vec![s("A"), (-1i32) as u32, s("B"), 5],
+                ),
+                // [2] enum64 { big = 0x1_0000_0001 }
+                (
+                    0,
+                    info(kind::ENUM64, 1, false),
+                    8,
+                    vec![s("big"), 1, 1],
+                ),
+            ],
+        );
+        let btf = Btf::parse(true, &blob).unwrap();
+        let Kind::Enum { vals, signed, is64, .. } = &btf.ty(1).unwrap().kind else {
+            panic!()
+        };
+        assert!(*signed && !*is64);
+        assert_eq!(vals[0].value as i64, -1);
+        assert_eq!(vals[1].value, 5);
+        let Kind::Enum { vals, is64, .. } = &btf.ty(2).unwrap().kind else {
+            panic!()
+        };
+        assert!(*is64);
+        assert_eq!(vals[0].value, 0x1_0000_0001);
+    }
+
+    #[test]
+    fn desync_is_detected() {
+        // A FUNC_PROTO whose vlen promises more params than the section holds.
+        let blob = build_btf(&[], &[(0, 13 << 24 | 3, 0, vec![0, 0])]);
+        assert!(Btf::parse(true, &blob).is_err());
+    }
+
+    #[test]
+    fn essential_names() {
+        assert_eq!(essential_name("task_struct"), "task_struct");
+        assert_eq!(essential_name("task_struct___v2"), "task_struct");
+        assert_eq!(essential_name("a___b___c"), "a");
+        assert_eq!(essential_name("___weird"), "___weird");
+        assert_eq!(essential_name(""), "");
+    }
+}

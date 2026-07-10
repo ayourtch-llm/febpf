@@ -230,13 +230,21 @@ in `src/elf.rs`, before `Vm::new` — same lifecycle stage as the existing map
 ## STATUS
 
 - Stage 0 (this spec): **done**.
-- Stage 1 (BTF type graph + `.maps` port): not started.
+- Stage 1 (BTF type graph + `.maps` port): **done** — `src/btf.rs` parses all
+  19 kinds into `Btf` (type table + string table + exact-name index), with
+  `resolve()` (modifier/typedef skipping), `type_size()`, `datasec()`, and
+  `essential_name()`. `elf.rs::btf_maps` re-implements `.maps` extraction on
+  top of it. Validated against `bpftool btf dump` on `/sys/kernel/btf/vmlinux`
+  (168,815 types; all (id, name) pairs and the full task_struct member layout
+  agree; parse ~56ms) in `tests/btf.rs`, plus synthetic unit tests in
+  `src/btf.rs`.
 - Stage 2 (`.BTF.ext`): not started.
 - Stage 3 (relocation algorithm): not started.
 - Stage 4 (patching + CLI): not started.
 
-Next step: create `src/btf.rs` with the full type-graph parser (§1.1), expose a
-`Btf` type + name index, and re-implement `elf.rs::btf::load_btf_maps` on top of
-it, keeping all existing ELF tests green.
-</content>
-</invoke>
+Next step (stage 2): parse `.BTF.ext` (§1.2) — a `BtfExt` type in `src/btf.rs`
+holding per-section `core_relo` records (semantic) plus `func_info`/`line_info`
+records (structural, for future source-level debugging). Ground truth already
+verified against clang 21: a `__attribute__((preserve_access_index))` struct
+access (`p->x + p->y + p->z`) yields 3 FIELD_BYTE_OFFSET relos with access
+strings "0:0"/"0:1"/"0:2" in section ".text" (see §1.2).
