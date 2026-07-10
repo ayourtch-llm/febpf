@@ -265,6 +265,7 @@ fn resolve_slice<'s>(
     ctx: &'s mut [u8],
     addr: u64,
     len: usize,
+    write: bool,
 ) -> Result<&'s mut [u8], String> {
     let handle = (addr >> 32) as usize;
     let off = addr as u32 as usize;
@@ -279,7 +280,16 @@ fn resolve_slice<'s>(
         Region::MapObj(_) => {
             return Err(format!("map object pointer {addr:#x} is not dereferenceable"))
         }
-        Region::MapValue { map, vref } => maps[map as usize].value_mut(vref),
+        Region::MapValue { map, vref } => {
+            let m = &mut maps[map as usize];
+            if write && m.def.readonly {
+                return Err(format!(
+                    "write to read-only map '{}' ({addr:#x})",
+                    m.def.name
+                ));
+            }
+            m.value_mut(vref)
+        }
     };
     buf.get_mut(off..off + len)
         .ok_or_else(|| format!("access out of bounds: {addr:#x} len {len}"))
@@ -287,12 +297,16 @@ fn resolve_slice<'s>(
 
 impl MemBus for Bus<'_> {
     fn read(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), String> {
-        let s = resolve_slice(self.regions, self.maps, self.stack, self.ctx, addr, buf.len())?;
+        let s = resolve_slice(
+            self.regions, self.maps, self.stack, self.ctx, addr, buf.len(), false,
+        )?;
         buf.copy_from_slice(s);
         Ok(())
     }
     fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), String> {
-        let s = resolve_slice(self.regions, self.maps, self.stack, self.ctx, addr, data.len())?;
+        let s = resolve_slice(
+            self.regions, self.maps, self.stack, self.ctx, addr, data.len(), true,
+        )?;
         s.copy_from_slice(data);
         Ok(())
     }
@@ -371,7 +385,7 @@ impl<'a> Machine<'a> {
     }
 
     #[inline]
-    fn mem(&mut self, addr: u64, len: usize) -> Result<&mut [u8], EbpfError> {
+    fn mem(&mut self, addr: u64, len: usize, write: bool) -> Result<&mut [u8], EbpfError> {
         let pc = self.pc;
         resolve_slice(
             &self.vm.regions,
@@ -380,18 +394,19 @@ impl<'a> Machine<'a> {
             self.ctx,
             addr,
             len,
+            write,
         )
         .map_err(|msg| EbpfError { pc, msg })
     }
 
     /// Read memory for the debugger (no mutation).
     pub fn read_mem(&mut self, addr: u64, len: usize) -> Result<Vec<u8>, EbpfError> {
-        Ok(self.mem(addr, len)?.to_vec())
+        Ok(self.mem(addr, len, false)?.to_vec())
     }
 
     #[inline]
     fn load(&mut self, addr: u64, size: usize) -> Result<u64, EbpfError> {
-        let s = self.mem(addr, size)?;
+        let s = self.mem(addr, size, false)?;
         Ok(match size {
             1 => s[0] as u64,
             2 => u16::from_le_bytes([s[0], s[1]]) as u64,
@@ -402,7 +417,7 @@ impl<'a> Machine<'a> {
 
     #[inline]
     fn store(&mut self, addr: u64, size: usize, v: u64) -> Result<(), EbpfError> {
-        let s = self.mem(addr, size)?;
+        let s = self.mem(addr, size, true)?;
         match size {
             1 => s[0] = v as u8,
             2 => s.copy_from_slice(&(v as u16).to_le_bytes()),
@@ -745,7 +760,7 @@ impl<'a> Machine<'a> {
     }
 
     fn read_bytes(&mut self, addr: u64, len: usize) -> Result<Vec<u8>, EbpfError> {
-        Ok(self.mem(addr, len)?.to_vec())
+        Ok(self.mem(addr, len, false)?.to_vec())
     }
 
     fn helper_call(&mut self, hid: u32) -> Result<(), EbpfError> {

@@ -688,3 +688,83 @@ fn user_registered_helper() {
     .unwrap();
     assert_eq!(vm.run(&mut []).unwrap(), 42 + 0xEE);
 }
+
+// ------------------------------------------------------------ read-only maps
+
+#[test]
+fn readonly_map_reads_ok() {
+    // reads through a frozen map's value pointer are fine
+    let src = "
+        .map ro array 4 8 1 ro
+        r1 = map[ro][0] + 0
+        r0 = *(u64 *)(r1 + 0)
+        exit";
+    assert_eq!(run_src(src), 0);
+}
+
+#[test]
+fn readonly_map_store_rejected_by_verifier() {
+    let e = verify_err(
+        "
+        .map ro array 4 8 1 ro
+        r1 = map[ro][0]
+        r2 = 1
+        *(u64 *)(r1 + 0) = r2
+        r0 = 0
+        exit",
+    );
+    assert!(e.contains("read-only"), "unexpected error: {e}");
+}
+
+#[test]
+fn readonly_map_store_rejected_at_runtime() {
+    // even unverified, the interpreter blocks the write
+    let mut vm = Vm::new(program(
+        "
+        .map ro array 4 8 1 ro
+        r1 = map[ro][0]
+        r2 = 1
+        *(u64 *)(r1 + 0) = r2
+        r0 = 0
+        exit",
+    ))
+    .unwrap();
+    let err = vm.run(&mut []).expect_err("write should fault");
+    assert!(err.to_string().contains("read-only"), "unexpected: {err}");
+}
+
+#[test]
+fn readonly_map_update_helper_rejected() {
+    let e = verify_err(
+        "
+        .map ro array 4 8 1 ro
+        w1 = 0
+        *(u32 *)(r10 - 4) = r1
+        r1 = 7
+        *(u64 *)(r10 - 16) = r1
+        r1 = map[ro]
+        r2 = r10
+        r2 += -4
+        r3 = r10
+        r3 += -16
+        r4 = 0
+        call map_update_elem
+        r0 = 0
+        exit",
+    );
+    assert!(e.contains("read-only"), "unexpected error: {e}");
+}
+
+#[test]
+fn map_value_lddw_with_offset() {
+    // writable direct value access: store at +8, read it back at +8
+    let src = "
+        .map m array 4 16 1
+        r1 = map[m][0] + 8
+        r2 = 77
+        *(u64 *)(r1 + 0) = r2
+        r3 = map[m][0]
+        r0 = *(u64 *)(r3 + 8)
+        exit";
+    assert_eq!(run_src(src), 77);
+}

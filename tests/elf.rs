@@ -88,11 +88,69 @@ fn cross_text_bpf_to_bpf_call() {
 }
 
 #[test]
+fn global_data_object() {
+    maybe_compile("global_data.c", "global_data.o");
+    let obj = load("tests/global_data.o");
+
+    // .rodata* (frozen, initialized), .data (initialized), .bss (zero).
+    let ro = obj
+        .maps
+        .iter()
+        .find(|m| m.name.starts_with(".rodata") && m.value_size == 16)
+        .expect("no .rodata table map");
+    assert!(ro.readonly);
+    assert_eq!(ro.init.len(), 16);
+    assert_eq!(ro.init[0..4], 10i32.to_le_bytes());
+    let data = obj.maps.iter().find(|m| m.name == ".data").expect("no .data map");
+    assert!(!data.readonly);
+    assert_eq!(data.init, 3i64.to_le_bytes());
+    let bss = obj.maps.iter().find(|m| m.name == ".bss").expect("no .bss map");
+    assert!(!bss.readonly);
+    assert!(bss.init.is_empty());
+    assert_eq!(bss.value_size, 8);
+
+    // Globals persist across runs of the same VM:
+    // run 1 (idx 0): bss = 10, scale = 4  -> 10 + 400 = 410
+    // run 2 (idx 0): bss = 20, scale = 5  -> 20 + 500 = 520
+    let prog = obj.programs.iter().find(|p| p.name == "socket").unwrap();
+    let mut vm = Vm::new(Program {
+        insns: prog.insns.clone(),
+        maps: obj.maps.clone(),
+    })
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 64,
+        ..Default::default()
+    })
+    .expect("verification failed");
+    assert_eq!(vm.run(&mut [0u8; 64]).unwrap(), 410);
+    assert_eq!(vm.run(&mut [0u8; 64]).unwrap(), 520);
+    // the printk format string lives in .rodata.str1.1
+    assert_eq!(vm.printk, vec!["count=10".to_string(), "count=20".to_string()]);
+
+    // ctx selects the table index: idx 3 -> bss = 40, scale = 4 -> 440
+    let mut vm2 = Vm::new(Program {
+        insns: prog.insns.clone(),
+        maps: obj.maps.clone(),
+    })
+    .unwrap();
+    vm2.verify(Config {
+        ctx_size: 64,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut ctx = [0u8; 64];
+    ctx[0] = 3;
+    assert_eq!(vm2.run(&mut ctx).unwrap(), 440);
+}
+
+#[test]
 fn jit_matches_interpreter_on_objects() {
     for (file, prog, ctx_len) in [
         ("tests/legacy_maps.o", "socket", 64),
         ("tests/btf_maps.o", "xdp", 64),
         ("tests/subprog.o", "socket", 8),
+        ("tests/global_data.o", "socket", 64),
     ] {
         let obj = load(file);
         let mut i_ctx = vec![0u8; ctx_len];

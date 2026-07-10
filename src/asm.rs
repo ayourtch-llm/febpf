@@ -343,7 +343,7 @@ pub fn assemble(source: &str) -> Result<Assembled, AsmError> {
             let first = p.next()?.clone();
             match first {
                 Tok::Ident(w) if w == ".map" => {
-                    // .map name kind key_size value_size max_entries
+                    // .map name kind key_size value_size max_entries [ro]
                     let name = p.expect_ident()?;
                     let kind_s = p.expect_ident()?;
                     let kind = match kind_s.as_str() {
@@ -354,6 +354,13 @@ pub fn assemble(source: &str) -> Result<Assembled, AsmError> {
                     let key_size = p.number()? as u32;
                     let value_size = p.number()? as u32;
                     let max_entries = p.number()? as u32;
+                    let readonly = match p.peek() {
+                        Some(Tok::Ident(f)) if f == "ro" => {
+                            p.next()?;
+                            true
+                        }
+                        _ => false,
+                    };
                     if map_ids.contains_key(&name) {
                         return Err(format!("duplicate map '{name}'"));
                     }
@@ -364,6 +371,8 @@ pub fn assemble(source: &str) -> Result<Assembled, AsmError> {
                         key_size,
                         value_size,
                         max_entries,
+                        readonly,
+                        init: Vec::new(),
                     });
                     Ok(())
                 }
@@ -832,10 +841,29 @@ fn parse_assignment(
                     if is32 {
                         return Err("map loads need a 64-bit register".into());
                     }
+                    // `map[name]` = map object pointer;
+                    // `map[name][0] + off` = pointer into the first value.
+                    let (src_reg, value_off) = if matches!(p.peek(), Some(Tok::Op("["))) {
+                        p.next()?;
+                        let elem = p.number()?;
+                        if elem != 0 {
+                            return Err("direct value access only supports element 0".into());
+                        }
+                        p.expect_op("]")?;
+                        let off = if matches!(p.peek(), Some(Tok::Op("+"))) {
+                            p.next()?;
+                            p.number()?
+                        } else {
+                            0
+                        };
+                        (pseudo::MAP_VALUE, off as i32)
+                    } else {
+                        (pseudo::MAP_ID, 0)
+                    };
                     insns.push(Insn {
                         opcode: class::LD | mode::IMM | size::DW,
                         dst,
-                        src: pseudo::MAP_ID,
+                        src: src_reg,
                         off: 0,
                         imm: id as i32,
                     });
@@ -844,7 +872,7 @@ fn parse_assignment(
                         dst: 0,
                         src: 0,
                         off: 0,
-                        imm: 0,
+                        imm: value_off,
                     });
                     Ok(())
                 }

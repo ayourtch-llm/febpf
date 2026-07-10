@@ -25,7 +25,9 @@ const EM_BPF: u16 = 247;
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_REL: u32 = 9;
+const SHT_NOBITS: u32 = 8;
 
+const SHF_ALLOC: u64 = 0x2;
 const SHF_EXECINSTR: u64 = 0x4;
 
 // BPF relocation types.
@@ -187,7 +189,11 @@ pub fn load(bytes: &[u8]) -> Result<Object, String> {
     let symbols = parse_symbols(&r, bytes, &sections[symtab_idx], symstr)?;
 
     // maps: prefer BTF-defined `.maps`, else the legacy `maps` section.
-    let (maps, map_by_symval) = load_maps(&r, bytes, &sections, &symbols)?;
+    let (mut maps, mut map_by_symval) = load_maps(&r, bytes, &sections, &symbols)?;
+
+    // Global data sections become single-entry array maps; `ld_imm64`
+    // relocations against their symbols resolve to value pointers.
+    load_data_maps(bytes, &sections, &mut maps, &mut map_by_symval)?;
 
     // The `.text` section holds subprograms that entry sections call into via
     // `R_BPF_64_32` relocations. We stitch all of `.text` onto the end of any
@@ -389,14 +395,30 @@ fn apply_relocations(
         }
         match reloc.kind {
             R_BPF_64_64 => {
-                // ld_imm64 map reference: resolve symbol → map index.
-                let map_idx = map_by_symval
-                    .resolve(sym)
-                    .ok_or_else(|| format!("map relocation for unknown symbol '{}'", sym.name))?;
-                insns[insn_idx].src = insn::pseudo::MAP_ID;
-                insns[insn_idx].imm = map_idx as i32;
-                if insn_idx + 1 < insns.len() {
-                    insns[insn_idx + 1].imm = 0;
+                // ld_imm64 map or global-data reference.
+                if insn_idx + 1 >= insns.len() {
+                    return Err(format!("ld_imm64 relocation at {insn_idx} truncated"));
+                }
+                match map_by_symval.resolve(sym) {
+                    Some(MapRef::Obj(map_idx)) => {
+                        insns[insn_idx].src = insn::pseudo::MAP_ID;
+                        insns[insn_idx].imm = map_idx as i32;
+                        insns[insn_idx + 1].imm = 0;
+                    }
+                    Some(MapRef::Data(map_idx)) => {
+                        // Pointer into the section's value: symbol offset plus
+                        // the addend clang stored in the instruction's imm.
+                        let off = (sym.value as u32).wrapping_add(insns[insn_idx].imm as u32);
+                        insns[insn_idx].src = insn::pseudo::MAP_VALUE;
+                        insns[insn_idx].imm = map_idx as i32;
+                        insns[insn_idx + 1].imm = off as i32;
+                    }
+                    None => {
+                        return Err(format!(
+                            "map relocation for unknown symbol '{}'",
+                            sym.name
+                        ));
+                    }
                 }
             }
             R_BPF_64_32 => {
@@ -424,20 +446,36 @@ fn apply_relocations(
     Ok(())
 }
 
-/// Maps a relocation symbol to a map index.
-enum MapIndex {
-    /// symbol value (offset into maps section) → map index
-    ByOffset(Vec<(u64, u16, usize)>), // (value, shndx, map_idx)
+/// What a `R_BPF_64_64` relocation symbol refers to.
+enum MapRef {
+    /// A map object (declared in `maps`/`.maps`): lddw a map pointer.
+    Obj(usize),
+    /// A global-data section mapped as a single-entry array map: lddw a
+    /// pointer into its value (the symbol offset is added by the caller).
+    Data(usize),
+}
+
+/// Maps a relocation symbol to a map reference.
+struct MapIndex {
+    /// (symbol value, section) → map index, for symbols in `maps`/`.maps`.
+    by_offset: Vec<(u64, u16, usize)>,
+    /// data section index → map index, for symbols in `.data`/`.rodata`/`.bss`.
+    data_secs: Vec<(u16, usize)>,
 }
 
 impl MapIndex {
-    fn resolve(&self, sym: &Symbol) -> Option<usize> {
-        match self {
-            MapIndex::ByOffset(v) => v
-                .iter()
-                .find(|(val, shndx, _)| *val == sym.value && *shndx == sym.shndx)
-                .map(|(_, _, idx)| *idx),
+    fn resolve(&self, sym: &Symbol) -> Option<MapRef> {
+        if let Some((_, _, idx)) = self
+            .by_offset
+            .iter()
+            .find(|(val, shndx, _)| *val == sym.value && *shndx == sym.shndx)
+        {
+            return Some(MapRef::Obj(*idx));
         }
+        self.data_secs
+            .iter()
+            .find(|(shndx, _)| *shndx == sym.shndx)
+            .map(|(_, idx)| MapRef::Data(*idx))
     }
 }
 
@@ -458,7 +496,58 @@ fn load_maps(
     if let Some(maps_idx) = sections.iter().position(|s| s.name == "maps") {
         return load_legacy_maps(r, bytes, sections, symbols, maps_idx);
     }
-    Ok((Vec::new(), MapIndex::ByOffset(Vec::new())))
+    Ok((
+        Vec::new(),
+        MapIndex {
+            by_offset: Vec::new(),
+            data_secs: Vec::new(),
+        },
+    ))
+}
+
+/// Is this a global data section we expose as a map?
+fn is_data_section(s: &Section) -> bool {
+    (s.kind == SHT_PROGBITS || s.kind == SHT_NOBITS)
+        && s.flags & SHF_ALLOC != 0
+        && s.flags & SHF_EXECINSTR == 0
+        && s.size > 0
+        && (s.name == ".data"
+            || s.name.starts_with(".data.")
+            || s.name == ".bss"
+            || s.name.starts_with(".bss.")
+            || s.name.starts_with(".rodata"))
+}
+
+/// Expose `.data`/`.rodata*`/`.bss` sections as single-entry array maps,
+/// initialized with the section contents (`.bss` is zero-filled). `.rodata`
+/// maps are frozen: the verifier and the runtime both reject writes.
+fn load_data_maps(
+    bytes: &[u8],
+    sections: &[Section],
+    maps: &mut Vec<MapDef>,
+    index: &mut MapIndex,
+) -> Result<(), String> {
+    for (i, sec) in sections.iter().enumerate() {
+        if !is_data_section(sec) {
+            continue;
+        }
+        let init = if sec.kind == SHT_NOBITS {
+            Vec::new() // .bss occupies no file space; storage is zero-filled
+        } else {
+            section_bytes(bytes, sections, i)?.to_vec()
+        };
+        index.data_secs.push((i as u16, maps.len()));
+        maps.push(MapDef {
+            name: sec.name.clone(),
+            kind: MapKind::Array,
+            key_size: 4,
+            value_size: sec.size as u32,
+            max_entries: 1,
+            readonly: sec.name.starts_with(".rodata"),
+            init,
+        });
+    }
+    Ok(())
 }
 
 fn load_legacy_maps(
@@ -491,10 +580,18 @@ fn load_legacy_maps(
             key_size,
             value_size,
             max_entries,
+            readonly: false,
+            init: Vec::new(),
         });
         index.push((sym.value, sym.shndx, i));
     }
-    Ok((maps, MapIndex::ByOffset(index)))
+    Ok((
+        maps,
+        MapIndex {
+            by_offset: index,
+            data_secs: Vec::new(),
+        },
+    ))
 }
 
 fn map_kind(ty: u32) -> Result<MapKind, String> {
@@ -799,6 +896,8 @@ mod btf {
                     .ok_or_else(|| format!("map '{map_name}': missing value size"))?,
                 max_entries: max_entries
                     .ok_or_else(|| format!("map '{map_name}': missing max_entries"))?,
+                readonly: false,
+                init: Vec::new(),
             });
             // symbol value equals the DATASEC offset
             let map_idx = maps.len() - 1;
@@ -813,6 +912,12 @@ mod btf {
                 }
             }
         }
-        Ok((maps, MapIndex::ByOffset(index)))
+        Ok((
+            maps,
+            MapIndex {
+                by_offset: index,
+                data_secs: Vec::new(),
+            },
+        ))
     }
 }

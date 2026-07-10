@@ -15,6 +15,7 @@ needs: programs, maps, and the two relocation kinds clang emits for them.
 | Legacy maps | `struct bpf_map_def` array in a `maps` section, one symbol per map |
 | BTF maps | minimal parse of BTF-defined `.maps` (the libbpf `__uint`/`__type` idiom) |
 | Map types | `BPF_MAP_TYPE_HASH` (1), `BPF_MAP_TYPE_ARRAY` (2) |
+| Global data | `.data`/`.data.*`, `.bss`/`.bss.*`, `.rodata*` (incl. `.rodata.str1.1`, `.rodata.cst16`) as single-entry array maps |
 
 Multiple `SEC()` programs in one object are all exposed; the CLI selects with
 `--prog <name>` (section name, e.g. `socket`, `xdp`; `.text` → `text`).
@@ -68,11 +69,33 @@ Parsing steps (`src/elf.rs::btf`):
 
 Cross-checked against `bpftool btf dump file <obj>`.
 
+## Global data sections
+
+Each allocatable, non-executable `.data*`/`.bss*`/`.rodata*` section becomes a
+single-entry array map (`key_size=4`, `value_size=` section size,
+`max_entries=1`), matching libbpf's internal-map model:
+
+- The section contents become the map's initial value (`MapDef::init`);
+  `.bss` is `SHT_NOBITS` and is zero-filled.
+- `.rodata*` maps are **frozen** (`MapDef::readonly`): the verifier rejects
+  stores through their value pointers and `map_update/delete_elem` on them,
+  and the runtime independently rejects writes (so `--no-verify` and the JIT
+  are covered too). Runtime update/delete return `-EPERM`, as the kernel does
+  for frozen maps.
+- `R_BPF_64_64` relocations whose symbol lives in a data section (clang emits
+  section symbols with the addend stored in the instruction's `imm`) are
+  lowered to `BPF_PSEUDO_MAP_VALUE` lddw: `imm` = map index, second `imm` =
+  `sym.value + addend` (byte offset into the value). `Vm::new` patches these
+  to a virtual address pointing into the map's storage, and the verifier
+  types them as `PTR_TO_MAP_VALUE` with that constant offset.
+
+This is what makes ordinary clang-compiled C — string literals, lookup
+tables, persistent counters in globals — load and run unmodified.
+
 ## Not supported (yet)
 
 - Full BTF (func/line info, CO-RE relocations, `.BTF.ext`).
 - Map types beyond hash/array (per-CPU, LRU, ringbuf, maps-of-maps, …).
-- Global data sections (`.bss`/`.data`/`.rodata`) as maps.
 - `R_BPF_64_ABS64`/`ABS32`/`NODYLD32` relocations.
 - Static linking of multiple objects.
 

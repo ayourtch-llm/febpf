@@ -1375,7 +1375,16 @@ impl<'a> Verifier<'a> {
                 }
                 (self.cfg.ctx_size as u64, "context")
             }
-            PtrKind::MapValue { map } => (self.maps[map as usize].value_size as u64, "map value"),
+            PtrKind::MapValue { map } => {
+                let def = &self.maps[map as usize];
+                if write && def.readonly {
+                    return Err(self.err(
+                        pc,
+                        format!("cannot write to read-only map '{}'", def.name),
+                    ));
+                }
+                (def.value_size as u64, "map value")
+            }
             PtrKind::MapValueOrNull { .. } => {
                 return Err(self.err(
                     pc,
@@ -1633,6 +1642,25 @@ impl<'a> Verifier<'a> {
                     };
                     self.check_helper_mem(state, pc, &p, sz.umax, write)?;
                 }
+            }
+        }
+
+        // Frozen (.rodata) maps cannot be mutated through helpers.
+        if let Some(map) = map_arg {
+            let def = &self.maps[map as usize];
+            if def.readonly
+                && matches!(
+                    hid,
+                    crate::helpers::id::MAP_UPDATE_ELEM | crate::helpers::id::MAP_DELETE_ELEM
+                )
+            {
+                return Err(self.err(
+                    pc,
+                    format!(
+                        "helper {} cannot modify read-only map '{}'",
+                        sig.name, def.name
+                    ),
+                ));
             }
         }
 

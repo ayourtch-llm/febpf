@@ -31,6 +31,12 @@ pub struct MapDef {
     pub key_size: u32,
     pub value_size: u32,
     pub max_entries: u32,
+    /// Frozen after creation: stores and update/delete are rejected
+    /// (used for `.rodata` global-data maps).
+    pub readonly: bool,
+    /// Initial contents, copied into the front of the storage at creation
+    /// (used for `.data`/`.rodata` global-data maps; rest is zero).
+    pub init: Vec<u8>,
 }
 
 /// Location of a map value inside its map's storage.
@@ -73,14 +79,25 @@ impl Map {
                 if def.key_size != 4 {
                     return Err(format!("array map '{}' requires key_size=4", def.name));
                 }
+                let mut data = vec![0u8; def.max_entries as usize * def.value_size as usize];
+                if def.init.len() > data.len() {
+                    return Err(format!(
+                        "map '{}': initial data larger than storage",
+                        def.name
+                    ));
+                }
+                data[..def.init.len()].copy_from_slice(&def.init);
                 (
-                    Storage::Array(vec![0u8; def.max_entries as usize * def.value_size as usize]),
+                    Storage::Array(data),
                     vec![0u32; def.max_entries as usize],
                 )
             }
             MapKind::Hash => {
                 if def.key_size == 0 {
                     return Err(format!("hash map '{}': zero key_size", def.name));
+                }
+                if !def.init.is_empty() {
+                    return Err(format!("hash map '{}' cannot have initial data", def.name));
                 }
                 (
                     Storage::Hash {
@@ -137,6 +154,9 @@ impl Map {
     /// Insert or overwrite. Existing values are updated in place so
     /// previously handed out references stay valid.
     pub fn update(&mut self, key: &[u8], value: &[u8]) -> Result<ValueRef, i64> {
+        if self.def.readonly {
+            return Err(-1); // EPERM: frozen map
+        }
         if key.len() != self.def.key_size as usize || value.len() != self.def.value_size as usize {
             return Err(-22); // EINVAL
         }
@@ -173,6 +193,9 @@ impl Map {
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<(), i64> {
+        if self.def.readonly {
+            return Err(-1); // EPERM: frozen map
+        }
         match &mut self.storage {
             Storage::Array(_) => Err(-22), // EINVAL: array elements cannot be deleted
             Storage::Hash { index, free, .. } => match index.remove(key) {

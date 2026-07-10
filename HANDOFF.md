@@ -14,8 +14,8 @@ load-bearing constraint. Don't add any without a very good reason and the
 user's OK (raw Linux syscalls via `asm!` are used instead of libc — see the
 JIT's `sys` module).
 
-Everything works today: `cargo test` is 56 green, `cargo clippy --all-targets`
-is 0 warnings, release builds clean. Two commits in git.
+Everything works today: `cargo test` is 62 green, `cargo clippy --all-targets`
+is 0 warnings, release builds clean.
 
 ## The big picture (data flow)
 
@@ -120,7 +120,28 @@ to the program stays valid. Deleted hash entries are tombstoned/reused, never
 freed — mirrors the kernel's RCU-grace-period semantics (a stale pointer reads
 recycled memory, never unsafe).
 
-### 6. Determinism
+### 6. Global data sections (added 2026-07-10, session 2)
+`.data`/`.bss`/`.rodata*` sections load as **single-entry array maps**
+(libbpf's internal-map model): `MapDef` gained `init: Vec<u8>` (section
+contents, `.bss` zero-fills) and `readonly: bool` (`.rodata*` frozen).
+Things that will bite you if you forget them:
+- clang does NOT put everything in plain `.rodata`: const tables land in
+  `.rodata.cst16` (SHF_MERGE) and string literals in `.rodata.str1.1`
+  (SHF_MERGE|SHF_STRINGS). Match by `.rodata` **prefix**.
+- Data relocations are section symbols (value 0) with the **addend stored in
+  the lddw's imm field**; final value offset = `sym.value + imm`. Lowered to
+  `pseudo::MAP_VALUE` (imm = map idx, second imm = offset) — the runtime
+  patching for that already existed in `Vm::new`.
+- read-only is enforced **three times deliberately**: verifier store path
+  (`check_mem_access`), verifier helper check (update/delete on frozen map),
+  and the runtime (`resolve_slice` takes `write: bool`). The runtime check is
+  what keeps `--no-verify` and the JIT honest (JIT defers all memory ops).
+- asm syntax grew `.map name kind key val entries [ro]` and
+  `rX = map[name][0] + off` (direct value pointer) to make this testable
+  without ELF fixtures.
+- `Map::update/delete` on frozen maps return `-EPERM` (-1), like the kernel.
+
+### 7. Determinism
 `get_prandom_u32` is a fixed-seed xorshift; hash maps never move values. So a
 buggy program replays identically under the debugger. Keep it that way.
 
@@ -133,13 +154,19 @@ buggy program replays identically under the debugger. Keep it that way.
   regenerate: `clang -O2 -g -target bpf -c examples/c/X.c -o tests/X.o` (use
   `-O0` for `subprog.c` so the cross-`.text` call isn't inlined away).
 - `Date.now()`/randomness are fine here (this is a normal shell, not a workflow
-  sandbox).
-- Scratch dir for throwaway files:
-  `/tmp/claude-1000/-home-ayourtch-rust-febpf/8e539042-9e74-4a14-94b5-6b9012fb3ac1/scratchpad`
+  sandbox). The scratchpad dir is session-specific — use whatever the current
+  session's system prompt says.
+- **Next session may be on the user's aarch64 Mac Mini** (they plan to check
+  out the repo there for the arm64 JIT backend). Expect macOS: `mmap`/`mprotect`
+  via raw syscalls differ (no `asm!` Linux syscall ABI — macOS needs libc or
+  its own syscall numbers AND `MAP_JIT` + `pthread_jit_write_protect_np` for
+  W^X), plus `sys_icache_invalidate` for i-cache flush. The `JitBackend` trait
+  split means x64.rs stays untouched; budget real time for the exec-mem layer,
+  not just the encoder.
 
 ## How to verify you haven't broken anything
 ```
-cargo test                     # 56 tests
+cargo test                     # 62 tests
 cargo clippy --all-targets     # must stay 0 warnings
 cargo build --release
 ./target/release/febpf bench examples/sum_loop.s --iters 50000 --jit   # ~11 GIPS
@@ -151,6 +178,40 @@ both interpreter and JIT and require identical results. If you touch codegen,
 these catch encoding bugs. Add more programs to the `programs()` list in
 `tests/jit.rs` when you add native opcodes.
 
+## "Wow" feature shortlist (user asked for these — things people wish existed)
+
+Ranked by wow-per-effort. Each builds on something we already have, which is
+what makes them feasible here when they aren't elsewhere:
+
+1. **Time-travel debugging** — `rstep`/`rcontinue` in the debugger, plus data
+   watchpoints ("break when this map byte changes", then step *back* to the
+   write). Execution is already fully deterministic (fixed-seed prandom,
+   stable map storage), so this is snapshot + replay-to-N, no state recording
+   needed. Kernel eBPF devs literally cannot have this; we get it almost free.
+2. **Verifier rejection explainer** — on reject, print the exact branch path
+   (as source-annotated disasm) from entry to the failing instruction with
+   the abstract register state at each step: a counterexample trace, "your
+   pointer can be NULL here because the branch at insn 12 was taken". The #1
+   real-world eBPF pain is inscrutable verifier errors. The DFS already has
+   the path; we just have to keep it and pretty-print it.
+3. **Source-level debugging** — parse `.BTF.ext` line info (we already parse
+   BTF) and show C source lines in the debugger/disasm/heatmap. `febpf debug
+   prog.o` stepping through *C, not bytecode*, with globals readable by name
+   (BTF has the types). bpftool shows line info statically; nobody steps it.
+4. **Kernel conformance mode** — `febpf conftest prog.o`: run the same
+   program+inputs under febpf and under the real kernel via
+   `BPF_PROG_TEST_RUN` (raw syscall, zero deps — we already do raw syscalls
+   in the JIT), diff results. Turns "toy reimplementation" into "validated
+   against Linux". Also a differential fuzzer: random ALU/branch programs,
+   interp vs JIT vs kernel must agree — this is how you find real bugs.
+5. **WASM playground** — the interpreter+verifier+asm are zero-dependency
+   pure-std Rust; a `wasm32` build (JIT feature-gated off) plus a small HTML
+   page = eBPF playground in the browser: paste asm or a hex .o, verify,
+   step, see the heatmap. Nothing like it exists; huge demo value.
+6. **CO-RE relocations** — `.BTF.ext` relocs against a target BTF (take
+   /sys/kernel/btf/vmlinux or a file). Makes real-world portable programs
+   load unmodified; pairs with #3 since both need `.BTF.ext`.
+
 ## Known limitations / where to go next (roughly prioritized)
 
 1. **aarch64 JIT backend** — the trait is ready, spec is written. Highest-value
@@ -160,8 +221,9 @@ these catch encoding bugs. Add more programs to the `programs()` list in
    their semantics.
 3. **Fuller BTF** — CO-RE relocations, `.BTF.ext` (func/line info). Current
    BTF is the minimal `.maps` subset only.
-4. **ELF gaps** — global data sections (`.bss`/`.data`/`.rodata`) as maps,
-   `R_BPF_64_ABS*` relocations, static linking of multiple objects.
+4. **ELF gaps** — `R_BPF_64_ABS*` relocations, static linking of multiple
+   objects. (Global data sections — `.bss`/`.data`/`.rodata*` as single-entry
+   array maps with init data and frozen `.rodata` — are DONE, 2026-07-10.)
 5. **Verifier depth** — it's solid but not exhaustive; e.g. more precise
    handling of variable-offset pointer arithmetic, dynptr, spin locks. Compare
    against kernel `verifier.c` behavior if extending.

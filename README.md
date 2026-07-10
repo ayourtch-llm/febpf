@@ -60,8 +60,10 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
 - **ELF loader** for real `clang -target bpf` objects: sections/symbols,
   `R_BPF_64_64` map relocations and `R_BPF_64_32` bpf-to-bpf calls (with
   cross-`.text` subprogram stitching), legacy `maps` **and** minimal
-  BTF-defined `.maps`. Tested against genuine clang output
-  (`docs/specs/elf-loading.md`).
+  BTF-defined `.maps`, plus global data sections (`.data`/`.bss`/`.rodata*`
+  as initialized single-entry array maps, `.rodata` frozen — string literals,
+  lookup tables and persistent globals just work). Tested against genuine
+  clang output (`docs/specs/elf-loading.md`).
 
 ## CLI
 
