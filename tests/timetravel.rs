@@ -1,6 +1,7 @@
 //! Time-travel debugging: snapshot/replay determinism and the reverse
 //! debugger commands built on it.
 
+use febpf::debug::{DebugSession, DebuggerOpts};
 use febpf::{asm, Program, Vm};
 
 fn vm(src: &str) -> Vm {
@@ -132,4 +133,190 @@ fn nondet_helper_calls_are_counted() {
     assert_eq!(m.nondet_calls, 0);
     m.run_to_count(u64::MAX).unwrap();
     assert_eq!(m.nondet_calls, 1);
+}
+
+// ---------------------------------------------------------------- debugger
+
+/// Run one command through the session, returning its output.
+fn cmd(s: &mut DebugSession, line: &str) -> String {
+    let mut out = Vec::new();
+    s.handle_command(line, &mut out).unwrap();
+    String::from_utf8(out).unwrap()
+}
+
+/// A tiny snapshot interval so short tests still exercise checkpointing.
+fn opts() -> DebuggerOpts {
+    DebuggerOpts {
+        echo_printk: false,
+        snapshot_interval: 3,
+    }
+}
+
+const LOOP_SRC: &str = "
+    r0 = 0
+    r2 = 10
+loop:
+    r0 += r2
+    r2 -= 1
+    if r2 != 0 goto loop
+    exit";
+
+#[test]
+fn rstep_matches_fresh_run() {
+    let mut v1 = vm(LOOP_SRC);
+    let mut c1 = [];
+    let mut s = DebugSession::new(&mut v1, &mut c1, &opts());
+    cmd(&mut s, "step 11");
+    assert_eq!(s.machine().insn_count, 11);
+    let o = cmd(&mut s, "rstep 4");
+    assert!(!o.contains("error"), "{o}");
+    assert_eq!(s.machine().insn_count, 7);
+
+    // A machine stepped 7 times from scratch must agree exactly.
+    let mut v2 = vm(LOOP_SRC);
+    let mut c2 = [];
+    let mut m2 = v2.machine(&mut c2);
+    m2.run_to_count(7).unwrap();
+    assert_eq!(s.machine().snapshot(), m2.snapshot());
+
+    // rstep 1 at a time down to 0.
+    cmd(&mut s, "rstep 7");
+    assert_eq!(s.machine().insn_count, 0);
+    let o = cmd(&mut s, "rstep");
+    assert!(o.contains("already at the start"), "{o}");
+}
+
+#[test]
+fn reverse_from_program_exit() {
+    let mut v = vm(LOOP_SRC);
+    let mut c = [];
+    let mut s = DebugSession::new(&mut v, &mut c, &opts());
+    let o = cmd(&mut s, "continue");
+    assert!(o.contains("exited with r0 = 55"), "{o}");
+    assert_eq!(s.finished(), Some(55));
+    let exit_count = s.machine().insn_count;
+
+    // Step back before the exit: the session is live again.
+    cmd(&mut s, "rstep 2");
+    assert_eq!(s.finished(), None);
+    assert_eq!(s.machine().insn_count, exit_count - 2);
+    // And forward again to the same exit.
+    let o = cmd(&mut s, "continue");
+    assert!(o.contains("exited with r0 = 55"), "{o}");
+    assert_eq!(s.machine().insn_count, exit_count);
+    // goto past the end clamps to the exit.
+    cmd(&mut s, "rstep 3");
+    let o = cmd(&mut s, "goto 99999");
+    assert!(o.contains("program ends after"), "{o}");
+    assert_eq!(s.machine().insn_count, exit_count);
+    assert_eq!(s.finished(), Some(55));
+}
+
+#[test]
+fn rcontinue_returns_to_previous_breakpoint() {
+    let mut v = vm(LOOP_SRC);
+    let mut c = [];
+    let mut s = DebugSession::new(&mut v, &mut c, &opts());
+    cmd(&mut s, "break 2");
+    cmd(&mut s, "continue"); // first hit: pc 2 at count 2
+    assert_eq!(s.machine().insn_count, 2);
+    cmd(&mut s, "continue"); // second hit: count 5
+    assert_eq!(s.machine().insn_count, 5);
+    cmd(&mut s, "continue"); // third hit: count 8
+    assert_eq!(s.machine().insn_count, 8);
+
+    let o = cmd(&mut s, "rcontinue");
+    assert!(o.contains("breakpoint hit at 2"), "{o}");
+    assert_eq!(s.machine().insn_count, 5);
+    assert_eq!(s.machine().pc, 2);
+
+    // No breakpoint earlier than count 2's hit besides itself: rcontinue
+    // twice more lands at the start.
+    cmd(&mut s, "rcontinue");
+    assert_eq!(s.machine().insn_count, 2);
+    let o = cmd(&mut s, "rcontinue");
+    assert!(o.contains("start of the program"), "{o}");
+    assert_eq!(s.machine().insn_count, 0);
+}
+
+const MAPWRITE_SRC: &str = "
+    .map m array 4 8 1
+    r6 = 3              ; a few quiet iterations first
+warmup:
+    r6 -= 1
+    if r6 != 0 goto warmup
+    r0 = 0
+    *(u32 *)(r10 - 4) = r0
+    r1 = 7
+    *(u64 *)(r10 - 16) = r1
+    r1 = map[m]
+    r2 = r10
+    r2 += -4
+    r3 = r10
+    r3 += -16
+    r4 = 0
+    call map_update_elem   ; <-- the write the watchpoint must catch
+    r5 = 5
+    r5 += 1
+    r0 = r5
+    exit";
+
+#[test]
+fn watchpoint_triggers_on_map_write_and_rcontinue_finds_it() {
+    let mut v = vm(MAPWRITE_SRC);
+    let mut c = [];
+    let mut s = DebugSession::new(&mut v, &mut c, &opts());
+
+    let o = cmd(&mut s, "watch map m 0");
+    assert!(o.contains("watchpoint 1 set"), "{o}");
+
+    let o = cmd(&mut s, "continue");
+    assert!(o.contains("watchpoint 1"), "{o}");
+    assert!(o.contains("changed by insn"), "{o}");
+    assert!(o.contains("0000000000000000 -> 0700000000000000"), "{o}");
+    let hit_count = s.machine().insn_count;
+
+    // Run on to the end, then reverse-continue straight back to the write.
+    let o = cmd(&mut s, "continue");
+    assert!(o.contains("exited"), "{o}");
+    let o = cmd(&mut s, "rcontinue");
+    assert!(o.contains("watchpoint 1"), "{o}");
+    assert!(o.contains("changed by insn"), "{o}");
+    assert_eq!(s.machine().insn_count, hit_count, "rcontinue must land on the write");
+
+    // Nothing changed the map before that: reverse again reaches the start.
+    let o = cmd(&mut s, "rcontinue");
+    assert!(o.contains("start of the program"), "{o}");
+}
+
+#[test]
+fn watch_raw_stack_address() {
+    // fp-16 is written by insn 6 (count 7). Watch it via raw address.
+    let mut v = vm(MAPWRITE_SRC);
+    let mut c = [];
+    let mut s = DebugSession::new(&mut v, &mut c, &opts());
+    let fp = s.machine().regs[10];
+    let o = cmd(&mut s, &format!("watch {:#x} 8", fp - 16));
+    assert!(o.contains("watchpoint 1 set"), "{o}");
+    let o = cmd(&mut s, "c");
+    assert!(o.contains("watchpoint 1"), "{o}");
+    assert!(o.contains("-> 0700000000000000"), "{o}");
+    // unwatch, and continue runs to completion.
+    cmd(&mut s, "unwatch 1");
+    let o = cmd(&mut s, "c");
+    assert!(o.contains("exited"), "{o}");
+}
+
+#[test]
+fn nondet_warning_on_reverse() {
+    let mut v = vm("call ktime_get_ns\n r6 = r0\n r0 = 0\n exit");
+    let mut c = [];
+    let mut s = DebugSession::new(&mut v, &mut c, &opts());
+    cmd(&mut s, "step 2");
+    let o = cmd(&mut s, "rstep");
+    assert!(o.contains("warning") && o.contains("non-deterministic"), "{o}");
+    // warned only once
+    cmd(&mut s, "step");
+    let o = cmd(&mut s, "rstep");
+    assert!(!o.contains("warning"), "{o}");
 }
