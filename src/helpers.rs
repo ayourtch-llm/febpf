@@ -1,0 +1,174 @@
+//! Helper function registry: kernel-compatible ids, names, and the type
+//! signatures the verifier uses to check calls.
+
+/// Kernel-compatible helper ids implemented by the runtime.
+pub mod id {
+    pub const MAP_LOOKUP_ELEM: u32 = 1;
+    pub const MAP_UPDATE_ELEM: u32 = 2;
+    pub const MAP_DELETE_ELEM: u32 = 3;
+    pub const KTIME_GET_NS: u32 = 5;
+    pub const TRACE_PRINTK: u32 = 6;
+    pub const GET_PRANDOM_U32: u32 = 7;
+    pub const GET_SMP_PROCESSOR_ID: u32 = 8;
+    /// First id available for user-registered helpers.
+    pub const FIRST_USER: u32 = 0x1_0000;
+}
+
+/// What the verifier requires of each argument register (r1..r5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgKind {
+    /// Unused argument; contents ignored (may be uninitialized).
+    None,
+    /// Any initialized scalar value.
+    Scalar,
+    /// A map pointer produced by `lddw rN = map[...]`.
+    ConstMapPtr,
+    /// Readable memory of exactly the map's key size (map from arg 1).
+    MapKey,
+    /// Readable memory of exactly the map's value size (map from arg 1).
+    MapValue,
+    /// Readable memory whose length is given by the argument at `size_arg`
+    /// (0-based index into args).
+    MemRead { size_arg: u8 },
+    /// Writable memory whose length is given by the argument at `size_arg`.
+    MemWrite { size_arg: u8 },
+    /// A scalar used as a memory size; must be a known bounded value > 0.
+    Size,
+    /// Anything, including uninitialized (kernel ARG_ANYTHING for varargs).
+    Any,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetKind {
+    /// Unknown scalar.
+    Scalar,
+    /// Pointer to the map's value, or NULL — must be null-checked before use.
+    MapValueOrNull,
+}
+
+#[derive(Debug, Clone)]
+pub struct HelperSig {
+    pub name: &'static str,
+    pub args: [ArgKind; 5],
+    pub ret: RetKind,
+}
+
+/// Signature of a built-in helper, if `id` names one.
+pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
+    use ArgKind::*;
+    let sig = match hid {
+        id::MAP_LOOKUP_ELEM => HelperSig {
+            name: "map_lookup_elem",
+            args: [ConstMapPtr, MapKey, None, None, None],
+            ret: RetKind::MapValueOrNull,
+        },
+        id::MAP_UPDATE_ELEM => HelperSig {
+            name: "map_update_elem",
+            args: [ConstMapPtr, MapKey, MapValue, Scalar, None],
+            ret: RetKind::Scalar,
+        },
+        id::MAP_DELETE_ELEM => HelperSig {
+            name: "map_delete_elem",
+            args: [ConstMapPtr, MapKey, None, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::KTIME_GET_NS => HelperSig {
+            name: "ktime_get_ns",
+            args: [None, None, None, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::TRACE_PRINTK => HelperSig {
+            name: "trace_printk",
+            args: [MemRead { size_arg: 1 }, Size, Any, Any, Any],
+            ret: RetKind::Scalar,
+        },
+        id::GET_PRANDOM_U32 => HelperSig {
+            name: "get_prandom_u32",
+            args: [None, None, None, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::GET_SMP_PROCESSOR_ID => HelperSig {
+            name: "get_smp_processor_id",
+            args: [None, None, None, None, None],
+            ret: RetKind::Scalar,
+        },
+        _ => return Option::None,
+    };
+    Some(sig)
+}
+
+pub fn helper_name(hid: u32) -> String {
+    match builtin_sig(hid) {
+        Some(s) => s.name.to_string(),
+        None => format!("helper#{hid}"),
+    }
+}
+
+pub fn helper_id(name: &str) -> Option<u32> {
+    [
+        id::MAP_LOOKUP_ELEM,
+        id::MAP_UPDATE_ELEM,
+        id::MAP_DELETE_ELEM,
+        id::KTIME_GET_NS,
+        id::TRACE_PRINTK,
+        id::GET_PRANDOM_U32,
+        id::GET_SMP_PROCESSOR_ID,
+    ].into_iter().find(|&hid| builtin_sig(hid).unwrap().name == name)
+}
+
+/// Memory access interface handed to user-registered helpers so they can
+/// dereference pointer arguments safely (bounds-checked by the VM).
+pub trait MemBus {
+    fn read(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), String>;
+    fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), String>;
+}
+
+/// A user-registered helper implementation.
+pub trait UserHelper {
+    fn call(&mut self, args: [u64; 5], mem: &mut dyn MemBus) -> Result<u64, String>;
+}
+
+impl<F> UserHelper for F
+where
+    F: FnMut([u64; 5], &mut dyn MemBus) -> Result<u64, String>,
+{
+    fn call(&mut self, args: [u64; 5], mem: &mut dyn MemBus) -> Result<u64, String> {
+        self(args, mem)
+    }
+}
+
+/// Registry of user helpers, keyed by helper id.
+#[derive(Default)]
+pub struct UserHelpers {
+    sigs: Vec<(u32, HelperSig)>,
+    impls: Vec<(u32, Option<Box<dyn UserHelper>>)>,
+}
+
+impl UserHelpers {
+    pub fn new() -> Self {
+        UserHelpers::default()
+    }
+    pub fn register(&mut self, hid: u32, sig: HelperSig, imp: Box<dyn UserHelper>) {
+        self.sigs.retain(|(i, _)| *i != hid);
+        self.impls.retain(|(i, _)| *i != hid);
+        self.sigs.push((hid, sig));
+        self.impls.push((hid, Some(imp)));
+    }
+    /// Signatures for the verifier.
+    pub fn sigs(&self) -> &[(u32, HelperSig)] {
+        &self.sigs
+    }
+    /// Temporarily remove an implementation so it can be called while the VM
+    /// state is mutably borrowed; return it with [`UserHelpers::put_back`].
+    pub fn take(&mut self, hid: u32) -> Option<Box<dyn UserHelper>> {
+        self.impls
+            .iter_mut()
+            .find(|(i, _)| *i == hid)
+            .and_then(|(_, f)| f.take())
+    }
+    pub fn put_back(&mut self, hid: u32, imp: Box<dyn UserHelper>) {
+        if let Some((_, slot)) = self.impls.iter_mut().find(|(i, _)| *i == hid) {
+            *slot = Some(imp);
+        }
+    }
+}

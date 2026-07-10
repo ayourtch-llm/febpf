@@ -1,0 +1,2164 @@
+//! The eBPF verifier: path-sensitive abstract interpretation over the
+//! program, modeled on the Linux kernel verifier.
+//!
+//! It proves, before execution, that:
+//! - every instruction is well-formed and reachable,
+//! - no register is read uninitialized, r10 is never written,
+//! - all memory accesses (stack, context, map values) are in bounds,
+//! - map-value pointers are null-checked before use,
+//! - helper calls match their signatures,
+//! - bpf-to-bpf calls respect the frame limit and return a value,
+//! - the program provably terminates within the instruction budget.
+//!
+//! Value tracking uses tnums ([`crate::tnum::Tnum`], known bits) plus
+//! signed/unsigned 64-bit ranges, with branch-condition refinement and
+//! subset-based state pruning at join points.
+
+// div/mod arms encode eBPF defined-by-zero semantics; `checked_div` hides them.
+#![allow(clippy::manual_checked_ops)]
+use crate::helpers::{builtin_sig, ArgKind, HelperSig, RetKind};
+use crate::insn::*;
+use crate::maps::MapDef;
+use crate::tnum::Tnum;
+use std::collections::HashMap;
+use std::fmt::Write as _;
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Size of the memory region r1 points to on entry (0 = no context).
+    pub ctx_size: usize,
+    /// Whether stores through the context pointer are allowed.
+    pub ctx_writable: bool,
+    /// Require naturally aligned memory accesses.
+    pub strict_alignment: bool,
+    /// Abstract instructions processed before "program too complex".
+    pub insn_budget: usize,
+    /// Bound on remembered states per prune point.
+    pub max_states_per_pc: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            ctx_size: 4096,
+            ctx_writable: true,
+            strict_alignment: false,
+            insn_budget: 1_000_000,
+            max_states_per_pc: 4096,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct VerifyError {
+    pub pc: usize,
+    pub msg: String,
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "at insn {}: {}", self.pc, self.msg)
+    }
+}
+impl std::error::Error for VerifyError {}
+
+#[derive(Debug, Default, Clone)]
+pub struct Stats {
+    /// Abstract instructions processed.
+    pub insns_processed: usize,
+    /// Branch states pushed for later exploration.
+    pub states_explored: usize,
+    /// Paths cut short because a subsuming state was already verified.
+    pub states_pruned: usize,
+    /// Deepest call-frame chain observed.
+    pub max_frames: usize,
+    /// Deepest stack byte written in any frame (positive number of bytes).
+    pub stack_usage: usize,
+    /// Number of distinct prune points.
+    pub prune_points: usize,
+}
+
+pub struct VerifyOk {
+    pub stats: Stats,
+    pub warnings: Vec<String>,
+    /// Human-readable register state at first visit of each insn (for the
+    /// analyzer), plus visit count.
+    pub insn_state: Vec<Option<(String, usize)>>,
+}
+
+// ---------------------------------------------------------------------------
+// Abstract values
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scalar {
+    pub tnum: Tnum,
+    pub umin: u64,
+    pub umax: u64,
+    pub smin: i64,
+    pub smax: i64,
+}
+
+impl Scalar {
+    pub fn unknown() -> Scalar {
+        Scalar {
+            tnum: Tnum::unknown(),
+            umin: 0,
+            umax: u64::MAX,
+            smin: i64::MIN,
+            smax: i64::MAX,
+        }
+    }
+    pub fn constant(v: u64) -> Scalar {
+        Scalar {
+            tnum: Tnum::const_val(v),
+            umin: v,
+            umax: v,
+            smin: v as i64,
+            smax: v as i64,
+        }
+    }
+    pub fn is_const(&self) -> bool {
+        self.umin == self.umax
+    }
+
+    /// Reconcile tnum and range information; false if contradictory
+    /// (the state is unreachable).
+    pub fn sync(&mut self) -> bool {
+        // bounds from tnum
+        self.umin = self.umin.max(self.tnum.umin());
+        self.umax = self.umax.min(self.tnum.umax());
+        // signed from unsigned when the range doesn't cross the sign boundary
+        if (self.umin as i64) <= (self.umax as i64) {
+            self.smin = self.smin.max(self.umin as i64);
+            self.smax = self.smax.min(self.umax as i64);
+        }
+        // unsigned from signed when the range doesn't cross zero
+        // when the signed range doesn't cross zero, its u64 view is ordered
+        if self.smin >= 0 || self.smax < 0 {
+            self.umin = self.umin.max(self.smin as u64);
+            self.umax = self.umax.min(self.smax as u64);
+        }
+        // tnum from unsigned range
+        self.tnum = self.tnum.intersect(Tnum::range(self.umin, self.umax));
+        self.umin = self.umin.max(self.tnum.umin());
+        self.umax = self.umax.min(self.tnum.umax());
+        self.umin <= self.umax && self.smin <= self.smax
+    }
+
+    fn from_tnum(t: Tnum) -> Scalar {
+        let mut s = Scalar {
+            tnum: t,
+            umin: t.umin(),
+            umax: t.umax(),
+            smin: i64::MIN,
+            smax: i64::MAX,
+        };
+        s.sync();
+        s
+    }
+
+    /// Zero-extended 32-bit view. Result ranges lie within [0, u32::MAX].
+    fn truncate32(&self) -> Scalar {
+        if self.umax <= u32::MAX as u64 {
+            let mut s = *self;
+            s.tnum = s.tnum.cast(4);
+            s.smin = s.umin as i64;
+            s.smax = s.umax as i64;
+            s.sync();
+            s
+        } else {
+            Scalar::from_tnum(self.tnum.cast(4))
+        }
+    }
+
+    pub fn is_subset_of(&self, o: &Scalar) -> bool {
+        self.umin >= o.umin
+            && self.umax <= o.umax
+            && self.smin >= o.smin
+            && self.smax <= o.smax
+            && self.tnum.is_subset_of(&o.tnum)
+    }
+}
+
+impl std::fmt::Display for Scalar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_const() {
+            return write!(f, "{}", self.umin as i64);
+        }
+        if *self == Scalar::unknown() {
+            return write!(f, "scalar");
+        }
+        write!(f, "scalar(")?;
+        let mut first = true;
+        if self.umin != 0 || self.umax != u64::MAX {
+            write!(f, "u=[{},{}]", self.umin, self.umax)?;
+            first = false;
+        }
+        if self.smin != i64::MIN || self.smax != i64::MAX {
+            if !first {
+                write!(f, " ")?;
+            }
+            write!(f, "s=[{},{}]", self.smin, self.smax)?;
+            first = false;
+        }
+        if self.tnum != Tnum::unknown() {
+            if !first {
+                write!(f, " ")?;
+            }
+            write!(f, "t={}", self.tnum)?;
+        }
+        write!(f, ")")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtrKind {
+    /// Pointer into the stack of frame `frame`.
+    Stack { frame: usize },
+    /// Pointer into the context region.
+    Ctx,
+    /// A map object pointer (not dereferenceable).
+    Map { map: u32 },
+    /// Pointer into a map value.
+    MapValue { map: u32 },
+    /// Result of map_lookup_elem before the null check.
+    MapValueOrNull { map: u32, id: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ptr {
+    pub kind: PtrKind,
+    /// Known constant part of the offset.
+    pub off: i64,
+    /// Variable part of the offset (const 0 when none).
+    pub var: Scalar,
+}
+
+impl Ptr {
+    fn new(kind: PtrKind) -> Ptr {
+        Ptr {
+            kind,
+            off: 0,
+            var: Scalar::constant(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegState {
+    Uninit,
+    Scalar(Scalar),
+    Ptr(Ptr),
+}
+
+impl RegState {
+    fn subsumed_by(&self, old: &RegState) -> bool {
+        match (old, self) {
+            (RegState::Uninit, _) => true, // old never read this reg
+            (RegState::Scalar(o), RegState::Scalar(n)) => n.is_subset_of(o),
+            (RegState::Ptr(o), RegState::Ptr(n)) => {
+                o.kind == n.kind && o.off == n.off && n.var.is_subset_of(&o.var)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for RegState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegState::Uninit => write!(f, "?"),
+            RegState::Scalar(s) => write!(f, "{s}"),
+            RegState::Ptr(p) => {
+                match p.kind {
+                    PtrKind::Stack { frame } => write!(f, "fp{frame}")?,
+                    PtrKind::Ctx => write!(f, "ctx")?,
+                    PtrKind::Map { map } => write!(f, "map{map}")?,
+                    PtrKind::MapValue { map } => write!(f, "map{map}_value")?,
+                    PtrKind::MapValueOrNull { map, .. } => write!(f, "map{map}_value_or_null")?,
+                }
+                if p.off != 0 {
+                    write!(f, "{:+}", p.off)?;
+                }
+                if !p.var.is_const() || p.var.umin != 0 {
+                    write!(f, "+var{}", p.var)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stack modeling
+// ---------------------------------------------------------------------------
+
+const SLOTS: usize = STACK_SIZE / 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotState {
+    /// Full 8-byte spill of a register (via aligned 8-byte store).
+    Spill(RegState),
+    /// Byte-granular data; bit i set = byte i initialized.
+    Bytes(u8),
+}
+
+impl SlotState {
+    const EMPTY: SlotState = SlotState::Bytes(0);
+
+    fn init_mask(&self) -> u8 {
+        match self {
+            SlotState::Spill(_) => 0xff,
+            SlotState::Bytes(m) => *m,
+        }
+    }
+    fn subsumed_by(&self, old: &SlotState) -> bool {
+        match (old, self) {
+            (SlotState::Spill(o), SlotState::Spill(n)) => n.subsumed_by(o),
+            (SlotState::Spill(_), _) => false,
+            (SlotState::Bytes(om), n) => {
+                // old byte pattern must be covered: every byte old had
+                // initialized must be initialized in new
+                om & !n.init_mask() == 0
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Frame {
+    regs: [RegState; NUM_REGS],
+    stack: [SlotState; SLOTS],
+    /// Where execution resumes in the caller (frames > 0).
+    ret_pc: usize,
+}
+
+impl Frame {
+    fn new(ret_pc: usize) -> Frame {
+        Frame {
+            regs: [RegState::Uninit; NUM_REGS],
+            stack: [SlotState::EMPTY; SLOTS],
+            ret_pc,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct VState {
+    frames: Vec<Frame>,
+}
+
+/// States remembered at one prune point, with a miss-streak backoff so that
+/// points which never yield prunes (e.g. a loop counting a fresh constant
+/// every iteration) stop paying the subsumption-scan cost.
+#[derive(Default)]
+struct PruneList {
+    states: Vec<VState>,
+    cursor: usize,
+    miss_streak: u32,
+    arrivals: u32,
+}
+
+const MISS_STREAK_LIMIT: u32 = 256;
+const BACKOFF_SCAN_EVERY: u32 = 64;
+
+impl VState {
+    fn cur(&self) -> &Frame {
+        self.frames.last().unwrap()
+    }
+    fn cur_mut(&mut self) -> &mut Frame {
+        self.frames.last_mut().unwrap()
+    }
+
+    fn subsumed_by(&self, old: &VState) -> bool {
+        if self.frames.len() != old.frames.len() {
+            return false;
+        }
+        for (nf, of) in self.frames.iter().zip(&old.frames) {
+            if nf.ret_pc != of.ret_pc {
+                return false;
+            }
+            for r in 0..NUM_REGS {
+                if !nf.regs[r].subsumed_by(&of.regs[r]) {
+                    return false;
+                }
+            }
+            for s in 0..SLOTS {
+                if !nf.stack[s].subsumed_by(&of.stack[s]) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn render(&self) -> String {
+        let mut out = String::new();
+        let f = self.cur();
+        if self.frames.len() > 1 {
+            let _ = write!(out, "frame{} ", self.frames.len() - 1);
+        }
+        for (i, r) in f.regs.iter().enumerate().take(10) {
+            if !matches!(r, RegState::Uninit) {
+                let _ = write!(out, "r{i}={r} ");
+            }
+        }
+        let used: Vec<usize> = (0..SLOTS)
+            .filter(|&s| f.stack[s] != SlotState::EMPTY)
+            .collect();
+        if !used.is_empty() {
+            let _ = write!(out, "stack:");
+            for s in used {
+                let off = (s as i64) * 8 - STACK_SIZE as i64;
+                match &f.stack[s] {
+                    SlotState::Spill(r) => {
+                        let _ = write!(out, " [{off}]={r}");
+                    }
+                    SlotState::Bytes(m) => {
+                        let _ = write!(out, " [{off}]=mm({m:08b})");
+                    }
+                }
+            }
+        }
+        out.trim_end().to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scalar ALU transfer functions
+// ---------------------------------------------------------------------------
+
+fn scalar_add(a: Scalar, b: Scalar) -> Scalar {
+    let mut r = Scalar {
+        tnum: a.tnum.add(b.tnum),
+        ..Scalar::unknown()
+    };
+    let (lo, o1) = a.umin.overflowing_add(b.umin);
+    let (hi, o2) = a.umax.overflowing_add(b.umax);
+    if !o1 && !o2 {
+        r.umin = lo;
+        r.umax = hi;
+    }
+    if let (Some(lo), Some(hi)) = (a.smin.checked_add(b.smin), a.smax.checked_add(b.smax)) {
+        r.smin = lo;
+        r.smax = hi;
+    }
+    r.sync();
+    r
+}
+
+fn scalar_sub(a: Scalar, b: Scalar) -> Scalar {
+    let mut r = Scalar {
+        tnum: a.tnum.sub(b.tnum),
+        ..Scalar::unknown()
+    };
+    if a.umin >= b.umax {
+        r.umin = a.umin - b.umax;
+        r.umax = a.umax - b.umin; // a.umax >= a.umin >= b.umax >= b.umin
+    }
+    if let (Some(lo), Some(hi)) = (a.smin.checked_sub(b.smax), a.smax.checked_sub(b.smin)) {
+        r.smin = lo;
+        r.smax = hi;
+    }
+    r.sync();
+    r
+}
+
+fn scalar_mul(a: Scalar, b: Scalar) -> Scalar {
+    let mut r = Scalar {
+        tnum: a.tnum.mul(b.tnum),
+        ..Scalar::unknown()
+    };
+    if let (Some(lo), Some(hi)) = (a.umin.checked_mul(b.umin), a.umax.checked_mul(b.umax)) {
+        r.umin = lo;
+        r.umax = hi;
+        if a.smin >= 0 && b.smin >= 0 && hi <= i64::MAX as u64 {
+            r.smin = lo as i64;
+            r.smax = hi as i64;
+        }
+    }
+    r.sync();
+    r
+}
+
+/// Unsigned division; division by zero yields 0 (ISA-defined).
+fn scalar_div(a: Scalar, b: Scalar) -> Scalar {
+    if a.is_const() && b.is_const() {
+        let v = if b.umin == 0 { 0 } else { a.umin / b.umin };
+        return Scalar::constant(v);
+    }
+    let mut r = Scalar::unknown();
+    r.umin = 0;
+    r.umax = a.umax; // result never exceeds the dividend (or 0 on div-by-0)
+    r.sync();
+    r
+}
+
+/// Unsigned modulo; x % 0 leaves dst unchanged (ISA-defined).
+fn scalar_mod(a: Scalar, b: Scalar) -> Scalar {
+    if a.is_const() && b.is_const() {
+        let v = if b.umin == 0 { a.umin } else { a.umin % b.umin };
+        return Scalar::constant(v);
+    }
+    let mut r = Scalar::unknown();
+    r.umin = 0;
+    r.umax = if b.umin >= 1 {
+        a.umax.min(b.umax - 1)
+    } else {
+        // divisor may be 0 (result = dividend) or up to umax-1 otherwise
+        a.umax.max(b.umax.saturating_sub(1))
+    };
+    r.sync();
+    r
+}
+
+fn scalar_bitop(op: u8, a: Scalar, b: Scalar) -> Scalar {
+    let t = match op {
+        alu::AND => a.tnum.and(b.tnum),
+        alu::OR => a.tnum.or(b.tnum),
+        _ => a.tnum.xor(b.tnum),
+    };
+    let mut r = Scalar::from_tnum(t);
+    match op {
+        alu::AND => r.umax = r.umax.min(a.umax.min(b.umax)),
+        alu::OR => r.umin = r.umin.max(a.umin.max(b.umin)),
+        _ => {}
+    }
+    r.sync();
+    r
+}
+
+fn scalar_shift(op: u8, is32: bool, a: Scalar, b: Scalar) -> Result<Scalar, String> {
+    let width: u64 = if is32 { 32 } else { 64 };
+    if b.is_const() {
+        let sh = b.umin;
+        if sh >= width {
+            return Err(format!("invalid shift by {sh} (width {width})"));
+        }
+        let sh = sh as u8;
+        let r = match op {
+            alu::LSH => {
+                let mut r = Scalar::from_tnum(a.tnum.lshift(sh));
+                if a.umax.leading_zeros() as u64 >= sh as u64 {
+                    r.umin = r.umin.max(a.umin << sh);
+                    r.umax = r.umax.min(a.umax << sh);
+                }
+                r.sync();
+                r
+            }
+            alu::RSH => {
+                let mut r = Scalar::from_tnum(a.tnum.rshift(sh));
+                r.umin = r.umin.max(a.umin >> sh);
+                r.umax = r.umax.min(a.umax >> sh);
+                r.sync();
+                r
+            }
+            _ => {
+                // ARSH
+                let mut r = Scalar::from_tnum(a.tnum.arshift(sh, if is32 { 32 } else { 64 }));
+                if !is32 {
+                    r.smin = r.smin.max(a.smin >> sh);
+                    r.smax = r.smax.min(a.smax >> sh);
+                }
+                r.sync();
+                r
+            }
+        };
+        Ok(r)
+    } else {
+        // variable shift: runtime masks the amount; result largely unknown
+        let mut r = Scalar::unknown();
+        if op == alu::RSH {
+            r.umax = a.umax;
+            r.umin = 0;
+        }
+        r.sync();
+        Ok(r)
+    }
+}
+
+fn scalar_endian(is_swap: bool, width_bits: i32, a: Scalar) -> Scalar {
+    let bytes = (width_bits / 8) as u8;
+    if a.is_const() {
+        let v = a.umin;
+        let out = if is_swap {
+            match width_bits {
+                16 => (v as u16).swap_bytes() as u64,
+                32 => (v as u32).swap_bytes() as u64,
+                _ => v.swap_bytes(),
+            }
+        } else {
+            // to-LE on a little-endian host: plain truncation
+            match width_bits {
+                16 => v as u16 as u64,
+                32 => v as u32 as u64,
+                _ => v,
+            }
+        };
+        return Scalar::constant(out);
+    }
+    if is_swap {
+        Scalar::from_tnum(Tnum::unknown().cast(bytes))
+    } else {
+        Scalar::from_tnum(a.tnum.cast(bytes))
+    }
+}
+
+/// Sign-extend a scalar known to hold a value representable in `bits`.
+fn scalar_movsx(b: Scalar, bits: u16) -> Scalar {
+    let half = 1u64 << (bits - 1);
+    if b.umax < half {
+        // non-negative in the narrow type: sext == zext == identity
+        let mut r = b;
+        r.tnum = r.tnum.cast((bits / 8) as u8);
+        r.sync();
+        return r;
+    }
+    if b.is_const() {
+        let v = b.umin;
+        let sext = match bits {
+            8 => v as u8 as i8 as i64 as u64,
+            16 => v as u16 as i16 as i64 as u64,
+            _ => v as u32 as i32 as i64 as u64,
+        };
+        return Scalar::constant(sext);
+    }
+    let mut r = Scalar::unknown();
+    // result confined to the sign-extended range of the narrow type
+    r.smin = -(half as i64);
+    r.smax = half as i64 - 1;
+    r.sync();
+    r
+}
+
+fn alu_scalar(
+    op: u8,
+    is32: bool,
+    signed_off: bool,
+    a: Scalar,
+    b: Scalar,
+) -> Result<Scalar, String> {
+    let (a, b) = if is32 {
+        (a.truncate32(), b.truncate32())
+    } else {
+        (a, b)
+    };
+    let mut r = match op {
+        alu::ADD => scalar_add(a, b),
+        alu::SUB => scalar_sub(a, b),
+        alu::MUL => scalar_mul(a, b),
+        alu::DIV => {
+            if signed_off {
+                if a.is_const() && b.is_const() {
+                    let (av, bv) = (a.umin as i64, b.umin as i64);
+                    let v = if bv == 0 { 0 } else { av.wrapping_div(bv) as u64 };
+                    Scalar::constant(if is32 { v as u32 as u64 } else { v })
+                } else {
+                    Scalar::unknown()
+                }
+            } else {
+                scalar_div(a, b)
+            }
+        }
+        alu::MOD => {
+            if signed_off {
+                if a.is_const() && b.is_const() {
+                    let (av, bv) = (a.umin as i64, b.umin as i64);
+                    let v = if bv == 0 {
+                        a.umin
+                    } else {
+                        av.wrapping_rem(bv) as u64
+                    };
+                    Scalar::constant(if is32 { v as u32 as u64 } else { v })
+                } else {
+                    Scalar::unknown()
+                }
+            } else {
+                scalar_mod(a, b)
+            }
+        }
+        alu::AND | alu::OR | alu::XOR => scalar_bitop(op, a, b),
+        alu::LSH | alu::RSH | alu::ARSH => scalar_shift(op, is32, a, b)?,
+        _ => return Err(format!("unhandled ALU op {op:#x}")),
+    };
+    if is32 {
+        // zero-extend the 32-bit result
+        r.tnum = r.tnum.cast(4);
+        if r.umax > u32::MAX as u64 {
+            r = Scalar::from_tnum(r.tnum);
+        }
+        r.umin = r.umin.min(u32::MAX as u64);
+        r.umax = r.umax.min(u32::MAX as u64);
+        r.smin = r.umin as i64;
+        r.smax = r.umax as i64;
+        r.sync();
+    }
+    Ok(r)
+}
+
+// ---------------------------------------------------------------------------
+// Branch analysis
+// ---------------------------------------------------------------------------
+
+/// Decide a comparison if the ranges force it. `None` = could go either way.
+fn branch_taken(op: u8, a: &Scalar, b: &Scalar) -> Option<bool> {
+    match op {
+        jmp::JEQ => {
+            if a.is_const() && b.is_const() {
+                Some(a.umin == b.umin)
+            } else if a.umax < b.umin || a.umin > b.umax || a.smax < b.smin || a.smin > b.smax {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        jmp::JNE => branch_taken(jmp::JEQ, a, b).map(|t| !t),
+        jmp::JGT => {
+            if a.umin > b.umax {
+                Some(true)
+            } else if a.umax <= b.umin {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        jmp::JGE => {
+            if a.umin >= b.umax {
+                Some(true)
+            } else if a.umax < b.umin {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        jmp::JLT => branch_taken(jmp::JGE, a, b).map(|t| !t),
+        jmp::JLE => branch_taken(jmp::JGT, a, b).map(|t| !t),
+        jmp::JSGT => {
+            if a.smin > b.smax {
+                Some(true)
+            } else if a.smax <= b.smin {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        jmp::JSGE => {
+            if a.smin >= b.smax {
+                Some(true)
+            } else if a.smax < b.smin {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        jmp::JSLT => branch_taken(jmp::JSGE, a, b).map(|t| !t),
+        jmp::JSLE => branch_taken(jmp::JSGT, a, b).map(|t| !t),
+        jmp::JSET => {
+            if b.is_const() {
+                if a.tnum.value & b.umin != 0 {
+                    return Some(true); // some known bit overlaps
+                }
+                if (a.tnum.value | a.tnum.mask) & b.umin == 0 {
+                    return Some(false); // no possible bit overlaps
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Refine `a` and `b` under the assumption `a OP b` is `taken`.
+/// Returns false if the assumption is contradictory (dead path).
+fn refine(op: u8, taken: bool, a: &mut Scalar, b: &mut Scalar) -> bool {
+    // Reduce "not taken" to the inverse op where cleanly possible.
+    let (op, taken) = match (op, taken) {
+        (jmp::JEQ, false) => (jmp::JNE, true),
+        (jmp::JNE, false) => (jmp::JEQ, true),
+        (jmp::JGT, false) => (jmp::JLE, true),
+        (jmp::JGE, false) => (jmp::JLT, true),
+        (jmp::JLT, false) => (jmp::JGE, true),
+        (jmp::JLE, false) => (jmp::JGT, true),
+        (jmp::JSGT, false) => (jmp::JSLE, true),
+        (jmp::JSGE, false) => (jmp::JSLT, true),
+        (jmp::JSLT, false) => (jmp::JSGE, true),
+        (jmp::JSLE, false) => (jmp::JSGT, true),
+        (o, t) => (o, t),
+    };
+    match (op, taken) {
+        (jmp::JEQ, true) => {
+            // both take the intersection
+            let umin = a.umin.max(b.umin);
+            let umax = a.umax.min(b.umax);
+            let smin = a.smin.max(b.smin);
+            let smax = a.smax.min(b.smax);
+            let t = a.tnum.intersect(b.tnum);
+            for r in [&mut *a, &mut *b] {
+                r.umin = umin;
+                r.umax = umax;
+                r.smin = smin;
+                r.smax = smax;
+                r.tnum = t;
+            }
+        }
+        (jmp::JNE, true) => {
+            // only useful when one side is const at a range boundary
+            fn nudge(x: &mut Scalar, y: &Scalar) {
+                if y.is_const() {
+                    let c = y.umin;
+                    if x.umin == c {
+                        x.umin = x.umin.saturating_add(1);
+                    }
+                    if x.umax == c {
+                        x.umax = x.umax.saturating_sub(1);
+                    }
+                    if x.smin == c as i64 {
+                        x.smin = x.smin.saturating_add(1);
+                    }
+                    if x.smax == c as i64 {
+                        x.smax = x.smax.saturating_sub(1);
+                    }
+                }
+            }
+            nudge(a, b);
+            nudge(b, a);
+        }
+        (jmp::JGT, true) => {
+            // a > b
+            if b.umin == u64::MAX {
+                return false;
+            }
+            a.umin = a.umin.max(b.umin + 1);
+            b.umax = b.umax.min(a.umax.saturating_sub(1));
+        }
+        (jmp::JGE, true) => {
+            a.umin = a.umin.max(b.umin);
+            b.umax = b.umax.min(a.umax);
+        }
+        (jmp::JLT, true) => {
+            if b.umax == 0 {
+                return false;
+            }
+            a.umax = a.umax.min(b.umax - 1);
+            b.umin = b.umin.max(a.umin.saturating_add(1));
+        }
+        (jmp::JLE, true) => {
+            a.umax = a.umax.min(b.umax);
+            b.umin = b.umin.max(a.umin);
+        }
+        (jmp::JSGT, true) => {
+            if b.smin == i64::MAX {
+                return false;
+            }
+            a.smin = a.smin.max(b.smin + 1);
+            b.smax = b.smax.min(a.smax.saturating_sub(1));
+        }
+        (jmp::JSGE, true) => {
+            a.smin = a.smin.max(b.smin);
+            b.smax = b.smax.min(a.smax);
+        }
+        (jmp::JSLT, true) => {
+            if b.smax == i64::MIN {
+                return false;
+            }
+            a.smax = a.smax.min(b.smax - 1);
+            b.smin = b.smin.max(a.smin.saturating_add(1));
+        }
+        (jmp::JSLE, true) => {
+            a.smax = a.smax.min(b.smax);
+            b.smin = b.smin.max(a.smin);
+        }
+        (jmp::JSET, false)
+            // a & b == 0: known-set bits of b are known-zero in a
+            if b.is_const() => {
+                a.tnum = a.tnum.and(Tnum::const_val(!b.umin));
+            }
+        _ => {}
+    }
+    a.sync() && b.sync()
+}
+
+// ---------------------------------------------------------------------------
+// The verifier proper
+// ---------------------------------------------------------------------------
+
+pub struct Verifier<'a> {
+    insns: &'a [Insn],
+    maps: &'a [MapDef],
+    user_sigs: &'a [(u32, HelperSig)],
+    cfg: Config,
+    stats: Stats,
+    warnings: Vec<String>,
+    /// Remembered states per prune point.
+    seen: HashMap<usize, PruneList>,
+    prune_points: Vec<bool>,
+    insn_state: Vec<Option<(String, usize)>>,
+    next_null_id: u32,
+}
+
+enum StepOutcome {
+    /// Continue at these successor states.
+    Next(Vec<(usize, VState)>),
+    /// Path finished (program exit).
+    Done,
+}
+
+impl<'a> Verifier<'a> {
+    pub fn new(
+        insns: &'a [Insn],
+        maps: &'a [MapDef],
+        user_sigs: &'a [(u32, HelperSig)],
+        cfg: Config,
+    ) -> Verifier<'a> {
+        Verifier {
+            insns,
+            maps,
+            user_sigs,
+            cfg,
+            stats: Stats::default(),
+            warnings: Vec::new(),
+            seen: HashMap::new(),
+            prune_points: Vec::new(),
+            insn_state: Vec::new(),
+            next_null_id: 1,
+        }
+    }
+
+    fn err(&self, pc: usize, msg: impl Into<String>) -> VerifyError {
+        VerifyError {
+            pc,
+            msg: msg.into(),
+        }
+    }
+
+    fn sig_for(&self, hid: u32) -> Option<HelperSig> {
+        builtin_sig(hid).or_else(|| {
+            self.user_sigs
+                .iter()
+                .find(|(i, _)| *i == hid)
+                .map(|(_, s)| s.clone())
+        })
+    }
+
+    pub fn verify(mut self) -> Result<VerifyOk, VerifyError> {
+        if self.insns.is_empty() {
+            return Err(self.err(0, "empty program"));
+        }
+        self.check_structure()?;
+        self.compute_prune_points();
+        self.insn_state = vec![None; self.insns.len()];
+
+        // initial state: r1 = ctx (if any), r10 = fp
+        let mut frame = Frame::new(0);
+        if self.cfg.ctx_size > 0 {
+            frame.regs[1] = RegState::Ptr(Ptr::new(PtrKind::Ctx));
+        }
+        frame.regs[REG_FP as usize] = RegState::Ptr(Ptr::new(PtrKind::Stack { frame: 0 }));
+        let init = VState {
+            frames: vec![frame],
+        };
+
+        let mut pending: Vec<(usize, VState)> = vec![(0, init)];
+        while let Some((pc, state)) = pending.pop() {
+            let mut pc = pc;
+            let mut state = state;
+            loop {
+                if self.stats.insns_processed >= self.cfg.insn_budget {
+                    return Err(self.err(
+                        pc,
+                        format!(
+                            "program too complex: exceeded {} processed instructions \
+                             (unbounded loop?)",
+                            self.cfg.insn_budget
+                        ),
+                    ));
+                }
+                if pc >= self.insns.len() {
+                    return Err(self.err(pc, "fell off the end of the program"));
+                }
+                // prune / remember
+                if self.prune_points[pc] {
+                    let cap = self.cfg.max_states_per_pc;
+                    let pl = self.seen.entry(pc).or_default();
+                    pl.arrivals = pl.arrivals.wrapping_add(1);
+                    let backoff = pl.miss_streak >= MISS_STREAK_LIMIT
+                        && !pl.arrivals.is_multiple_of(BACKOFF_SCAN_EVERY);
+                    if !backoff {
+                        if pl.states.iter().any(|old| state.subsumed_by(old)) {
+                            self.stats.states_pruned += 1;
+                            pl.miss_streak = 0;
+                            break;
+                        }
+                        pl.miss_streak = pl.miss_streak.saturating_add(1);
+                        // ring buffer: keep the most recent states so
+                        // convergent forks of a loop iteration still prune
+                        if pl.states.len() < cap {
+                            pl.states.push(state.clone());
+                        } else {
+                            pl.states[pl.cursor % cap] = state.clone();
+                            pl.cursor = pl.cursor.wrapping_add(1);
+                        }
+                    }
+                }
+                self.stats.insns_processed += 1;
+                self.stats.max_frames = self.stats.max_frames.max(state.frames.len());
+                match &mut self.insn_state[pc] {
+                    Some((_, n)) => *n += 1,
+                    slot @ None => *slot = Some((state.render(), 1)),
+                }
+
+                match self.step(pc, state)? {
+                    StepOutcome::Done => break,
+                    StepOutcome::Next(mut succs) => {
+                        if succs.is_empty() {
+                            break; // all successors dead
+                        }
+                        let (npc, nstate) = succs.pop().unwrap();
+                        for other in succs {
+                            self.stats.states_explored += 1;
+                            pending.push(other);
+                        }
+                        pc = npc;
+                        state = nstate;
+                    }
+                }
+            }
+        }
+
+        self.stats.prune_points = self.prune_points.iter().filter(|p| **p).count();
+        Ok(VerifyOk {
+            stats: self.stats,
+            warnings: self.warnings,
+            insn_state: self.insn_state,
+        })
+    }
+
+    // -- structural pre-pass ------------------------------------------------
+
+    /// Validate opcodes, jump targets and lddw pairing; reject unreachable
+    /// instructions and missing exit paths.
+    fn check_structure(&mut self) -> Result<(), VerifyError> {
+        let n = self.insns.len();
+        // mark lddw second slots
+        let mut is_second = vec![false; n];
+        let mut i = 0;
+        while i < n {
+            let ins = self.insns[i];
+            if ins.is_wide() {
+                if i + 1 >= n {
+                    return Err(self.err(i, "truncated lddw"));
+                }
+                if self.insns[i + 1].opcode != 0 {
+                    return Err(self.err(i + 1, "invalid lddw second slot (opcode must be 0)"));
+                }
+                is_second[i + 1] = true;
+                i += 2;
+            } else {
+                if ins.opcode == 0 {
+                    return Err(self.err(i, "invalid opcode 0"));
+                }
+                i += 1;
+            }
+        }
+        // per-insn validity + collect edges
+        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut i = 0;
+        while i < n {
+            let ins = self.insns[i];
+            let width = if ins.is_wide() { 2 } else { 1 };
+            self.check_insn_form(i, ins)?;
+            let add_edge = |targets: &mut Vec<usize>, t: i64| -> Result<(), VerifyError> {
+                if t < 0 || t as usize >= n {
+                    return Err(VerifyError {
+                        pc: i,
+                        msg: format!("jump target {t} out of range"),
+                    });
+                }
+                if is_second[t as usize] {
+                    return Err(VerifyError {
+                        pc: i,
+                        msg: format!("jump target {t} lands in the middle of lddw"),
+                    });
+                }
+                targets.push(t as usize);
+                Ok(())
+            };
+            let cls = ins.class();
+            if cls == class::JMP || cls == class::JMP32 {
+                match ins.op() {
+                    jmp::EXIT => {}
+                    jmp::JA => {
+                        let rel = if cls == class::JMP32 {
+                            ins.imm as i64
+                        } else {
+                            ins.off as i64
+                        };
+                        add_edge(&mut edges[i], i as i64 + 1 + rel)?;
+                    }
+                    jmp::CALL => {
+                        if ins.src == call_kind::LOCAL {
+                            add_edge(&mut edges[i], i as i64 + 1 + ins.imm as i64)?;
+                        }
+                        add_edge(&mut edges[i], (i + width) as i64)?;
+                    }
+                    _ => {
+                        add_edge(&mut edges[i], i as i64 + 1 + ins.off as i64)?;
+                        add_edge(&mut edges[i], (i + width) as i64)?;
+                    }
+                }
+            } else {
+                if i + width > n {
+                    return Err(self.err(i, "program does not end with exit"));
+                }
+                if i + width < n {
+                    add_edge(&mut edges[i], (i + width) as i64)?;
+                } else {
+                    return Err(self.err(i, "last instruction must be exit or jump"));
+                }
+            }
+            i += width;
+        }
+        // reachability
+        let mut reach = vec![false; n];
+        let mut stack = vec![0usize];
+        while let Some(p) = stack.pop() {
+            if reach[p] {
+                continue;
+            }
+            reach[p] = true;
+            for &t in &edges[p] {
+                if !reach[t] {
+                    stack.push(t);
+                }
+            }
+        }
+        let mut i = 0;
+        while i < n {
+            if !reach[i] && !is_second[i] {
+                return Err(self.err(i, "unreachable instruction"));
+            }
+            i += if self.insns[i].is_wide() { 2 } else { 1 };
+        }
+        Ok(())
+    }
+
+    /// Reject malformed single instructions (bad opcodes, bad field use).
+    fn check_insn_form(&mut self, pc: usize, ins: Insn) -> Result<(), VerifyError> {
+        let bad = |msg: String| VerifyError { pc, msg };
+        if ins.dst >= NUM_REGS as u8 {
+            return Err(bad(format!("invalid dst register r{}", ins.dst)));
+        }
+        if ins.src >= NUM_REGS as u8 && ins.class() != class::LD {
+            return Err(bad(format!("invalid src register r{}", ins.src)));
+        }
+        match ins.class() {
+            class::ALU | class::ALU64 => match ins.op() {
+                alu::ADD | alu::SUB | alu::MUL | alu::OR | alu::AND | alu::LSH | alu::RSH
+                | alu::XOR | alu::ARSH => Ok(()),
+                alu::DIV | alu::MOD => {
+                    if ins.off != 0 && ins.off != 1 {
+                        Err(bad(format!("invalid offset {} for div/mod", ins.off)))
+                    } else {
+                        Ok(())
+                    }
+                }
+                alu::MOV => match ins.off {
+                    0 | 8 | 16 | 32 => Ok(()),
+                    o => Err(bad(format!("invalid offset {o} for mov"))),
+                },
+                alu::NEG => Ok(()),
+                alu::END => match ins.imm {
+                    16 | 32 | 64 => Ok(()),
+                    w => Err(bad(format!("invalid byte swap width {w}"))),
+                },
+                op => Err(bad(format!("unknown ALU op {op:#x}"))),
+            },
+            class::JMP | class::JMP32 => match ins.op() {
+                jmp::JA | jmp::EXIT => Ok(()),
+                jmp::CALL => {
+                    if ins.class() == class::JMP32 {
+                        Err(bad("call must use the JMP class".into()))
+                    } else if ins.src == call_kind::KFUNC {
+                        Err(bad("kfunc calls are not supported".into()))
+                    } else {
+                        Ok(())
+                    }
+                }
+                jmp::JEQ | jmp::JGT | jmp::JGE | jmp::JSET | jmp::JNE | jmp::JSGT | jmp::JSGE
+                | jmp::JLT | jmp::JLE | jmp::JSLT | jmp::JSLE => Ok(()),
+                op => Err(bad(format!("unknown JMP op {op:#x}"))),
+            },
+            class::LD => {
+                if ins.is_wide() {
+                    match ins.src {
+                        pseudo::IMM64 => Ok(()),
+                        pseudo::MAP_ID | pseudo::MAP_VALUE => {
+                            if (ins.imm as usize) < self.maps.len() {
+                                Ok(())
+                            } else {
+                                Err(bad(format!("lddw references unknown map {}", ins.imm)))
+                            }
+                        }
+                        s => Err(bad(format!("unsupported lddw pseudo src {s}"))),
+                    }
+                } else {
+                    Err(bad(format!(
+                        "legacy packet access (opcode {:#04x}) is not supported",
+                        ins.opcode
+                    )))
+                }
+            }
+            class::LDX => match ins.mem_mode() {
+                mode::MEM => Ok(()),
+                mode::MEMSX => {
+                    if ins.mem_size() == 8 {
+                        Err(bad("sign-extending 8-byte load is meaningless".into()))
+                    } else {
+                        Ok(())
+                    }
+                }
+                m => Err(bad(format!("invalid LDX mode {m:#x}"))),
+            },
+            class::ST => {
+                if ins.mem_mode() == mode::MEM {
+                    Ok(())
+                } else {
+                    Err(bad(format!("invalid ST mode {:#x}", ins.mem_mode())))
+                }
+            }
+            class::STX => match ins.mem_mode() {
+                mode::MEM => Ok(()),
+                mode::ATOMIC => {
+                    let sz = ins.mem_size();
+                    if sz != 4 && sz != 8 {
+                        return Err(bad("atomic operations require u32 or u64".into()));
+                    }
+                    use crate::insn::atomic as a;
+                    match ins.imm {
+                        x if [
+                            a::ADD,
+                            a::OR,
+                            a::AND,
+                            a::XOR,
+                            a::ADD | a::FETCH,
+                            a::OR | a::FETCH,
+                            a::AND | a::FETCH,
+                            a::XOR | a::FETCH,
+                            a::XCHG,
+                            a::CMPXCHG,
+                        ]
+                        .contains(&x) =>
+                        {
+                            Ok(())
+                        }
+                        x => Err(bad(format!("unknown atomic operation {x:#x}"))),
+                    }
+                }
+                m => Err(bad(format!("invalid STX mode {m:#x}"))),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    fn compute_prune_points(&mut self) {
+        let n = self.insns.len();
+        let mut pts = vec![false; n];
+        let mut i = 0;
+        while i < n {
+            let ins = self.insns[i];
+            let cls = ins.class();
+            if cls == class::JMP || cls == class::JMP32 {
+                match ins.op() {
+                    jmp::EXIT => {}
+                    jmp::JA => {
+                        let rel = if cls == class::JMP32 {
+                            ins.imm as i64
+                        } else {
+                            ins.off as i64
+                        };
+                        let t = i as i64 + 1 + rel;
+                        if t >= 0 && (t as usize) < n {
+                            pts[t as usize] = true;
+                        }
+                    }
+                    jmp::CALL => {
+                        if ins.src == call_kind::LOCAL {
+                            let t = i as i64 + 1 + ins.imm as i64;
+                            if t >= 0 && (t as usize) < n {
+                                pts[t as usize] = true;
+                            }
+                        }
+                    }
+                    _ => {
+                        let t = i as i64 + 1 + ins.off as i64;
+                        if t >= 0 && (t as usize) < n {
+                            pts[t as usize] = true;
+                        }
+                        if i + 1 < n {
+                            pts[i + 1] = true;
+                        }
+                    }
+                }
+            }
+            i += if ins.is_wide() { 2 } else { 1 };
+        }
+        self.prune_points = pts;
+    }
+
+    // -- reading/writing registers -----------------------------------------
+
+    fn read_reg(&self, state: &VState, pc: usize, r: u8) -> Result<RegState, VerifyError> {
+        let v = state.cur().regs[r as usize];
+        if matches!(v, RegState::Uninit) {
+            return Err(self.err(pc, format!("read of uninitialized register r{r}")));
+        }
+        Ok(v)
+    }
+
+    fn write_reg(
+        &self,
+        state: &mut VState,
+        pc: usize,
+        r: u8,
+        v: RegState,
+    ) -> Result<(), VerifyError> {
+        if r == REG_FP {
+            return Err(self.err(pc, "r10 (frame pointer) is read-only"));
+        }
+        state.cur_mut().regs[r as usize] = v;
+        Ok(())
+    }
+
+    // -- memory access checking ---------------------------------------------
+
+    /// Check an access of `size` bytes through pointer `p`, at additional
+    /// constant displacement `disp`. Returns the resolved constant stack
+    /// offset when the target is the stack.
+    fn check_mem_access(
+        &mut self,
+        state: &VState,
+        pc: usize,
+        p: &Ptr,
+        disp: i64,
+        size: u64,
+        write: bool,
+    ) -> Result<Option<(usize, i64)>, VerifyError> {
+        let (region_size, what): (u64, &str) = match p.kind {
+            PtrKind::Stack { frame } => {
+                if !p.var.is_const() || p.var.umin != 0 {
+                    return Err(self.err(pc, "variable-offset stack access is not allowed"));
+                }
+                let off = p.off + disp;
+                if off < -(STACK_SIZE as i64) || off + size as i64 > 0 {
+                    return Err(self.err(
+                        pc,
+                        format!(
+                            "stack access out of bounds: off {off} size {size} \
+                             (valid: [-{STACK_SIZE}, 0))"
+                        ),
+                    ));
+                }
+                if self.cfg.strict_alignment && (off.rem_euclid(size as i64)) != 0 {
+                    return Err(self.err(pc, format!("misaligned stack access at off {off}")));
+                }
+                let depth = (-off) as usize;
+                // depth relative to that frame; global max is fine for stats
+                if frame + 1 == state.frames.len() {
+                    self.stats.stack_usage = self.stats.stack_usage.max(depth);
+                }
+                return Ok(Some((frame, off)));
+            }
+            PtrKind::Ctx => {
+                if write && !self.cfg.ctx_writable {
+                    return Err(self.err(pc, "context is read-only"));
+                }
+                (self.cfg.ctx_size as u64, "context")
+            }
+            PtrKind::MapValue { map } => (self.maps[map as usize].value_size as u64, "map value"),
+            PtrKind::MapValueOrNull { .. } => {
+                return Err(self.err(
+                    pc,
+                    "map value pointer may be NULL; compare it against 0 first",
+                ));
+            }
+            PtrKind::Map { .. } => {
+                return Err(self.err(pc, "map object pointers cannot be dereferenced"));
+            }
+        };
+        let lo = p.off + disp + p.var.smin;
+        let hi = p.off + disp + p.var.smax;
+        if p.var.smin == i64::MIN || p.var.smax == i64::MAX {
+            return Err(self.err(
+                pc,
+                format!("{what} access with unbounded variable offset; bound it first"),
+            ));
+        }
+        if lo < 0 {
+            return Err(self.err(
+                pc,
+                format!("{what} access out of bounds: min offset {lo} < 0"),
+            ));
+        }
+        if hi + size as i64 > region_size as i64 {
+            return Err(self.err(
+                pc,
+                format!(
+                    "{what} access out of bounds: max offset {} > size {region_size}",
+                    hi + size as i64
+                ),
+            ));
+        }
+        if self.cfg.strict_alignment {
+            let total = p.var.tnum.add(Tnum::const_val((p.off + disp) as u64));
+            let amask = size - 1;
+            if total.value & amask != 0 || total.mask & amask != 0 {
+                return Err(self.err(pc, format!("possibly misaligned {what} access")));
+            }
+        }
+        Ok(None)
+    }
+
+    fn stack_store(
+        &mut self,
+        state: &mut VState,
+        pc: usize,
+        frame: usize,
+        off: i64,
+        size: u64,
+        val: RegState,
+    ) -> Result<(), VerifyError> {
+        let base = (STACK_SIZE as i64 + off) as usize;
+        let stack = &mut state.frames[frame].stack;
+        if size == 8 && base.is_multiple_of(8) {
+            stack[base / 8] = SlotState::Spill(val);
+            return Ok(());
+        }
+        if matches!(val, RegState::Ptr(_)) {
+            return Err(self.err(pc, "pointer spills must be 8-byte aligned stores"));
+        }
+        for b in base..base + size as usize {
+            let slot = b / 8;
+            let bit = 1u8 << (b % 8);
+            stack[slot] = match stack[slot] {
+                SlotState::Spill(_) => SlotState::Bytes(0xff), // overwrite keeps init
+                SlotState::Bytes(m) => SlotState::Bytes(m | bit),
+            };
+        }
+        Ok(())
+    }
+
+    fn stack_load(
+        &self,
+        state: &VState,
+        pc: usize,
+        frame: usize,
+        off: i64,
+        size: u64,
+    ) -> Result<RegState, VerifyError> {
+        let base = (STACK_SIZE as i64 + off) as usize;
+        let stack = &state.frames[frame].stack;
+        if size == 8 && base.is_multiple_of(8) {
+            match stack[base / 8] {
+                SlotState::Spill(v) => return Ok(v),
+                SlotState::Bytes(0xff) => return Ok(RegState::Scalar(Scalar::unknown())),
+                SlotState::Bytes(_) => {
+                    return Err(self.err(
+                        pc,
+                        format!("read of partially uninitialized stack at off {off}"),
+                    ));
+                }
+            }
+        }
+        for b in base..base + size as usize {
+            let slot = b / 8;
+            let bit = 1u8 << (b % 8);
+            if stack[slot].init_mask() & bit == 0 {
+                return Err(self.err(
+                    pc,
+                    format!("read of uninitialized stack byte at off {}", b as i64 - STACK_SIZE as i64),
+                ));
+            }
+        }
+        Ok(RegState::Scalar(Scalar::unknown()))
+    }
+
+    /// Check that `len` bytes at `p` are readable (helper argument).
+    fn check_helper_mem(
+        &mut self,
+        state: &mut VState,
+        pc: usize,
+        p: &Ptr,
+        len: u64,
+        write: bool,
+    ) -> Result<(), VerifyError> {
+        if len == 0 {
+            return Ok(());
+        }
+        if let Some((frame, off)) = self.check_mem_access(state, pc, p, 0, len, write)? {
+            if write {
+                self.stack_store(state, pc, frame, off, len, RegState::Scalar(Scalar::unknown()))?;
+            } else {
+                // every byte must be initialized
+                let base = (STACK_SIZE as i64 + off) as usize;
+                for b in base..base + len as usize {
+                    let slot = state.frames[frame].stack[b / 8];
+                    if slot.init_mask() & (1u8 << (b % 8)) == 0 {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper reads uninitialized stack byte at off {}",
+                                b as i64 - STACK_SIZE as i64
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // -- helper calls ---------------------------------------------------------
+
+    fn check_helper_call(
+        &mut self,
+        state: &mut VState,
+        pc: usize,
+        hid: u32,
+    ) -> Result<(), VerifyError> {
+        let sig = self
+            .sig_for(hid)
+            .ok_or_else(|| self.err(pc, format!("call to unknown helper #{hid}")))?;
+        let args: Vec<RegState> = (1..=5).map(|r| state.cur().regs[r]).collect();
+        let mut map_arg: Option<u32> = None;
+
+        for (i, kind) in sig.args.iter().enumerate() {
+            let reg = i as u8 + 1;
+            let val = args[i];
+            let need_init = !matches!(kind, ArgKind::None | ArgKind::Any);
+            if need_init && matches!(val, RegState::Uninit) {
+                return Err(self.err(
+                    pc,
+                    format!("helper {} arg{}: r{reg} is uninitialized", sig.name, i + 1),
+                ));
+            }
+            match kind {
+                ArgKind::None | ArgKind::Any => {}
+                ArgKind::Scalar | ArgKind::Size => {
+                    if !matches!(val, RegState::Scalar(_)) {
+                        return Err(self.err(
+                            pc,
+                            format!("helper {} arg{}: expected scalar in r{reg}", sig.name, i + 1),
+                        ));
+                    }
+                }
+                ArgKind::ConstMapPtr => match val {
+                    RegState::Ptr(Ptr {
+                        kind: PtrKind::Map { map },
+                        ..
+                    }) => map_arg = Some(map),
+                    _ => {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {} arg{}: expected map pointer in r{reg}",
+                                sig.name,
+                                i + 1
+                            ),
+                        ));
+                    }
+                },
+                ArgKind::MapKey | ArgKind::MapValue => {
+                    let map = map_arg.ok_or_else(|| {
+                        self.err(pc, format!("helper {}: map argument missing", sig.name))
+                    })?;
+                    let len = if matches!(kind, ArgKind::MapKey) {
+                        self.maps[map as usize].key_size as u64
+                    } else {
+                        self.maps[map as usize].value_size as u64
+                    };
+                    let p = match val {
+                        RegState::Ptr(p) => p,
+                        _ => {
+                            return Err(self.err(
+                                pc,
+                                format!(
+                                    "helper {} arg{}: expected pointer to memory in r{reg}",
+                                    sig.name,
+                                    i + 1
+                                ),
+                            ));
+                        }
+                    };
+                    self.check_helper_mem(state, pc, &p, len, false)?;
+                }
+                ArgKind::MemRead { size_arg } | ArgKind::MemWrite { size_arg } => {
+                    let write = matches!(kind, ArgKind::MemWrite { .. });
+                    let sz = match args[*size_arg as usize] {
+                        RegState::Scalar(s) => s,
+                        _ => {
+                            return Err(self.err(
+                                pc,
+                                format!(
+                                    "helper {}: size argument r{} must be a scalar",
+                                    sig.name,
+                                    size_arg + 1
+                                ),
+                            ));
+                        }
+                    };
+                    if sz.umax > 1 << 20 {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {}: size in r{} unbounded (umax={})",
+                                sig.name,
+                                size_arg + 1,
+                                sz.umax
+                            ),
+                        ));
+                    }
+                    let p = match val {
+                        RegState::Ptr(p) => p,
+                        _ => {
+                            return Err(self.err(
+                                pc,
+                                format!(
+                                    "helper {} arg{}: expected pointer to memory in r{reg}",
+                                    sig.name,
+                                    i + 1
+                                ),
+                            ));
+                        }
+                    };
+                    self.check_helper_mem(state, pc, &p, sz.umax, write)?;
+                }
+            }
+        }
+
+        // effects: r1-r5 clobbered, r0 = return value
+        let f = state.cur_mut();
+        for r in 1..=5 {
+            f.regs[r] = RegState::Uninit;
+        }
+        f.regs[0] = match sig.ret {
+            RetKind::Scalar => RegState::Scalar(Scalar::unknown()),
+            RetKind::MapValueOrNull => {
+                let map = map_arg.ok_or_else(|| {
+                    self.err(
+                        pc,
+                        format!("helper {}: returns map value but has no map arg", sig.name),
+                    )
+                })?;
+                let id = self.next_null_id;
+                self.next_null_id += 1;
+                RegState::Ptr(Ptr::new(PtrKind::MapValueOrNull { map, id }))
+            }
+        };
+        Ok(())
+    }
+
+    /// Refine every copy of a maybe-null pointer with identity `id`.
+    fn mark_ptr_or_null(state: &mut VState, id: u32, becomes_null: bool) {
+        for frame in &mut state.frames {
+            let fix = |r: &mut RegState| {
+                if let RegState::Ptr(p) = r {
+                    if let PtrKind::MapValueOrNull { map, id: pid } = p.kind {
+                        if pid == id {
+                            if becomes_null {
+                                *r = RegState::Scalar(Scalar::constant(0));
+                            } else {
+                                p.kind = PtrKind::MapValue { map };
+                            }
+                        }
+                    }
+                }
+            };
+            for r in frame.regs.iter_mut() {
+                fix(r);
+            }
+            for s in frame.stack.iter_mut() {
+                if let SlotState::Spill(r) = s {
+                    fix(r);
+                }
+            }
+        }
+    }
+
+    // -- single-step ----------------------------------------------------------
+
+    fn step(&mut self, pc: usize, mut state: VState) -> Result<StepOutcome, VerifyError> {
+        let ins = self.insns[pc];
+        let cls = ins.class();
+        match cls {
+            class::ALU | class::ALU64 => {
+                self.step_alu(pc, &mut state, ins)?;
+                Ok(StepOutcome::Next(vec![(pc + 1, state)]))
+            }
+            class::LD => {
+                // lddw variants
+                match ins.src {
+                    pseudo::IMM64 => {
+                        let v = wide_imm(self.insns, pc);
+                        self.write_reg(&mut state, pc, ins.dst, RegState::Scalar(Scalar::constant(v)))?;
+                    }
+                    pseudo::MAP_ID => {
+                        self.write_reg(
+                            &mut state,
+                            pc,
+                            ins.dst,
+                            RegState::Ptr(Ptr::new(PtrKind::Map {
+                                map: ins.imm as u32,
+                            })),
+                        )?;
+                    }
+                    pseudo::MAP_VALUE => {
+                        let map = ins.imm as u32;
+                        let off = self.insns[pc + 1].imm as i64;
+                        let vs = self.maps[map as usize].value_size as i64;
+                        if off < 0 || off > vs {
+                            return Err(self.err(pc, format!("map value offset {off} out of range")));
+                        }
+                        let mut p = Ptr::new(PtrKind::MapValue { map });
+                        p.off = off;
+                        self.write_reg(&mut state, pc, ins.dst, RegState::Ptr(p))?;
+                    }
+                    _ => unreachable!("checked in prepass"),
+                }
+                Ok(StepOutcome::Next(vec![(pc + 2, state)]))
+            }
+            class::LDX => {
+                let base = self.read_reg(&state, pc, ins.src)?;
+                let p = match base {
+                    RegState::Ptr(p) => p,
+                    RegState::Scalar(_) => {
+                        return Err(self.err(
+                            pc,
+                            format!("r{} is a scalar; loads need a pointer", ins.src),
+                        ));
+                    }
+                    RegState::Uninit => unreachable!(),
+                };
+                let size = ins.mem_size() as u64;
+                let loaded =
+                    match self.check_mem_access(&state, pc, &p, ins.off as i64, size, false)? {
+                        Some((frame, off)) => self.stack_load(&state, pc, frame, off, size)?,
+                        None => RegState::Scalar(Scalar::unknown()),
+                    };
+                let loaded = if ins.mem_mode() == mode::MEMSX {
+                    match loaded {
+                        RegState::Scalar(s) => {
+                            RegState::Scalar(scalar_movsx(s, (size * 8) as u16))
+                        }
+                        other => other,
+                    }
+                } else if size < 8 {
+                    match loaded {
+                        RegState::Scalar(s) => {
+                            let mut s = s;
+                            s.tnum = s.tnum.cast(size as u8);
+                            let max = if size == 8 { u64::MAX } else { (1u64 << (size * 8)) - 1 };
+                            s.umin = s.umin.min(max);
+                            s.umax = s.umax.min(max);
+                            s.smin = s.smin.max(0);
+                            s.smax = s.smax.min(max as i64);
+                            s.sync();
+                            RegState::Scalar(s)
+                        }
+                        // narrow load can't restore a pointer spill
+                        _ => RegState::Scalar(Scalar::unknown()),
+                    }
+                } else {
+                    loaded
+                };
+                self.write_reg(&mut state, pc, ins.dst, loaded)?;
+                Ok(StepOutcome::Next(vec![(pc + 1, state)]))
+            }
+            class::ST | class::STX => {
+                let base = self.read_reg(&state, pc, ins.dst)?;
+                let p = match base {
+                    RegState::Ptr(p) => p,
+                    _ => {
+                        return Err(self.err(
+                            pc,
+                            format!("r{} is a scalar; stores need a pointer", ins.dst),
+                        ));
+                    }
+                };
+                let size = ins.mem_size() as u64;
+                if ins.mem_mode() == mode::ATOMIC {
+                    return self.step_atomic(pc, state, ins, p, size);
+                }
+                let val = if cls == class::ST {
+                    RegState::Scalar(Scalar::constant(ins.imm as i64 as u64))
+                } else {
+                    self.read_reg(&state, pc, ins.src)?
+                };
+                if matches!(val, RegState::Ptr(_)) && !matches!(p.kind, PtrKind::Stack { .. }) {
+                    return Err(self.err(
+                        pc,
+                        "pointers may only be stored to the stack (pointer leak)",
+                    ));
+                }
+                if let Some((frame, off)) = self.check_mem_access(&state, pc, &p, ins.off as i64, size, true)? {
+                    self.stack_store(&mut state, pc, frame, off, size, val)?
+                }
+                Ok(StepOutcome::Next(vec![(pc + 1, state)]))
+            }
+            class::JMP | class::JMP32 => self.step_jmp(pc, state, ins),
+            _ => unreachable!(),
+        }
+    }
+
+    fn step_atomic(
+        &mut self,
+        pc: usize,
+        mut state: VState,
+        ins: Insn,
+        p: Ptr,
+        size: u64,
+    ) -> Result<StepOutcome, VerifyError> {
+        use crate::insn::atomic as a;
+        // atomics read and write the target
+        self.check_mem_access(&state, pc, &p, ins.off as i64, size, true)?;
+        if let Some((frame, off)) =
+            self.check_mem_access(&state, pc, &p, ins.off as i64, size, false)?
+        {
+            // target must be initialized; result of RMW is an unknown scalar
+            self.stack_load(&state, pc, frame, off, size)?;
+            self.stack_store(
+                &mut state,
+                pc,
+                frame,
+                off,
+                size,
+                RegState::Scalar(Scalar::unknown()),
+            )?;
+        }
+        // source operand must be an initialized scalar
+        match self.read_reg(&state, pc, ins.src)? {
+            RegState::Scalar(_) => {}
+            _ => return Err(self.err(pc, "atomic source must be a scalar")),
+        }
+        if ins.imm == a::CMPXCHG {
+            match self.read_reg(&state, pc, 0)? {
+                RegState::Scalar(_) => {}
+                _ => return Err(self.err(pc, "cmpxchg needs a scalar in r0")),
+            }
+            self.write_reg(&mut state, pc, 0, RegState::Scalar(Scalar::unknown()))?;
+        } else if ins.imm & a::FETCH != 0 || ins.imm == a::XCHG {
+            self.write_reg(&mut state, pc, ins.src, RegState::Scalar(Scalar::unknown()))?;
+        }
+        Ok(StepOutcome::Next(vec![(pc + 1, state)]))
+    }
+
+    fn step_alu(&mut self, pc: usize, state: &mut VState, ins: Insn) -> Result<(), VerifyError> {
+        let is32 = ins.class() == class::ALU;
+        let op = ins.op();
+
+        // operand b
+        let b: RegState = if op == alu::NEG || op == alu::END {
+            RegState::Scalar(Scalar::constant(0))
+        } else if ins.is_src_reg() {
+            self.read_reg(state, pc, ins.src)?
+        } else {
+            RegState::Scalar(Scalar::constant(ins.imm as i64 as u64))
+        };
+
+        if op == alu::MOV {
+            let v = match b {
+                RegState::Scalar(s) => {
+                    let s = if ins.off != 0 {
+                        // movsx
+                        let s = if is32 { s.truncate32() } else { s };
+                        let mut r = scalar_movsx(s, ins.off as u16);
+                        if is32 {
+                            r = r.truncate32();
+                        }
+                        r
+                    } else if is32 {
+                        s.truncate32()
+                    } else {
+                        s
+                    };
+                    RegState::Scalar(s)
+                }
+                RegState::Ptr(p) => {
+                    if ins.off != 0 {
+                        return Err(self.err(pc, "sign-extending move of a pointer"));
+                    }
+                    if is32 {
+                        self.warnings.push(format!(
+                            "insn {pc}: 32-bit move truncates pointer r{} to scalar",
+                            ins.src
+                        ));
+                        RegState::Scalar(Scalar::from_tnum(Tnum::unknown().cast(4)))
+                    } else {
+                        RegState::Ptr(p)
+                    }
+                }
+                RegState::Uninit => unreachable!(),
+            };
+            return self.write_reg(state, pc, ins.dst, v);
+        }
+
+        let a = self.read_reg(state, pc, ins.dst)?;
+
+        // pointer arithmetic
+        let a_ptr = matches!(a, RegState::Ptr(_));
+        let b_ptr = matches!(b, RegState::Ptr(_));
+        if a_ptr || b_ptr {
+            if is32 {
+                return Err(self.err(pc, "32-bit arithmetic on a pointer"));
+            }
+            match op {
+                alu::ADD => {
+                    let (p, s) = match (a, b) {
+                        (RegState::Ptr(p), RegState::Scalar(s))
+                        | (RegState::Scalar(s), RegState::Ptr(p)) => (p, s),
+                        _ => return Err(self.err(pc, "cannot add two pointers")),
+                    };
+                    let np = self.adjust_ptr(pc, p, s, false)?;
+                    return self.write_reg(state, pc, ins.dst, RegState::Ptr(np));
+                }
+                alu::SUB => {
+                    match (a, b) {
+                        (RegState::Ptr(pa), RegState::Ptr(pb)) => {
+                            if std::mem::discriminant(&pa.kind) != std::mem::discriminant(&pb.kind)
+                            {
+                                return Err(self.err(
+                                    pc,
+                                    "subtracting pointers into different regions",
+                                ));
+                            }
+                            return self.write_reg(
+                                state,
+                                pc,
+                                ins.dst,
+                                RegState::Scalar(Scalar::unknown()),
+                            );
+                        }
+                        (RegState::Ptr(p), RegState::Scalar(s)) => {
+                            let np = self.adjust_ptr(pc, p, s, true)?;
+                            return self.write_reg(state, pc, ins.dst, RegState::Ptr(np));
+                        }
+                        _ => return Err(self.err(pc, "cannot subtract a pointer from a scalar")),
+                    }
+                }
+                _ => {
+                    return Err(self.err(
+                        pc,
+                        format!("arithmetic op {:#x} on a pointer is not allowed", op),
+                    ));
+                }
+            }
+        }
+
+        // scalar ALU
+        let (sa, sb) = match (a, b) {
+            (RegState::Scalar(x), RegState::Scalar(y)) => (x, y),
+            _ => unreachable!(),
+        };
+        let result = match op {
+            alu::NEG => alu_scalar(alu::SUB, is32, false, Scalar::constant(0), sa)
+                .map_err(|m| self.err(pc, m))?,
+            alu::END => {
+                let is_swap = ins.class() == class::ALU64 || ins.is_src_reg();
+                let mut r = scalar_endian(is_swap, ins.imm, sa);
+                r.sync();
+                r
+            }
+            op => alu_scalar(op, is32, ins.off == 1, sa, sb).map_err(|m| self.err(pc, m))?,
+        };
+        self.write_reg(state, pc, ins.dst, RegState::Scalar(result))
+    }
+
+    fn adjust_ptr(&self, pc: usize, p: Ptr, s: Scalar, sub: bool) -> Result<Ptr, VerifyError> {
+        if matches!(p.kind, PtrKind::Map { .. } | PtrKind::MapValueOrNull { .. }) {
+            return Err(self.err(
+                pc,
+                "arithmetic on this pointer type is not allowed (null-check it first?)",
+            ));
+        }
+        let mut np = p;
+        if s.is_const() {
+            let c = s.umin as i64;
+            let delta = if sub { c.checked_neg() } else { Some(c) };
+            let new_off = delta.and_then(|d| np.off.checked_add(d));
+            match new_off {
+                Some(o) if o.abs() <= 1 << 29 => np.off = o,
+                _ => return Err(self.err(pc, "pointer offset out of range")),
+            }
+        } else {
+            if matches!(p.kind, PtrKind::Stack { .. }) {
+                return Err(self.err(pc, "variable offset on a stack pointer is not allowed"));
+            }
+            let nv = if sub {
+                scalar_sub(np.var, s)
+            } else {
+                scalar_add(np.var, s)
+            };
+            np.var = nv;
+        }
+        Ok(np)
+    }
+
+    fn step_jmp(
+        &mut self,
+        pc: usize,
+        mut state: VState,
+        ins: Insn,
+    ) -> Result<StepOutcome, VerifyError> {
+        let is32 = ins.class() == class::JMP32;
+        match ins.op() {
+            jmp::JA => {
+                let rel = if is32 { ins.imm as i64 } else { ins.off as i64 };
+                let t = (pc as i64 + 1 + rel) as usize;
+                Ok(StepOutcome::Next(vec![(t, state)]))
+            }
+            jmp::EXIT => {
+                let r0 = state.cur().regs[0];
+                if state.frames.len() > 1 {
+                    match r0 {
+                        RegState::Scalar(_) => {}
+                        RegState::Uninit => {
+                            return Err(self.err(pc, "subprogram exits without setting r0"));
+                        }
+                        RegState::Ptr(_) => {
+                            return Err(self.err(pc, "subprogram may not return a pointer"));
+                        }
+                    }
+                    let ret_pc = state.cur().ret_pc;
+                    state.frames.pop();
+                    let f = state.cur_mut();
+                    f.regs[0] = r0;
+                    for r in 1..=5 {
+                        f.regs[r] = RegState::Uninit;
+                    }
+                    Ok(StepOutcome::Next(vec![(ret_pc, state)]))
+                } else {
+                    match r0 {
+                        RegState::Scalar(_) => Ok(StepOutcome::Done),
+                        RegState::Uninit => {
+                            Err(self.err(pc, "program exits without setting r0"))
+                        }
+                        RegState::Ptr(_) => Err(self.err(pc, "program may not return a pointer")),
+                    }
+                }
+            }
+            jmp::CALL => {
+                if ins.src == call_kind::LOCAL {
+                    if state.frames.len() >= MAX_CALL_FRAMES {
+                        return Err(self.err(
+                            pc,
+                            format!("call depth exceeds {MAX_CALL_FRAMES} frames"),
+                        ));
+                    }
+                    let target = (pc as i64 + 1 + ins.imm as i64) as usize;
+                    let caller = state.cur().clone();
+                    let mut callee = Frame::new(pc + 1);
+                    callee.regs[1..6].copy_from_slice(&caller.regs[1..6]);
+                    let frame_idx = state.frames.len();
+                    callee.regs[REG_FP as usize] =
+                        RegState::Ptr(Ptr::new(PtrKind::Stack { frame: frame_idx }));
+                    state.frames.push(callee);
+                    Ok(StepOutcome::Next(vec![(target, state)]))
+                } else {
+                    self.check_helper_call(&mut state, pc, ins.imm as u32)?;
+                    Ok(StepOutcome::Next(vec![(pc + 1, state)]))
+                }
+            }
+            op => {
+                let target = (pc as i64 + 1 + ins.off as i64) as usize;
+                let a = self.read_reg(&state, pc, ins.dst)?;
+                let b: RegState = if ins.is_src_reg() {
+                    self.read_reg(&state, pc, ins.src)?
+                } else {
+                    RegState::Scalar(Scalar::constant(ins.imm as i64 as u64))
+                };
+
+                // null-check refinement on maybe-null map values
+                if !is32 && matches!(op, jmp::JEQ | jmp::JNE) {
+                    if let (
+                        RegState::Ptr(Ptr {
+                            kind: PtrKind::MapValueOrNull { id, .. },
+                            ..
+                        }),
+                        RegState::Scalar(s),
+                    ) = (a, b)
+                    {
+                        if s.is_const() && s.umin == 0 {
+                            let mut on_target = state.clone();
+                            let eq = op == jmp::JEQ;
+                            // taken: condition true
+                            Self::mark_ptr_or_null(&mut on_target, id, eq);
+                            Self::mark_ptr_or_null(&mut state, id, !eq);
+                            self.stats.states_explored += 1;
+                            return Ok(StepOutcome::Next(vec![
+                                (pc + 1, state),
+                                (target, on_target),
+                            ]));
+                        }
+                    }
+                }
+
+                // pointer comparisons: allowed, no refinement
+                let (sa, sb) = match (a, b) {
+                    (RegState::Scalar(x), RegState::Scalar(y)) => (x, y),
+                    _ => {
+                        self.stats.states_explored += 1;
+                        return Ok(StepOutcome::Next(vec![
+                            (pc + 1, state.clone()),
+                            (target, state),
+                        ]));
+                    }
+                };
+
+                // 32-bit compares refine only when values fit in 32 bits
+                let refinable =
+                    !is32 || (sa.umax <= u32::MAX as u64 && sb.umax <= u32::MAX as u64);
+                let (ca, cb) = if is32 {
+                    (sa.truncate32(), sb.truncate32())
+                } else {
+                    (sa, sb)
+                };
+
+                if let Some(taken) = branch_taken(op, &ca, &cb) {
+                    let t = if taken { target } else { pc + 1 };
+                    return Ok(StepOutcome::Next(vec![(t, state)]));
+                }
+
+                let mut succs: Vec<(usize, VState)> = Vec::with_capacity(2);
+                for (taken, npc) in [(false, pc + 1), (true, target)] {
+                    let mut ns = state.clone();
+                    if refinable {
+                        let (mut ra, mut rb) = (ca, cb);
+                        if !refine(op, taken, &mut ra, &mut rb) {
+                            continue; // contradictory: path is dead
+                        }
+                        let f = ns.cur_mut();
+                        f.regs[ins.dst as usize] = RegState::Scalar(ra);
+                        if ins.is_src_reg() {
+                            f.regs[ins.src as usize] = RegState::Scalar(rb);
+                        }
+                    }
+                    succs.push((npc, ns));
+                }
+                if succs.len() > 1 {
+                    self.stats.states_explored += 1;
+                }
+                Ok(StepOutcome::Next(succs))
+            }
+        }
+    }
+}
+
+/// Convenience wrapper: verify `insns` against `maps` with `cfg`.
+pub fn verify(
+    insns: &[Insn],
+    maps: &[MapDef],
+    user_sigs: &[(u32, HelperSig)],
+    cfg: Config,
+) -> Result<VerifyOk, VerifyError> {
+    Verifier::new(insns, maps, user_sigs, cfg).verify()
+}
