@@ -150,4 +150,33 @@ command strings and assert on machine state and captured output.
 
 ## STATUS
 
-Stage 1 (spec) committed; implementation in progress.
+**Done — all four stages implemented and committed.**
+
+- Stage 2 — snapshot/restore core (`maps.rs` `MapSnapshot`, `interp.rs`
+  `Snapshot` / `Machine::{snapshot,restore,run_to_count}`, `nondet_calls`).
+- Stage 3 — `DebugSession` + `handle_command(line, out)`; REPL is a thin
+  stdin loop; program exit no longer ends the session.
+- Stage 4 — checkpoints, `rstep` / `rcontinue` / `goto`, `watch` (raw addr +
+  logical map targets), `unwatch`, nondet warning.
+- Tests (tests/timetravel.rs, tests/debugger.rs): replay determinism with
+  full-state equality against a straight run (maps, prandom, frames, ctx,
+  regions), rstep ≡ fresh k-step run, reverse from program exit, rcontinue
+  to previous breakpoint, watchpoint on a map write + rcontinue back to the
+  write, raw-address watch, nondet warning. `cargo test` 74 green,
+  `cargo clippy --all-targets` 0 warnings.
+
+Small deviations from the plan above (all deliberate):
+
+- `goto` past the recorded exit clamps to the exit count instead of
+  re-executing the exit instruction.
+- Watchpoint evaluation during `rcontinue` uses the same
+  `eval_watch`/segment-scan described here; the "step back to the write"
+  flow reports the writer's pc in the stop message rather than a separate
+  command.
+- One old REPL behavior changed: `step`/`continue` reaching exit used to
+  return from the REPL immediately; now the session stays open (so you can
+  `rstep` back from the exit) and `quit` returns the recorded r0.
+
+Possible follow-ups (not required): a `tt-interval` command to tune the
+checkpoint spacing at runtime; capping checkpoint memory for very long runs;
+watch expressions over registers.
