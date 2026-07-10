@@ -29,10 +29,12 @@ options:
   --strict-align       verifier: require aligned memory accesses
   --readonly-ctx       verifier: forbid stores to the context
   --iters <n>          bench: iterations (default 1000)
+  --prog <name>        select a program from a multi-program ELF object
   -o <file>            output file (asm)
 
-input files ending in .s/.asm/.bpf are assembled; anything else is loaded
-as raw little-endian eBPF bytecode.
+input files ending in .s/.asm/.bpf are assembled; ELF objects from
+`clang -target bpf` are loaded (maps + relocations); anything else is
+treated as raw little-endian eBPF bytecode.
 ";
 
 struct Opts {
@@ -46,6 +48,7 @@ struct Opts {
     readonly_ctx: bool,
     iters: u64,
     jit: bool,
+    prog: Option<String>,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -62,6 +65,7 @@ fn parse_args() -> Result<Opts, String> {
         readonly_ctx: false,
         iters: 1000,
         jit: false,
+        prog: None,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -84,6 +88,7 @@ fn parse_args() -> Result<Opts, String> {
             }
             "--no-verify" => o.no_verify = true,
             "--jit" => o.jit = true,
+            "--prog" => o.prog = Some(args.next().ok_or("--prog needs a value")?),
             "--strict-align" => o.strict_align = true,
             "--readonly-ctx" => o.readonly_ctx = true,
             f if !f.starts_with('-') && o.file.is_empty() => o.file = f.to_string(),
@@ -96,7 +101,7 @@ fn parse_args() -> Result<Opts, String> {
     Ok(o)
 }
 
-fn load_program(path: &str) -> Result<Program, String> {
+fn load_program(path: &str, prog: Option<&str>) -> Result<Program, String> {
     let is_source = [".s", ".asm", ".bpf"]
         .iter()
         .any(|ext| path.ends_with(ext));
@@ -104,12 +109,40 @@ fn load_program(path: &str) -> Result<Program, String> {
         let src =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
         let a = asm::assemble(&src).map_err(|e| format!("{path}: {e}"))?;
-        Ok(Program {
+        return Ok(Program {
             insns: a.insns,
             maps: a.maps,
+        });
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    // ELF object (clang -target bpf) vs raw bytecode.
+    if bytes.len() >= 4 && &bytes[0..4] == b"\x7fELF" {
+        let obj = febpf::elf::load(&bytes).map_err(|e| format!("{path}: {e}"))?;
+        let chosen = match prog {
+            Some(name) => obj
+                .programs
+                .iter()
+                .find(|p| p.name == name)
+                .ok_or_else(|| {
+                    let names: Vec<&str> = obj.programs.iter().map(|p| p.name.as_str()).collect();
+                    format!("no program '{name}' in {path}; available: {}", names.join(", "))
+                })?,
+            None => &obj.programs[0],
+        };
+        if prog.is_none() && obj.programs.len() > 1 {
+            let names: Vec<&str> = obj.programs.iter().map(|p| p.name.as_str()).collect();
+            eprintln!(
+                "note: {path} has {} programs ({}); using '{}' (--prog to choose)",
+                obj.programs.len(),
+                names.join(", "),
+                chosen.name
+            );
+        }
+        Ok(Program {
+            insns: chosen.insns.clone(),
+            maps: obj.maps,
         })
     } else {
-        let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
         let insns = insn::decode_program(&bytes)?;
         Ok(Program {
             insns,
@@ -160,7 +193,7 @@ fn run() -> Result<ExitCode, String> {
         print!("{USAGE}");
         return Ok(ExitCode::SUCCESS);
     }
-    let prog = load_program(&o.file)?;
+    let prog = load_program(&o.file, o.prog.as_deref())?;
 
     match o.cmd.as_str() {
         "asm" => {

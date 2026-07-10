@@ -57,6 +57,11 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
 - **Execution profiler**: `febpf profile` runs the program and prints a
   per-instruction heatmap (counts, %, log-scaled bar) plus hottest-block
   summary.
+- **ELF loader** for real `clang -target bpf` objects: sections/symbols,
+  `R_BPF_64_64` map relocations and `R_BPF_64_32` bpf-to-bpf calls (with
+  cross-`.text` subprogram stitching), legacy `maps` **and** minimal
+  BTF-defined `.maps`. Tested against genuine clang output
+  (`docs/specs/elf-loading.md`).
 
 ## CLI
 
@@ -154,12 +159,18 @@ arguments, call-depth overflow, writes to `r10`.
 - **Determinism**: `get_prandom_u32` is a fixed-seed xorshift and hash maps
   never move values, so buggy programs replay identically under the
   debugger.
-- **Not implemented (yet)**: ELF object loading (`clang -target bpf` `.o`),
-  BTF, kfuncs, legacy packet-access instructions, JIT compilation.
+- **JIT**: `docs/specs/jit-backend.md` — architecture-independent frontend +
+  `JitBackend` trait; x86-64 done, aarch64/riscv64 documented as drop-in.
+- **ELF loading**: `docs/specs/elf-loading.md`.
+- **Not implemented (yet)**: full BTF (CO-RE, func/line info), kfuncs,
+  per-CPU/ringbuf map types, legacy packet-access instructions, aarch64/riscv
+  JIT backends.
 
 ## Tests
 
-`cargo test` — 48 tests covering ISA semantics (including div/mod-by-zero,
-sign extension, byte swaps, atomics), verifier accept/reject cases, map
-round-trips, bpf-to-bpf calls, custom helpers, and assembler/disassembler
-round-tripping.
+`cargo test` — 56 tests: ISA semantics (div/mod-by-zero, sign extension,
+byte swaps, atomics), verifier accept/reject cases, map round-trips,
+bpf-to-bpf calls, custom helpers, assembler/disassembler round-tripping,
+**JIT-vs-interpreter differential** tests, and **ELF loading** against real
+clang output (legacy `maps`, BTF `.maps`, cross-`.text` calls). The ELF
+tests recompile the `examples/c/*.c` fixtures when clang is present.
