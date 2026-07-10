@@ -1,5 +1,9 @@
 //! Interactive debugger: breakpoints, single-stepping, register / stack /
 //! memory / map inspection, and execution tracing.
+//!
+//! The REPL is a thin stdin/stdout loop over [`DebugSession`], which is
+//! driveable programmatically (and from tests) via
+//! [`DebugSession::handle_command`].
 
 use crate::disasm::disasm_insn;
 use crate::interp::{Machine, Vm};
@@ -16,6 +20,14 @@ impl Default for DebuggerOpts {
     }
 }
 
+/// What the REPL should do after a command.
+pub enum Outcome {
+    /// Keep reading commands.
+    Continue,
+    /// Leave the debugger; carries r0 if the program ran to completion.
+    Quit(Option<u64>),
+}
+
 fn parse_num(s: &str) -> Option<u64> {
     let s = s.trim();
     if let Some(hex) = s.strip_prefix("0x") {
@@ -25,36 +37,7 @@ fn parse_num(s: &str) -> Option<u64> {
     }
 }
 
-fn print_insn(m: &Machine, pc: usize) {
-    let insns = m.vm_ref().insns();
-    if pc < insns.len() {
-        println!("{pc:4}: {}", disasm_insn(insns, pc));
-    } else {
-        println!("{pc:4}: <out of bounds>");
-    }
-}
-
-fn print_regs(m: &Machine) {
-    for row in 0..3 {
-        let mut line = String::new();
-        for col in 0..4 {
-            let r = row * 4 + col;
-            if r > 10 {
-                break;
-            }
-            line.push_str(&format!("r{r:<2}= {:#018x}  ", m.regs[r]));
-        }
-        println!("{}", line.trim_end());
-    }
-    println!(
-        "pc = {}  frame = {}  insns executed = {}",
-        m.pc,
-        m.current_frame(),
-        m.insn_count
-    );
-}
-
-fn hexdump(bytes: &[u8], base: u64) {
+fn hexdump(out: &mut dyn Write, bytes: &[u8], base: u64) -> io::Result<()> {
     for (i, chunk) in bytes.chunks(16).enumerate() {
         let mut hex = String::new();
         let mut ascii = String::new();
@@ -66,8 +49,9 @@ fn hexdump(bytes: &[u8], base: u64) {
                 '.'
             });
         }
-        println!("{:#010x}: {hex:<48} |{ascii}|", base + (i * 16) as u64);
+        writeln!(out, "{:#010x}: {hex:<48} |{ascii}|", base + (i * 16) as u64)?;
     }
+    Ok(())
 }
 
 const HELP: &str = "\
@@ -75,7 +59,7 @@ commands:
   s, step [N]        execute N instructions (default 1)
   c, continue        run until breakpoint, exit or error
   b, break <pc>      set breakpoint at instruction index
-  d, delete <pc>     remove breakpoint
+  d, delete <pc>     remove breakpoint (no arg: remove all)
   i, info            show breakpoints
   r, regs            show registers
   l, list [pc]       disassemble around pc (default: current)
@@ -87,26 +71,102 @@ commands:
   q, quit            leave the debugger
 ";
 
-/// Run an interactive debugging session for `vm` with context `ctx`.
-/// Returns the program's r0 if it ran to completion.
-pub fn repl(vm: &mut Vm, ctx: &mut [u8], opts: DebuggerOpts) -> io::Result<Option<u64>> {
-    vm.echo_printk = opts.echo_printk;
-    let mut breakpoints: HashSet<usize> = HashSet::new();
-    let mut trace = false;
-    let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
+/// One interactive debugging session: a live [`Machine`] plus debugger state.
+pub struct DebugSession<'a> {
+    m: Machine<'a>,
+    breakpoints: HashSet<usize>,
+    trace: bool,
+    finished: Option<u64>,
+}
 
-    let mut m = vm.machine(ctx);
-    println!("febpf debugger — type 'help' for commands");
-    print_insn(&m, m.pc);
+impl<'a> DebugSession<'a> {
+    pub fn new(vm: &'a mut Vm, ctx: &'a mut [u8], opts: &DebuggerOpts) -> Self {
+        vm.echo_printk = opts.echo_printk;
+        DebugSession {
+            m: vm.machine(ctx),
+            breakpoints: HashSet::new(),
+            trace: false,
+            finished: None,
+        }
+    }
 
-    loop {
-        print!("(febpf) ");
-        io::stdout().flush()?;
-        let line = match lines.next() {
-            Some(l) => l?,
-            None => return Ok(None), // EOF
-        };
+    /// The underlying machine, for inspection in tests/tools.
+    pub fn machine(&mut self) -> &mut Machine<'a> {
+        &mut self.m
+    }
+
+    /// r0, if the program has run to completion.
+    pub fn finished(&self) -> Option<u64> {
+        self.finished
+    }
+
+    fn print_insn(&self, out: &mut dyn Write, pc: usize) -> io::Result<()> {
+        let insns = self.m.vm_ref().insns();
+        if pc < insns.len() {
+            writeln!(out, "{pc:4}: {}", disasm_insn(insns, pc))
+        } else {
+            writeln!(out, "{pc:4}: <out of bounds>")
+        }
+    }
+
+    /// Print the current position (used by the REPL banner).
+    pub fn print_position(&self, out: &mut dyn Write) -> io::Result<()> {
+        self.print_insn(out, self.m.pc)
+    }
+
+    fn print_regs(&self, out: &mut dyn Write) -> io::Result<()> {
+        for row in 0..3 {
+            let mut line = String::new();
+            for col in 0..4 {
+                let r = row * 4 + col;
+                if r > 10 {
+                    break;
+                }
+                line.push_str(&format!("r{r:<2}= {:#018x}  ", self.m.regs[r]));
+            }
+            writeln!(out, "{}", line.trim_end())?;
+        }
+        writeln!(
+            out,
+            "pc = {}  frame = {}  insns executed = {}",
+            self.m.pc,
+            self.m.current_frame(),
+            self.m.insn_count
+        )
+    }
+
+    /// Execute one instruction; returns whether the caller may keep stepping.
+    fn step_once(&mut self, out: &mut dyn Write) -> io::Result<bool> {
+        if let Some(r0) = self.finished {
+            writeln!(out, "program has exited (r0 = {r0}); 'q' to leave")?;
+            return Ok(false);
+        }
+        if self.trace {
+            self.print_insn(out, self.m.pc)?;
+        }
+        match self.m.step() {
+            Ok(Some(r0)) => {
+                self.finished = Some(r0);
+                writeln!(out, "program exited with r0 = {r0} ({r0:#x})")?;
+                Ok(false)
+            }
+            Ok(None) => {
+                if self.breakpoints.contains(&self.m.pc) {
+                    writeln!(out, "breakpoint hit at {}", self.m.pc)?;
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            }
+            Err(e) => {
+                writeln!(out, "{e}")?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Handle one debugger command line, writing output to `out`.
+    pub fn handle_command(&mut self, line: &str, out: &mut dyn Write) -> io::Result<Outcome> {
         let mut it = line.split_whitespace();
         let cmd = it.next().unwrap_or("");
         let arg1 = it.next();
@@ -114,135 +174,136 @@ pub fn repl(vm: &mut Vm, ctx: &mut [u8], opts: DebuggerOpts) -> io::Result<Optio
 
         match cmd {
             "" => {}
-            "help" | "h" | "?" => print!("{HELP}"),
-            "q" | "quit" | "exit" => return Ok(None),
+            "help" | "h" | "?" => write!(out, "{HELP}")?,
+            "q" | "quit" | "exit" => return Ok(Outcome::Quit(self.finished)),
             "s" | "step" => {
                 let n = arg1.and_then(parse_num).unwrap_or(1);
                 for _ in 0..n {
-                    if trace {
-                        print_insn(&m, m.pc);
-                    }
-                    match m.step() {
-                        Ok(Some(r0)) => {
-                            println!("program exited with r0 = {r0} ({r0:#x})");
-                            return Ok(Some(r0));
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            println!("{e}");
-                            break;
-                        }
-                    }
-                    if breakpoints.contains(&m.pc) {
-                        println!("breakpoint hit at {}", m.pc);
+                    if !self.step_once(out)? {
                         break;
                     }
                 }
-                print_insn(&m, m.pc);
+                if self.finished.is_none() {
+                    self.print_insn(out, self.m.pc)?;
+                }
             }
-            "c" | "continue" | "run" => loop {
-                if trace {
-                    print_insn(&m, m.pc);
+            "c" | "continue" | "run" => {
+                while self.step_once(out)? {}
+                if self.finished.is_none() {
+                    self.print_insn(out, self.m.pc)?;
                 }
-                match m.step() {
-                    Ok(Some(r0)) => {
-                        println!("program exited with r0 = {r0} ({r0:#x})");
-                        return Ok(Some(r0));
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        println!("{e}");
-                        print_insn(&m, m.pc);
-                        break;
-                    }
-                }
-                if breakpoints.contains(&m.pc) {
-                    println!("breakpoint hit at {}", m.pc);
-                    print_insn(&m, m.pc);
-                    break;
-                }
-            },
+            }
             "b" | "break" => match arg1.and_then(parse_num) {
                 Some(pc) => {
-                    breakpoints.insert(pc as usize);
-                    println!("breakpoint set at {pc}");
+                    self.breakpoints.insert(pc as usize);
+                    writeln!(out, "breakpoint set at {pc}")?;
                 }
-                None => println!("usage: break <pc>"),
+                None => writeln!(out, "usage: break <pc>")?,
             },
             "d" | "delete" => match arg1.and_then(parse_num) {
                 Some(pc) => {
-                    breakpoints.remove(&(pc as usize));
+                    self.breakpoints.remove(&(pc as usize));
                 }
                 None => {
-                    breakpoints.clear();
-                    println!("all breakpoints removed");
+                    self.breakpoints.clear();
+                    writeln!(out, "all breakpoints removed")?;
                 }
             },
             "i" | "info" => {
-                let mut bps: Vec<_> = breakpoints.iter().collect();
+                let mut bps: Vec<_> = self.breakpoints.iter().collect();
                 bps.sort();
-                println!("breakpoints: {bps:?}");
+                writeln!(out, "breakpoints: {bps:?}")?;
             }
-            "r" | "regs" => print_regs(&m),
+            "r" | "regs" => self.print_regs(out)?,
             "l" | "list" => {
-                let insns = m.vm_ref().insns();
                 let center = arg1
                     .and_then(parse_num)
                     .map(|v| v as usize)
-                    .unwrap_or(m.pc);
+                    .unwrap_or(self.m.pc);
+                let insns = self.m.vm_ref().insns();
                 let lo = center.saturating_sub(5);
+                let hi = (center + 6).min(insns.len().saturating_sub(1));
+                let mut lines = Vec::new();
                 let mut pc = lo;
-                // align to instruction boundary from 0 if lddw slots interfere
-                while pc <= (center + 6).min(insns.len().saturating_sub(1)) {
-                    let marker = if pc == m.pc { "=>" } else { "  " };
-                    let bp = if breakpoints.contains(&pc) { "*" } else { " " };
-                    println!("{marker}{bp}{pc:4}: {}", disasm_insn(insns, pc));
+                while pc <= hi {
+                    let marker = if pc == self.m.pc { "=>" } else { "  " };
+                    let bp = if self.breakpoints.contains(&pc) { "*" } else { " " };
+                    lines.push(format!("{marker}{bp}{pc:4}: {}", disasm_insn(insns, pc)));
                     pc += if insns[pc].is_wide() { 2 } else { 1 };
+                }
+                for l in lines {
+                    writeln!(out, "{l}")?;
                 }
             }
             "x" => match arg1.and_then(parse_num) {
                 Some(addr) => {
                     let len = arg2.and_then(parse_num).unwrap_or(64) as usize;
-                    match m.read_mem(addr, len) {
-                        Ok(bytes) => hexdump(&bytes, addr),
-                        Err(e) => println!("{e}"),
+                    match self.m.read_mem(addr, len) {
+                        Ok(bytes) => hexdump(out, &bytes, addr)?,
+                        Err(e) => writeln!(out, "{e}")?,
                     }
                 }
-                None => println!("usage: x <addr> [len]"),
+                None => writeln!(out, "usage: x <addr> [len]")?,
             },
             "stack" => {
-                let fp = m.regs[10];
+                let fp = self.m.regs[10];
                 let base = fp - crate::insn::STACK_SIZE as u64;
-                match m.read_mem(base, crate::insn::STACK_SIZE) {
-                    Ok(bytes) => hexdump(&bytes, base),
-                    Err(e) => println!("{e}"),
+                match self.m.read_mem(base, crate::insn::STACK_SIZE) {
+                    Ok(bytes) => hexdump(out, &bytes, base)?,
+                    Err(e) => writeln!(out, "{e}")?,
                 }
             }
             "maps" => {
-                for map in &m.vm_ref().maps {
-                    println!(
+                for map in &self.m.vm_ref().maps {
+                    writeln!(
+                        out,
                         "map '{}' ({}, key={}B value={}B max={}):",
                         map.def.name, map.def.kind, map.def.key_size, map.def.value_size,
                         map.def.max_entries
-                    );
+                    )?;
                     for (k, v) in map.iter_entries() {
-                        let hex = |b: &[u8]| {
-                            b.iter().map(|x| format!("{x:02x}")).collect::<String>()
-                        };
-                        println!("  [{}] = {}", hex(&k), hex(&v));
+                        let hex =
+                            |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+                        writeln!(out, "  [{}] = {}", hex(&k), hex(&v))?;
                     }
                 }
             }
             "printk" => {
-                for line in &m.vm_ref().printk {
-                    println!("{line}");
+                for line in &self.m.vm_ref().printk {
+                    writeln!(out, "{line}")?;
                 }
             }
             "t" | "trace" => {
-                trace = !trace;
-                println!("trace {}", if trace { "on" } else { "off" });
+                self.trace = !self.trace;
+                writeln!(out, "trace {}", if self.trace { "on" } else { "off" })?;
             }
-            other => println!("unknown command '{other}' — try 'help'"),
+            other => writeln!(out, "unknown command '{other}' — try 'help'")?,
+        }
+        Ok(Outcome::Continue)
+    }
+}
+
+/// Run an interactive debugging session for `vm` with context `ctx`.
+/// Returns the program's r0 if it ran to completion.
+pub fn repl(vm: &mut Vm, ctx: &mut [u8], opts: DebuggerOpts) -> io::Result<Option<u64>> {
+    let mut session = DebugSession::new(vm, ctx, &opts);
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+    let mut out = io::stdout();
+
+    writeln!(out, "febpf debugger — type 'help' for commands")?;
+    session.print_position(&mut out)?;
+
+    loop {
+        write!(out, "(febpf) ")?;
+        out.flush()?;
+        let line = match lines.next() {
+            Some(l) => l?,
+            None => return Ok(session.finished()), // EOF
+        };
+        match session.handle_command(&line, &mut out)? {
+            Outcome::Continue => {}
+            Outcome::Quit(r0) => return Ok(r0),
         }
     }
 }
