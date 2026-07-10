@@ -247,14 +247,31 @@ in `src/elf.rs`, before `Vm::new` — same lifecycle stage as the existing map
   `tests/core_probe.o`; `tests/btf.rs::btf_ext_of_core_probe_object` verifies
   the 3 FIELD_BYTE_OFFSET relos ("0:0"/"0:1"/"0:2" on struct point in ".text"),
   func_info (FUNC 'probe' at insn 0) and line_info against clang 21 output.
-- Stage 3 (relocation algorithm): not started.
+- Stage 3 (relocation algorithm): **done** — `src/relo.rs`:
+  `calc_relo(local, &CoreRelo, target, &CandidateIndex) -> ReloResult
+  { new_val, orig_val, validate, matched }`. Implements all 13 relo kinds:
+  access-spec parse, local spec walk by member index (anonymous members fold
+  into the bit offset and produce no step, as libbpf), `CandidateIndex` keyed
+  by essential name, target replay by member NAME with recursive descent into
+  anonymous members + `fields_compat` checks, `types_compat` (TYPE_EXISTS) and
+  `types_match` (TYPE_MATCHES), bitfield byte-offset/LSHIFT/RSHIFT (LE
+  formulas), ambiguity rule (all candidates must agree on `new_val`),
+  EXISTS-family → 0 on no match, others hard-error. Deviations from libbpf:
+  none intended; candidate root name is the type's own name (typedef roots
+  match target typedefs), anonymous roots error. 11 unit tests in `src/relo.rs`
+  (shifted layouts, name-vs-index, anon nesting both directions, arrays,
+  bitfields, flavors, ambiguity, missing field/type, enums incl. ENUM64,
+  typedef roots) + a self-relocation differential in `tests/btf.rs` (fixture's
+  own BTF as target must reproduce clang's baked-in offsets).
 - Stage 4 (patching + CLI): not started.
 
-Next step (stage 3): implement §2 in `src/btf.rs` (or a `core` submodule):
-access-spec parsing, local spec walk (by member index), candidate search via
-essential names, target spec walk (by member NAME, recursing into anonymous
-members), per-kind value computation (§2 step 5), ambiguity rules. API sketch:
-`pub fn calc_core_relo(local: &Btf, relo: &CoreRelo, target: &Btf) ->
-Result<ReloValue, String>` where `ReloValue { new_val: u64, orig_val: u64,
-patch: PatchKind (imm/off/imm64), validate: bool }`. Unit-test on synthetic
-BTF (shifted offsets, flavors, missing fields, ambiguous candidates).
+Next step (stage 4): instruction patching + CLI (§3, §4). In `elf.rs::load`,
+accept an optional target BTF; when the object has `.BTF.ext` core_relos for a
+loaded section, compute each relo and patch the insn at `insn_off/8` (relative
+to that section's code): mem-class → `off` (validate old off == orig_val,
+check i16 range), ALU imm → `imm`, lddw → both `imm` slots. Remember `.text`
+stitching: relos for ".text" apply at the appended `text_base` offset in every
+program that stitched it. CLI: `--target-btf <path>`, default
+`/sys/kernel/btf/vmlinux` when present and relos exist. Test: run
+`tests/core_probe.o` under interp+JIT against a hand-built shifted target BTF
+and assert the result matches the shifted ctx layout.

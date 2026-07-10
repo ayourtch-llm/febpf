@@ -178,3 +178,31 @@ fn btf_ext_of_core_probe_object() {
         assert!(rec.line() > 0 && rec.line() < 100);
     }
 }
+
+#[test]
+fn core_relos_resolve_against_own_btf() {
+    // Self-relocation: using the object's own BTF as the target must
+    // reproduce exactly the offsets clang baked into the instructions.
+    maybe_compile("core_probe.c", "core_probe.o");
+    let bytes = std::fs::read("tests/core_probe.o").expect("fixture");
+    let (btf_raw, le) = febpf::elf::read_section(&bytes, ".BTF")
+        .unwrap()
+        .expect("no .BTF");
+    let (ext_raw, _) = febpf::elf::read_section(&bytes, ".BTF.ext")
+        .unwrap()
+        .expect("no .BTF.ext");
+    let btf = Btf::parse(le, &btf_raw).unwrap();
+    let ext = BtfExt::parse(le, &ext_raw).unwrap();
+    let index = febpf::relo::CandidateIndex::new(&btf);
+
+    let mut relos = ext.core_relos[0].recs.clone();
+    relos.sort_by_key(|r| r.insn_off);
+    let expected_offsets = [0u64, 4, 8]; // x, y, z in struct point
+    for (r, want) in relos.iter().zip(expected_offsets) {
+        let res = febpf::relo::calc_relo(&btf, r, &btf, &index).unwrap();
+        assert_eq!(res.new_val, want, "insn_off {}", r.insn_off);
+        assert_eq!(res.orig_val, want);
+        assert_eq!(res.matched, 1);
+        assert!(res.validate);
+    }
+}

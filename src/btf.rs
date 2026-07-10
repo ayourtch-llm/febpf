@@ -763,7 +763,7 @@ pub fn essential_name(name: &str) -> &str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Hand-assemble a BTF blob from (name, info, size_or_type, extra-words).
