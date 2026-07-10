@@ -166,8 +166,24 @@ point; a user who wants the terse form has the first line. Affected commands:
 
 ## STATUS
 
+**Complete.** All four stages done; `cargo test` 71 green, clippy 0 warnings.
+
 - [x] Stage 1: spec written.
 - [x] Stage 2: capture + replay (`VerifyError.trace`, path arena, replay).
 - [x] Stage 3: rendering (`verifier::render_trace`) + cause notes + CLI
       (`--no-explain`; shown by default in verify/analyze/run/profile/bench/debug).
-- [ ] Stage 4: tests + polish.
+- [x] Stage 4: tests — trace structure tests (`trace_*` in
+      `tests/integration.rs`) and rendered-explanation tests (`explain_*`)
+      covering NULL map-value deref (origin + branch named), out-of-bounds
+      stack, uninitialized register, long-path truncation, and the
+      too-complex budget rejection.
+
+Deviations from the plan above: none material. `PathNode` dropped its `pc`
+field (not needed for replay). The truncation marker in rendering relies on
+the head window being exactly 8 steps (`TRACE_HEAD`); if you change the
+constant, keep `render_trace`'s `i == 8` in sync.
+
+Possible follow-ups (not required): notes for pointer-leak and
+helper-signature rejections; folding repeated loop iterations in the tail
+window ("x N times"); a trace hook in the debugger to seed breakpoints from
+the counterexample path.

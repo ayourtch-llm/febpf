@@ -877,3 +877,112 @@ fn trace_long_path_is_truncated() {
     assert_eq!(t.steps.first().unwrap().pc, 0);
     assert_eq!(t.steps.last().unwrap().pc, e.pc);
 }
+
+// Assemble, verify (expecting failure), and render the explanation.
+fn explain_err(src: &str) -> (febpf::VerifyError, String) {
+    let prog = program(src);
+    let vm = Vm::new(prog.clone()).unwrap();
+    let e = match vm.verify(Config::default()) {
+        Ok(_) => panic!("expected verification to fail"),
+        Err(e) => e,
+    };
+    let text = febpf::verifier::render_trace(&prog.insns, &e);
+    (e, text)
+}
+
+/// The rendered explanation must name the failing instruction and the cause.
+#[test]
+fn explain_null_deref_names_origin_and_branch() {
+    let (e, text) = explain_err(
+        "
+        .map m array 4 8 1
+        w1 = 0
+        *(u32 *)(r10 - 4) = r1
+        r1 = map[m]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        r1 = *(u32 *)(r10 - 4)
+        if r1 > 7 goto bad
+        r0 = 0
+        exit
+    bad:
+        r0 = *(u64 *)(r0)
+        exit",
+    );
+    assert_eq!(e.pc, 11);
+    assert!(text.contains("->  11: r0 = *(u64 *)(r0)"), "{text}");
+    assert!(text.contains("[taken]"), "{text}");
+    assert!(text.contains("^ map value pointer may be NULL"), "{text}");
+    assert!(
+        text.contains("r0 may be NULL here: it was returned by map_lookup_elem at insn 6"),
+        "{text}"
+    );
+}
+
+#[test]
+fn explain_stack_oob_names_insn() {
+    let (e, text) = explain_err(
+        "
+        r1 = 5
+        *(u64 *)(r10 - 516) = r1
+        r0 = 0
+        exit",
+    );
+    assert_eq!(e.pc, 1);
+    assert!(text.contains("->   1: *(u64 *)(r10 - 516) = r1"), "{text}");
+    assert!(text.contains("^ stack access out of bounds"), "{text}");
+}
+
+#[test]
+fn explain_uninit_register_names_register() {
+    let (e, text) = explain_err("r0 = 1\n r2 = r3\n exit");
+    assert_eq!(e.pc, 1);
+    assert!(text.contains("->   1: r2 = r3"), "{text}");
+    assert!(
+        text.contains("r3 is uninitialized: no instruction on this path writes it"),
+        "{text}"
+    );
+}
+
+#[test]
+fn explain_long_path_shows_omission_marker() {
+    let (e, text) = explain_err(
+        "
+        r0 = 0
+    loop:
+        r0 += 1
+        if r0 < 200 goto loop
+        r1 = r9
+        exit",
+    );
+    assert!(e.msg.contains("uninitialized"), "{e}");
+    assert!(text.contains("steps omitted"), "{text}");
+    assert!(text.contains("r9 is uninitialized"), "{text}");
+}
+
+#[test]
+fn explain_too_complex_has_trace() {
+    let prog = program(
+        "
+        r0 = 0
+    loop:
+        r0 += 1
+        if r0 != 0 goto loop
+        exit",
+    );
+    let vm = Vm::new(prog.clone()).unwrap();
+    let e = match vm.verify(Config {
+        insn_budget: 10_000,
+        ..Default::default()
+    }) {
+        Ok(_) => panic!("expected too-complex rejection"),
+        Err(e) => e,
+    };
+    assert!(e.msg.contains("too complex"), "{e}");
+    let t = e.trace.as_ref().expect("complexity rejection carries a trace");
+    assert!(t.truncated > 0);
+    // the tail window shows the loop body repeating
+    let text = febpf::verifier::render_trace(&prog.insns, &e);
+    assert!(text.contains("if r0 != 0 goto"), "{text}");
+}
