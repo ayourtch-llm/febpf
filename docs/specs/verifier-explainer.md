@@ -167,6 +167,6 @@ point; a user who wants the terse form has the first line. Affected commands:
 ## STATUS
 
 - [x] Stage 1: spec written.
-- [ ] Stage 2: capture + replay.
+- [x] Stage 2: capture + replay (`VerifyError.trace`, path arena, replay).
 - [ ] Stage 3: rendering + CLI.
 - [ ] Stage 4: tests + polish.

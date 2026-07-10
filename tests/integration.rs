@@ -768,3 +768,112 @@ fn map_value_lddw_with_offset() {
         exit";
     assert_eq!(run_src(src), 77);
 }
+
+// -------------------------------------------------- rejection explainer
+
+/// Like `verify_err` but returns the whole error (with counterexample trace).
+fn verify_err_full(src: &str) -> febpf::VerifyError {
+    let vm = Vm::new(program(src)).unwrap();
+    match vm.verify(Config::default()) {
+        Ok(_) => panic!("expected verification to fail"),
+        Err(e) => e,
+    }
+}
+
+#[test]
+fn trace_covers_path_to_failure() {
+    let e = verify_err_full(
+        "
+        r0 = 1
+        r1 = 2
+        r2 = r3      ; r3 uninitialized
+        exit",
+    );
+    assert_eq!(e.pc, 2);
+    let t = e.trace.expect("rejection should carry a trace");
+    assert_eq!(t.truncated, 0);
+    let pcs: Vec<usize> = t.steps.iter().map(|s| s.pc).collect();
+    assert_eq!(pcs, vec![0, 1, 2], "trace must walk entry -> failing insn");
+    // the failing step reflects the state before the instruction
+    assert!(t.steps[2].state.contains("r0=1"), "{:?}", t.steps[2]);
+    assert!(t.steps[2].state.contains("r1=2"), "{:?}", t.steps[2]);
+}
+
+#[test]
+fn trace_records_branch_decisions() {
+    // failure only on the branch-taken path (r1 too large for ctx read)
+    let src = "
+        r0 = *(u32 *)(r1 + 0)
+        if r0 > 10 goto bad
+        r0 = 0
+        exit
+    bad:
+        r2 = *(u64 *)(r1 + 8000)
+        exit";
+    let vm = Vm::new(program(src)).unwrap();
+    let e = match vm.verify(Config {
+        ctx_size: 64,
+        ..Default::default()
+    }) {
+        Ok(_) => panic!("expected verification to fail"),
+        Err(e) => e,
+    };
+    assert_eq!(e.pc, 4);
+    let t = e.trace.expect("trace");
+    let branch_step = t
+        .steps
+        .iter()
+        .find(|s| s.pc == 1)
+        .expect("conditional at insn 1 on the path");
+    assert_eq!(
+        branch_step.branch,
+        Some((true, 4)),
+        "the counterexample takes the branch to insn 4"
+    );
+    // path must not include the not-taken side (insns 2/3)
+    assert!(t.steps.iter().all(|s| s.pc != 2 && s.pc != 3));
+}
+
+#[test]
+fn trace_null_path_reaches_deref() {
+    let e = verify_err_full(
+        "
+        .map m array 4 8 1
+        w1 = 0
+        *(u32 *)(r10 - 4) = r1
+        r1 = map[m]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        r0 = *(u64 *)(r0)
+        exit",
+    );
+    assert!(e.msg.contains("NULL"), "{e}");
+    let t = e.trace.expect("trace");
+    let last = t.steps.last().unwrap();
+    assert_eq!(last.pc, e.pc);
+    assert!(
+        last.state.contains("map0_value_or_null"),
+        "failing state should show the maybe-null pointer: {}",
+        last.state
+    );
+}
+
+#[test]
+fn trace_long_path_is_truncated() {
+    // bounded loop long enough to overflow the head+tail windows
+    let e = verify_err_full(
+        "
+        r0 = 0
+    loop:
+        r0 += 1
+        if r0 < 200 goto loop
+        r1 = r9      ; r9 uninitialized: fails after a long path
+        exit",
+    );
+    assert!(e.msg.contains("uninitialized"), "{e}");
+    let t = e.trace.expect("trace");
+    assert!(t.truncated > 0, "long path should be truncated");
+    assert_eq!(t.steps.first().unwrap().pc, 0);
+    assert_eq!(t.steps.last().unwrap().pc, e.pc);
+}

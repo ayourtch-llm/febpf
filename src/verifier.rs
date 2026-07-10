@@ -20,7 +20,7 @@ use crate::helpers::{builtin_sig, ArgKind, HelperSig, RetKind};
 use crate::insn::*;
 use crate::maps::MapDef;
 use crate::tnum::Tnum;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 
 #[derive(Debug, Clone)]
@@ -53,6 +53,33 @@ impl Default for Config {
 pub struct VerifyError {
     pub pc: usize,
     pub msg: String,
+    /// Counterexample: the exact path the verifier walked from entry to the
+    /// failing instruction. `None` for structural (pre-DFS) errors or if the
+    /// path could not be reconstructed.
+    pub trace: Option<Trace>,
+}
+
+/// A replayed counterexample path ending at the failing instruction.
+#[derive(Debug)]
+pub struct Trace {
+    /// Steps in program order. When the path is long, this holds a window of
+    /// the first few and last few steps; `truncated` counts the omitted
+    /// middle. The final entry is the failing instruction itself (not
+    /// executed).
+    pub steps: Vec<TraceStep>,
+    /// Number of steps omitted between the head and tail windows.
+    pub truncated: usize,
+    /// Cause hints, e.g. where a maybe-NULL pointer came from.
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraceStep {
+    pub pc: usize,
+    /// Rendered abstract state *before* executing the instruction.
+    pub state: String,
+    /// For a conditional jump on the path: (taken, jump target).
+    pub branch: Option<(bool, usize)>,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -701,6 +728,22 @@ fn alu_scalar(
 // Branch analysis
 // ---------------------------------------------------------------------------
 
+/// For a conditional jump, report whether the step from `pc` to `npc` took
+/// the branch and where the branch target is. `None` for non-conditionals.
+fn cond_branch_info(ins: Insn, pc: usize, npc: usize) -> Option<(bool, usize)> {
+    let cls = ins.class();
+    if cls != class::JMP && cls != class::JMP32 {
+        return None;
+    }
+    match ins.op() {
+        jmp::JA | jmp::EXIT | jmp::CALL => None,
+        _ => {
+            let target = (pc as i64 + 1 + ins.off as i64) as usize;
+            Some((npc == target, target))
+        }
+    }
+}
+
 /// Decide a comparison if the ranges force it. `None` = could go either way.
 fn branch_taken(op: u8, a: &Scalar, b: &Scalar) -> Option<bool> {
     match op {
@@ -895,6 +938,21 @@ pub struct Verifier<'a> {
     prune_points: Vec<bool>,
     insn_state: Vec<Option<(String, usize)>>,
     next_null_id: u32,
+    /// Path arena: one node per successor of every multi-successor step,
+    /// forming a tree of branch decisions rooted at program entry. Used to
+    /// replay the failing path when verification is rejected.
+    path_nodes: Vec<PathNode>,
+    /// During trace replay: map from maybe-null pointer id to the pc and
+    /// helper name that created it.
+    replay_null_origin: Option<HashMap<u32, (usize, String)>>,
+}
+
+/// One branch decision on a verification path (see `Verifier::path_nodes`).
+struct PathNode {
+    /// Previous decision on this path.
+    parent: Option<u32>,
+    /// Index into the successor list that this path followed.
+    choice: u8,
 }
 
 enum StepOutcome {
@@ -922,6 +980,8 @@ impl<'a> Verifier<'a> {
             prune_points: Vec::new(),
             insn_state: Vec::new(),
             next_null_id: 1,
+            path_nodes: Vec::new(),
+            replay_null_origin: None,
         }
     }
 
@@ -929,6 +989,7 @@ impl<'a> Verifier<'a> {
         VerifyError {
             pc,
             msg: msg.into(),
+            trace: None,
         }
     }
 
@@ -949,33 +1010,29 @@ impl<'a> Verifier<'a> {
         self.compute_prune_points();
         self.insn_state = vec![None; self.insns.len()];
 
-        // initial state: r1 = ctx (if any), r10 = fp
-        let mut frame = Frame::new(0);
-        if self.cfg.ctx_size > 0 {
-            frame.regs[1] = RegState::Ptr(Ptr::new(PtrKind::Ctx));
-        }
-        frame.regs[REG_FP as usize] = RegState::Ptr(Ptr::new(PtrKind::Stack { frame: 0 }));
-        let init = VState {
-            frames: vec![frame],
-        };
-
-        let mut pending: Vec<(usize, VState)> = vec![(0, init)];
-        while let Some((pc, state)) = pending.pop() {
+        // work items: (pc, state, last path node, steps taken from entry)
+        let mut pending: Vec<(usize, VState, Option<u32>, u32)> =
+            vec![(0, self.initial_state(), None, 0)];
+        while let Some((pc, state, node, len)) = pending.pop() {
             let mut pc = pc;
             let mut state = state;
+            let mut node = node;
+            let mut len = len;
             loop {
                 if self.stats.insns_processed >= self.cfg.insn_budget {
-                    return Err(self.err(
+                    let e = self.err(
                         pc,
                         format!(
                             "program too complex: exceeded {} processed instructions \
                              (unbounded loop?)",
                             self.cfg.insn_budget
                         ),
-                    ));
+                    );
+                    return Err(self.attach_trace(e, node, len));
                 }
                 if pc >= self.insns.len() {
-                    return Err(self.err(pc, "fell off the end of the program"));
+                    let e = self.err(pc, "fell off the end of the program");
+                    return Err(self.attach_trace(e, node, len));
                 }
                 // prune / remember
                 if self.prune_points[pc] {
@@ -1008,19 +1065,38 @@ impl<'a> Verifier<'a> {
                     slot @ None => *slot = Some((state.render(), 1)),
                 }
 
-                match self.step(pc, state)? {
-                    StepOutcome::Done => break,
-                    StepOutcome::Next(mut succs) => {
+                match self.step(pc, state) {
+                    Err(e) => return Err(self.attach_trace(e, node, len)),
+                    Ok(StepOutcome::Done) => break,
+                    Ok(StepOutcome::Next(mut succs)) => {
                         if succs.is_empty() {
                             break; // all successors dead
                         }
-                        let (npc, nstate) = succs.pop().unwrap();
-                        for other in succs {
-                            self.stats.states_explored += 1;
-                            pending.push(other);
+                        if succs.len() > 1 {
+                            // record one decision node per successor
+                            let first_id = self.path_nodes.len() as u32;
+                            for i in 0..succs.len() {
+                                self.path_nodes.push(PathNode {
+                                    parent: node,
+                                    choice: i as u8,
+                                });
+                            }
+                            let cont = succs.len() - 1; // we continue on the last
+                            let (npc, nstate) = succs.pop().unwrap();
+                            for (i, (opc, ostate)) in succs.into_iter().enumerate() {
+                                self.stats.states_explored += 1;
+                                pending.push((opc, ostate, Some(first_id + i as u32), len + 1));
+                            }
+                            node = Some(first_id + cont as u32);
+                            len += 1;
+                            pc = npc;
+                            state = nstate;
+                        } else {
+                            let (npc, nstate) = succs.pop().unwrap();
+                            len += 1;
+                            pc = npc;
+                            state = nstate;
                         }
-                        pc = npc;
-                        state = nstate;
                     }
                 }
             }
@@ -1032,6 +1108,146 @@ impl<'a> Verifier<'a> {
             warnings: self.warnings,
             insn_state: self.insn_state,
         })
+    }
+
+    // -- counterexample trace (rejection explainer) --------------------------
+
+    /// Initial abstract state: r1 = ctx (if any), r10 = fp.
+    fn initial_state(&self) -> VState {
+        let mut frame = Frame::new(0);
+        if self.cfg.ctx_size > 0 {
+            frame.regs[1] = RegState::Ptr(Ptr::new(PtrKind::Ctx));
+        }
+        frame.regs[REG_FP as usize] = RegState::Ptr(Ptr::new(PtrKind::Stack { frame: 0 }));
+        VState {
+            frames: vec![frame],
+        }
+    }
+
+    /// Attach a counterexample trace to `e` by replaying the failing path.
+    /// `node` is the last branch decision on the path, `len` the number of
+    /// instructions executed from entry (the failing one not included).
+    fn attach_trace(&mut self, mut e: VerifyError, node: Option<u32>, len: u32) -> VerifyError {
+        e.trace = self.build_trace(e.pc, node, len);
+        e
+    }
+
+    fn build_trace(&mut self, err_pc: usize, node: Option<u32>, len: u32) -> Option<Trace> {
+        // Reconstruct the branch-decision list from entry.
+        let mut decisions: Vec<u8> = Vec::new();
+        let mut n = node;
+        while let Some(i) = n {
+            let nd = &self.path_nodes[i as usize];
+            decisions.push(nd.choice);
+            n = nd.parent;
+        }
+        decisions.reverse();
+        self.replay_null_origin = Some(HashMap::new());
+        self.replay(err_pc, &decisions, len)
+    }
+
+    /// Re-run the abstract interpreter along one recorded path (pruning
+    /// disabled), capturing a bounded window of per-step states. `step()` is
+    /// deterministic in `(pc, state)`, so following the recorded choices at
+    /// every multi-successor point reproduces the exact failing path.
+    fn replay(&mut self, err_pc: usize, decisions: &[u8], len: u32) -> Option<Trace> {
+        const TRACE_HEAD: usize = 8;
+        const TRACE_TAIL: usize = 48;
+        fn push_step(
+            head: &mut Vec<TraceStep>,
+            tail: &mut VecDeque<TraceStep>,
+            total: &mut usize,
+            s: TraceStep,
+        ) {
+            if head.len() < TRACE_HEAD {
+                head.push(s.clone());
+            }
+            if tail.len() == TRACE_TAIL {
+                tail.pop_front();
+            }
+            tail.push_back(s);
+            *total += 1;
+        }
+
+        let mut state = self.initial_state();
+        let mut pc = 0usize;
+        let mut di = 0usize;
+        let mut head: Vec<TraceStep> = Vec::new();
+        let mut tail: VecDeque<TraceStep> = VecDeque::new();
+        let mut total = 0usize;
+        let final_state;
+
+        loop {
+            if total as u32 == len {
+                // Arrived at the failing instruction; do not execute it.
+                if pc != err_pc {
+                    return None; // replay diverged (should not happen)
+                }
+                if pc < self.insns.len() {
+                    let s = TraceStep {
+                        pc,
+                        state: state.render(),
+                        branch: None,
+                    };
+                    push_step(&mut head, &mut tail, &mut total, s);
+                }
+                final_state = state;
+                break;
+            }
+            if pc >= self.insns.len() {
+                return None;
+            }
+            let pre = state.render();
+            let ins = self.insns[pc];
+            let cur_pc = pc;
+            let succs = match self.step(pc, state) {
+                Ok(StepOutcome::Next(s)) => s,
+                _ => return None, // exit or error before the recorded point
+            };
+            let choice = if succs.len() > 1 {
+                let c = *decisions.get(di)? as usize;
+                di += 1;
+                c
+            } else {
+                0
+            };
+            let (npc, nstate) = succs.into_iter().nth(choice)?;
+            let branch = cond_branch_info(ins, cur_pc, npc);
+            push_step(
+                &mut head,
+                &mut tail,
+                &mut total,
+                TraceStep {
+                    pc: cur_pc,
+                    state: pre,
+                    branch,
+                },
+            );
+            pc = npc;
+            state = nstate;
+        }
+
+        // Assemble head + tail windows without duplicating overlap.
+        let cut = head.len();
+        let ring_start = total - tail.len();
+        let mut steps = head;
+        for (j, s) in tail.iter().enumerate() {
+            if ring_start + j >= cut {
+                steps.push(s.clone());
+            }
+        }
+        let notes = self.trace_notes(err_pc, &final_state);
+        Some(Trace {
+            steps,
+            truncated: ring_start.saturating_sub(cut),
+            notes,
+        })
+    }
+
+    /// Cause hints derived from the failing instruction and the abstract
+    /// state right before it.
+    fn trace_notes(&self, _err_pc: usize, _pre_state: &VState) -> Vec<String> {
+        Vec::new()
     }
 
     // -- structural pre-pass ------------------------------------------------
@@ -1073,12 +1289,14 @@ impl<'a> Verifier<'a> {
                     return Err(VerifyError {
                         pc: i,
                         msg: format!("jump target {t} out of range"),
+                        trace: None,
                     });
                 }
                 if is_second[t as usize] {
                     return Err(VerifyError {
                         pc: i,
                         msg: format!("jump target {t} lands in the middle of lddw"),
+                        trace: None,
                     });
                 }
                 targets.push(t as usize);
@@ -1145,7 +1363,11 @@ impl<'a> Verifier<'a> {
 
     /// Reject malformed single instructions (bad opcodes, bad field use).
     fn check_insn_form(&mut self, pc: usize, ins: Insn) -> Result<(), VerifyError> {
-        let bad = |msg: String| VerifyError { pc, msg };
+        let bad = |msg: String| VerifyError {
+            pc,
+            msg,
+            trace: None,
+        };
         if ins.dst >= NUM_REGS as u8 {
             return Err(bad(format!("invalid dst register r{}", ins.dst)));
         }
@@ -1680,6 +1902,9 @@ impl<'a> Verifier<'a> {
                 })?;
                 let id = self.next_null_id;
                 self.next_null_id += 1;
+                if let Some(origins) = &mut self.replay_null_origin {
+                    origins.insert(id, (pc, sig.name.to_string()));
+                }
                 RegState::Ptr(Ptr::new(PtrKind::MapValueOrNull { map, id }))
             }
         };
