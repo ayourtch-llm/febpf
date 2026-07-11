@@ -188,6 +188,7 @@ pub struct Type {
 }
 
 /// A parsed BTF blob: type table + string table + name index.
+#[derive(Clone)]
 pub struct Btf {
     types: Vec<Type>,
     strs: Vec<u8>,

@@ -75,6 +75,11 @@ fn hexbytes(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Final path component of a source file path.
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 fn fmt_val(v: &Option<Vec<u8>>) -> String {
     match v {
         Some(b) => hexbytes(b),
@@ -134,8 +139,11 @@ struct Watchpoint {
 const HELP: &str = "\
 commands:
   s, step [N]        execute N instructions (default 1)
+  steps [N]          step N source lines, descending into calls
+  n, nexts [N]       step N source lines, stepping over calls
   c, continue        run until breakpoint, watchpoint, exit or error
   rs, rstep [N]      step backward N instructions (time travel)
+  rsteps [N]         step backward N source lines (time travel)
   rc, rcontinue      run backward to the previous breakpoint hit or
                      watchpoint change (e.g. back to the write that
                      changed a watched map value)
@@ -148,7 +156,9 @@ commands:
   unwatch [id]       delete watchpoint (no arg: delete all)
   i, info            show breakpoints and watchpoints
   r, regs            show registers
-  l, list [pc]       disassemble around pc (default: current)
+  p, print [name]    read a global variable by name (no arg: list globals)
+  bt, backtrace      source-level call stack (subprogram names)
+  l, list [pc]       disassemble around pc, interleaving C source
   x <addr> [len]     hex-dump memory at virtual address (default 64 bytes)
   stack              hex-dump the current stack frame
   maps               dump map contents
@@ -217,9 +227,45 @@ impl<'a> DebugSession<'a> {
         }
     }
 
-    /// Print the current position (used by the REPL banner).
+    /// Print the current position (used by the REPL banner): the C source
+    /// line, if known, followed by the disassembled instruction.
     pub fn print_position(&self, out: &mut dyn Write) -> io::Result<()> {
-        self.print_insn(out, self.m.pc)
+        self.print_loc(out, self.m.pc)
+    }
+
+    /// Source line + instruction at `pc`.
+    fn print_loc(&self, out: &mut dyn Write, pc: usize) -> io::Result<()> {
+        self.print_source_line(out, pc)?;
+        self.print_insn(out, pc)
+    }
+
+    /// Print the C source line covering `pc` (as `func at file:line  text`),
+    /// if debug info is available.
+    fn print_source_line(&self, out: &mut dyn Write, pc: usize) -> io::Result<()> {
+        let Some(di) = self.m.vm_ref().debug() else {
+            return Ok(());
+        };
+        let func = di.func_at(pc).map(|f| f.name.as_str()).unwrap_or("?");
+        if let Some(l) = di.line_at(pc) {
+            if l.text.is_empty() {
+                writeln!(out, "{func} at {}:{}", basename(&l.file), l.line)?;
+            } else {
+                writeln!(
+                    out,
+                    "{func} at {}:{}  {}",
+                    basename(&l.file),
+                    l.line,
+                    l.text.trim()
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The (file, line) covering `pc`, for source-level stepping.
+    fn line_key(&self, pc: usize) -> Option<(String, u32)> {
+        let di = self.m.vm_ref().debug()?;
+        di.line_at(pc).map(|l| (l.file.clone(), l.line))
     }
 
     fn print_regs(&self, out: &mut dyn Write) -> io::Result<()> {
@@ -426,7 +472,123 @@ impl<'a> DebugSession<'a> {
                 writeln!(out, "no earlier breakpoint/watchpoint hit; at the start of the program")?;
             }
         }
-        self.print_insn(out, self.m.pc)
+        self.print_loc(out, self.m.pc)
+    }
+
+    /// Source-level step: execute until the covering C source line changes.
+    /// With `step_over`, ignore line changes while inside a deeper call frame
+    /// (steps over bpf-to-bpf calls); otherwise descend into them. Returns
+    /// false when the program stops (exit / breakpoint / watchpoint / error).
+    fn source_step(&mut self, step_over: bool, out: &mut dyn Write) -> io::Result<bool> {
+        if self.m.vm_ref().debug().is_none() {
+            // No line info: fall back to a single instruction step.
+            return self.step_once(out);
+        }
+        let start_key = self.line_key(self.m.pc);
+        let start_frame = self.m.current_frame();
+        loop {
+            if !self.step_once(out)? {
+                return Ok(false);
+            }
+            let frame = self.m.current_frame();
+            if step_over && frame > start_frame {
+                continue; // inside a called subprogram; keep going
+            }
+            let changed = self.line_key(self.m.pc) != start_key;
+            if changed || frame < start_frame {
+                return Ok(true);
+            }
+        }
+    }
+
+    /// Reverse source step: time-travel backward to the previous distinct C
+    /// source line.
+    fn reverse_source_step(&mut self, n: u64, out: &mut dyn Write) -> io::Result<()> {
+        if self.m.vm_ref().debug().is_none() {
+            self.goto_count(self.m.insn_count.saturating_sub(n), out)?;
+            return self.print_loc(out, self.m.pc);
+        }
+        self.warn_nondet(out)?;
+        for _ in 0..n {
+            let cur = self.m.insn_count;
+            if cur == 0 {
+                writeln!(out, "already at the start of the program")?;
+                break;
+            }
+            let start_key = self.line_key(self.m.pc);
+            let mut t = cur;
+            loop {
+                t -= 1;
+                self.goto_count(t, out)?;
+                if t == 0 || self.line_key(self.m.pc) != start_key {
+                    break;
+                }
+            }
+        }
+        self.print_loc(out, self.m.pc)
+    }
+
+    /// Print a global variable by name (or list all globals), rendering the
+    /// value through the BTF type graph.
+    fn print_global(&self, name: Option<&str>, out: &mut dyn Write) -> io::Result<()> {
+        let vm = self.m.vm_ref();
+        let Some(di) = vm.debug() else {
+            writeln!(out, "no debug info (load a program built with clang -g)")?;
+            return Ok(());
+        };
+        let Some(name) = name else {
+            if di.globals().is_empty() {
+                writeln!(out, "no known globals")?;
+            }
+            for g in di.globals() {
+                writeln!(out, "  {}: {}  (in {})", g.name, di.type_name(g.type_id), g.map_name)?;
+            }
+            return Ok(());
+        };
+        let Some(g) = di.global(name) else {
+            writeln!(out, "no global named '{name}'")?;
+            return Ok(());
+        };
+        let size = di.btf().type_size(g.type_id).unwrap_or(0) as usize;
+        let map = &vm.maps[g.map];
+        let key = 0u32.to_le_bytes();
+        let bytes = map
+            .lookup(&key)
+            .map(|vref| map.value(vref))
+            .and_then(|v| v.get(g.offset as usize..g.offset as usize + size));
+        match bytes {
+            Some(b) => writeln!(
+                out,
+                "{}: {} = {}",
+                g.name,
+                di.type_name(g.type_id),
+                di.render_value(g.type_id, b)
+            ),
+            None => writeln!(out, "{}: <unreadable>", g.name),
+        }
+    }
+
+    /// Print a source-level backtrace: the subprogram call stack, innermost
+    /// first, with function names and source lines.
+    fn print_backtrace(&self, out: &mut dyn Write) -> io::Result<()> {
+        let pcs = self.m.backtrace_pcs();
+        let di = self.m.vm_ref().debug();
+        for (depth, pc) in pcs.iter().enumerate() {
+            let func = di
+                .and_then(|d| d.func_at(*pc))
+                .map(|f| f.name.as_str())
+                .unwrap_or("?");
+            match di.and_then(|d| d.line_at(*pc)) {
+                Some(l) => writeln!(
+                    out,
+                    "#{depth}  {func}  at {}:{}  (insn {pc})",
+                    basename(&l.file),
+                    l.line
+                )?,
+                None => writeln!(out, "#{depth}  {func}  (insn {pc})")?,
+            }
+        }
+        Ok(())
     }
 
     fn add_watch(&mut self, args: &[&str], out: &mut dyn Write) -> io::Result<()> {
@@ -510,13 +672,35 @@ impl<'a> DebugSession<'a> {
                     }
                 }
                 if self.finished.is_none() {
-                    self.print_insn(out, self.m.pc)?;
+                    self.print_loc(out, self.m.pc)?;
+                }
+            }
+            "steps" => {
+                let n = arg1.and_then(parse_num).unwrap_or(1);
+                for _ in 0..n {
+                    if !self.source_step(false, out)? {
+                        break;
+                    }
+                }
+                if self.finished.is_none() {
+                    self.print_loc(out, self.m.pc)?;
+                }
+            }
+            "nexts" | "n" => {
+                let n = arg1.and_then(parse_num).unwrap_or(1);
+                for _ in 0..n {
+                    if !self.source_step(true, out)? {
+                        break;
+                    }
+                }
+                if self.finished.is_none() {
+                    self.print_loc(out, self.m.pc)?;
                 }
             }
             "c" | "continue" | "run" => {
                 while self.step_once(out)? {}
                 if self.finished.is_none() {
-                    self.print_insn(out, self.m.pc)?;
+                    self.print_loc(out, self.m.pc)?;
                 }
             }
             "rs" | "rstep" => {
@@ -527,8 +711,12 @@ impl<'a> DebugSession<'a> {
                 } else {
                     self.warn_nondet(out)?;
                     self.goto_count(cur.saturating_sub(n), out)?;
-                    self.print_insn(out, self.m.pc)?;
+                    self.print_loc(out, self.m.pc)?;
                 }
+            }
+            "rsteps" => {
+                let n = arg1.and_then(parse_num).unwrap_or(1);
+                self.reverse_source_step(n, out)?;
             }
             "rc" | "rcontinue" | "rcont" => self.reverse_continue(out)?,
             "goto" => match arg1.and_then(parse_num) {
@@ -544,10 +732,12 @@ impl<'a> DebugSession<'a> {
                             self.m.insn_count
                         )?;
                     }
-                    self.print_insn(out, self.m.pc)?;
+                    self.print_loc(out, self.m.pc)?;
                 }
                 None => writeln!(out, "usage: goto <instruction count>")?,
             },
+            "p" | "print" => self.print_global(arg1, out)?,
+            "bt" | "backtrace" | "where" => self.print_backtrace(out)?,
             "b" | "break" => match arg1.and_then(parse_num) {
                 Some(pc) => {
                     self.breakpoints.insert(pc as usize);
@@ -598,12 +788,35 @@ impl<'a> DebugSession<'a> {
                     .and_then(parse_num)
                     .map(|v| v as usize)
                     .unwrap_or(self.m.pc);
-                let insns = self.m.vm_ref().insns();
+                let vm = self.m.vm_ref();
+                let insns = vm.insns();
+                let di = vm.debug();
                 let lo = center.saturating_sub(5);
                 let hi = (center + 6).min(insns.len().saturating_sub(1));
                 let mut lines = Vec::new();
+                let mut last_src: Option<(String, u32)> = None;
                 let mut pc = lo;
                 while pc <= hi {
+                    // Interleave the covering C source line when it changes.
+                    if let Some(di) = di {
+                        if di.func_at(pc).map(|f| f.insn) == Some(pc) {
+                            if let Some(f) = di.func_at(pc) {
+                                lines.push(format!("; ---- {} ----", f.name));
+                            }
+                        }
+                        if let Some(l) = di.line_at(pc) {
+                            let key = (l.file.clone(), l.line);
+                            if last_src.as_ref() != Some(&key) {
+                                last_src = Some(key);
+                                lines.push(format!(
+                                    "; {}:{}  {}",
+                                    basename(&l.file),
+                                    l.line,
+                                    l.text.trim()
+                                ));
+                            }
+                        }
+                    }
                     let marker = if pc == self.m.pc { "=>" } else { "  " };
                     let bp = if self.breakpoints.contains(&pc) { "*" } else { " " };
                     lines.push(format!("{marker}{bp}{pc:4}: {}", disasm_insn(insns, pc)));

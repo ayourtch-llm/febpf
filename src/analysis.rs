@@ -1,11 +1,51 @@
 //! Program analysis: control-flow graph extraction, DOT export, and
 //! verifier-annotated listings.
 
+use crate::debuginfo::DebugInfo;
 use crate::disasm::disasm_insn;
 use crate::insn::*;
 use crate::verifier::VerifyOk;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+
+/// Tracks the last-emitted source line so a listing only prints a source
+/// comment when the covering line changes (addr2line-style interleaving).
+struct SourceInterleaver<'a> {
+    debug: Option<&'a DebugInfo>,
+    /// (file, line) last emitted, so identical consecutive lines collapse.
+    last: Option<(String, u32)>,
+}
+
+impl<'a> SourceInterleaver<'a> {
+    fn new(debug: Option<&'a DebugInfo>) -> Self {
+        SourceInterleaver { debug, last: None }
+    }
+
+    /// Emit source context for instruction `pc` into `out` if the covering
+    /// source line just changed. Also emits a subprogram header at a function
+    /// boundary.
+    fn emit(&mut self, out: &mut String, pc: usize) {
+        let Some(di) = self.debug else { return };
+        if let Some(f) = di.func_at(pc) {
+            if f.insn == pc {
+                let _ = writeln!(out, "; ---- {} ----", f.name);
+            }
+        }
+        let Some(line) = di.line_at(pc) else { return };
+        let key = (line.file.clone(), line.line);
+        if self.last.as_ref() == Some(&key) {
+            return;
+        }
+        self.last = Some(key);
+        // Show just the file's basename to keep listings readable.
+        let file = line.file.rsplit('/').next().unwrap_or(&line.file);
+        if line.text.is_empty() {
+            let _ = writeln!(out, "; {}:{}", file, line.line);
+        } else {
+            let _ = writeln!(out, "; {}:{}  {}", file, line.line, line.text.trim());
+        }
+    }
+}
 
 /// A basic block: a maximal straight-line instruction sequence.
 #[derive(Debug)]
@@ -203,12 +243,28 @@ pub fn stats(insns: &[Insn], cfg: &Cfg) -> ProgStats {
     }
 }
 
-/// Disassembly listing annotated with the verifier's abstract state before
-/// each instruction (as seen on its first visit) and visit counts.
-pub fn annotated_listing(insns: &[Insn], vres: &VerifyOk) -> String {
+/// Plain disassembly interleaved with C source lines from `debug`.
+pub fn source_listing(insns: &[Insn], debug: &DebugInfo) -> String {
     let mut out = String::new();
+    let mut src = SourceInterleaver::new(Some(debug));
     let mut pc = 0;
     while pc < insns.len() {
+        src.emit(&mut out, pc);
+        let _ = writeln!(out, "{pc:4}: {}", disasm_insn(insns, pc));
+        pc += if insns[pc].is_wide() { 2 } else { 1 };
+    }
+    out
+}
+
+/// Disassembly listing annotated with the verifier's abstract state before
+/// each instruction (as seen on its first visit) and visit counts. When
+/// `debug` is present, C source lines are interleaved.
+pub fn annotated_listing(insns: &[Insn], vres: &VerifyOk, debug: Option<&DebugInfo>) -> String {
+    let mut out = String::new();
+    let mut src = SourceInterleaver::new(debug);
+    let mut pc = 0;
+    while pc < insns.len() {
+        src.emit(&mut out, pc);
         match &vres.insn_state[pc] {
             Some((state, visits)) => {
                 if !state.is_empty() {
@@ -232,7 +288,7 @@ pub fn annotated_listing(insns: &[Insn], vres: &VerifyOk) -> String {
 
 /// Execution heatmap: disassembly annotated with per-instruction execution
 /// counts and a log-scaled intensity bar, plus a hottest-blocks summary.
-pub fn heatmap_listing(insns: &[Insn], counts: &[u64]) -> String {
+pub fn heatmap_listing(insns: &[Insn], counts: &[u64], debug: Option<&DebugInfo>) -> String {
     let max = counts.iter().copied().max().unwrap_or(0);
     let total: u64 = counts.iter().sum();
     let mut out = String::new();
@@ -250,8 +306,10 @@ pub fn heatmap_listing(insns: &[Insn], counts: &[u64]) -> String {
         let blocks = 1 + (frac * 7.0).round() as usize;
         "█".repeat(blocks)
     };
+    let mut src = SourceInterleaver::new(debug);
     let mut pc = 0;
     while pc < insns.len() {
+        src.emit(&mut out, pc);
         let c = counts.get(pc).copied().unwrap_or(0);
         let pct = if total > 0 {
             100.0 * c as f64 / total as f64

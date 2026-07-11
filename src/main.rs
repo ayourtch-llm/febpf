@@ -1,6 +1,7 @@
 //! febpf command-line tool: assemble, disassemble, verify, analyze, run,
 //! debug and benchmark eBPF programs.
 
+use febpf::debuginfo::DebugInfo;
 use febpf::{analysis, asm, debug, disasm, insn, verifier, Program, Vm};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -148,7 +149,11 @@ fn read_target_btf(path: &str) -> Result<Vec<u8>, String> {
 
 const VMLINUX_BTF: &str = "/sys/kernel/btf/vmlinux";
 
-fn load_program(path: &str, prog: Option<&str>, target_btf: Option<&str>) -> Result<Program, String> {
+fn load_program(
+    path: &str,
+    prog: Option<&str>,
+    target_btf: Option<&str>,
+) -> Result<(Program, Option<DebugInfo>), String> {
     let is_source = [".s", ".asm", ".bpf"]
         .iter()
         .any(|ext| path.ends_with(ext));
@@ -156,10 +161,13 @@ fn load_program(path: &str, prog: Option<&str>, target_btf: Option<&str>) -> Res
         let src =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
         let a = asm::assemble(&src).map_err(|e| format!("{path}: {e}"))?;
-        return Ok(Program {
-            insns: a.insns,
-            maps: a.maps,
-        });
+        return Ok((
+            Program {
+                insns: a.insns,
+                maps: a.maps,
+            },
+            None,
+        ));
     }
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     // ELF object (clang -target bpf) vs raw bytecode.
@@ -178,16 +186,12 @@ fn load_program(path: &str, prog: Option<&str>, target_btf: Option<&str>) -> Res
         };
         let obj = febpf::elf::load_with_target_btf(&bytes, target.as_deref())
             .map_err(|e| format!("{path}: {e}"))?;
-        let chosen = match prog {
-            Some(name) => obj
-                .programs
-                .iter()
-                .find(|p| p.name == name)
-                .ok_or_else(|| {
-                    let names: Vec<&str> = obj.programs.iter().map(|p| p.name.as_str()).collect();
-                    format!("no program '{name}' in {path}; available: {}", names.join(", "))
-                })?,
-            None => &obj.programs[0],
+        let idx = match prog {
+            Some(name) => obj.programs.iter().position(|p| p.name == name).ok_or_else(|| {
+                let names: Vec<&str> = obj.programs.iter().map(|p| p.name.as_str()).collect();
+                format!("no program '{name}' in {path}; available: {}", names.join(", "))
+            })?,
+            None => 0,
         };
         if prog.is_none() && obj.programs.len() > 1 {
             let names: Vec<&str> = obj.programs.iter().map(|p| p.name.as_str()).collect();
@@ -195,19 +199,27 @@ fn load_program(path: &str, prog: Option<&str>, target_btf: Option<&str>) -> Res
                 "note: {path} has {} programs ({}); using '{}' (--prog to choose)",
                 obj.programs.len(),
                 names.join(", "),
-                chosen.name
+                obj.programs[idx].name
             );
         }
-        Ok(Program {
-            insns: chosen.insns.clone(),
-            maps: obj.maps,
-        })
+        let mut programs = obj.programs;
+        let chosen = programs.swap_remove(idx);
+        Ok((
+            Program {
+                insns: chosen.insns,
+                maps: obj.maps,
+            },
+            chosen.debug,
+        ))
     } else {
         let insns = insn::decode_program(&bytes)?;
-        Ok(Program {
-            insns,
-            maps: Vec::new(),
-        })
+        Ok((
+            Program {
+                insns,
+                maps: Vec::new(),
+            },
+            None,
+        ))
     }
 }
 
@@ -256,7 +268,7 @@ fn run() -> Result<ExitCode, String> {
     if o.cmd == "fuzz" {
         return conftest::fuzz(&o);
     }
-    let prog = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
+    let (prog, debug) = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
     if o.cmd == "conftest" {
         return conftest::conftest(&o, prog);
     }
@@ -278,7 +290,10 @@ fn run() -> Result<ExitCode, String> {
                 );
             }
         }
-        "disasm" => print!("{}", disasm::disasm_program(&prog.insns)),
+        "disasm" => match &debug {
+            Some(di) => print!("{}", analysis::source_listing(&prog.insns, di)),
+            None => print!("{}", disasm::disasm_program(&prog.insns)),
+        },
         "verify" => {
             let ctx = make_ctx(&o)?;
             let vm = Vm::new(prog.clone())?;
@@ -330,7 +345,10 @@ fn run() -> Result<ExitCode, String> {
                     println!("  PASSED");
                     print_verify_stats(&ok);
                     println!("\n== annotated listing (abstract state on first visit) ==");
-                    print!("{}", analysis::annotated_listing(&prog.insns, &ok));
+                    print!(
+                        "{}",
+                        analysis::annotated_listing(&prog.insns, &ok, debug.as_ref())
+                    );
                 }
                 Err(e) => {
                     println!("\n== verifier ==");
@@ -385,12 +403,18 @@ fn run() -> Result<ExitCode, String> {
             vm.enable_profiling();
             let r0 = vm.run(&mut ctx).map_err(|e| e.to_string())?;
             let counts = vm.profile.take().unwrap();
-            print!("{}", analysis::heatmap_listing(&prog.insns, &counts));
+            print!(
+                "{}",
+                analysis::heatmap_listing(&prog.insns, &counts, debug.as_ref())
+            );
             println!("\nr0 = {r0} ({r0:#x})");
         }
         "debug" => {
             let mut ctx = make_ctx(&o)?;
             let mut vm = Vm::new(prog)?;
+            if let Some(di) = debug {
+                vm.set_debug(di);
+            }
             if !o.no_verify {
                 match vm.verify(verifier_config(&o, ctx.len())) {
                     Ok(_) => println!("verifier: PASSED"),
