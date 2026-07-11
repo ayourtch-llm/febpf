@@ -112,6 +112,20 @@ pub struct VerifyOk {
     /// Human-readable register state at first visit of each insn (for the
     /// analyzer), plus visit count.
     pub insn_state: Vec<Option<(String, usize)>>,
+    /// Machine-readable **join over all visits** of the current frame's
+    /// register states on entry to each insn. `None` = never reached (dead
+    /// code). A fact true here holds on every path reaching that PC, so it is
+    /// sound to optimize on (see `docs/specs/equiv-optimizer.md` §4). Indexed
+    /// by instruction slot; the second slot of a `lddw` is `None`.
+    pub pc_regs: Vec<Option<[RegState; NUM_REGS]>>,
+}
+
+impl VerifyOk {
+    /// Abstract register state joined across every path reaching `pc`, or
+    /// `None` if `pc` is unreachable (dead code) or out of range.
+    pub fn regs_at(&self, pc: usize) -> Option<&[RegState; NUM_REGS]> {
+        self.pc_regs.get(pc).and_then(|s| s.as_ref())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +221,26 @@ impl Scalar {
             && self.smax <= o.smax
             && self.tnum.is_subset_of(&o.tnum)
     }
+
+    /// Least upper bound: the tightest scalar containing every value either
+    /// operand could hold. Used to join abstract states across paths reaching
+    /// the same PC (see [`VerifyOk::pc_regs`]).
+    pub fn join(&self, o: &Scalar) -> Scalar {
+        let mut r = Scalar {
+            tnum: self.tnum.union(o.tnum),
+            umin: self.umin.min(o.umin),
+            umax: self.umax.max(o.umax),
+            smin: self.smin.min(o.smin),
+            smax: self.smax.max(o.smax),
+        };
+        // `sync` only tightens; a union of two valid scalars stays non-empty.
+        // Guard defensively: if reconciliation somehow contradicts, widen to
+        // the safe top element rather than keep an empty (unsound) state.
+        if !r.sync() {
+            return Scalar::unknown();
+        }
+        r
+    }
 }
 
 impl std::fmt::Display for Scalar {
@@ -281,6 +315,29 @@ pub enum RegState {
 }
 
 impl RegState {
+    /// Least upper bound of two register states for the same PC reached along
+    /// different paths. A scalar joins with a scalar; a pointer with an
+    /// identical-kind/-offset pointer joins its variable part; anything else
+    /// (including one side `Uninit` that the other read as a value) widens to
+    /// the top scalar. Sound over-approximation: a fact true in the join holds
+    /// on every joined path.
+    pub fn join(&self, o: &RegState) -> RegState {
+        match (self, o) {
+            (RegState::Uninit, RegState::Uninit) => RegState::Uninit,
+            (RegState::Scalar(a), RegState::Scalar(b)) => RegState::Scalar(a.join(b)),
+            (RegState::Ptr(a), RegState::Ptr(b))
+                if a.kind == b.kind && a.off == b.off =>
+            {
+                RegState::Ptr(Ptr {
+                    kind: a.kind,
+                    off: a.off,
+                    var: a.var.join(&b.var),
+                })
+            }
+            _ => RegState::Scalar(Scalar::unknown()),
+        }
+    }
+
     fn subsumed_by(&self, old: &RegState) -> bool {
         match (old, self) {
             (RegState::Uninit, _) => true, // old never read this reg
@@ -938,6 +995,9 @@ pub struct Verifier<'a> {
     seen: HashMap<usize, PruneList>,
     prune_points: Vec<bool>,
     insn_state: Vec<Option<(String, usize)>>,
+    /// Join-over-all-visits of the current frame's registers per insn (see
+    /// [`VerifyOk::pc_regs`]).
+    pc_regs: Vec<Option<[RegState; NUM_REGS]>>,
     next_null_id: u32,
     /// Path arena: one node per successor of every multi-successor step,
     /// forming a tree of branch decisions rooted at program entry. Used to
@@ -980,6 +1040,7 @@ impl<'a> Verifier<'a> {
             seen: HashMap::new(),
             prune_points: Vec::new(),
             insn_state: Vec::new(),
+            pc_regs: Vec::new(),
             next_null_id: 1,
             path_nodes: Vec::new(),
             replay_null_origin: None,
@@ -1010,6 +1071,7 @@ impl<'a> Verifier<'a> {
         self.check_structure()?;
         self.compute_prune_points();
         self.insn_state = vec![None; self.insns.len()];
+        self.pc_regs = vec![None; self.insns.len()];
 
         // work items: (pc, state, last path node, steps taken from entry)
         let mut pending: Vec<(usize, VState, Option<u32>, u32)> =
@@ -1065,6 +1127,19 @@ impl<'a> Verifier<'a> {
                     Some((_, n)) => *n += 1,
                     slot @ None => *slot = Some((state.render(), 1)),
                 }
+                // Join this visit's current-frame registers into the per-PC
+                // abstract state used by the optimizer (sound across paths).
+                {
+                    let regs = &state.cur().regs;
+                    match &mut self.pc_regs[pc] {
+                        Some(acc) => {
+                            for r in 0..NUM_REGS {
+                                acc[r] = acc[r].join(&regs[r]);
+                            }
+                        }
+                        slot @ None => *slot = Some(*regs),
+                    }
+                }
 
                 match self.step(pc, state) {
                     Err(e) => return Err(self.attach_trace(e, node, len)),
@@ -1108,6 +1183,7 @@ impl<'a> Verifier<'a> {
             stats: self.stats,
             warnings: self.warnings,
             insn_state: self.insn_state,
+            pc_regs: self.pc_regs,
         })
     }
 

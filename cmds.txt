@@ -1,0 +1,24 @@
+# febpf: kernel-differential commands to run in a root terminal
+# (from the repo root, /home/ayourtch/rust/febpf)
+
+# 1. Re-run the kernel differential fuzzer (10k programs)
+sudo ./target/release/febpf fuzz --kernel --iters 10000
+
+# 2. Re-check the seed that "failed" before the retval read-back fix
+sudo ./target/release/febpf fuzz --kernel --seed 18064443168305234040 --iters 1
+
+# 3. Run the privilege-gated conformance tests (kernel round-trip + kernel fuzz)
+#    Either via cargo:
+sudo cargo test --test conftest
+#    ...or build unprivileged first, then run the test binary directly:
+#    cargo test --test conftest --no-run 2>&1 | grep conftest   # prints binary path
+#    sudo ./target/debug/deps/conftest-<hash>
+
+# 4. Single-program conformance check against the kernel (example)
+sudo ./target/release/febpf conftest tests/legacy_maps.o
+
+# 5. Verifier differential vs the kernel (NEW): compares febpf-verifier and
+#    kernel-verifier accept/reject verdicts. Any "FEBPF-LAX" line = a real
+#    soundness gap (febpf accepts what the kernel rejects); reproduce via the
+#    printed --seed. Many "FEBPF-STRICT" lines are expected/normal.
+sudo ./target/release/febpf vfuzz --kernel --iters 20000

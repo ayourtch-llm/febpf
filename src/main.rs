@@ -31,6 +31,8 @@ commands:
                               (or --run to just reproduce r0)
   race <file>                 explore interleavings of N instances sharing maps
                               and report concurrency races (lost updates, etc.)
+  equiv <a> <b>               decide observable equivalence of two programs
+  optimize <file> [-o out]    verifier-guided, equivalence-checked optimizer
 
 options:
   --ctx <hex|@file>    context memory contents (hex string or file)
@@ -65,7 +67,10 @@ treated as raw little-endian eBPF bytecode.
 struct Opts {
     cmd: String,
     file: String,
+    /// Second positional file (for `equiv <a> <b>`).
+    file2: Option<String>,
     out: Option<String>,
+    stats: bool,
     ctx_hex: Option<String>,
     ctx_size: Option<usize>,
     no_verify: bool,
@@ -84,7 +89,6 @@ struct Opts {
     procs: usize,
     schedules: usize,
     schedule: Option<String>,
-    stats: bool,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -93,7 +97,9 @@ fn parse_args() -> Result<Opts, String> {
     let mut o = Opts {
         cmd,
         file: String::new(),
+        file2: None,
         out: None,
+        stats: false,
         ctx_hex: None,
         ctx_size: None,
         no_verify: false,
@@ -112,7 +118,6 @@ fn parse_args() -> Result<Opts, String> {
         procs: 2,
         schedules: 2000,
         schedule: None,
-        stats: false,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -179,6 +184,7 @@ fn parse_args() -> Result<Opts, String> {
             "--strict-align" => o.strict_align = true,
             "--readonly-ctx" => o.readonly_ctx = true,
             f if !f.starts_with('-') && o.file.is_empty() => o.file = f.to_string(),
+            f if !f.starts_with('-') && o.file2.is_none() => o.file2 = Some(f.to_string()),
             other => return Err(format!("unknown option '{other}'")),
         }
     }
@@ -478,6 +484,118 @@ fn cmd_race(o: &Opts, prog: Program) -> Result<ExitCode, String> {
     })
 }
 
+/// Build equivalence-checker options from CLI flags. A `--ctx` value becomes a
+/// fixed input always tested; `--ctx-size` (or the `--ctx` length, else 64)
+/// sizes the generated inputs.
+fn equiv_options(o: &Opts) -> Result<febpf::equiv::Options, String> {
+    let fixed = if o.ctx_hex.is_some() {
+        Some(make_ctx(o)?)
+    } else {
+        None
+    };
+    let ctx_size = o
+        .ctx_size
+        .or_else(|| fixed.as_ref().map(|c| c.len()))
+        .unwrap_or(64);
+    Ok(febpf::equiv::Options {
+        ctx_size,
+        fixed_ctx: fixed,
+        iters: o.iters as usize,
+        seed: o.seed.unwrap_or(0x5eed_1234),
+        insn_limit: 2_000_000,
+    })
+}
+
+/// `febpf equiv <a> <b> [--ctx ...] [--ctx-size n] [--iters N] [--seed N]`.
+fn cmd_equiv(o: &Opts) -> Result<ExitCode, String> {
+    use febpf::equiv::{self, Verdict};
+    let file_b = o
+        .file2
+        .as_deref()
+        .ok_or("equiv needs two programs: febpf equiv <a> <b>")?;
+    let (pa, _) = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
+    let (pb, _) = load_program(file_b, o.prog.as_deref(), o.target_btf.as_deref())?;
+    let opts = equiv_options(o)?;
+    let verdict = equiv::check(&pa, &pb, &opts)?;
+    match &verdict {
+        Verdict::ProvenEquivalent(reason) => {
+            println!("PROVEN-EQUIVALENT (abstract)");
+            println!("  {reason}");
+        }
+        Verdict::Equivalent { inputs } => {
+            println!("EQUIVALENT ({inputs} inputs, no counterexample found)");
+            println!("  empirical: differential falsification found no separating input");
+        }
+        Verdict::NotEquivalent(w) => {
+            println!("NOT-EQUIVALENT");
+            print!("{}", equiv::render_witness(w));
+        }
+    }
+    Ok(ExitCode::from(verdict.exit_code()))
+}
+
+/// `febpf optimize <file> [-o out.bin] [--stats] [--ctx ...] [--iters N]`.
+/// Applies verifier-gated sound rewrites, self-checks equivalence, and only
+/// then emits the result (raw bytecode). Refuses (nonzero exit) if it cannot
+/// prove behavior was preserved or the output fails to re-verify.
+fn cmd_optimize(o: &Opts, prog: Program) -> Result<ExitCode, String> {
+    use febpf::equiv::Verdict;
+    let ctx = make_ctx(o)?;
+    let cfg = verifier_config(o, ctx.len());
+    let equiv_opts = equiv_options(o)?;
+    let result = febpf::optimize::optimize(&prog, cfg, &equiv_opts)?;
+    let s = &result.stats;
+
+    match &result.self_check {
+        Verdict::ProvenEquivalent(reason) => {
+            println!("equivalence: PROVEN-EQUIVALENT (abstract) — {reason}");
+        }
+        Verdict::Equivalent { inputs } => {
+            println!("equivalence: EQUIVALENT ({inputs} inputs, empirical)");
+        }
+        Verdict::NotEquivalent(_) => unreachable!("optimize would have errored"),
+    }
+
+    if o.stats {
+        println!("== optimizer stats ==");
+        println!(
+            "  insns: {} -> {} ({:+})",
+            s.insns_before,
+            s.insns_after,
+            s.insns_after as isize - s.insns_before as isize
+        );
+        println!("  rounds: {}", s.rounds);
+        println!("  constant folding:    {}", s.constant_fold);
+        println!("  dead-branch elim:    {}", s.dead_branch);
+        println!("  strength reduction:  {}", s.strength_reduction);
+        println!("  algebraic identity:  {}", s.algebraic_identity);
+        println!("  redundant mask elim: {}", s.redundant_mask);
+        println!("  total rewrites:      {}", s.total_rewrites());
+    } else {
+        println!(
+            "optimized {} -> {} insns ({} rewrites)",
+            s.insns_before,
+            s.insns_after,
+            s.total_rewrites()
+        );
+    }
+
+    if let Some(out) = o.out.as_deref() {
+        let bytes = insn::encode_program(&result.program.insns);
+        std::fs::write(out, &bytes).map_err(|e| format!("cannot write {out}: {e}"))?;
+        println!("wrote {} bytes to {out}", bytes.len());
+        if !result.program.maps.is_empty() {
+            println!(
+                "note: {} map definition(s) are not stored in raw bytecode",
+                result.program.maps.len()
+            );
+        }
+    } else {
+        print!("{}", disasm::disasm_program(&result.program.insns));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run() -> Result<ExitCode, String> {
     let o = parse_args().map_err(|e| format!("{e}\n\n{USAGE}"))?;
     if o.cmd == "help" {
@@ -493,9 +611,15 @@ fn run() -> Result<ExitCode, String> {
     if o.cmd == "replay" {
         return cmd_replay(&o);
     }
+    if o.cmd == "equiv" {
+        return cmd_equiv(&o);
+    }
     let (prog, debug) = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
     if o.cmd == "record" {
         return cmd_record(&o, prog);
+    }
+    if o.cmd == "optimize" {
+        return cmd_optimize(&o, prog);
     }
     if o.cmd == "conftest" {
         return conftest::conftest(&o, prog);
