@@ -340,16 +340,26 @@ fn core_alu_relocation_against_running_kernel() {
         eprintln!("skipping: bpftool unavailable");
         return;
     };
+    if !out.status.success() {
+        eprintln!(
+            "skipping: bpftool could not dump {vmlinux}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return;
+    }
     let dump = String::from_utf8_lossy(&out.stdout);
     // First 'pid' member inside STRUCT task_struct.
-    let expected: u64 = dump
+    let Some(expected) = dump
         .split("STRUCT 'task_struct' size")
         .nth(1)
         .and_then(|s| s.lines().find(|l| l.contains("'pid' type_id")))
         .and_then(|l| l.rsplit("bits_offset=").next())
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .expect("bpftool: no task_struct.pid")
-        / 8;
+        .map(|offset| offset / 8)
+    else {
+        eprintln!("skipping: bpftool output has no parseable task_struct.pid");
+        return;
+    };
 
     let probe = std::fs::read("tests/core_task.o").unwrap();
     let obj = elf::load_with_target_btf(&probe, Some(&target)).unwrap();
