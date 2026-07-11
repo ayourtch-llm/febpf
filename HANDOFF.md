@@ -336,8 +336,14 @@ PERF_EVENT_ARRAY for this corpus). Coverage progression (loads / verifies):
   pointer returns (batch appended to `tracing-helpers.md` / `elf-loading.md`):
   100% / 78.6%. Zero load failures remain.
 - + load-time rodata DCE (`rodata-dce.md`), merged on top of the above:
-  **100% / 89.3%** (50/56). The two parallel batches' fixes compounded
+  100% / 89.3% (50/56). The two parallel batches' fixes compounded
   (each measured 78.6% alone).
+- + get_socket_cookie (#46) + get_func_ip (#173) + ksnoop verdict-parity
+  investigation (appended to `tracing-helpers.md`): **100% / 91.1%** (51/56).
+  Also tightened subprog stack-pointer returns back to the exact kernel rule
+  (reject ANY stack pointer, `prepare_func_exit()` conservatism) — the
+  caller-frame allowance from the load-failure batch was laxer than the
+  kernel and would have shown up as FEBPF-LAX in `vfuzz --kernel`.
 **Workflow: merge a coverage batch → `./scripts/scan-corpus.sh` → the histogram
 names the next batch.** febpf is an analysis/test/CI/debug engine, NOT a datapath
 runtime — "production useful" means verify/explain/differential-test/debug real
@@ -349,21 +355,25 @@ measure the previous build; and helper names in the histogram come from the
 uapi header now — the old hardcoded table had wrong ids (#113 was labelled
 ringbuf_output; it is probe_read_kernel).
 
-What blocks the remaining 6 objects (2026-07-11 scan, post-merge of both
-parallel batches — get_stack/kconfig/subprog-returns AND rodata DCE, whose
-fixes compounded):
+What blocks the remaining 5 objects (2026-07-11 scan, after the #46/#173
+batch):
 1. **4 × BTF-typed ctx scalar-derefs** — `r1 = *(u32*)(r6+2804)` where r6
    came from a `tp_btf` ctx load: real kernels type that as PTR_TO_BTF_ID and
    allow direct kernel-memory reads (`bitesize`, `offcputime`, `runqlat`,
    `runqslower`). Fix = model BTF-typed ctx pointers (bigger; verifier + a
-   deterministic "kernel memory reads as zero" story). The main remaining class.
-2. **1 × verifier bounds depth** (`ksnoop`): variable-size
-   `perf_event_output` where the size reg is bounded [0,65535] but the data
-   map value is 16296 bytes — the real program clamps; febpf's range
-   refinement loses it. Needs a look at how the kernel bounds
-   ARG_CONST_SIZE against the region here.
-3. **1 × helper #46 bpf_get_socket_cookie** (`tcppktlat`) — small,
-   deterministic per-socket-token model would do.
+   deterministic "kernel memory reads as zero" story). The ONLY remaining
+   fixable class.
+2. **1 × `ksnoop` — DO NOT "FIX"; the rejection is correct.** Investigated
+   2026-07-11 (full write-up in `tracing-helpers.md`): the real kernel
+   verifier rejects this exact object with the identical error — upstream bcc
+   commit `0ae562c` (2025-07-13, after our v0.31.0 corpus pin) changed
+   `output_trace()`'s `trace_len` from u16 to u64 precisely because of it.
+   febpf is at verdict parity here. The upstream-FIXED ksnoop needs one more
+   verifier feature to pass: **linked scalar ids** (kernel
+   `sync_linked_regs`, commit 75748837b7e5 — mov links src/dst ids, branch
+   refinements propagate to same-id regs/spills; pruning subsumption must
+   compare id links via an idmap or it becomes unsound). That's the named
+   next verifier feature, relevant only once the corpus pin advances.
 
 ## Known limitations / where to go next (roughly prioritized)
 

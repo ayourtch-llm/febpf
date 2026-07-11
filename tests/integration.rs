@@ -848,10 +848,13 @@ fn subprog_may_return_map_value_pointer() {
     assert_eq!(run_src(src), 1);
 }
 
-/// Returning a caller-frame stack pointer back to the caller is fine (the
-/// frame is still live); returning the subprogram's OWN stack pointer is not.
+/// The kernel rejects returning ANY stack pointer from a subprogram — even a
+/// still-live caller-frame one. prepare_func_exit(): "technically it's ok to
+/// return caller's stack pointer [...] but let's be conservative" and errors
+/// with "cannot return stack pointer to the caller". Mirror it exactly so the
+/// vfuzz verdict parity (0 FEBPF-LAX) holds.
 #[test]
-fn subprog_may_return_caller_stack_pointer() {
+fn subprog_may_not_return_caller_stack_pointer() {
     let src = "
         r1 = 42
         *(u64 *)(r10 - 8) = r1
@@ -863,11 +866,12 @@ fn subprog_may_return_caller_stack_pointer() {
     ident:
         r0 = r1
         exit";
-    assert_eq!(run_src(src), 42);
+    let err = verify_err(src);
+    assert!(err.contains("cannot return stack pointer"), "{err}");
 }
 
-/// A pointer into the exiting frame's own stack dies with the frame and must
-/// be rejected at verification.
+/// A pointer into the exiting frame's own stack dies with the frame and is
+/// likewise rejected (same kernel rule).
 #[test]
 fn subprog_may_not_return_own_stack_pointer() {
     let src = "
@@ -879,7 +883,7 @@ fn subprog_may_not_return_own_stack_pointer() {
         r0 += -8
         exit";
     let err = verify_err(src);
-    assert!(err.contains("own stack frame"), "{err}");
+    assert!(err.contains("cannot return stack pointer"), "{err}");
 }
 
 /// get_stackid rejects (at verification) a map that is not a stack_trace map.
@@ -915,6 +919,74 @@ fn tracing_identity_helpers_are_deterministic_constants() {
         r0 = 0
         exit";
     assert_eq!(run_src(src), 0x0000_0001_0000_0001);
+}
+
+/// get_socket_cookie returns the fixed, documented, nonzero token
+/// 0x0000_0000_c00c_1e01 (febpf has no sockets); it is deterministic across
+/// calls and accepts its argument loosely (ctx-like pointer OR scalar), the
+/// same shape as the kernel's (ctx)/(sk) flavors.
+#[test]
+fn get_socket_cookie_is_fixed_nonzero_token() {
+    let src = "
+        r1 = r10
+        call get_socket_cookie
+        r6 = r0
+        r1 = 0
+        call get_socket_cookie
+        if r0 != r6 goto bad
+        r0 = r6
+        exit
+    bad:
+        r0 = 0
+        exit";
+    assert_eq!(run_src(src), 0x0000_0000_c00c_1e01);
+}
+
+/// get_func_ip returns the fixed opaque token 0xffff_0000_0000_0002 (febpf
+/// has no attach point); like get_current_task's token it must not be
+/// dereferenced, and probe_read of it faults cleanly.
+#[test]
+fn get_func_ip_is_opaque_nonzero_token() {
+    let src = "
+        r1 = 0
+        call get_func_ip
+        r6 = r0
+        ; probe_read(fp-8, 8, token) must -EFAULT and zero-fill
+        r1 = r10
+        r1 += -8
+        r2 = 8
+        r3 = r6
+        call probe_read_kernel
+        if r0 == 0 goto bad
+        r1 = *(u64 *)(r10 - 8)
+        if r1 != 0 goto bad
+        r0 = r6
+        exit
+    bad:
+        r0 = 0
+        exit";
+    assert_eq!(run_src(src), 0xffff_0000_0000_0002);
+}
+
+/// The caller must null-check a returned map_value_or_null before deref —
+/// the pointer's typing survives the frame pop.
+#[test]
+fn subprog_returned_pointer_still_needs_null_check() {
+    let src = "
+        .map a array 4 8 1
+        call lookup0
+        r0 = *(u64 *)(r0 + 0)
+        exit
+    lookup0:
+        w1 = 0
+        *(u32 *)(r10 - 4) = r1
+        r1 = map[a]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        exit";
+    let err = verify_err(src);
+    assert!(err.contains("NULL"), "{err}");
 }
 
 /// get_current_comm fills the buffer with \"febpf\" NUL-padded and marks the
