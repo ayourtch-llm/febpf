@@ -157,4 +157,16 @@ merely *mentions* an unsupported type in one map can still be inspected.
 - Stage 2 (per-CPU): **done** — `PerCpuArray`/`PerCpuHash` (types 6/5), NR_CPUS=4
   storage, CPU-0 in-program view, `Map::value_cpu` for inspection, ELF/BTF +
   `.map` keywords, 2 integration tests (round-trip + slot independence).
-- Stage 3 (LRU hash): _pending_.
+- Stage 3 (LRU hash): **done** — `LruHash` (type 9); deterministic eviction via a
+  per-map monotonic access tick (bumped on update and on lookup via
+  `Map::touch`); victim is the min-`last_used` live entry, slot reused; live
+  entries never move. ELF/BTF + `.map` keyword. Determinism test (touch changes
+  which entry is evicted; identical across re-runs).
+
+### Next / remaining
+- Exit-time "unreleased ringbuf reservation" verifier check (documented gap).
+- maps-of-maps (`ARRAY_OF_MAPS`/`HASH_OF_MAPS`), `LRU_PERCPU_HASH`,
+  `PERCPU_ARRAY` direct-value (`MAP_VALUE` lddw) — only plain arrays support the
+  direct-value pointer today.
+- Extending "current CPU" beyond 0 would let programs observe per-CPU
+  independence directly (today only the inspection API can).

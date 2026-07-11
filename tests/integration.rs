@@ -545,6 +545,83 @@ fn percpu_hash_roundtrip() {
     assert_eq!(m.value_cpu(vref, 1), [0u8; 8]);
 }
 
+// ------------------------------------------------------------------ LRU
+
+/// Insert k1,k2 (fills a capacity-2 LRU), touch k1 via a lookup, then insert
+/// k3. The least-recently-used live entry (k2) must be the one evicted.
+const LRU_PROG: &str = "
+    .map lru lru_hash 4 8 2
+    w1 = 1
+    *(u32 *)(r10 - 4) = r1
+    r1 = 10
+    *(u64 *)(r10 - 16) = r1
+    r1 = map[lru]
+    r2 = r10
+    r2 += -4
+    r3 = r10
+    r3 += -16
+    r4 = 0
+    call map_update_elem
+    w1 = 2
+    *(u32 *)(r10 - 4) = r1
+    r1 = 20
+    *(u64 *)(r10 - 16) = r1
+    r1 = map[lru]
+    r2 = r10
+    r2 += -4
+    r3 = r10
+    r3 += -16
+    r4 = 0
+    call map_update_elem
+    w1 = 1
+    *(u32 *)(r10 - 4) = r1
+    r1 = map[lru]
+    r2 = r10
+    r2 += -4
+    call map_lookup_elem
+    w1 = 3
+    *(u32 *)(r10 - 4) = r1
+    r1 = 30
+    *(u64 *)(r10 - 16) = r1
+    r1 = map[lru]
+    r2 = r10
+    r2 += -4
+    r3 = r10
+    r3 += -16
+    r4 = 0
+    call map_update_elem
+    r0 = 0
+    exit";
+
+fn run_lru() -> Vec<(u32, u64)> {
+    let mut vm = Vm::new(program(LRU_PROG)).unwrap();
+    vm.verify(Config::default()).expect("verification failed");
+    vm.run(&mut []).expect("run failed");
+    let m = vm.maps.iter().find(|m| m.def.name == "lru").unwrap();
+    let mut out: Vec<(u32, u64)> = m
+        .iter_entries()
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                u32::from_ne_bytes(k.try_into().unwrap()),
+                u64::from_le_bytes(v.try_into().unwrap()),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn lru_evicts_least_recently_used_deterministically() {
+    let entries = run_lru();
+    // k2 was the LRU (k1 was touched after both inserts), so it is evicted;
+    // k1 and k3 remain.
+    assert_eq!(entries, vec![(1, 10), (3, 30)]);
+    // Deterministic: a second identical run evicts exactly the same entry.
+    assert_eq!(run_lru(), entries);
+}
+
 // ------------------------------------------------------------------ calls
 
 #[test]
