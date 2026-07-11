@@ -57,6 +57,7 @@ pub struct Map {
     pub region_handles: Vec<u32>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 enum Storage {
     Array(Vec<u8>),
     Hash {
@@ -64,6 +65,17 @@ enum Storage {
         slab: Vec<Box<[u8]>>,
         free: Vec<u32>,
     },
+}
+
+/// A point-in-time copy of a map's contents *and* its VM region-handle
+/// assignments, for the debugger's time travel. Restoring the handles matters:
+/// they are allocated lazily in execution order, so replay from a snapshot
+/// must resume allocation from exactly the snapshotted state or guest-visible
+/// virtual addresses would diverge from the original run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MapSnapshot {
+    storage: Storage,
+    region_handles: Vec<u32>,
 }
 
 impl Map {
@@ -206,6 +218,20 @@ impl Map {
                 None => Err(-2), // ENOENT
             },
         }
+    }
+
+    /// Capture contents + region-handle state (see [`MapSnapshot`]).
+    pub fn snapshot(&self) -> MapSnapshot {
+        MapSnapshot {
+            storage: self.storage.clone(),
+            region_handles: self.region_handles.clone(),
+        }
+    }
+
+    /// Restore a snapshot taken from this map.
+    pub fn restore(&mut self, s: &MapSnapshot) {
+        self.storage = s.storage.clone();
+        self.region_handles = s.region_handles.clone();
     }
 
     /// Live entries, for dumping from the CLI/debugger.

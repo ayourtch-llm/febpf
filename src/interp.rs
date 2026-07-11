@@ -15,7 +15,7 @@
 #![allow(clippy::manual_checked_ops)]
 use crate::helpers::{self, MemBus, UserHelpers};
 use crate::insn::*;
-use crate::maps::{Map, MapDef, ValueRef};
+use crate::maps::{Map, MapDef, MapSnapshot, ValueRef};
 use std::time::Instant;
 
 #[derive(Debug)]
@@ -39,7 +39,7 @@ pub struct Program {
     pub maps: Vec<MapDef>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Region {
     Invalid,
     Ctx,
@@ -232,9 +232,44 @@ impl Vm {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
 struct SavedFrame {
     ret_pc: usize,
     regs6_9: [u64; 4],
+}
+
+/// A point-in-time copy of *everything* an execution reads or writes: machine
+/// core, per-frame stacks, context, maps, the region table, prandom state and
+/// the printk log. Restoring one and re-stepping replays execution exactly
+/// (assuming deterministic helpers — see [`Machine::nondet_calls`]), which is
+/// what powers the debugger's time travel.
+///
+/// A snapshot is only meaningful for the machine it was taken from (same
+/// program, same context buffer length).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Snapshot {
+    regs: [u64; NUM_REGS],
+    pc: usize,
+    insn_count: u64,
+    frames: Vec<SavedFrame>,
+    stack: Vec<u8>,
+    ctx: Vec<u8>,
+    /// Region table: map-value regions are created lazily in execution order,
+    /// so replay must resume handle allocation from the snapshotted state or
+    /// guest-visible virtual addresses would diverge from the original run.
+    regions: Vec<Region>,
+    maps: Vec<MapSnapshot>,
+    prandom: u64,
+    printk: Vec<String>,
+    profile: Option<Vec<u64>>,
+    nondet_calls: u64,
+}
+
+impl Snapshot {
+    /// Instruction count at which this snapshot was taken.
+    pub fn insn_count(&self) -> u64 {
+        self.insn_count
+    }
 }
 
 /// One in-flight execution of a [`Vm`] program. Use [`Machine::step`] to
@@ -246,6 +281,10 @@ pub struct Machine<'a> {
     pub pc: usize,
     frames: Vec<SavedFrame>,
     pub insn_count: u64,
+    /// Calls made so far to helpers whose results replay cannot reproduce
+    /// (`ktime_get_ns`, user-registered helpers). The debugger warns before
+    /// reverse execution when this is nonzero.
+    pub nondet_calls: u64,
     /// Set by the JIT trampoline when a deferred instruction faults.
     jit_fault: Option<EbpfError>,
 }
@@ -326,8 +365,63 @@ impl<'a> Machine<'a> {
             pc: 0,
             frames: Vec::new(),
             insn_count: 0,
+            nondet_calls: 0,
             jit_fault: None,
         }
+    }
+
+    /// Capture the full execution state (see [`Snapshot`]).
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            regs: self.regs,
+            pc: self.pc,
+            insn_count: self.insn_count,
+            frames: self.frames.clone(),
+            stack: self.vm.stack.clone(),
+            ctx: self.ctx.to_vec(),
+            regions: self.vm.regions.clone(),
+            maps: self.vm.maps.iter().map(Map::snapshot).collect(),
+            prandom: self.vm.prandom,
+            printk: self.vm.printk.clone(),
+            profile: self.vm.profile.clone(),
+            nondet_calls: self.nondet_calls,
+        }
+    }
+
+    /// Restore a snapshot previously taken from *this* machine.
+    pub fn restore(&mut self, s: &Snapshot) {
+        self.regs = s.regs;
+        self.pc = s.pc;
+        self.insn_count = s.insn_count;
+        self.frames = s.frames.clone();
+        self.vm.stack.copy_from_slice(&s.stack);
+        self.ctx.copy_from_slice(&s.ctx);
+        self.vm.regions = s.regions.clone();
+        for (m, ms) in self.vm.maps.iter_mut().zip(&s.maps) {
+            m.restore(ms);
+        }
+        self.vm.prandom = s.prandom;
+        self.vm.printk = s.printk.clone();
+        self.vm.profile = s.profile.clone();
+        self.nondet_calls = s.nondet_calls;
+        self.jit_fault = None;
+    }
+
+    /// Step until `insn_count` reaches `target` (used to replay after a
+    /// [`Machine::restore`]). Returns `Some(r0)` if the program exits first.
+    pub fn run_to_count(&mut self, target: u64) -> Result<Option<u64>, EbpfError> {
+        while self.insn_count < target {
+            if let Some(r0) = self.step()? {
+                return Ok(Some(r0));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Toggle printk echoing (the debugger suppresses it during replay so
+    /// reverse execution doesn't repeat output). Returns the previous value.
+    pub fn set_echo_printk(&mut self, on: bool) -> bool {
+        std::mem::replace(&mut self.vm.echo_printk, on)
     }
 
     /// A pointer to the register file, for the JIT prologue to load from and
@@ -791,7 +885,10 @@ impl<'a> Machine<'a> {
                     Err(e) => e as u64,
                 }
             }
-            helpers::id::KTIME_GET_NS => self.vm.start.elapsed().as_nanos() as u64,
+            helpers::id::KTIME_GET_NS => {
+                self.nondet_calls += 1; // wall clock: replay cannot reproduce it
+                self.vm.start.elapsed().as_nanos() as u64
+            }
             helpers::id::TRACE_PRINTK => {
                 let fmt = self.read_bytes(args[0], args[1] as usize)?;
                 let line = self.format_printk(&fmt, [args[2], args[3], args[4]])?;
@@ -813,7 +910,8 @@ impl<'a> Machine<'a> {
             }
             helpers::id::GET_SMP_PROCESSOR_ID => 0,
             _ => {
-                // user-registered helper
+                // user-registered helper: arbitrary code, assume non-deterministic
+                self.nondet_calls += 1;
                 let pc = self.pc;
                 let mut helper = self
                     .vm
