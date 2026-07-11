@@ -145,6 +145,10 @@ impl Replay {
             p.push(match m.kind {
                 MapKind::Array => 0,
                 MapKind::Hash => 1,
+                MapKind::PerCpuArray => 2,
+                MapKind::PerCpuHash => 3,
+                MapKind::LruHash => 4,
+                MapKind::RingBuf => 5,
             });
             p.extend_from_slice(&m.key_size.to_le_bytes());
             p.extend_from_slice(&m.value_size.to_le_bytes());
@@ -263,6 +267,10 @@ impl Replay {
                         let kind = match r.u8()? {
                             0 => MapKind::Array,
                             1 => MapKind::Hash,
+                            2 => MapKind::PerCpuArray,
+                            3 => MapKind::PerCpuHash,
+                            4 => MapKind::LruHash,
+                            5 => MapKind::RingBuf,
                             k => return Err(format!("unknown map kind {k}")),
                         };
                         let key_size = r.u32()?;

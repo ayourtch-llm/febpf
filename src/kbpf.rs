@@ -65,6 +65,10 @@ const BPF_PROG_TEST_RUN: i32 = 10;
 const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
 const BPF_MAP_TYPE_HASH: u32 = 1;
 const BPF_MAP_TYPE_ARRAY: u32 = 2;
+const BPF_MAP_TYPE_PERCPU_HASH: u32 = 5;
+const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
+const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
+const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 
 // ---- lddw pseudo src_reg values the kernel understands --------------------
 const BPF_PSEUDO_MAP_FD: u8 = 1;
@@ -198,6 +202,10 @@ mod imp {
         let map_type = match def.kind {
             MapKind::Array => BPF_MAP_TYPE_ARRAY,
             MapKind::Hash => BPF_MAP_TYPE_HASH,
+            MapKind::PerCpuArray => BPF_MAP_TYPE_PERCPU_ARRAY,
+            MapKind::PerCpuHash => BPF_MAP_TYPE_PERCPU_HASH,
+            MapKind::LruHash => BPF_MAP_TYPE_LRU_HASH,
+            MapKind::RingBuf => BPF_MAP_TYPE_RINGBUF,
         };
         let mut a = [0u8; ATTR_SIZE];
         put_u32(&mut a, 0, map_type);

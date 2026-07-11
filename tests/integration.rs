@@ -345,6 +345,131 @@ fn hash_map_counter_loop() {
     assert_eq!(run_src(src), 999); // first iteration inserts 0, then 999 increments
 }
 
+// --------------------------------------------------------------- ringbuf
+
+/// Verify + run a program, returning the whole Vm so the caller can inspect
+/// captured ringbuf records.
+fn build_run(src: &str) -> Vm {
+    let mut vm = Vm::new(program(src)).unwrap();
+    vm.verify(Config::default()).expect("verification failed");
+    vm.run(&mut []).expect("run failed");
+    vm
+}
+
+#[test]
+fn ringbuf_reserve_submit_captures_record() {
+    let src = "
+        .map rb ringbuf 0 0 4096
+        r1 = map[rb]
+        r2 = 8
+        r3 = 0
+        call ringbuf_reserve
+        if r0 == 0 goto out
+        r6 = r0
+        r1 = 0x1122334455667788 ll
+        *(u64 *)(r6 + 0) = r1
+        r1 = r6
+        r2 = 0
+        call ringbuf_submit
+        r0 = 0
+        exit
+    out:
+        r0 = 1
+        exit";
+    let vm = build_run(src);
+    let recs = vm.ringbuf_records("rb").expect("ringbuf map");
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0], 0x1122334455667788u64.to_le_bytes());
+}
+
+#[test]
+fn ringbuf_reserve_null_check_path() {
+    // capacity 8 but request 16 -> reserve returns NULL at runtime; the
+    // program takes the null branch and emits nothing.
+    let src = "
+        .map rb ringbuf 0 0 8
+        r1 = map[rb]
+        r2 = 16
+        r3 = 0
+        call ringbuf_reserve
+        if r0 == 0 goto null
+        r6 = r0
+        r1 = r6
+        r2 = 0
+        call ringbuf_submit
+        r0 = 1
+        exit
+    null:
+        r0 = 200
+        exit";
+    let mut vm = Vm::new(program(src)).unwrap();
+    vm.verify(Config::default()).expect("verification failed");
+    let r = vm.run(&mut []).expect("run failed");
+    assert_eq!(r, 200);
+    assert_eq!(vm.ringbuf_records("rb").unwrap().len(), 0);
+}
+
+#[test]
+fn ringbuf_use_after_submit_rejected() {
+    let src = "
+        .map rb ringbuf 0 0 64
+        r1 = map[rb]
+        r2 = 8
+        r3 = 0
+        call ringbuf_reserve
+        if r0 == 0 goto out
+        r6 = r0
+        r1 = r6
+        r2 = 0
+        call ringbuf_submit
+        r1 = *(u64 *)(r6 + 0)
+        r0 = 0
+        exit
+    out:
+        r0 = 1
+        exit";
+    let e = verify_err(src);
+    assert!(
+        e.contains("submitted/discarded"),
+        "unexpected error: {e}"
+    );
+}
+
+#[test]
+fn ringbuf_reserve_without_nullcheck_rejected() {
+    let src = "
+        .map rb ringbuf 0 0 64
+        r1 = map[rb]
+        r2 = 8
+        r3 = 0
+        call ringbuf_reserve
+        r1 = *(u64 *)(r0 + 0)
+        r0 = 0
+        exit";
+    let e = verify_err(src);
+    assert!(e.contains("may be NULL"), "unexpected error: {e}");
+}
+
+#[test]
+fn ringbuf_output_captures_from_stack() {
+    let src = "
+        .map rb ringbuf 0 0 4096
+        r1 = 0x11223344
+        *(u32 *)(r10 - 8) = r1
+        r1 = map[rb]
+        r2 = r10
+        r2 += -8
+        r3 = 4
+        r4 = 0
+        call ringbuf_output
+        r0 = 0
+        exit";
+    let vm = build_run(src);
+    let recs = vm.ringbuf_records("rb").expect("ringbuf map");
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0], 0x11223344u32.to_le_bytes());
+}
+
 // ------------------------------------------------------------------ calls
 
 #[test]

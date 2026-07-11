@@ -10,6 +10,10 @@ pub mod id {
     pub const TRACE_PRINTK: u32 = 6;
     pub const GET_PRANDOM_U32: u32 = 7;
     pub const GET_SMP_PROCESSOR_ID: u32 = 8;
+    pub const RINGBUF_OUTPUT: u32 = 130;
+    pub const RINGBUF_RESERVE: u32 = 131;
+    pub const RINGBUF_SUBMIT: u32 = 132;
+    pub const RINGBUF_DISCARD: u32 = 133;
     /// First id available for user-registered helpers.
     pub const FIRST_USER: u32 = 0x1_0000;
 }
@@ -36,6 +40,9 @@ pub enum ArgKind {
     Size,
     /// Anything, including uninitialized (kernel ARG_ANYTHING for varargs).
     Any,
+    /// A pointer to a ringbuf-reserved record (from `ringbuf_reserve`, after a
+    /// null check), at offset 0. Consumed by `ringbuf_submit`/`_discard`.
+    RingbufReserved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +51,9 @@ pub enum RetKind {
     Scalar,
     /// Pointer to the map's value, or NULL — must be null-checked before use.
     MapValueOrNull,
+    /// Pointer to a writable ringbuf record of `size_arg` bytes, or NULL —
+    /// must be null-checked before use (from `ringbuf_reserve`).
+    RingbufMemOrNull { size_arg: u8 },
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +102,28 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [None, None, None, None, None],
             ret: RetKind::Scalar,
         },
+        id::RINGBUF_OUTPUT => HelperSig {
+            name: "ringbuf_output",
+            // (map, data, size, flags)
+            args: [ConstMapPtr, MemRead { size_arg: 2 }, Size, Any, None],
+            ret: RetKind::Scalar,
+        },
+        id::RINGBUF_RESERVE => HelperSig {
+            name: "ringbuf_reserve",
+            // (map, size, flags) -> PTR_TO_MEM-or-NULL of `size` bytes
+            args: [ConstMapPtr, Size, Any, None, None],
+            ret: RetKind::RingbufMemOrNull { size_arg: 1 },
+        },
+        id::RINGBUF_SUBMIT => HelperSig {
+            name: "ringbuf_submit",
+            args: [RingbufReserved, Any, None, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::RINGBUF_DISCARD => HelperSig {
+            name: "ringbuf_discard",
+            args: [RingbufReserved, Any, None, None, None],
+            ret: RetKind::Scalar,
+        },
         _ => return Option::None,
     };
     Some(sig)
@@ -113,6 +145,10 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::TRACE_PRINTK,
         id::GET_PRANDOM_U32,
         id::GET_SMP_PROCESSOR_ID,
+        id::RINGBUF_OUTPUT,
+        id::RINGBUF_RESERVE,
+        id::RINGBUF_SUBMIT,
+        id::RINGBUF_DISCARD,
     ].into_iter().find(|&hid| builtin_sig(hid).unwrap().name == name)
 }
 

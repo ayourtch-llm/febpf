@@ -83,7 +83,9 @@ null-checked), refines on a `== 0` / `!= 0` test to `RingbufMem{id,size}`
 `MapValueOrNull` id mechanism. Submit/discard take a `RingbufMem` at offset 0
 and mark every copy of that `id` `RingbufConsumed`; deref/arith/consume of a
 `RingbufConsumed` (or a still-maybe-null `RingbufMemOrNull`) is rejected. A
-reservation that is never consumed is reported at program exit.
+reservation that is never consumed is *not* yet flagged at program exit (the
+kernel's "unreleased reference" check) — a documented known limitation; the
+runtime simply drops the un-submitted bytes.
 
 ---
 
@@ -149,6 +151,8 @@ merely *mentions* an unsupported type in one map can still be inspected.
 ## STATUS
 
 - Spec + plan: **done**.
-- Stage 1 (ringbuf): _pending_.
+- Stage 1 (ringbuf): **done** — helpers 130-133, `Region::RingReserved`, verifier
+  reserved-pointer type + null-check/consume refinement, ELF/BTF type 27,
+  `.map ... ringbuf`, 5 integration tests.
 - Stage 2 (per-CPU): _pending_.
 - Stage 3 (LRU hash): _pending_.

@@ -349,6 +349,10 @@ pub fn assemble(source: &str) -> Result<Assembled, AsmError> {
                     let kind = match kind_s.as_str() {
                         "array" => MapKind::Array,
                         "hash" => MapKind::Hash,
+                        "percpu_array" => MapKind::PerCpuArray,
+                        "percpu_hash" => MapKind::PerCpuHash,
+                        "lru_hash" => MapKind::LruHash,
+                        "ringbuf" => MapKind::RingBuf,
                         _ => return Err(format!("unknown map kind '{kind_s}'")),
                     };
                     let key_size = p.number()? as u32;

@@ -37,9 +37,13 @@ const SHF_EXECINSTR: u64 = 0x4;
 const R_BPF_64_64: u32 = 1;
 const R_BPF_64_32: u32 = 10;
 
-// Legacy BPF map types we support.
+// BPF map types we support.
 const BPF_MAP_TYPE_HASH: u32 = 1;
 const BPF_MAP_TYPE_ARRAY: u32 = 2;
+const BPF_MAP_TYPE_PERCPU_HASH: u32 = 5;
+const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
+const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
+const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 
 /// One program (executable section) from an object.
 pub struct LoadedProgram {
@@ -914,7 +918,14 @@ fn map_kind(ty: u32) -> Result<MapKind, String> {
     match ty {
         BPF_MAP_TYPE_HASH => Ok(MapKind::Hash),
         BPF_MAP_TYPE_ARRAY => Ok(MapKind::Array),
-        other => Err(format!("unsupported map type {other} (only hash/array)")),
+        BPF_MAP_TYPE_PERCPU_HASH => Ok(MapKind::PerCpuHash),
+        BPF_MAP_TYPE_PERCPU_ARRAY => Ok(MapKind::PerCpuArray),
+        BPF_MAP_TYPE_LRU_HASH => Ok(MapKind::LruHash),
+        BPF_MAP_TYPE_RINGBUF => Ok(MapKind::RingBuf),
+        other => Err(format!(
+            "unsupported map type {other} \
+             (supported: hash/array/percpu_hash/percpu_array/lru_hash/ringbuf)"
+        )),
     }
 }
 
@@ -1010,12 +1021,17 @@ mod btf_maps {
                     _ => {}
                 }
             }
+            let kind = kind.ok_or_else(|| format!("map '{map_name}': missing type"))?;
+            // Ringbufs have no key/value; libbpf omits those members entirely.
+            let no_kv = kind == crate::maps::MapKind::RingBuf;
             maps.push(MapDef {
                 name: map_name.clone(),
-                kind: kind.ok_or_else(|| format!("map '{map_name}': missing type"))?,
+                kind,
                 key_size: key_size
+                    .or(no_kv.then_some(0))
                     .ok_or_else(|| format!("map '{map_name}': missing key size"))?,
                 value_size: value_size
+                    .or(no_kv.then_some(0))
                     .ok_or_else(|| format!("map '{map_name}': missing value size"))?,
                 max_entries: max_entries
                     .ok_or_else(|| format!("map '{map_name}': missing max_entries"))?,

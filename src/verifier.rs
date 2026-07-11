@@ -286,6 +286,14 @@ pub enum PtrKind {
     MapValue { map: u32 },
     /// Result of map_lookup_elem before the null check.
     MapValueOrNull { map: u32, id: u32 },
+    /// Writable ringbuf record of `size` bytes (from ringbuf_reserve, after the
+    /// null check). `id` ties every copy together for consume-tracking.
+    RingbufMem { id: u32, size: u32 },
+    /// Result of ringbuf_reserve before the null check.
+    RingbufMemOrNull { id: u32, size: u32 },
+    /// A ringbuf record already submitted/discarded; any further use is an
+    /// error (use-after-consume).
+    RingbufConsumed { id: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,6 +370,11 @@ impl std::fmt::Display for RegState {
                     PtrKind::Map { map } => write!(f, "map{map}")?,
                     PtrKind::MapValue { map } => write!(f, "map{map}_value")?,
                     PtrKind::MapValueOrNull { map, .. } => write!(f, "map{map}_value_or_null")?,
+                    PtrKind::RingbufMem { size, .. } => write!(f, "ringbuf_mem[{size}]")?,
+                    PtrKind::RingbufMemOrNull { size, .. } => {
+                        write!(f, "ringbuf_mem_or_null[{size}]")?
+                    }
+                    PtrKind::RingbufConsumed { .. } => write!(f, "ringbuf_consumed")?,
                 }
                 if p.off != 0 {
                     write!(f, "{:+}", p.off)?;
@@ -1791,6 +1804,19 @@ impl<'a> Verifier<'a> {
                     "map value pointer may be NULL; compare it against 0 first",
                 ));
             }
+            PtrKind::RingbufMem { size, .. } => (size as u64, "ringbuf record"),
+            PtrKind::RingbufMemOrNull { .. } => {
+                return Err(self.err(
+                    pc,
+                    "ringbuf record pointer may be NULL; compare it against 0 first",
+                ));
+            }
+            PtrKind::RingbufConsumed { .. } => {
+                return Err(self.err(
+                    pc,
+                    "use of a ringbuf record after it was submitted/discarded",
+                ));
+            }
             PtrKind::Map { .. } => {
                 return Err(self.err(pc, "map object pointers cannot be dereferenced"));
             }
@@ -1949,6 +1975,8 @@ impl<'a> Verifier<'a> {
             .ok_or_else(|| self.err(pc, format!("call to unknown helper #{hid}")))?;
         let args: Vec<RegState> = (1..=5).map(|r| state.cur().regs[r]).collect();
         let mut map_arg: Option<u32> = None;
+        // Ringbuf record id to mark consumed after this call (submit/discard).
+        let mut consume_id: Option<u32> = None;
 
         for (i, kind) in sig.args.iter().enumerate() {
             let reg = i as u8 + 1;
@@ -2051,7 +2079,70 @@ impl<'a> Verifier<'a> {
                     };
                     self.check_helper_mem(state, pc, &p, sz.umax, write)?;
                 }
+                ArgKind::RingbufReserved => {
+                    let p = match val {
+                        RegState::Ptr(p) => p,
+                        _ => {
+                            return Err(self.err(
+                                pc,
+                                format!(
+                                    "helper {} arg{}: expected a ringbuf record pointer in r{reg}",
+                                    sig.name,
+                                    i + 1
+                                ),
+                            ));
+                        }
+                    };
+                    let id = match p.kind {
+                        PtrKind::RingbufMem { id, .. } => id,
+                        PtrKind::RingbufMemOrNull { .. } => {
+                            return Err(self.err(
+                                pc,
+                                format!(
+                                    "helper {}: ringbuf record may be NULL; null-check it \
+                                     before submit/discard",
+                                    sig.name
+                                ),
+                            ));
+                        }
+                        PtrKind::RingbufConsumed { .. } => {
+                            return Err(self.err(
+                                pc,
+                                format!(
+                                    "helper {}: ringbuf record was already submitted/discarded",
+                                    sig.name
+                                ),
+                            ));
+                        }
+                        _ => {
+                            return Err(self.err(
+                                pc,
+                                format!(
+                                    "helper {} arg{}: r{reg} is not a ringbuf-reserved pointer",
+                                    sig.name,
+                                    i + 1
+                                ),
+                            ));
+                        }
+                    };
+                    if p.off != 0 || !p.var.is_const() || p.var.umin != 0 {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {} needs the original ringbuf record pointer (offset 0)",
+                                sig.name
+                            ),
+                        ));
+                    }
+                    consume_id = Some(id);
+                }
             }
+        }
+
+        // Consume the ringbuf record (submit/discard): every copy becomes
+        // unusable, so a later deref or a second submit is rejected.
+        if let Some(id) = consume_id {
+            Self::mark_consumed(state, id);
         }
 
         // Frozen (.rodata) maps cannot be mutated through helpers.
@@ -2094,8 +2185,62 @@ impl<'a> Verifier<'a> {
                 }
                 RegState::Ptr(Ptr::new(PtrKind::MapValueOrNull { map, id }))
             }
+            RetKind::RingbufMemOrNull { size_arg } => {
+                let size = match args[size_arg as usize] {
+                    RegState::Scalar(s) if s.is_const() => s.umin as u32,
+                    RegState::Scalar(_) => {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {}: reservation size (r{}) must be a known constant",
+                                sig.name,
+                                size_arg + 1
+                            ),
+                        ));
+                    }
+                    _ => {
+                        return Err(self.err(
+                            pc,
+                            format!("helper {}: reservation size must be a scalar", sig.name),
+                        ));
+                    }
+                };
+                let id = self.next_null_id;
+                self.next_null_id += 1;
+                if let Some(origins) = &mut self.replay_null_origin {
+                    origins.insert(id, (pc, sig.name.to_string()));
+                }
+                RegState::Ptr(Ptr::new(PtrKind::RingbufMemOrNull { id, size }))
+            }
         };
         Ok(())
+    }
+
+    /// Mark every copy of ringbuf record `id` consumed (after submit/discard).
+    fn mark_consumed(state: &mut VState, id: u32) {
+        for frame in &mut state.frames {
+            let fix = |r: &mut RegState| {
+                if let RegState::Ptr(p) = r {
+                    let pid = match p.kind {
+                        PtrKind::RingbufMem { id, .. } | PtrKind::RingbufMemOrNull { id, .. } => {
+                            Some(id)
+                        }
+                        _ => None,
+                    };
+                    if pid == Some(id) {
+                        p.kind = PtrKind::RingbufConsumed { id };
+                    }
+                }
+            };
+            for r in frame.regs.iter_mut() {
+                fix(r);
+            }
+            for s in frame.stack.iter_mut() {
+                if let SlotState::Spill(r) = s {
+                    fix(r);
+                }
+            }
+        }
     }
 
     /// Refine every copy of a maybe-null pointer with identity `id`.
@@ -2103,14 +2248,22 @@ impl<'a> Verifier<'a> {
         for frame in &mut state.frames {
             let fix = |r: &mut RegState| {
                 if let RegState::Ptr(p) = r {
-                    if let PtrKind::MapValueOrNull { map, id: pid } = p.kind {
-                        if pid == id {
+                    match p.kind {
+                        PtrKind::MapValueOrNull { map, id: pid } if pid == id => {
                             if becomes_null {
                                 *r = RegState::Scalar(Scalar::constant(0));
                             } else {
                                 p.kind = PtrKind::MapValue { map };
                             }
                         }
+                        PtrKind::RingbufMemOrNull { id: pid, size } if pid == id => {
+                            if becomes_null {
+                                *r = RegState::Scalar(Scalar::constant(0));
+                            } else {
+                                p.kind = PtrKind::RingbufMem { id: pid, size };
+                            }
+                        }
+                        _ => {}
                     }
                 }
             };
@@ -2414,7 +2567,13 @@ impl<'a> Verifier<'a> {
     }
 
     fn adjust_ptr(&self, pc: usize, p: Ptr, s: Scalar, sub: bool) -> Result<Ptr, VerifyError> {
-        if matches!(p.kind, PtrKind::Map { .. } | PtrKind::MapValueOrNull { .. }) {
+        if matches!(
+            p.kind,
+            PtrKind::Map { .. }
+                | PtrKind::MapValueOrNull { .. }
+                | PtrKind::RingbufMemOrNull { .. }
+                | PtrKind::RingbufConsumed { .. }
+        ) {
             return Err(self.err(
                 pc,
                 "arithmetic on this pointer type is not allowed (null-check it first?)",
@@ -2517,16 +2676,18 @@ impl<'a> Verifier<'a> {
                     RegState::Scalar(Scalar::constant(ins.imm as i64 as u64))
                 };
 
-                // null-check refinement on maybe-null map values
+                // null-check refinement on maybe-null map values / ringbuf records
+                let or_null_id = |r: RegState| match r {
+                    RegState::Ptr(Ptr {
+                        kind:
+                            PtrKind::MapValueOrNull { id, .. }
+                            | PtrKind::RingbufMemOrNull { id, .. },
+                        ..
+                    }) => Some(id),
+                    _ => None,
+                };
                 if !is32 && matches!(op, jmp::JEQ | jmp::JNE) {
-                    if let (
-                        RegState::Ptr(Ptr {
-                            kind: PtrKind::MapValueOrNull { id, .. },
-                            ..
-                        }),
-                        RegState::Scalar(s),
-                    ) = (a, b)
-                    {
+                    if let (Some(id), RegState::Scalar(s)) = (or_null_id(a), b) {
                         if s.is_const() && s.umin == 0 {
                             let mut on_target = state.clone();
                             let eq = op == jmp::JEQ;
