@@ -9,6 +9,7 @@ use febpf::verifier::Config;
 use febpf::{elf, Program, Vm};
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// True when the local clang can actually emit BPF objects. Finding `clang` is
 /// not enough: Apple clang ships no BPF backend, and running it anyway fails
@@ -33,7 +34,14 @@ fn maybe_compile(src: &str, out: &str) {
     let opt = if src == "subprog.c" { "-O0" } else { "-O2" };
     // Build to a temp path and install on success, so a clang that fails
     // partway can never leave the committed fixture damaged.
-    let tmp = format!("tests/{out}.tmp");
+    // Tests and integration-test binaries may compile the same fixture at
+    // once, so every invocation needs its own staging path.
+    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let tmp = format!(
+        "tests/.{out}.{}.{}.tmp",
+        std::process::id(),
+        TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    );
     let status = Command::new("clang")
         .args([opt, "-g", "-target", "bpf", "-c", &src_path, "-o"])
         .arg(&tmp)

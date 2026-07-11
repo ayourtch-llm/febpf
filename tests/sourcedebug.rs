@@ -7,6 +7,7 @@ use febpf::debuginfo::DebugInfo;
 use febpf::{elf, Program, Vm};
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Regenerate a fixture only when clang can actually target BPF (Apple clang
 /// cannot, and a failed run would destroy the committed .o), and install it
@@ -24,7 +25,14 @@ fn maybe_compile(src: &str, out: &str, opt: &str) {
     if !Path::new(&src_path).exists() {
         return;
     }
-    let tmp = format!("tests/{out}.tmp");
+    // Tests and integration-test binaries may compile the same fixture at
+    // once, so every invocation needs its own staging path.
+    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let tmp = format!(
+        "tests/.{out}.{}.{}.tmp",
+        std::process::id(),
+        TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    );
     let status = Command::new("clang")
         .args([opt, "-g", "-target", "bpf", "-c", &src_path, "-o"])
         .arg(&tmp)

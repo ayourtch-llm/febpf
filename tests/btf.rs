@@ -8,6 +8,7 @@
 use febpf::btf::{relo_kind, Btf, BtfExt, Kind};
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const VMLINUX: &str = "/sys/kernel/btf/vmlinux";
 
@@ -128,7 +129,14 @@ fn maybe_compile(src: &str, out: &str) {
     if !Path::new(&src_path).exists() {
         return;
     }
-    let tmp = format!("tests/{out}.tmp");
+    // Tests run concurrently, so a fixed temp name would let one invocation
+    // rename another's output before it installs its own fixture.
+    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let tmp = format!(
+        "tests/.{out}.{}.{}.tmp",
+        std::process::id(),
+        TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    );
     let status = Command::new("clang")
         .args(["-O2", "-g", "-target", "bpf", "-c", &src_path, "-o"])
         .arg(&tmp)
