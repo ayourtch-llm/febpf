@@ -213,3 +213,24 @@ fn debugger_reverse_source_step() {
     let o = cmd(&mut s, "rsteps"); // back to line 5
     assert!(o.contains("subprog.c:5"), "rsteps: {o}");
 }
+
+#[test]
+fn analysis_source_interleaving() {
+    maybe_compile("subprog.c", "subprog.o", "-O0");
+    let obj = load("tests/subprog.o");
+    let di = debug_of(&obj, "socket");
+    let prog = obj.programs.iter().find(|p| p.name == "socket").unwrap();
+
+    // Plain source-interleaved disassembly.
+    let listing = febpf::analysis::source_listing(&prog.insns, di);
+    assert!(listing.contains("; ---- prog ----"), "no func header:\n{listing}");
+    assert!(listing.contains("; ---- triple ----"), "no triple header:\n{listing}");
+    assert!(listing.contains("return x + x + x"), "no source text:\n{listing}");
+    // Each distinct source line appears once (deduped), not per instruction.
+    assert_eq!(listing.matches("return x + x + x").count(), 1);
+
+    // Heatmap interleaves source too.
+    let counts = vec![1u64; prog.insns.len()];
+    let heat = febpf::analysis::heatmap_listing(&prog.insns, &counts, Some(di));
+    assert!(heat.contains("subprog.c:13"), "heatmap missing source:\n{heat}");
+}

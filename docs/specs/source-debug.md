@@ -174,4 +174,44 @@ clang 21 + committed `.o` fixtures.
 
 ## STATUS
 
-_In progress — stage 1 (spec) committed._
+**Done — all stages implemented and committed.** `cargo test` 116 green,
+`cargo clippy --all-targets` 0 warnings.
+
+- Stage 2 — `src/debuginfo.rs` (`DebugInfo` with `line_at`/`func_at`/`global`
+  lookups and `render_value` one aggregate level deep); `elf.rs`
+  `build_debug_info` translating per-section `.BTF.ext` offsets to flat
+  instruction indices (entry at 0, stitched `.text` at `text_base`);
+  `LoadedProgram.debug`; `Vm::{set_debug,debug}` (not snapshotted);
+  `Machine::backtrace_pcs`; `main.rs` wiring.
+- Stage 3 — debugger: source line + function in the position banner, `list`
+  source interleaving, `print`/`p <name>` typed globals (list with no arg),
+  `bt`/`backtrace`, `steps`/`nexts` (into/over), and `rsteps` reverse source
+  step composing with time travel.
+- Stage 4 — `analysis::source_listing` plus optional `debug` arg on
+  `heatmap_listing`/`annotated_listing`; `febpf disasm` interleaves source
+  when the object has line info, `profile` and `analyze` show C against the
+  heatmap / verifier listing.
+
+Tests: `src/debuginfo.rs` unit tests (lookup + rendering, clang-independent)
+and `tests/sourcedebug.rs` differential against `subprog.o` (line text, `.text`
+stitching offset, func boundaries, steps-into vs nexts-over, two-level
+backtrace, rsteps, analysis interleaving) and `global_data.o` (globals
+metadata + typed `print` after a run).
+
+Deviations / notes:
+
+- `.rodata` globals: clang emits a single `.rodata` DATASEC but the ELF splits
+  const data across `.rodata.cst16` / `.rodata.str1.1`; globals in merged
+  rodata are matched best-effort to the first `.rodata*` map (offsets across
+  multiple rodata sections could be ambiguous). `.bss`/`.data` globals match
+  exactly. `ro_table` resolves to `.rodata.cst16` and renders correctly.
+- `render_value` renders one aggregate level deep by design (per the task);
+  nested structs/arrays show `{…}` / `[…]`. Bitfield members are skipped.
+- `rsteps` (reverse source step) is implemented (was flagged as optional
+  bonus); it decrements the instruction count via `goto_count` until the
+  covering line changes, reusing the deterministic replay.
+
+Possible follow-ups (not required): DWARF `.debug_line` fallback for objects
+without embedded `.BTF.ext` line text; reading locals/args by name (needs
+stack-slot debug info clang does not emit for BPF today); `list <func>` by
+name; column-accurate source carets.
