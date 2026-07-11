@@ -65,8 +65,11 @@ const BPF_PROG_TEST_RUN: i32 = 10;
 const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
 const BPF_MAP_TYPE_HASH: u32 = 1;
 const BPF_MAP_TYPE_ARRAY: u32 = 2;
+const BPF_MAP_TYPE_PERF_EVENT_ARRAY: u32 = 4;
 const BPF_MAP_TYPE_PERCPU_HASH: u32 = 5;
 const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
+const BPF_MAP_TYPE_STACK_TRACE: u32 = 7;
+const BPF_MAP_TYPE_CGROUP_ARRAY: u32 = 8;
 const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
 const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 
@@ -206,6 +209,9 @@ mod imp {
             MapKind::PerCpuHash => BPF_MAP_TYPE_PERCPU_HASH,
             MapKind::LruHash => BPF_MAP_TYPE_LRU_HASH,
             MapKind::RingBuf => BPF_MAP_TYPE_RINGBUF,
+            MapKind::PerfEventArray => BPF_MAP_TYPE_PERF_EVENT_ARRAY,
+            MapKind::CgroupArray => BPF_MAP_TYPE_CGROUP_ARRAY,
+            MapKind::StackTrace => BPF_MAP_TYPE_STACK_TRACE,
         };
         let mut a = [0u8; ATTR_SIZE];
         put_u32(&mut a, 0, map_type);

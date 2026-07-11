@@ -237,6 +237,15 @@ impl Vm {
             .map(|m| m.ringbuf_records())
     }
 
+    /// Records emitted via `bpf_perf_event_output` to a named perf-event array
+    /// map (for tests and tooling), mirroring [`Vm::ringbuf_records`].
+    pub fn perf_records(&self, name: &str) -> Option<&[Vec<u8>]> {
+        self.maps
+            .iter()
+            .find(|m| m.def.name == name)
+            .map(|m| m.perf_records())
+    }
+
     /// Current `get_prandom_u32` state. Before a run this is the seed the next
     /// run will start from; recorded into replay files for reproducibility.
     pub fn prandom_seed(&self) -> u64 {
@@ -1317,6 +1326,49 @@ impl<'a> Machine<'a> {
                 (x.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u32 as u64
             }
             helpers::id::GET_SMP_PROCESSOR_ID => 0,
+            // Core tracing helpers: febpf has no processes/tasks, so these
+            // return fixed, documented constants (docs/specs/map-types-2.md).
+            helpers::id::GET_CURRENT_PID_TGID => 0x0000_0001_0000_0001, // tgid=1, pid=1
+            helpers::id::GET_CURRENT_UID_GID => 0,                      // uid=gid=0
+            helpers::id::GET_CURRENT_TASK => 0xffff_0000_0000_0001, // opaque, non-deref token
+            helpers::id::GET_CURRENT_COMM => {
+                let size = args[1] as usize;
+                let buf = self.mem(args[0], size, true)?;
+                buf.fill(0);
+                let comm = b"febpf";
+                let n = comm.len().min(size.saturating_sub(1));
+                buf[..n].copy_from_slice(&comm[..n]);
+                0
+            }
+            helpers::id::GET_STACKID => {
+                // (ctx, map, flags). Deterministic model: the id is the FNV-1a
+                // hash of the call stack's instruction indices, masked to 31
+                // bits; the stored "stack" is those pcs as LE u64s, padded to
+                // value_size. Same call site => same id and stored stack.
+                let m = self.map_from_ptr(args[1])?;
+                let pcs = self.backtrace_pcs();
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                for pc in &pcs {
+                    for b in (*pc as u64).to_le_bytes() {
+                        h ^= b as u64;
+                        h = h.wrapping_mul(0x100_0000_01b3);
+                    }
+                }
+                let id = (h & 0x7fff_ffff) as u32;
+                let vsize = self.vm.maps[m].def.value_size as usize;
+                let mut val = vec![0u8; vsize];
+                for (i, pc) in pcs.iter().enumerate() {
+                    let off = i * 8;
+                    if off + 8 > vsize {
+                        break;
+                    }
+                    val[off..off + 8].copy_from_slice(&(*pc as u64).to_le_bytes());
+                }
+                // A full map drops the store but still returns the id (like
+                // the kernel, which may drop without BPF_F_REUSE_STACKID).
+                let _ = self.vm.maps[m].update(&id.to_le_bytes(), &val);
+                id as u64
+            }
             helpers::id::RINGBUF_RESERVE => {
                 let m = self.map_from_ptr(args[0])?;
                 self.ringbuf_reserve(m, args[1] as u32)
@@ -1333,6 +1385,20 @@ impl<'a> Machine<'a> {
                 let m = self.map_from_ptr(args[0])?;
                 let data = self.read_bytes(args[1], args[2] as usize)?;
                 match self.vm.maps[m].ringbuf_output(data) {
+                    Ok(()) => 0,
+                    Err(e) => e as u64,
+                }
+            }
+            helpers::id::PERF_EVENT_OUTPUT => {
+                // (ctx, map, flags, data, size). Low 32 bits of flags select a
+                // CPU index; BPF_F_CURRENT_CPU (0xffffffff) = current = CPU 0.
+                let m = self.map_from_ptr(args[1])?;
+                let cpu = match args[2] as u32 {
+                    0xffff_ffff => 0,
+                    c => c,
+                };
+                let data = self.read_bytes(args[3], args[4] as usize)?;
+                match self.vm.maps[m].perf_output(cpu, data) {
                     Ok(()) => 0,
                     Err(e) => e as u64,
                 }

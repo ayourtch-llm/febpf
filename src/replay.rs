@@ -149,6 +149,9 @@ impl Replay {
                 MapKind::PerCpuHash => 3,
                 MapKind::LruHash => 4,
                 MapKind::RingBuf => 5,
+                MapKind::PerfEventArray => 6,
+                MapKind::CgroupArray => 7,
+                MapKind::StackTrace => 8,
             });
             p.extend_from_slice(&m.key_size.to_le_bytes());
             p.extend_from_slice(&m.value_size.to_le_bytes());
@@ -271,6 +274,9 @@ impl Replay {
                             3 => MapKind::PerCpuHash,
                             4 => MapKind::LruHash,
                             5 => MapKind::RingBuf,
+                            6 => MapKind::PerfEventArray,
+                            7 => MapKind::CgroupArray,
+                            8 => MapKind::StackTrace,
                             k => return Err(format!("unknown map kind {k}")),
                         };
                         let key_size = r.u32()?;
