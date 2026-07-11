@@ -2,8 +2,9 @@
 //! `clang -g -target bpf` objects. Regenerates fixtures when clang is present
 //! (like tests/elf.rs), else uses the committed `.o`.
 
+use febpf::debug::{DebugSession, DebuggerOpts, Outcome};
 use febpf::debuginfo::DebugInfo;
-use febpf::elf;
+use febpf::{elf, Program, Vm};
 use std::path::Path;
 use std::process::Command;
 
@@ -38,6 +39,31 @@ fn debug_of<'a>(obj: &'a elf::Object, prog: &str) -> &'a DebugInfo {
 fn load(path: &str) -> elf::Object {
     let bytes = std::fs::read(path).unwrap();
     elf::load(&bytes).unwrap()
+}
+
+/// Build a `Vm` from one program of an object, with its debug info attached.
+fn vm_of(path: &str, prog: &str) -> Vm {
+    let bytes = std::fs::read(path).unwrap();
+    let mut obj = elf::load(&bytes).unwrap();
+    let idx = obj.programs.iter().position(|p| p.name == prog).unwrap();
+    let p = obj.programs.swap_remove(idx);
+    let mut vm = Vm::new(Program {
+        insns: p.insns,
+        maps: obj.maps,
+    })
+    .unwrap();
+    if let Some(di) = p.debug {
+        vm.set_debug(di);
+    }
+    vm
+}
+
+/// Run one debugger command, returning captured output.
+fn cmd(s: &mut DebugSession, line: &str) -> String {
+    let mut out = Vec::new();
+    let outcome = s.handle_command(line, &mut out).unwrap();
+    assert!(matches!(outcome, Outcome::Continue | Outcome::Quit(_)));
+    String::from_utf8(out).unwrap()
 }
 
 #[test]
@@ -101,4 +127,89 @@ fn globals_metadata_and_rendering() {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
     assert_eq!(di.render_value(ro.type_id, &bytes), "[10, 20, 30, 40]");
+}
+
+#[test]
+fn debugger_shows_source_and_steps() {
+    maybe_compile("subprog.c", "subprog.o", "-O0");
+    let mut v = vm_of("tests/subprog.o", "socket");
+    let mut ctx = vec![0u8; 8];
+    let mut s = DebugSession::new(&mut v, &mut ctx, &DebuggerOpts::default());
+
+    // Position banner carries the C source line and function name.
+    let mut out = Vec::new();
+    s.print_position(&mut out).unwrap();
+    let banner = String::from_utf8(out).unwrap();
+    assert!(banner.contains("prog at"), "banner: {banner}");
+    assert!(banner.contains("subprog.c:11"), "banner: {banner}");
+
+    // `steps` from line 11 lands on the next distinct source line (13).
+    let o = cmd(&mut s, "steps");
+    assert!(o.contains("subprog.c:13"), "steps -> {o}");
+
+    // `steps` again descends into `triple` (line 5 then 7).
+    let o = cmd(&mut s, "steps");
+    assert!(o.contains("triple"), "steps into triple -> {o}");
+
+    // Backtrace now shows the two-level call stack.
+    let o = cmd(&mut s, "bt");
+    assert!(o.contains("#0  triple"), "bt: {o}");
+    assert!(o.contains("#1  prog"), "bt: {o}");
+}
+
+#[test]
+fn debugger_nexts_steps_over_call() {
+    maybe_compile("subprog.c", "subprog.o", "-O0");
+    let mut v = vm_of("tests/subprog.o", "socket");
+    let mut ctx = vec![0u8; 8];
+    let mut s = DebugSession::new(&mut v, &mut ctx, &DebuggerOpts::default());
+
+    cmd(&mut s, "steps"); // to the call line (13)
+    // `nexts` steps over triple; the program has nothing after the call but
+    // the return, so it runs to exit without ever showing `triple`.
+    let o = cmd(&mut s, "nexts");
+    assert!(!o.contains("triple at"), "nexts entered triple: {o}");
+    assert!(o.contains("exited") || o.contains("13"), "nexts: {o}");
+    assert!(s.machine().current_frame() == 0);
+}
+
+#[test]
+fn debugger_print_global_by_name() {
+    maybe_compile("global_data.c", "global_data.o", "-O2");
+    let mut v = vm_of("tests/global_data.o", "socket");
+    let mut ctx = vec![5u8, 0, 0, 0]; // ctx word = 5 -> idx = 5 & 3 = 1
+    let mut s = DebugSession::new(&mut v, &mut ctx, &DebuggerOpts::default());
+
+    cmd(&mut s, "c"); // run to completion; globals now hold final values
+
+    // ro_table[1] == 20 added to bss_counter.
+    let o = cmd(&mut s, "print bss_counter");
+    assert!(o.contains("bss_counter: long = 20"), "print bss: {o}");
+    // data_scale started at 3, += 1.
+    let o = cmd(&mut s, "print data_scale");
+    assert!(o.contains("data_scale: long = 4"), "print data: {o}");
+    // Typed array rendering, one level deep.
+    let o = cmd(&mut s, "print ro_table");
+    assert!(o.contains("[10, 20, 30, 40]"), "print ro_table: {o}");
+    // Unknown name is reported, not a panic.
+    let o = cmd(&mut s, "print nope");
+    assert!(o.contains("no global named 'nope'"), "print nope: {o}");
+
+    // Listing all globals with `print` (no arg).
+    let o = cmd(&mut s, "print");
+    assert!(o.contains("bss_counter") && o.contains("data_scale"), "list: {o}");
+}
+
+#[test]
+fn debugger_reverse_source_step() {
+    maybe_compile("subprog.c", "subprog.o", "-O0");
+    let mut v = vm_of("tests/subprog.o", "socket");
+    let mut ctx = vec![0u8; 8];
+    let mut s = DebugSession::new(&mut v, &mut ctx, &DebuggerOpts::default());
+
+    cmd(&mut s, "steps"); // line 13
+    cmd(&mut s, "steps"); // into triple, line 5
+    cmd(&mut s, "steps"); // line 7
+    let o = cmd(&mut s, "rsteps"); // back to line 5
+    assert!(o.contains("subprog.c:5"), "rsteps: {o}");
 }
