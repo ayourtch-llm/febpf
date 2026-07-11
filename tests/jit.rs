@@ -5,7 +5,7 @@
     feature = "jit",
     any(
         all(target_arch = "x86_64", target_os = "linux"),
-        all(target_arch = "aarch64", target_os = "macos")
+        all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))
     )
 ))]
 

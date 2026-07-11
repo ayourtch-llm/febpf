@@ -37,7 +37,9 @@ mod classify;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod x64;
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+// The A64 encoder is OS-independent: macOS and Linux differ only in the
+// executable-memory layer (`arm_macos` vs `arm_linux` below).
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 pub mod aarch64;
 
 pub use classify::{AluOp, Cc, DeferredRegs, Lowering, RegMask, RegOrImm, ShiftOp, Width, ALL_REGS};
@@ -178,18 +180,18 @@ pub fn compile(insns: &[Insn]) -> Result<JitProgram, String> {
 }
 
 /// Compile `insns` for the host architecture.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 pub fn compile(insns: &[Insn]) -> Result<JitProgram, String> {
     compile_with::<aarch64::Aarch64Backend>(insns)
 }
 
 #[cfg(not(any(
     all(target_arch = "x86_64", target_os = "linux"),
-    all(target_arch = "aarch64", target_os = "macos")
+    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))
 )))]
 pub fn compile(_insns: &[Insn]) -> Result<JitProgram, String> {
-    Err("JIT is only implemented for x86-64 Linux and arm64 macOS (see \
-         docs/specs/jit-backend.md to add another architecture)"
+    Err("JIT is only implemented for x86-64 Linux and aarch64 (macOS/Linux) — \
+         see docs/specs/jit-backend.md to add another architecture"
         .into())
 }
 
@@ -286,42 +288,50 @@ struct ExecMem {
 // threads by febpf itself.
 unsafe impl Send for ExecMem {}
 
+// Each supported platform provides a module with the same three functions —
+// `alloc_rw`, `seal_rx`, `free` — and `osmem` aliases the right one. The
+// backends (instruction encoders) are OS-independent; only this layer is not.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use x86_linux as osmem;
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+use arm_linux as osmem;
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+use arm_macos as osmem;
+
+// The supported-platform predicate. `cfg` cannot expand a macro, so it is
+// spelled out at each use; keep the three copies in sync with `compile()`.
 impl ExecMem {
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    ))]
     fn new(len: usize) -> Result<ExecMem, String> {
         let len = len.max(1);
-        let ptr = unsafe { sys::mmap_rw(len) }?;
+        let ptr = unsafe { osmem::alloc_rw(len) }?;
         Ok(ExecMem { ptr, len })
     }
 
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    ))]
     fn make_executable(&mut self) -> Result<(), String> {
-        unsafe { sys::mprotect_rx(self.ptr, self.len) }
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    fn new(len: usize) -> Result<ExecMem, String> {
-        let len = len.max(1);
-        let ptr = unsafe { macsys::mmap_jit(len) }?;
-        Ok(ExecMem { ptr, len })
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    fn make_executable(&mut self) -> Result<(), String> {
-        unsafe { macsys::seal_and_flush(self.ptr, self.len) };
-        Ok(())
+        unsafe { osmem::seal_rx(self.ptr, self.len) }
     }
 
     #[cfg(not(any(
         all(target_arch = "x86_64", target_os = "linux"),
-        all(target_arch = "aarch64", target_os = "macos")
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     )))]
     fn new(_len: usize) -> Result<ExecMem, String> {
         Err("executable memory allocation unsupported on this platform".into())
     }
+
     #[cfg(not(any(
         all(target_arch = "x86_64", target_os = "linux"),
-        all(target_arch = "aarch64", target_os = "macos")
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     )))]
     fn make_executable(&mut self) -> Result<(), String> {
         Ok(())
@@ -330,13 +340,12 @@ impl ExecMem {
 
 impl Drop for ExecMem {
     fn drop(&mut self) {
-        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        #[cfg(any(
+            all(target_arch = "x86_64", target_os = "linux"),
+            all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+        ))]
         unsafe {
-            sys::munmap(self.ptr, self.len);
-        }
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-        unsafe {
-            macsys::unmap(self.ptr, self.len);
+            osmem::free(self.ptr, self.len);
         }
     }
 }
@@ -351,7 +360,7 @@ impl Drop for ExecMem {
 /// leaves the calling thread's write gate open; `compile_with` performs all
 /// writes on that same thread before `seal_and_flush` closes the gate.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-mod macsys {
+mod arm_macos {
     use core::ffi::c_void;
 
     extern "C" {
@@ -369,7 +378,7 @@ mod macsys {
     const MAP_ANON: i32 = 0x1000;
     const MAP_JIT: i32 = 0x0800;
 
-    pub unsafe fn mmap_jit(len: usize) -> Result<*mut u8, String> {
+    pub unsafe fn alloc_rw(len: usize) -> Result<*mut u8, String> {
         let p = mmap(
             core::ptr::null_mut(),
             len,
@@ -386,19 +395,28 @@ mod macsys {
         Ok(p as *mut u8)
     }
 
-    pub unsafe fn seal_and_flush(ptr: *mut u8, len: usize) {
+    pub unsafe fn seal_rx(ptr: *mut u8, len: usize) -> Result<(), String> {
         pthread_jit_write_protect_np(1);
         sys_icache_invalidate(ptr as *mut c_void, len);
+        Ok(())
     }
 
-    pub unsafe fn unmap(ptr: *mut u8, len: usize) {
+    pub unsafe fn free(ptr: *mut u8, len: usize) {
         munmap(ptr as *mut c_void, len);
     }
 }
 
-/// Raw Linux syscalls for W^X code memory — keeps the crate dependency-free.
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-mod sys {
+/// W^X JIT memory on **aarch64 Linux** — raw syscalls, like the x86-64 path
+/// (Linux has a stable syscall ABI, so no libc is needed).
+///
+/// Unlike x86-64, ARM does not keep the instruction cache coherent with the
+/// data cache: freshly written code must be pushed out of the D-cache to the
+/// point of unification and the stale I-cache lines invalidated, or the CPU
+/// happily executes whatever was in those lines before. That is what
+/// `flush_icache` does; skipping it produces crashes that look random and
+/// depend on what previously occupied the memory.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+mod arm_linux {
     use std::arch::asm;
 
     const PROT_READ: usize = 0x1;
@@ -407,7 +425,102 @@ mod sys {
     const MAP_PRIVATE: usize = 0x2;
     const MAP_ANONYMOUS: usize = 0x20;
 
-    pub unsafe fn mmap_rw(len: usize) -> Result<*mut u8, String> {
+    // aarch64 syscall numbers (asm-generic): differ from x86-64's.
+    const SYS_MUNMAP: usize = 215;
+    const SYS_MMAP: usize = 222;
+    const SYS_MPROTECT: usize = 226;
+
+    pub unsafe fn alloc_rw(len: usize) -> Result<*mut u8, String> {
+        let ret: isize;
+        asm!(
+            "svc #0",
+            in("x8") SYS_MMAP,
+            inlateout("x0") 0usize => ret,   // addr = NULL
+            in("x1") len,
+            in("x2") PROT_READ | PROT_WRITE,
+            in("x3") MAP_PRIVATE | MAP_ANONYMOUS,
+            in("x4") -1isize,                // fd
+            in("x5") 0usize,                 // offset
+            options(nostack),
+        );
+        if (-4095..0).contains(&ret) {
+            return Err(format!("mmap failed (errno {})", -ret));
+        }
+        Ok(ret as *mut u8)
+    }
+
+    pub unsafe fn seal_rx(ptr: *mut u8, len: usize) -> Result<(), String> {
+        let ret: isize;
+        asm!(
+            "svc #0",
+            in("x8") SYS_MPROTECT,
+            inlateout("x0") ptr => ret,
+            in("x1") len,
+            in("x2") PROT_READ | PROT_EXEC,
+            options(nostack),
+        );
+        if ret != 0 {
+            return Err(format!("mprotect failed (errno {})", -ret));
+        }
+        flush_icache(ptr, len);
+        Ok(())
+    }
+
+    pub unsafe fn free(ptr: *mut u8, len: usize) {
+        asm!(
+            "svc #0",
+            in("x8") SYS_MUNMAP,
+            inlateout("x0") ptr => _,
+            in("x1") len,
+            options(nostack),
+        );
+    }
+
+    /// Clean the data cache to the point of unification, then invalidate the
+    /// instruction cache, over `[ptr, ptr+len)` — the standard A64 sequence
+    /// (what libgcc's `__clear_cache` compiles to).
+    ///
+    /// `CTR_EL0` gives the cache line sizes; `DC CVAU` / `IC IVAU` / the
+    /// `CTR_EL0` read are all permitted from EL0 on Linux (SCTLR_EL1.UCI/UCT).
+    unsafe fn flush_icache(ptr: *mut u8, len: usize) {
+        let (start, end) = (ptr as usize, ptr as usize + len);
+
+        let ctr: usize;
+        asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+        // Line sizes are logged in words: bits 19:16 = D-cache, 3:0 = I-cache.
+        let dline = 4usize << ((ctr >> 16) & 0xF);
+        let iline = 4usize << (ctr & 0xF);
+
+        let mut addr = start & !(dline - 1);
+        while addr < end {
+            asm!("dc cvau, {}", in(reg) addr, options(nostack, preserves_flags));
+            addr += dline;
+        }
+        asm!("dsb ish", options(nostack, preserves_flags));
+
+        let mut addr = start & !(iline - 1);
+        while addr < end {
+            asm!("ic ivau, {}", in(reg) addr, options(nostack, preserves_flags));
+            addr += iline;
+        }
+        asm!("dsb ish", "isb", options(nostack, preserves_flags));
+    }
+}
+
+/// Raw Linux syscalls for W^X code memory — keeps the crate dependency-free.
+/// x86-64 keeps its instruction cache coherent with the data cache, so unlike
+/// the ARM paths this needs no cache maintenance.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod x86_linux {
+    use std::arch::asm;
+
+    const PROT_READ: usize = 0x1;
+    const PROT_WRITE: usize = 0x2;
+    const PROT_EXEC: usize = 0x4;
+    const MAP_PRIVATE: usize = 0x2;
+    const MAP_ANONYMOUS: usize = 0x20;
+
+    pub unsafe fn alloc_rw(len: usize) -> Result<*mut u8, String> {
         let ret: isize;
         asm!(
             "syscall",
@@ -427,7 +540,7 @@ mod sys {
         Ok(ret as *mut u8)
     }
 
-    pub unsafe fn mprotect_rx(ptr: *mut u8, len: usize) -> Result<(), String> {
+    pub unsafe fn seal_rx(ptr: *mut u8, len: usize) -> Result<(), String> {
         let ret: isize;
         asm!(
             "syscall",
@@ -444,7 +557,7 @@ mod sys {
         Ok(())
     }
 
-    pub unsafe fn munmap(ptr: *mut u8, len: usize) {
+    pub unsafe fn free(ptr: *mut u8, len: usize) {
         asm!(
             "syscall",
             inlateout("rax") 11isize => _, // SYS_munmap
