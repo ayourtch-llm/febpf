@@ -38,6 +38,7 @@ options:
   --ctx <hex|@file>    context memory contents (hex string or file)
   --packet <file>      run an XDP program over raw packet bytes from file
   --pcap <file>        run an XDP program over every packet in classic pcap
+  --packet-index <n>   record packet N from --pcap (1-based, default 1)
   --ctx-size <n>       context size in bytes (default 4096, or data length)
   --no-verify          run without verifying first (still memory-safe)
   --no-explain         don't print the counterexample trace when rejected
@@ -76,6 +77,7 @@ struct Opts {
     ctx_hex: Option<String>,
     packet: Option<String>,
     pcap: Option<String>,
+    packet_index: usize,
     ctx_size: Option<usize>,
     no_verify: bool,
     no_explain: bool,
@@ -107,6 +109,7 @@ fn parse_args() -> Result<Opts, String> {
         ctx_hex: None,
         packet: None,
         pcap: None,
+        packet_index: 1,
         ctx_size: None,
         no_verify: false,
         no_explain: false,
@@ -131,6 +134,16 @@ fn parse_args() -> Result<Opts, String> {
             "--ctx" => o.ctx_hex = Some(args.next().ok_or("--ctx needs a value")?),
             "--packet" => o.packet = Some(args.next().ok_or("--packet needs a value")?),
             "--pcap" => o.pcap = Some(args.next().ok_or("--pcap needs a value")?),
+            "--packet-index" => {
+                o.packet_index = args
+                    .next()
+                    .ok_or("--packet-index needs a value")?
+                    .parse()
+                    .map_err(|e| format!("bad --packet-index: {e}"))?;
+                if o.packet_index == 0 {
+                    return Err("--packet-index is 1-based and must be nonzero".into());
+                }
+            }
             "--ctx-size" => {
                 o.ctx_size = Some(
                     args.next()
@@ -417,14 +430,36 @@ fn verifier_config(o: &Opts, ctx_len: usize, xdp: bool) -> verifier::Config {
 }
 
 /// `febpf record <prog> [--ctx ...] [--stop-at N] -o out.febpf`
-fn cmd_record(o: &Opts, prog: Program) -> Result<ExitCode, String> {
+fn cmd_record(o: &Opts, prog: Program, xdp: bool) -> Result<ExitCode, String> {
     let out = o
         .out
         .as_deref()
         .ok_or("record needs an output file: -o <out.febpf>")?;
-    let ctx = make_ctx(o)?;
     let seed = febpf::interp::DEFAULT_PRANDOM_SEED;
-    let replay = febpf::replay::Replay::record(&prog, ctx, seed, o.stop_at, Vec::new())?;
+    let replay = if xdp {
+        let packet = if let Some(path) = &o.pcap {
+            let bytes = std::fs::read(path).map_err(|e| format!("cannot read pcap {path}: {e}"))?;
+            let capture = febpf::pcap::parse(&bytes)?;
+            capture
+                .packets
+                .get(o.packet_index - 1)
+                .ok_or_else(|| {
+                    format!(
+                        "pcap has {} packet(s); cannot select --packet-index {}",
+                        capture.packets.len(),
+                        o.packet_index
+                    )
+                })?
+                .data
+                .to_vec()
+        } else {
+            read_packet(o)?
+        };
+        febpf::replay::Replay::record_xdp(&prog, packet, seed, o.stop_at, Vec::new())?
+    } else {
+        let ctx = make_ctx(o)?;
+        febpf::replay::Replay::record(&prog, ctx, seed, o.stop_at, Vec::new())?
+    };
     let bytes = replay.to_bytes();
     std::fs::write(out, &bytes).map_err(|e| format!("cannot write {out}: {e}"))?;
     let outcome = match &replay.outcome {
@@ -433,11 +468,14 @@ fn cmd_record(o: &Opts, prog: Program) -> Result<ExitCode, String> {
         None => "not captured".to_string(),
     };
     println!(
-        "wrote {} bytes to {out} ({} insns, {} map(s), ctx {}B, {}) [{outcome}]",
+        "wrote {} bytes to {out} ({} insns, {} map(s), {}, {}) [{outcome}]",
         bytes.len(),
         replay.insns.len(),
         replay.maps.len(),
-        replay.ctx.len(),
+        match &replay.packet {
+            Some(packet) => format!("XDP packet {}B", packet.len()),
+            None => format!("ctx {}B", replay.ctx.len()),
+        },
         match replay.stop_at {
             Some(n) => format!("cursor @ {n}"),
             None => "no cursor".to_string(),
@@ -691,14 +729,14 @@ fn run() -> Result<ExitCode, String> {
     if o.packet.is_some() && o.pcap.is_some() {
         return Err("--packet and --pcap are mutually exclusive".into());
     }
-    if o.pcap.is_some() && o.cmd != "run" {
-        return Err("--pcap is currently supported by the run command".into());
+    if o.pcap.is_some() && !matches!(o.cmd.as_str(), "run" | "record") {
+        return Err("--pcap is currently supported by run and record".into());
     }
     let xdp = elf_xdp || o.packet.is_some() || o.pcap.is_some();
     if xdp
         && !matches!(
             o.cmd.as_str(),
-            "asm" | "disasm" | "verify" | "analyze" | "dot" | "run" | "profile"
+            "asm" | "disasm" | "verify" | "analyze" | "dot" | "run" | "profile" | "record"
         )
     {
         return Err(format!(
@@ -707,7 +745,7 @@ fn run() -> Result<ExitCode, String> {
         ));
     }
     if o.cmd == "record" {
-        return cmd_record(&o, prog);
+        return cmd_record(&o, prog, xdp);
     }
     if o.cmd == "optimize" {
         return cmd_optimize(&o, prog);

@@ -9,6 +9,9 @@ XDP semantics for assembler/raw programs and supplies raw packet bytes.
 (maps persist between packets) and prints `ABORTED`/`DROP`/`PASS`/`TX`/
 `REDIRECT` verdicts with packet indices and timestamps. Both byte orders and
 microsecond/nanosecond pcap variants are accepted; pcapng is rejected clearly.
+`record --pcap <file> --packet-index N -o packet.febpf` extracts a chosen
+packet into the replay container, including its packet bytes and XDP mode, so
+`replay packet.febpf` opens that invocation in the time-travel debugger.
 
 ## Verifier model
 
@@ -48,6 +51,6 @@ writes are copied back to the caller on exit or runtime error.
 
 This slice covers verifier semantics, deterministic interpreter execution,
 automatic ELF program-type selection, raw packet-file CLI runs, and a
-pcap-in/verdict-out harness. JIT execution, putting packet captures into the
-`.febpf` replay container, and kernel `BPF_PROG_TEST_RUN` differential
-validation are follow-up layers.
+pcap-in/verdict-out harness, and selected-packet `.febpf` replay/debugging. JIT
+execution and kernel `BPF_PROG_TEST_RUN` differential validation are follow-up
+layers.

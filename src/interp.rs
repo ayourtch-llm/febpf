@@ -352,24 +352,25 @@ impl Vm {
     /// virtual `xdp_md` context internally and copies packet writes back to
     /// the caller on both successful exit and runtime error.
     pub fn run_xdp(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
-        if !self.xdp {
-            return Err(EbpfError {
-                pc: 0,
-                msg: "run_xdp requires successful verification with Config::xdp".to_string(),
-            });
-        }
-        if packet.len() > u32::MAX as usize {
-            return Err(EbpfError {
-                pc: 0,
-                msg: "packet is too large for xdp_md data/data_end".to_string(),
-            });
-        }
-        self.packet.clear();
-        self.packet.extend_from_slice(packet);
-        let mut ctx = [0u8; 24];
+        let mut ctx = self.prepare_xdp(packet).map_err(|msg| EbpfError { pc: 0, msg })?;
         let result = self.run(&mut ctx);
         packet.copy_from_slice(&self.packet);
         result
+    }
+
+    /// Install packet bytes and return the synthetic `xdp_md` context used by
+    /// [`Vm::machine`]. This is the debugger/replay counterpart of
+    /// [`Vm::run_xdp`]. The VM must first verify under XDP rules.
+    pub fn prepare_xdp(&mut self, packet: &[u8]) -> Result<Vec<u8>, String> {
+        if !self.xdp {
+            return Err("XDP execution requires successful verification with Config::xdp".into());
+        }
+        if packet.len() > u32::MAX as usize {
+            return Err("packet is too large for xdp_md data/data_end".into());
+        }
+        self.packet.clear();
+        self.packet.extend_from_slice(packet);
+        Ok(vec![0u8; 24])
     }
 
     /// Create a single-stepping execution (for the debugger).

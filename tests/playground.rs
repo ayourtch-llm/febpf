@@ -97,3 +97,39 @@ fn replay_session_opens_at_cursor() {
     // A corrupt file is rejected cleanly (no panic).
     assert!(replay_session(b"not a replay").is_err());
 }
+
+#[test]
+fn xdp_replay_session_opens_on_packet() {
+    use febpf::playground::replay_session;
+    use febpf::replay::Replay;
+    use febpf::{asm, Program};
+
+    let a = asm::assemble(
+        "r2 = *(u32 *)(r1 + 0)\n\
+         r3 = *(u32 *)(r1 + 4)\n\
+         r4 = r2\n\
+         r4 += 1\n\
+         if r4 > r3 goto short\n\
+         r0 = *(u8 *)(r2 + 0)\n\
+         exit\n\
+         short:\n\
+         r0 = 0\n\
+         exit",
+    )
+    .unwrap();
+    let prog = Program {
+        insns: a.insns,
+        maps: a.maps,
+        btf_ctx: None,
+    };
+    let r = Replay::record_xdp(
+        &prog,
+        vec![0x7f],
+        febpf::interp::DEFAULT_PRANDOM_SEED,
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+    let mut s = replay_session(&r.to_bytes()).unwrap();
+    assert!(s.command("continue").contains("r0 = 127"));
+}

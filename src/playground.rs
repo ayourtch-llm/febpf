@@ -243,6 +243,8 @@ pub struct Session {
     seed: Option<u64>,
     /// User-supplied map contents applied before each replay.
     preload: Vec<crate::replay::MapPreload>,
+    /// XDP packet input for replay sessions.
+    packet: Option<Vec<u8>>,
 }
 
 /// Load a replay file's bytes into a debugger [`Session`], positioned at its
@@ -285,6 +287,7 @@ impl Session {
             steps: 0,
             seed: None,
             preload: Vec::new(),
+            packet: None,
         })
     }
 
@@ -301,6 +304,7 @@ impl Session {
             steps: r.stop_at.unwrap_or(0),
             seed: Some(r.seed),
             preload: r.preload,
+            packet: r.packet,
         })
     }
 
@@ -313,7 +317,18 @@ impl Session {
             vm.set_prandom_seed(seed);
         }
         crate::replay::apply_preload(&mut vm, &self.preload)?;
-        let mut ctx = self.ctx_template.clone();
+        let mut ctx = if let Some(packet) = &self.packet {
+            vm.verify(crate::verifier::Config {
+                ctx_size: 24,
+                ctx_writable: false,
+                xdp: true,
+                ..Default::default()
+            })
+            .map_err(|e| format!("replayed XDP program no longer verifies: {e}"))?;
+            vm.prepare_xdp(packet)?
+        } else {
+            self.ctx_template.clone()
+        };
         let mut m = vm.machine(&mut ctx);
         let mut status = Status::Running;
         while m.insn_count < self.steps {

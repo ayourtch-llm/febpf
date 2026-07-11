@@ -58,6 +58,7 @@ N     payload        (payload_len bytes; parsed per-tag below)
 | 0x06 | CURSOR  | no       | `u64` stop-at instruction count (absent ⇒ no cursor) |
 | 0x07 | PRELOAD | no       | `u32 nentries`, then per entry: `u32 map_index`, `bytes(key)`, `bytes(value)` (user-supplied map contents applied *after* map init, *before* the run) |
 | 0x08 | OUTCOME | no       | determinism guard: `u8 kind` (0=exit,1=error); if 0 then `u64 r0`, if 1 then `str(message)` |
+| 0x09 | PACKET  | no       | original XDP packet bytes; presence selects XDP verification/execution and makes CTX the synthetic 24-byte `xdp_md` image |
 
 Round-trip is exact: `from_bytes(to_bytes(r)) == r` for every field.
 
@@ -94,6 +95,8 @@ the r0 comparison is the real signal.
 
 ```
 febpf record <prog> [--ctx <hex|@file>] [--ctx-size N] [--stop-at N] -o bug.febpf
+febpf record <xdp-prog> --packet frame.bin [--stop-at N] -o packet.febpf
+febpf record <xdp-prog> --pcap capture.pcap --packet-index N -o packet.febpf
 febpf replay <bug.febpf> [--run]
 ```
 
@@ -101,6 +104,11 @@ febpf replay <bug.febpf> [--run]
   object, or raw bytecode — same loader as every other command), builds the ctx,
   runs it once to capture the determinism-guard OUTCOME, and writes the replay
   file. `--stop-at N` stores a CURSOR at instruction count N.
+- For XDP, `--packet` stores one raw frame. `--pcap` plus the 1-based
+  `--packet-index` extracts one capture record. The PACKET section preserves
+  the original bytes, and replay rebuilds the packet virtual region before
+  opening the debugger, so data/data_end pointers and packet mutations remain
+  time-travel reproducible.
 - `replay bug.febpf` loads the file and drops into the **time-travel debugger**,
   positioned at the CURSOR if one is present (otherwise at count 0).
 - `replay bug.febpf --run` instead runs to completion and prints r0, applying the

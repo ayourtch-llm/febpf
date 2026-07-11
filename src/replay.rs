@@ -30,6 +30,7 @@ const TAG_SEED: u8 = 0x05;
 const TAG_CURSOR: u8 = 0x06;
 const TAG_PRELOAD: u8 = 0x07;
 const TAG_OUTCOME: u8 = 0x08;
+const TAG_PACKET: u8 = 0x09;
 
 /// The febpf version stamped into a recorded file (its `CARGO_PKG_VERSION`).
 pub fn febpf_version() -> String {
@@ -61,6 +62,9 @@ pub struct Replay {
     pub insns: Vec<Insn>,
     pub maps: Vec<MapDef>,
     pub ctx: Vec<u8>,
+    /// XDP packet input. When present, `ctx` is the synthetic xdp_md image and
+    /// replay verifies/executes under packet data/data_end rules.
+    pub packet: Option<Vec<u8>>,
     pub seed: u64,
     /// Optional "stop at instruction count N" cursor for the debugger.
     pub stop_at: Option<u64>,
@@ -94,6 +98,44 @@ impl Replay {
             insns: prog.insns.clone(),
             maps: prog.maps.clone(),
             ctx,
+            packet: None,
+            seed,
+            stop_at,
+            preload,
+            outcome: Some(outcome),
+        })
+    }
+
+    /// Record one XDP packet invocation, including the packet bytes required
+    /// to reconstruct data/data_end virtual pointers in the debugger.
+    pub fn record_xdp(
+        prog: &Program,
+        packet: Vec<u8>,
+        seed: u64,
+        stop_at: Option<u64>,
+        preload: Vec<MapPreload>,
+    ) -> Result<Replay, String> {
+        let mut vm = Vm::new(prog.clone())?;
+        vm.set_prandom_seed(seed);
+        apply_preload(&mut vm, &preload)?;
+        vm.verify(crate::verifier::Config {
+            ctx_size: 24,
+            ctx_writable: false,
+            xdp: true,
+            ..Default::default()
+        })
+        .map_err(|e| format!("XDP verification failed: {e}"))?;
+        let mut run_packet = packet.clone();
+        let outcome = match vm.run_xdp(&mut run_packet) {
+            Ok(r0) => Outcome::Exit(r0),
+            Err(e) => Outcome::Error(e.to_string()),
+        };
+        Ok(Replay {
+            febpf_version: febpf_version(),
+            insns: prog.insns.clone(),
+            maps: prog.maps.clone(),
+            ctx: vec![0u8; 24],
+            packet: Some(packet),
             seed,
             stop_at,
             preload,
@@ -116,7 +158,19 @@ impl Replay {
         let mut vm = Vm::new(self.program())?;
         vm.set_prandom_seed(self.seed);
         apply_preload(&mut vm, &self.preload)?;
-        Ok((vm, self.ctx.clone()))
+        let ctx = if let Some(packet) = &self.packet {
+            vm.verify(crate::verifier::Config {
+                ctx_size: 24,
+                ctx_writable: false,
+                xdp: true,
+                ..Default::default()
+            })
+            .map_err(|e| format!("replayed XDP program no longer verifies: {e}"))?;
+            vm.prepare_xdp(packet)?
+        } else {
+            self.ctx.clone()
+        };
+        Ok((vm, ctx))
     }
 
     // -- serialization ------------------------------------------------------
@@ -164,6 +218,11 @@ impl Replay {
 
         // CTX (raw bytes, length is the section length)
         section(&mut out, TAG_CTX, &self.ctx);
+
+        // PACKET marks an XDP replay and carries the original packet input.
+        if let Some(packet) = &self.packet {
+            section(&mut out, TAG_PACKET, packet);
+        }
 
         // SEED
         section(&mut out, TAG_SEED, &self.seed.to_le_bytes());
@@ -229,6 +288,7 @@ impl Replay {
         let mut stop_at = None;
         let mut preload = Vec::new();
         let mut outcome = None;
+        let mut packet = None;
 
         let mut pos = 10usize;
         while pos < bytes.len() {
@@ -336,6 +396,7 @@ impl Replay {
                         k => return Err(format!("unknown outcome kind {k}")),
                     });
                 }
+                TAG_PACKET => packet = Some(payload.to_vec()),
                 _ => {} // unknown section: skip (forward compatibility)
             }
         }
@@ -345,6 +406,7 @@ impl Replay {
             insns: insns.ok_or("replay file missing INSNS section")?,
             maps: maps.ok_or("replay file missing MAPS section")?,
             ctx: ctx.ok_or("replay file missing CTX section")?,
+            packet,
             seed: seed.ok_or("replay file missing SEED section")?,
             stop_at,
             preload,

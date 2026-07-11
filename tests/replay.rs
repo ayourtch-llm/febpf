@@ -120,6 +120,38 @@ fn replay_preserves_ctx_dependent_result() {
 }
 
 #[test]
+fn xdp_packet_round_trips_and_replays() {
+    let p = prog("
+        r2 = *(u32 *)(r1 + 0)
+        r3 = *(u32 *)(r1 + 4)
+        r4 = r2
+        r4 += 2
+        if r4 > r3 goto short
+        r0 = *(u16 *)(r2 + 0)
+        exit
+    short:
+        r0 = 0
+        exit
+    ");
+    let packet = vec![0x34, 0x12, 0xaa];
+    let rec = Replay::record_xdp(
+        &p,
+        packet.clone(),
+        DEFAULT_PRANDOM_SEED,
+        Some(5),
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(rec.packet, Some(packet));
+    assert_eq!(rec.outcome, Some(Outcome::Exit(0x1234)));
+
+    let parsed = Replay::from_bytes(&rec.to_bytes()).unwrap();
+    assert_eq!(parsed, rec);
+    let (mut vm, mut ctx) = parsed.build_vm().unwrap();
+    assert_eq!(vm.run(&mut ctx).unwrap(), 0x1234);
+}
+
+#[test]
 fn preload_round_trips_and_reproduces() {
     // Look up preloaded hash key 7 and return its value.
     let p = prog("
