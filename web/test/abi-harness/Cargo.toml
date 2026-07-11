@@ -1,0 +1,13 @@
+[package]
+name = "abi-harness"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# NOTE: this is a standalone test harness, NOT part of the febpf crate. It is
+# deliberately outside febpf's zero-dependency boundary: it uses the pure-Rust
+# `wasmi` interpreter to drive the compiled febpf.wasm through its full
+# string-passing ABI (alloc -> write -> call -> unpack -> read -> free), exactly
+# as web/febpf.js does in the browser. Run with `cargo run` from this directory.
+[dependencies]
+wasmi = "0.36"

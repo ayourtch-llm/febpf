@@ -187,6 +187,30 @@ host. Serving needs a real server for the `application/wasm` MIME type
 - [x] Stage 3 — web page (`web/index.html` + `web/febpf.js`, vanilla/offline;
       two demo prefills incl. a verifier-failing one, .o file input, and the
       time-travel debugger panel; JS exports cross-checked against the wasm)
-- [ ] Stage 4 — Makefile, docs, smoke test
+- [x] Stage 4 — Makefile, docs, smoke test (`web/Makefile`: `make` → `web/dist/`
+      self-contained; README section added. `web/test/smoke.sh` runs
+      `febpf_selftest` under wasmtime; `web/test/abi-harness` drives the full
+      string ABI through `wasmi` — 9/9 checks pass, including time-travel.)
+
+## Verification evidence
+
+Run in this environment (no node/browser; wasmtime 27 + wasmi 0.36 used):
+
+- `cargo test` and `cargo test --no-default-features`: all green (55 native
+  tests incl. the new 8 `tests/playground.rs`).
+- `cargo clippy --all-targets` and `... --no-default-features`: 0 warnings.
+- `cargo build --release && ./target/release/febpf bench examples/sum_loop.s
+  --iters 50000 --jit` → 9.5 GIPS (JIT still works on the default build).
+- `cd web && make` → `web/dist/{index.html,febpf.js,febpf.wasm}` (356K wasm).
+- `web/test/smoke.sh` → `febpf_selftest() = 15`, SMOKE TEST PASSED (the engine
+  assembles+verifies+runs+debugs a program inside wasm).
+- `web/test/abi-harness` (`cargo run`) → ALL ABI CHECKS PASSED: the compiled
+  `.wasm` driven through alloc/write/call/unpack/read/free exactly as the
+  browser does, verifying verify/run/disasm/analyze and the debugger's
+  `rstep` time travel.
+
+Manual browser check: `cd web && make && cd dist && python3 -m http.server
+8000`, open `http://localhost:8000`; the selftest badge should read
+"wasm OK · selftest 15/15".
 </content>
 </invoke>

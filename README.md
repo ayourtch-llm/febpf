@@ -149,6 +149,37 @@ maybe-NULL map values, pointer leaks to non-stack memory, unbounded loops
 ("program too complex"), unreachable code, missing `exit`/`r0`, bad helper
 arguments, call-depth overflow, writes to `r10`.
 
+## WASM playground
+
+The interpreter, verifier, assembler, disassembler, analysis and a
+replay-based time-travel debugger are pure-std, zero-dependency Rust, so they
+compile to `wasm32-unknown-unknown` and run **entirely in the browser** — paste
+assembler or drop a clang `.o`, then verify / run / disassemble / analyze /
+step (and *un*-step). The x86-64 JIT is feature-gated off for this build
+(`default = ["jit"]`), so nothing pulls `asm!` into wasm.
+
+```
+rustup target add wasm32-unknown-unknown
+cd web && make            # → web/dist/  (index.html, febpf.js, febpf.wasm)
+cd dist && python3 -m http.server 8000      # then open http://localhost:8000
+```
+
+`web/dist/` is fully self-contained — `rsync` it to any static host. Serving
+needs a real server so the `.wasm` gets the `application/wasm` MIME type;
+`file://` will not instantiate it. `make clean` removes `dist/`.
+
+The ABI is hand-written (no `wasm-bindgen`): `extern "C"` exports
+(`febpf_verify`, `febpf_run`, `febpf_analyze`, `febpf_dbg_cmd`, …) with an
+allocator and linear-memory string passing, packed as `(ptr << 32) | len`
+u64 returns; `web/febpf.js` is the matching glue. See
+`docs/specs/wasm-playground.md`.
+
+Smoke tests (no browser needed): `web/test/smoke.sh` runs the in-wasm
+`febpf_selftest` under any `wasmtime` (set `WASMTIME=/path/to/wasmtime`), and
+`web/test/abi-harness` (`cargo run`) drives the *full string ABI* through the
+pure-Rust `wasmi` interpreter — the exact marshalling the browser does,
+including time-travel `rstep`.
+
 ## Design notes
 
 - **Interpreter**: direct threaded `match` dispatch over the fixed 8-byte
