@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>febpf — eBPF playground</title>
+    <style>
+      :root {
+        --bg: #f6f7f9;
+        --panel: #ffffff;
+        --ink: #1b1f24;
+        --muted: #5b6570;
+        --border: #d8dde3;
+        --accent: #2f6fed;
+        --accent-ink: #ffffff;
+        --ok: #1a7f37;
+        --bad: #cf222e;
+        --code-bg: #0d1117;
+        --code-ink: #d7dee8;
+        --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0d1117;
+          --panel: #161b22;
+          --ink: #e6edf3;
+          --muted: #9198a1;
+          --border: #30363d;
+          --accent: #4c8dff;
+          --code-bg: #010409;
+          --code-ink: #d7dee8;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--ink);
+      }
+      header {
+        padding: 18px 24px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        flex-wrap: wrap;
+      }
+      header h1 { margin: 0; font-size: 20px; letter-spacing: -0.01em; }
+      header .sub { color: var(--muted); font-size: 13px; }
+      #selftest {
+        margin-left: auto;
+        font: 12px var(--mono);
+        padding: 3px 9px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        color: var(--muted);
+      }
+      #selftest.ok { color: var(--ok); border-color: var(--ok); }
+      #selftest.bad { color: var(--bad); border-color: var(--bad); }
+      main {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 16px;
+        padding: 16px 24px 40px;
+      }
+      @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 14px;
+      }
+      .panel h2 {
+        margin: 0 0 10px;
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+      }
+      textarea {
+        width: 100%;
+        min-height: 340px;
+        resize: vertical;
+        font: 13px/1.5 var(--mono);
+        color: var(--ink);
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 10px;
+        tab-size: 4;
+      }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
+      button {
+        font: 500 13px system-ui, sans-serif;
+        padding: 7px 12px;
+        border-radius: 7px;
+        border: 1px solid var(--border);
+        background: var(--panel);
+        color: var(--ink);
+        cursor: pointer;
+      }
+      button:hover { border-color: var(--accent); }
+      button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      select, input[type="text"] {
+        font: 13px var(--mono);
+        padding: 6px 8px;
+        border-radius: 7px;
+        border: 1px solid var(--border);
+        background: var(--panel);
+        color: var(--ink);
+      }
+      label.file {
+        font: 500 13px system-ui, sans-serif;
+        padding: 7px 12px;
+        border-radius: 7px;
+        border: 1px dashed var(--border);
+        cursor: pointer;
+      }
+      label.file input { display: none; }
+      .muted { color: var(--muted); font-size: 12px; }
+      pre {
+        margin: 0;
+        white-space: pre;
+        overflow-x: auto;
+        background: var(--code-bg);
+        color: var(--code-ink);
+        border-radius: 8px;
+        padding: 12px;
+        font: 12.5px/1.5 var(--mono);
+        min-height: 340px;
+        max-height: 60vh;
+      }
+      pre.short { min-height: 120px; max-height: 40vh; }
+      pre .ok { color: #3fb950; }
+      pre .bad { color: #ff7b72; }
+      .dbg-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+      footer { padding: 0 24px 40px; color: var(--muted); font-size: 12px; }
+      code { font-family: var(--mono); background: rgba(127,127,127,0.15); padding: 1px 5px; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>febpf</h1>
+      <span class="sub">userland eBPF — verifier · interpreter · analyzer · time-travel debugger, in your browser</span>
+      <span id="selftest">loading…</span>
+    </header>
+
+    <main>
+      <section class="panel">
+        <h2>Program source</h2>
+        <div class="row">
+          <button id="demo-good">Demo: map + loop</button>
+          <button id="demo-bad">Demo: fails the verifier</button>
+          <label class="file">Load .o…<input type="file" id="objfile" accept=".o,.bpf,application/octet-stream" /></label>
+        </div>
+        <textarea id="src" spellcheck="false"></textarea>
+        <div class="row">
+          <span class="muted">ctx (hex, optional):</span>
+          <input type="text" id="ctx" placeholder="e.g. deadbeef00000000  — empty = 4096 zero bytes" style="flex:1;min-width:180px" />
+        </div>
+        <div class="row">
+          <button class="primary" id="btn-verify">Verify</button>
+          <button id="btn-run">Run</button>
+          <button id="btn-disasm">Disassemble</button>
+          <button id="btn-analyze">Analyze</button>
+          <select id="analyze-mode" title="analysis output">
+            <option value="0">annotated listing</option>
+            <option value="1">CFG (Graphviz DOT)</option>
+            <option value="2">execution heatmap</option>
+          </select>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Output</h2>
+        <pre id="out">Pick a demo and hit Verify.</pre>
+      </section>
+
+      <section class="panel" style="grid-column: 1 / -1">
+        <h2>Time-travel debugger</h2>
+        <div class="row">
+          <button class="primary" id="dbg-new">New session (from source)</button>
+          <button id="dbg-step" disabled>step</button>
+          <button id="dbg-step10" disabled>step 10</button>
+          <button id="dbg-rstep" disabled>rstep</button>
+          <button id="dbg-continue" disabled>continue</button>
+          <button id="dbg-reset" disabled>reset</button>
+          <button id="dbg-regs" disabled>regs</button>
+          <button id="dbg-stack" disabled>stack</button>
+          <button id="dbg-maps" disabled>maps</button>
+        </div>
+        <div class="row">
+          <span class="muted">command:</span>
+          <input type="text" id="dbg-cmd" placeholder="e.g.  goto 20   ·   x 0x200000000 32   ·   printk" style="flex:1;min-width:220px" disabled />
+          <button id="dbg-send" disabled>send</button>
+        </div>
+        <div class="dbg-grid">
+          <pre id="dbg-out" class="short">No session. Click “New session”.</pre>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      Everything runs locally in WebAssembly — no server round-trips, no
+      dependencies. Serve this directory with any static web server
+      (<code>python3 -m http.server</code>); <code>file://</code> will not load the
+      <code>.wasm</code>.
+    </footer>
+
+    <script src="febpf.js"></script>
+    <script>
+      const DEMO_GOOD = `; Sum 1..=10 into an array map slot, then read it back into r0.
+; Demonstrates a loop, a BPF map, and helper calls. Result: r0 = 55.
+.map acc array 4 8 1
+
+    r6 = 0                      ; accumulator
+    r7 = 1                      ; i = 1
+loop:
+    r6 += r7
+    r7 += 1
+    if r7 <= 10 goto loop
+
+    w1 = 0
+    *(u32 *)(r10 - 4) = r1      ; key = 0
+    *(u64 *)(r10 - 16) = r6     ; value = sum (55)
+    r1 = map[acc]
+    r2 = r10
+    r2 += -4
+    r3 = r10
+    r3 += -16
+    r4 = 0
+    call map_update_elem
+
+    r1 = map[acc]
+    r2 = r10
+    r2 += -4
+    call map_lookup_elem
+    if r0 == 0 goto miss
+    r0 = *(u64 *)(r0 + 0)
+    exit
+miss:
+    r0 = 0
+    exit
+`;
+
+      const DEMO_BAD = `; This program FAILS verification — a classic real-world mistake.
+; map_lookup_elem may return NULL, but we dereference r0 without
+; checking. The verifier rejects the possibly-NULL load and points at it.
+.map acc array 4 8 1
+
+    w1 = 0
+    *(u32 *)(r10 - 4) = r1      ; key = 0
+    r1 = map[acc]
+    r2 = r10
+    r2 += -4
+    call map_lookup_elem
+    ; missing:  if r0 == 0 goto out
+    r0 = *(u64 *)(r0 + 0)       ; <-- dereference of a maybe-NULL pointer
+    exit
+`;
+
+      const $ = (id) => document.getElementById(id);
+      const out = $("out");
+      const dbgOut = $("dbg-out");
+      let objBytes = null; // set when a .o file is loaded
+      let session = null;
+
+      function source() {
+        return objBytes ? objBytes : $("src").value;
+      }
+      function usingObject() {
+        return objBytes !== null;
+      }
+      function clearObject() {
+        objBytes = null;
+      }
+
+      function show(pre, text) {
+        pre.textContent = text;
+      }
+
+      // --- wiring ---
+      $("demo-good").onclick = () => { clearObject(); $("src").value = DEMO_GOOD; show(out, "Loaded demo. Hit Verify or Run."); };
+      $("demo-bad").onclick = () => { clearObject(); $("src").value = DEMO_BAD; show(out, "Loaded a program that fails verification. Hit Verify."); };
+
+      $("objfile").onchange = async (e) => {
+        const f = e.target.files[0];
+        if (!f) return;
+        objBytes = new Uint8Array(await f.arrayBuffer());
+        $("src").value = `; loaded ELF object: ${f.name} (${objBytes.length} bytes)\n; the textarea is ignored until you pick a demo again.`;
+        show(out, `Loaded ${f.name}. Verify / Run / Disassemble now operate on the object.`);
+      };
+      $("src").addEventListener("input", clearObject);
+
+      const guard = (fn) => () => {
+        if (!Febpf.ready()) { show(out, "wasm module still loading…"); return; }
+        try { fn(); } catch (err) { show(out, "error: " + err.message); }
+      };
+
+      $("btn-verify").onclick = guard(() => show(out, Febpf.verify(source())));
+      $("btn-run").onclick = guard(() => show(out, Febpf.run(source(), $("ctx").value)));
+      $("btn-disasm").onclick = guard(() => show(out, Febpf.disasm(source())));
+      $("btn-analyze").onclick = guard(() =>
+        show(out, Febpf.analyze(source(), parseInt($("analyze-mode").value, 10))),
+      );
+
+      // --- debugger ---
+      const dbgButtons = ["dbg-step","dbg-step10","dbg-rstep","dbg-continue","dbg-reset","dbg-regs","dbg-stack","dbg-maps","dbg-send"];
+      function setDbgEnabled(on) {
+        dbgButtons.forEach((id) => ($(id).disabled = !on));
+        $("dbg-cmd").disabled = !on;
+      }
+      function dbg(cmd) {
+        if (session === null) { show(dbgOut, "No session."); return; }
+        show(dbgOut, Febpf.dbgCmd(session, cmd));
+      }
+      $("dbg-new").onclick = guard(() => {
+        if (session !== null) Febpf.dbgFree(session);
+        session = Febpf.dbgNew(source(), $("ctx").value);
+        setDbgEnabled(true);
+        show(dbgOut, Febpf.dbgCmd(session, "regs"));
+      });
+      $("dbg-step").onclick = () => dbg("step 1");
+      $("dbg-step10").onclick = () => dbg("step 10");
+      $("dbg-rstep").onclick = () => dbg("rstep 1");
+      $("dbg-continue").onclick = () => dbg("continue");
+      $("dbg-reset").onclick = () => dbg("reset");
+      $("dbg-regs").onclick = () => dbg("regs");
+      $("dbg-stack").onclick = () => dbg("stack");
+      $("dbg-maps").onclick = () => dbg("maps");
+      $("dbg-send").onclick = () => dbg($("dbg-cmd").value);
+      $("dbg-cmd").addEventListener("keydown", (e) => { if (e.key === "Enter") dbg($("dbg-cmd").value); });
+
+      // --- boot ---
+      $("src").value = DEMO_GOOD;
+      Febpf.init().then(() => {
+        const badge = $("selftest");
+        const r = Febpf.selftest();
+        if (r === 15) { badge.textContent = "wasm OK · selftest 15/15"; badge.className = "ok"; }
+        else { badge.textContent = "selftest " + r + "/15"; badge.className = "bad"; }
+      }).catch((e) => {
+        $("selftest").textContent = "wasm failed to load";
+        $("selftest").className = "bad";
+        show(out, "Failed to load febpf.wasm: " + e.message +
+          "\n\nAre you serving over http:// ? file:// cannot instantiate wasm.");
+      });
+    </script>
+  </body>
+</html>

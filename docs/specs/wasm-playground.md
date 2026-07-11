@@ -184,7 +184,9 @@ host. Serving needs a real server for the `application/wasm` MIME type
       feature ways; wasm cdylib builds; `wasmtime --invoke febpf_selftest`
       returns 15 — the engine runs end-to-end in wasm. Note: `Instant` panics on
       `wasm32-unknown-unknown`, so `ktime_get_ns` uses a cfg'd zero clock.)
-- [ ] Stage 3 — web page
+- [x] Stage 3 — web page (`web/index.html` + `web/febpf.js`, vanilla/offline;
+      two demo prefills incl. a verifier-failing one, .o file input, and the
+      time-travel debugger panel; JS exports cross-checked against the wasm)
 - [ ] Stage 4 — Makefile, docs, smoke test
 </content>
 </invoke>
