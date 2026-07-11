@@ -461,6 +461,68 @@ fn cmd_equiv(o: &Opts) -> Result<ExitCode, String> {
     Ok(ExitCode::from(verdict.exit_code()))
 }
 
+/// `febpf optimize <file> [-o out.bin] [--stats] [--ctx ...] [--iters N]`.
+/// Applies verifier-gated sound rewrites, self-checks equivalence, and only
+/// then emits the result (raw bytecode). Refuses (nonzero exit) if it cannot
+/// prove behavior was preserved or the output fails to re-verify.
+fn cmd_optimize(o: &Opts, prog: Program) -> Result<ExitCode, String> {
+    use febpf::equiv::Verdict;
+    let ctx = make_ctx(o)?;
+    let cfg = verifier_config(o, ctx.len());
+    let equiv_opts = equiv_options(o)?;
+    let result = febpf::optimize::optimize(&prog, cfg, &equiv_opts)?;
+    let s = &result.stats;
+
+    match &result.self_check {
+        Verdict::ProvenEquivalent(reason) => {
+            println!("equivalence: PROVEN-EQUIVALENT (abstract) — {reason}");
+        }
+        Verdict::Equivalent { inputs } => {
+            println!("equivalence: EQUIVALENT ({inputs} inputs, empirical)");
+        }
+        Verdict::NotEquivalent(_) => unreachable!("optimize would have errored"),
+    }
+
+    if o.stats {
+        println!("== optimizer stats ==");
+        println!(
+            "  insns: {} -> {} ({:+})",
+            s.insns_before,
+            s.insns_after,
+            s.insns_after as isize - s.insns_before as isize
+        );
+        println!("  rounds: {}", s.rounds);
+        println!("  constant folding:    {}", s.constant_fold);
+        println!("  dead-branch elim:    {}", s.dead_branch);
+        println!("  strength reduction:  {}", s.strength_reduction);
+        println!("  algebraic identity:  {}", s.algebraic_identity);
+        println!("  redundant mask elim: {}", s.redundant_mask);
+        println!("  total rewrites:      {}", s.total_rewrites());
+    } else {
+        println!(
+            "optimized {} -> {} insns ({} rewrites)",
+            s.insns_before,
+            s.insns_after,
+            s.total_rewrites()
+        );
+    }
+
+    if let Some(out) = o.out.as_deref() {
+        let bytes = insn::encode_program(&result.program.insns);
+        std::fs::write(out, &bytes).map_err(|e| format!("cannot write {out}: {e}"))?;
+        println!("wrote {} bytes to {out}", bytes.len());
+        if !result.program.maps.is_empty() {
+            println!(
+                "note: {} map definition(s) are not stored in raw bytecode",
+                result.program.maps.len()
+            );
+        }
+    } else {
+        print!("{}", disasm::disasm_program(&result.program.insns));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run() -> Result<ExitCode, String> {
     let o = parse_args().map_err(|e| format!("{e}\n\n{USAGE}"))?;
     if o.cmd == "help" {
@@ -482,6 +544,9 @@ fn run() -> Result<ExitCode, String> {
     let (prog, debug) = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
     if o.cmd == "record" {
         return cmd_record(&o, prog);
+    }
+    if o.cmd == "optimize" {
+        return cmd_optimize(&o, prog);
     }
     if o.cmd == "conftest" {
         return conftest::conftest(&o, prog);

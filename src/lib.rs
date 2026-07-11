@@ -35,6 +35,7 @@ pub mod interp;
 pub mod jit;
 pub mod kbpf;
 pub mod maps;
+pub mod optimize;
 pub mod playground;
 pub mod relo;
 pub mod replay;
