@@ -1662,6 +1662,19 @@ impl<'a> Verifier<'a> {
                 return Ok(Some((frame, off)));
             }
             PtrKind::Ctx => {
+                // The kernel forbids dereferencing a ctx pointer once it has a
+                // *variable* (non-constant) offset — i.e. after pointer arith
+                // with a register/unknown operand. Fixed constant-offset ctx
+                // field access (e.g. `*(u32*)(r1 + 8)`) stays legal.
+                if !p.var.is_const() {
+                    return Err(self.err(
+                        pc,
+                        format!(
+                            "dereference of modified ctx ptr off={}+{} disallowed",
+                            p.off, p.var
+                        ),
+                    ));
+                }
                 if write && !self.cfg.ctx_writable {
                     return Err(self.err(pc, "context is read-only"));
                 }

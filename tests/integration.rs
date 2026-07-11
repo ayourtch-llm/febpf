@@ -505,6 +505,33 @@ fn reject_ctx_oob() {
 }
 
 #[test]
+fn reject_modified_ctx_ptr_deref() {
+    // Give the ctx pointer a *variable* offset (register arithmetic with an
+    // unknown value), then dereference it. The kernel rejects this; so must we.
+    let e = verify_err_ctx(
+        "
+        r2 = *(u8 *)(r1 + 0)
+        r2 &= 4
+        r1 += r2
+        r0 = *(u8 *)(r1 + 0)
+        exit",
+        16,
+    );
+    assert!(e.contains("modified ctx ptr"), "{e}");
+}
+
+#[test]
+fn accept_fixed_offset_ctx_access() {
+    // A *constant*-offset ctx field access must stay legal (not over-tightened).
+    let vm = Vm::new(program("r0 = *(u32 *)(r1 + 8)\n exit")).unwrap();
+    vm.verify(Config {
+        ctx_size: 16,
+        ..Default::default()
+    })
+    .expect("fixed-offset ctx access must verify");
+}
+
+#[test]
 fn reject_scalar_deref() {
     let e = verify_err("r1 = 1000\n r0 = *(u64 *)(r1)\n exit");
     assert!(e.contains("scalar"), "{e}");
