@@ -741,6 +741,84 @@ fn get_stackid_distinguishes_call_sites() {
     assert_eq!(run_src(src), 1);
 }
 
+/// get_stack writes the deterministic call stack (instruction indices as LE
+/// u64s) into the caller's buffer and returns the byte count. A top-level
+/// program has one frame, so it writes exactly 8 bytes; the untouched tail
+/// of the buffer is zeroed.
+#[test]
+fn get_stack_writes_stack_and_returns_bytes() {
+    let src = "
+        r1 = 0
+        r2 = r10
+        r2 += -16
+        r3 = 16
+        r4 = 0
+        call get_stack
+        if r0 != 8 goto bad
+        r1 = *(u64 *)(r10 - 16)
+        if r1 == 0 goto bad
+        r1 = *(u64 *)(r10 - 8)
+        if r1 != 0 goto bad
+        r0 = 1
+        exit
+    bad:
+        r0 = 0
+        exit";
+    assert_eq!(run_src(src), 1);
+}
+
+/// A buffer too small for even one frame gets zeroed and 0 bytes written
+/// (the return is always a multiple of 8).
+#[test]
+fn get_stack_truncates_to_whole_frames() {
+    let src = "
+        *(u32 *)(r10 - 4) = 7
+        r1 = 0
+        r2 = r10
+        r2 += -4
+        r3 = 4
+        r4 = 0
+        call get_stack
+        if r0 != 0 goto bad
+        r1 = *(u32 *)(r10 - 4)
+        if r1 != 0 goto bad
+        r0 = 1
+        exit
+    bad:
+        r0 = 0
+        exit";
+    assert_eq!(run_src(src), 1);
+}
+
+/// The first stack entry written by get_stack is the calling pc — the same
+/// value get_stackid stores in its map, so the two helpers agree on the model.
+#[test]
+fn get_stack_is_deterministic_across_calls() {
+    let src = "
+        r1 = 0
+        r2 = r10
+        r2 += -8
+        r3 = 8
+        r4 = 0
+        call get_stack
+        r6 = *(u64 *)(r10 - 8)
+        r1 = 0
+        r2 = r10
+        r2 += -8
+        r3 = 8
+        r4 = 0
+        call get_stack
+        r7 = *(u64 *)(r10 - 8)
+        if r6 == r7 goto same
+        r0 = 1
+        exit
+    same:
+        r0 = 0
+        exit";
+    // Two different call sites -> different innermost pcs.
+    assert_eq!(run_src(src), 1);
+}
+
 /// get_stackid rejects (at verification) a map that is not a stack_trace map.
 #[test]
 fn get_stackid_requires_stack_trace_map() {

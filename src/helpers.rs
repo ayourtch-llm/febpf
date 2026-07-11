@@ -19,6 +19,7 @@ pub mod id {
     pub const GET_CURRENT_TASK: u32 = 35;
     pub const CURRENT_TASK_UNDER_CGROUP: u32 = 37;
     pub const PROBE_READ_STR: u32 = 45;
+    pub const GET_STACK: u32 = 67;
     pub const PROBE_READ_USER: u32 = 112;
     pub const PROBE_READ_KERNEL: u32 = 113;
     pub const PROBE_READ_USER_STR: u32 = 114;
@@ -142,6 +143,13 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [Any, ConstMapPtr, Scalar, None, None],
             ret: RetKind::Scalar,
         },
+        id::GET_STACK => HelperSig {
+            name: "get_stack",
+            // (ctx, buf, size, flags); buf must be writable for `size` bytes.
+            // ctx/flags accepted loosely like get_stackid. No map involved.
+            args: [Any, MemWrite { size_arg: 2 }, Size, Scalar, None],
+            ret: RetKind::Scalar,
+        },
         // probe_read family: (dst, size, unsafe_ptr). The source is
         // ARG_ANYTHING in the kernel (any scalar/pointer); febpf resolves it
         // through the virtual-address model at runtime and faults cleanly.
@@ -236,6 +244,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::GET_CURRENT_COMM,
         id::GET_CURRENT_TASK,
         id::GET_STACKID,
+        id::GET_STACK,
         id::PROBE_READ,
         id::PROBE_READ_STR,
         id::PROBE_READ_KERNEL,
