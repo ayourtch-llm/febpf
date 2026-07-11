@@ -114,6 +114,23 @@ pub unsafe extern "C" fn febpf_dbg_new(
     }
 }
 
+/// Open a **replay file** (`.febpf`) as a debug session under `handle`,
+/// positioned at its recorded cursor. The host writes the file's raw bytes
+/// into a buffer (via [`febpf_alloc`]) and passes `(ptr, len)`. Returns "OK"
+/// or "ERR <msg>". This is the browser entry point for a shared `bug.febpf`.
+///
+/// # Safety: `(data, data_len)` must describe a live buffer.
+#[no_mangle]
+pub unsafe extern "C" fn febpf_dbg_replay(handle: u32, data: *const u8, data_len: usize) -> u64 {
+    match playground::replay_session(slice(data, data_len)) {
+        Ok(s) => {
+            SESSIONS.with(|m| m.borrow_mut().insert(handle, s));
+            ret("OK".to_string())
+        }
+        Err(e) => ret(format!("ERR {e}")),
+    }
+}
+
 /// Run one debugger command against `handle`.
 ///
 /// # Safety: `cmd` must describe a live buffer of `cmd_len` bytes.
