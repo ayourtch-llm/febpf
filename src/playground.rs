@@ -215,6 +215,16 @@ pub struct Session {
     ctx_template: Vec<u8>,
     /// Target instruction count (the "current position" in time).
     steps: u64,
+    /// PRNG seed to reproduce a recorded run (`None` ⇒ engine default).
+    seed: Option<u64>,
+    /// User-supplied map contents applied before each replay.
+    preload: Vec<crate::replay::MapPreload>,
+}
+
+/// Load a replay file's bytes into a debugger [`Session`], positioned at its
+/// recorded cursor. Lets the same `bug.febpf` open in the browser build.
+pub fn replay_session(bytes: &[u8]) -> Result<Session, String> {
+    Session::from_replay(bytes)
 }
 
 /// Where a replay ended relative to the requested target.
@@ -249,6 +259,24 @@ impl Session {
             prog,
             ctx_template,
             steps: 0,
+            seed: None,
+            preload: Vec::new(),
+        })
+    }
+
+    /// Build a session from a serialized replay file (see `crate::replay`),
+    /// starting at the recorded cursor with the recorded seed and preload.
+    pub fn from_replay(bytes: &[u8]) -> Result<Session, String> {
+        let r = crate::replay::Replay::from_bytes(bytes)?;
+        let prog = r.program();
+        // Validate that a VM can be built (map defs etc.) up front.
+        Vm::new(prog.clone())?;
+        Ok(Session {
+            prog,
+            ctx_template: r.ctx,
+            steps: r.stop_at.unwrap_or(0),
+            seed: Some(r.seed),
+            preload: r.preload,
         })
     }
 
@@ -257,6 +285,10 @@ impl Session {
     fn with_replay<R>(&self, f: impl FnOnce(&mut Machine, &Status) -> R) -> Result<R, String> {
         let mut vm = Vm::new(self.prog.clone())?;
         vm.insn_limit = RUN_INSN_LIMIT;
+        if let Some(seed) = self.seed {
+            vm.set_prandom_seed(seed);
+        }
+        crate::replay::apply_preload(&mut vm, &self.preload)?;
         let mut ctx = self.ctx_template.clone();
         let mut m = vm.machine(&mut ctx);
         let mut status = Status::Running;

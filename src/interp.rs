@@ -78,6 +78,11 @@ enum Region {
 const CTX_HANDLE: u32 = 1;
 const STACK0_HANDLE: u32 = 2;
 
+/// Seed for the deterministic `get_prandom_u32` xorshift. A run is a pure
+/// function of (program, ctx, this seed, map preload), which is what makes
+/// replay files reproducible — see `src/replay.rs`.
+pub const DEFAULT_PRANDOM_SEED: u64 = 0x853c49e6748fea9b;
+
 #[inline]
 fn mkaddr(handle: u32, off: u32) -> u64 {
     ((handle as u64) << 32) | off as u64
@@ -140,7 +145,7 @@ impl Vm {
             regions,
             stack: vec![0u8; MAX_CALL_FRAMES * STACK_SIZE],
             start: Clock::start(),
-            prandom: 0x853c49e6748fea9b,
+            prandom: DEFAULT_PRANDOM_SEED,
             printk: Vec::new(),
             echo_printk: false,
             insn_limit: u64::MAX,
@@ -219,6 +224,18 @@ impl Vm {
 
     pub fn insns(&self) -> &[Insn] {
         &self.insns
+    }
+
+    /// Current `get_prandom_u32` state. Before a run this is the seed the next
+    /// run will start from; recorded into replay files for reproducibility.
+    pub fn prandom_seed(&self) -> u64 {
+        self.prandom
+    }
+
+    /// Set the `get_prandom_u32` seed (used when loading a replay file so the
+    /// deterministic PRNG stream matches the recorded run).
+    pub fn set_prandom_seed(&mut self, seed: u64) {
+        self.prandom = seed;
     }
 
     /// Attach source-level debug info (set by the ELF loader path).

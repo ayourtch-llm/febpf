@@ -27,6 +27,10 @@ pub struct DebuggerOpts {
     /// Take a time-travel checkpoint every this many executed instructions.
     /// Reverse operations cost O(interval) replay steps.
     pub snapshot_interval: u64,
+    /// Position the session at this absolute instruction count on entry
+    /// (used by `febpf replay` to drop in at a recorded cursor). `None` starts
+    /// at count 0.
+    pub start_at: Option<u64>,
 }
 
 impl Default for DebuggerOpts {
@@ -34,6 +38,7 @@ impl Default for DebuggerOpts {
         DebuggerOpts {
             echo_printk: true,
             snapshot_interval: 10_000,
+            start_at: None,
         }
     }
 }
@@ -1275,6 +1280,10 @@ pub fn repl(vm: &mut Vm, ctx: &mut [u8], opts: DebuggerOpts) -> io::Result<Optio
     let mut out = io::stdout();
 
     writeln!(out, "febpf debugger — type 'help' for commands")?;
+    if let Some(n) = opts.start_at {
+        writeln!(out, "replay: positioning at instruction count {n}")?;
+        session.goto_count(n, &mut out)?;
+    }
     session.print_position(&mut out)?;
 
     loop {

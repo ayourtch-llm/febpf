@@ -36,6 +36,7 @@ pub mod kbpf;
 pub mod maps;
 pub mod playground;
 pub mod relo;
+pub mod replay;
 pub mod tnum;
 pub mod verifier;
 

@@ -90,6 +90,22 @@ const Febpf = (() => {
       if (!status.startsWith("OK")) throw new Error(status.replace(/^ERR /, ""));
       return handle;
     },
+    // Open a shared replay file (.febpf) in the debugger. `fileBytes` is a
+    // Uint8Array/ArrayBuffer of the raw file (e.g. from a file <input> or a
+    // fetch()). The session starts at the file's recorded cursor; drive it with
+    // dbgCmd/dbgFree exactly like dbgNew's handle.
+    dbgReplay: (fileBytes) => {
+      const handle = ++dbgSeq;
+      const bytes =
+        fileBytes instanceof ArrayBuffer ? new Uint8Array(fileBytes) : fileBytes;
+      const a = writeBytes(bytes);
+      const status = readResult(
+        exports.febpf_dbg_replay(handle, a.ptr, a.len),
+      );
+      exports.febpf_free(a.ptr, a.len);
+      if (!status.startsWith("OK")) throw new Error(status.replace(/^ERR /, ""));
+      return handle;
+    },
     dbgCmd: (handle, cmd) => {
       const c = writeBytes(enc.encode(cmd));
       const out = readResult(exports.febpf_dbg_cmd(handle, c.ptr, c.len));
