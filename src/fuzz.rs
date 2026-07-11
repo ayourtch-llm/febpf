@@ -10,6 +10,8 @@
 //! pointer arithmetic).
 
 use crate::insn::*;
+use crate::maps::MapDef;
+use crate::verifier::Config;
 
 /// SplitMix64: a tiny, fast, fully deterministic PRNG. Seeded runs replay
 /// bit-for-bit, which is what makes a fuzzer finding reproducible.
@@ -171,6 +173,81 @@ pub fn interp_vs_jit(insns: &[Insn]) -> Result<(u64, u64), String> {
     Ok((r_interp, r_jit))
 }
 
+// ===========================================================================
+// Verifier differential fuzzing (see docs/specs/verifier-diff.md)
+// ===========================================================================
+
+/// The verifier context size febpf assumes for these programs. The runtime
+/// context handed to the interpreter is sized to match, so a context access
+/// the verifier proves in-bounds is genuinely in-bounds at run time (otherwise
+/// a smaller runtime ctx would raise spurious out-of-bounds "safety faults").
+pub const VFUZZ_CTX_SIZE: usize = 4096;
+
+/// febpf's verifier verdict for a program: `Ok(())` = accepted,
+/// `Err(reason)` = rejected (the rendered `VerifyError`).
+pub fn febpf_verdict(insns: &[Insn], maps: &[MapDef]) -> Result<(), String> {
+    let prog = crate::Program {
+        insns: insns.to_vec(),
+        maps: maps.to_vec(),
+    };
+    // Vm::new can fail for a structurally-malformed program (e.g. a truncated
+    // lddw); treat that as a rejection — the verifier would reject it too.
+    let vm = crate::Vm::new(prog).map_err(|e| format!("malformed: {e}"))?;
+    vm.verify(Config::default()).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Is this interpreter runtime error a **verifier-caught safety fault** — i.e.
+/// a memory or structural violation the verifier is supposed to prove absent?
+///
+/// If febpf's verifier *accepted* a program and the interpreter then raises one
+/// of these, febpf's verifier is unsound against its own runtime. Legitimate
+/// runtime outcomes (defined div-by-zero, normal exit, instruction-limit trip,
+/// unknown-helper) are **not** safety faults.
+pub fn is_safety_error(msg: &str) -> bool {
+    msg.contains("out of bounds")       // memory / jump / pc out of bounds
+        || msg.contains("unaligned")    // misaligned access
+        || msg.contains("invalid register")
+        || msg.contains("not a map pointer")
+}
+
+/// Result of the kernel-free self-consistency check for one program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfConsistency {
+    /// febpf's verifier rejected the program — nothing to run.
+    Rejected,
+    /// Accepted, then ran under the interpreter with no verifier-caught fault
+    /// (a normal exit, or only a benign runtime outcome).
+    AcceptedClean,
+    /// Accepted, but the interpreter raised a verifier-caught safety fault —
+    /// a soundness bug in febpf's verifier (fully reproducible unprivileged).
+    AcceptedSafetyFault(String),
+}
+
+/// Enforce febpf's local soundness invariant: a verify-*accepted* program must
+/// run without a verifier-caught safety fault. Needs no privilege.
+pub fn check_self_consistency(insns: &[Insn], maps: &[MapDef]) -> SelfConsistency {
+    if febpf_verdict(insns, maps).is_err() {
+        return SelfConsistency::Rejected;
+    }
+    let prog = crate::Program {
+        insns: insns.to_vec(),
+        maps: maps.to_vec(),
+    };
+    // Size the runtime ctx to the verifier's assumed ctx size (see the const).
+    let mut ctx = vec![0u8; VFUZZ_CTX_SIZE];
+    let mut vm = match crate::Vm::new(prog) {
+        Ok(vm) => vm,
+        // Accepted by verify() above, so Vm::new should not fail here; if it
+        // somehow does, that itself is an inconsistency worth surfacing.
+        Err(e) => return SelfConsistency::AcceptedSafetyFault(format!("vm build failed after accept: {e}")),
+    };
+    match vm.run(&mut ctx) {
+        Ok(_) => SelfConsistency::AcceptedClean,
+        Err(e) if is_safety_error(&e.msg) => SelfConsistency::AcceptedSafetyFault(e.msg),
+        Err(_) => SelfConsistency::AcceptedClean, // benign runtime outcome
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +274,42 @@ mod tests {
                 ),
                 Err(e) => panic!("seed {seed}: engine error: {e}\n{}", crate::disasm::disasm_program(&prog)),
             }
+        }
+    }
+
+    /// Self-consistency over the conservative generator: every program febpf
+    /// accepts must run without a verifier-caught safety fault. This generator
+    /// is memory/pointer-free, so all programs are accepted and run clean — the
+    /// check is the invariant that must hold before frontier programs stress it.
+    #[test]
+    fn conservative_generator_self_consistent() {
+        for seed in 0..3000u64 {
+            let mut rng = Prng::new(seed);
+            let prog = gen_program(&mut rng);
+            if let SelfConsistency::AcceptedSafetyFault(m) = check_self_consistency(&prog, &[]) {
+                panic!(
+                    "seed {seed}: verify accepted but runtime safety fault: {m}\n{}",
+                    crate::disasm::disasm_program(&prog)
+                );
+            }
+        }
+    }
+
+    /// Verdict classification is stable per seed (determinism prerequisite for
+    /// reproducible `--seed` triage).
+    #[test]
+    fn febpf_verdict_is_stable_per_seed() {
+        for seed in 0..500u64 {
+            let mut a = Prng::new(seed);
+            let mut b = Prng::new(seed);
+            let pa = gen_program(&mut a);
+            let pb = gen_program(&mut b);
+            assert_eq!(pa, pb, "generator not deterministic at seed {seed}");
+            assert_eq!(
+                febpf_verdict(&pa, &[]).is_ok(),
+                febpf_verdict(&pb, &[]).is_ok(),
+                "verdict not stable at seed {seed}"
+            );
         }
     }
 
