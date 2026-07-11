@@ -56,30 +56,33 @@ BTF_ARG=""
 
 mkdir -p "$CORPUS"
 
-# Kernel helper id -> name (best-effort, from include/uapi/linux/bpf.h). Used
-# only to annotate the helper histogram; unknown ids are shown as helper#<id>.
+# Kernel helper id -> name. Prefer reading the authoritative
+# ___BPF_FUNC_MAPPER list from the installed uapi header (id = declared value);
+# fall back to a small built-in table. Unknown ids show as helper#<id>.
+BPF_UAPI_H=/usr/include/linux/bpf.h
 helper_name() {
+    if [ -r "$BPF_UAPI_H" ]; then
+        local n
+        n="$(sed -n "s/^[[:space:]]*FN(\([a-z0-9_]*\), $1,.*/\1/p" "$BPF_UAPI_H" | head -1)"
+        if [ -n "$n" ]; then echo "$n"; return; fi
+    fi
     case "$1" in
         1) echo map_lookup_elem ;;         2) echo map_update_elem ;;
         3) echo map_delete_elem ;;         4) echo probe_read ;;
         5) echo ktime_get_ns ;;            6) echo trace_printk ;;
         7) echo get_prandom_u32 ;;         8) echo get_smp_processor_id ;;
-        9) echo skb_store_bytes ;;         10) echo l3_csum_replace ;;
-        11) echo l4_csum_replace ;;        12) echo tail_call ;;
-        13) echo clone_redirect ;;         14) echo get_current_pid_tgid ;;
+        12) echo tail_call ;;              14) echo get_current_pid_tgid ;;
         15) echo get_current_uid_gid ;;    16) echo get_current_comm ;;
-        17) echo get_cgroup_classid ;;     18) echo skb_vlan_push ;;
-        19) echo skb_vlan_pop ;;           20) echo skb_get_tunnel_key ;;
-        23) echo redirect ;;               25) echo perf_event_read ;;
-        26) echo perf_event_output ;;      27) echo skb_load_bytes ;;
-        28) echo get_stackid ;;            35) echo get_current_task ;;
-        44) echo perf_event_read_value ;;  51) echo get_current_cgroup_id ;;
-        65) echo tail_call_static ;;       69) echo get_current_task ;;
-        95) echo ringbuf_output ;;         112) echo snprintf ;;
-        113) echo ringbuf_output ;;        114) echo ringbuf_reserve ;;
-        115) echo ringbuf_submit ;;        116) echo ringbuf_discard ;;
-        117) echo ringbuf_query ;;         121) echo get_task_stack ;;
-        131) echo ringbuf_reserve ;;       162) echo snprintf ;;
+        22) echo perf_event_read ;;        25) echo perf_event_output ;;
+        26) echo skb_load_bytes ;;         27) echo get_stackid ;;
+        35) echo get_current_task ;;       37) echo current_task_under_cgroup ;;
+        45) echo probe_read_str ;;         80) echo get_current_cgroup_id ;;
+        112) echo probe_read_user ;;       113) echo probe_read_kernel ;;
+        114) echo probe_read_user_str ;;   115) echo probe_read_kernel_str ;;
+        130) echo ringbuf_output ;;        131) echo ringbuf_reserve ;;
+        132) echo ringbuf_submit ;;        133) echo ringbuf_discard ;;
+        134) echo ringbuf_query ;;         141) echo get_task_stack ;;
+        158) echo get_current_task_btf ;;  165) echo snprintf ;;
         173) echo get_func_ip ;;
         *) echo "helper#$1" ;;
     esac
