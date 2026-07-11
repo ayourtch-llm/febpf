@@ -535,6 +535,37 @@ impl<'a> Machine<'a> {
         self.vm
     }
 
+    /// Human-readable description of a virtual address' region, for the
+    /// dataflow queries (`origin`/`who`/`whenwrite`). Resolves the handle
+    /// through the (private) region table: `ctx`, `stack frame N` (with the
+    /// live frame's fp-relative offset), `map '<name>' value`, `map object`,
+    /// or an out-of-range note. `addr = handle << 32 | offset`.
+    pub fn describe_addr(&self, addr: u64) -> String {
+        let handle = (addr >> 32) as usize;
+        let off = addr as u32;
+        match self.vm.regions.get(handle) {
+            Some(Region::Ctx) => format!("ctx+{off}"),
+            Some(Region::Stack(f)) => {
+                // For the currently-live frame, present the fp-relative slot
+                // (fp points at the top of the 512-byte stack region).
+                let live = STACK0_HANDLE + self.frames.len() as u32 == handle as u32;
+                if live {
+                    let rel = off as i64 - STACK_SIZE as i64;
+                    format!("stack frame {f} (fp{rel:+})")
+                } else {
+                    format!("stack frame {f} +{off}")
+                }
+            }
+            Some(Region::MapObj(m)) => {
+                format!("map '{}' object", self.vm.maps[*m as usize].def.name)
+            }
+            Some(Region::MapValue { map, .. }) => {
+                format!("map '{}' value +{off}", self.vm.maps[*map as usize].def.name)
+            }
+            Some(Region::Invalid) | None => format!("<addr {addr:#x}>"),
+        }
+    }
+
     fn err(&self, msg: impl Into<String>) -> EbpfError {
         EbpfError {
             pc: self.pc,

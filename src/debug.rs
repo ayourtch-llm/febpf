@@ -17,6 +17,7 @@
 //! [`DebugSession::handle_command`].
 
 use crate::disasm::disasm_insn;
+use crate::insn::{call_kind, class, jmp, NUM_REGS};
 use crate::interp::{Machine, Snapshot, Vm};
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
@@ -43,6 +44,45 @@ pub enum Outcome {
     Continue,
     /// Leave the debugger; carries r0 if the program ran to completion.
     Quit(Option<u64>),
+}
+
+/// Parse a register operand (`r0`..`r10`).
+fn parse_reg(s: &str) -> Option<u8> {
+    let n = s.trim().strip_prefix('r').or_else(|| s.trim().strip_prefix('R'))?;
+    let v: u8 = n.parse().ok()?;
+    (v < NUM_REGS as u8).then_some(v)
+}
+
+/// A contiguous span of guest memory (virtual address + length).
+#[derive(Clone, Copy)]
+struct MemRange {
+    addr: u64,
+    len: usize,
+}
+
+impl MemRange {
+    /// Do the two spans share any byte?
+    fn overlaps(&self, addr: u64, len: usize) -> bool {
+        self.addr < addr.saturating_add(len as u64) && addr < self.addr.saturating_add(self.len as u64)
+    }
+}
+
+/// One executed instruction's dataflow effect, recorded during an on-demand
+/// replay of the current interval (see `docs/specs/dataflow-queries.md`).
+struct Step {
+    /// `insn_count` *after* executing (1-based).
+    count: u64,
+    pc: usize,
+    /// Register this instruction defined, if any.
+    def_reg: Option<u8>,
+    /// Value written to `def_reg` (post-state).
+    def_val: u64,
+    /// Memory this instruction wrote, if any.
+    store: Option<MemRange>,
+    /// Value stored (STX source register / ST immediate).
+    store_val: u64,
+    /// Memory this instruction read into `def_reg` (LDX).
+    load: Option<MemRange>,
 }
 
 fn parse_num(s: &str) -> Option<u64> {
@@ -156,6 +196,10 @@ commands:
   unwatch [id]       delete watchpoint (no arg: delete all)
   i, info            show breakpoints and watchpoints
   r, regs            show registers
+  origin <reg>       trace a register's value back to where it was born
+  when <reg>         pc of the most recent write to a register
+  whenwrite <a|reg>  pc of the most recent write to a memory location
+  who <a|reg> [len]  who wrote the bytes at a memory location (pc + source)
   p, print [name]    read a global variable by name (no arg: list globals)
   bt, backtrace      source-level call stack (subprogram names)
   l, list [pc]       disassemble around pc, interleaving C source
@@ -652,6 +696,213 @@ impl<'a> DebugSession<'a> {
         Ok(())
     }
 
+    // -- dataflow queries ----------------------------------------------------
+
+    /// Rebuild the per-step write-log covering the current replay interval:
+    /// restore the nearest checkpoint at or before the current position and
+    /// single-step forward to it, recording each instruction's dataflow
+    /// effect. Determinism means this ends exactly where we started, so the
+    /// session is undisturbed (same mechanism as `goto_count`, but recording).
+    fn build_write_log(&mut self) -> Vec<Step> {
+        let target = self.m.insn_count;
+        let pos = self.checkpoints.partition_point(|s| s.insn_count() <= target);
+        let snap = if pos == 0 {
+            self.base.clone()
+        } else {
+            self.checkpoints[pos - 1].clone()
+        };
+        self.m.restore(&snap);
+        let prev_echo = self.m.set_echo_printk(false);
+        let mut log = Vec::new();
+        while self.m.insn_count < target {
+            let pc = self.m.pc;
+            let insn = self.m.vm_ref().insns()[pc];
+            let regs = self.m.regs;
+            let mut def_reg = None;
+            let mut store = None;
+            let mut load = None;
+            let mut store_val = 0u64;
+            match insn.class() {
+                class::ALU | class::ALU64 => def_reg = Some(insn.dst),
+                class::LD if insn.is_wide() => def_reg = Some(insn.dst),
+                class::LDX => {
+                    def_reg = Some(insn.dst);
+                    let addr = regs[insn.src as usize].wrapping_add(insn.off as i64 as u64);
+                    load = Some(MemRange { addr, len: insn.mem_size() });
+                }
+                class::ST => {
+                    let addr = regs[insn.dst as usize].wrapping_add(insn.off as i64 as u64);
+                    store = Some(MemRange { addr, len: insn.mem_size() });
+                    store_val = insn.imm as i64 as u64;
+                }
+                class::STX => {
+                    let addr = regs[insn.dst as usize].wrapping_add(insn.off as i64 as u64);
+                    store = Some(MemRange { addr, len: insn.mem_size() });
+                    store_val = regs[insn.src as usize];
+                }
+                class::JMP | class::JMP32
+                    if insn.op() == jmp::CALL && insn.src == call_kind::HELPER =>
+                {
+                    def_reg = Some(0); // helper return in r0
+                }
+                _ => {}
+            }
+            if self.m.step().is_err() {
+                break;
+            }
+            let def_val = def_reg.map_or(0, |r| self.m.regs[r as usize]);
+            log.push(Step {
+                count: self.m.insn_count,
+                pc,
+                def_reg,
+                def_val,
+                store,
+                store_val,
+                load,
+            });
+        }
+        self.m.set_echo_printk(prev_echo);
+        log
+    }
+
+    /// Print the source line covering `pc`, indented, when debug info exists.
+    fn print_source_indent(&self, out: &mut dyn Write, pc: usize) -> io::Result<()> {
+        let Some(di) = self.m.vm_ref().debug() else {
+            return Ok(());
+        };
+        if let Some(l) = di.line_at(pc) {
+            let func = di.func_at(pc).map(|f| f.name.as_str()).unwrap_or("?");
+            if l.text.is_empty() {
+                writeln!(out, "        at {} {}:{}", func, basename(&l.file), l.line)?;
+            } else {
+                writeln!(
+                    out,
+                    "        at {} {}:{}  {}",
+                    func,
+                    basename(&l.file),
+                    l.line,
+                    l.text.trim()
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a `whenwrite`/`who` memory argument: a register name yields the
+    /// register's current value (a pointer); otherwise parse a raw address.
+    fn resolve_mem_arg(&self, arg: &str) -> Option<u64> {
+        if let Some(r) = parse_reg(arg) {
+            Some(self.m.regs[r as usize])
+        } else {
+            parse_num(arg)
+        }
+    }
+
+    /// `when <reg>`: the most recent instruction (before now) that wrote `reg`.
+    fn cmd_when(&mut self, arg: Option<&str>, out: &mut dyn Write) -> io::Result<()> {
+        let Some(r) = arg.and_then(parse_reg) else {
+            writeln!(out, "usage: when <reg>")?;
+            return Ok(());
+        };
+        let cur = self.m.regs[r as usize];
+        let log = self.build_write_log();
+        match log.iter().rev().find(|s| s.def_reg == Some(r)) {
+            Some(s) => {
+                let insns = self.m.vm_ref().insns();
+                writeln!(
+                    out,
+                    "r{r} last written by insn {} (count {}): {}  (= {:#x})",
+                    s.pc,
+                    s.count,
+                    disasm_insn(insns, s.pc),
+                    s.def_val
+                )?;
+                self.print_source_indent(out, s.pc)?;
+            }
+            None => writeln!(
+                out,
+                "r{r} not written in the current interval (value {cur:#x})"
+            )?,
+        }
+        Ok(())
+    }
+
+    /// Shared body of `whenwrite` / `who`: locate the last write to
+    /// `[addr, addr+len)` in the current interval and report it.
+    fn report_mem_writer(
+        &mut self,
+        addr: u64,
+        len: usize,
+        show_value: bool,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        let region = self.m.describe_addr(addr);
+        let log = self.build_write_log();
+        let found = log
+            .iter()
+            .rev()
+            .find(|s| s.store.is_some_and(|m| m.overlaps(addr, len)));
+        match found {
+            Some(s) => {
+                let insns = self.m.vm_ref().insns();
+                if show_value {
+                    writeln!(
+                        out,
+                        "{region} (len {len}) last written by insn {} (count {}): {}  (= {:#x})",
+                        s.pc,
+                        s.count,
+                        disasm_insn(insns, s.pc),
+                        s.store_val
+                    )?;
+                } else {
+                    writeln!(
+                        out,
+                        "{region} (len {len}) last written by insn {} (count {}): {}",
+                        s.pc,
+                        s.count,
+                        disasm_insn(insns, s.pc)
+                    )?;
+                }
+                self.print_source_indent(out, s.pc)?;
+            }
+            None => {
+                let cur = self.m.read_mem(addr, len).ok();
+                match cur {
+                    Some(b) => writeln!(
+                        out,
+                        "{region} (len {len}) not written in the current interval (now = {})",
+                        hexbytes(&b)
+                    )?,
+                    None => writeln!(
+                        out,
+                        "{region} (len {len}) not written in the current interval"
+                    )?,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `whenwrite <addr|reg> [len]`: pc of the last write to a memory location.
+    fn cmd_whenwrite(&mut self, args: &[&str], out: &mut dyn Write) -> io::Result<()> {
+        let Some(addr) = args.first().and_then(|a| self.resolve_mem_arg(a)) else {
+            writeln!(out, "usage: whenwrite <addr|reg> [len]")?;
+            return Ok(());
+        };
+        let len = args.get(1).and_then(|s| parse_num(s)).unwrap_or(8) as usize;
+        self.report_mem_writer(addr, len, false, out)
+    }
+
+    /// `who <addr|reg> [len]`: who wrote these bytes — pc, source, value.
+    fn cmd_who(&mut self, args: &[&str], out: &mut dyn Write) -> io::Result<()> {
+        let Some(addr) = args.first().and_then(|a| self.resolve_mem_arg(a)) else {
+            writeln!(out, "usage: who <addr|reg> [len]")?;
+            return Ok(());
+        };
+        let len = args.get(1).and_then(|s| parse_num(s)).unwrap_or(8) as usize;
+        self.report_mem_writer(addr, len, true, out)
+    }
+
     /// Handle one debugger command line, writing output to `out`.
     pub fn handle_command(&mut self, line: &str, out: &mut dyn Write) -> io::Result<Outcome> {
         let mut it = line.split_whitespace();
@@ -736,6 +987,9 @@ impl<'a> DebugSession<'a> {
                 }
                 None => writeln!(out, "usage: goto <instruction count>")?,
             },
+            "when" => self.cmd_when(arg1, out)?,
+            "whenwrite" | "ww" => self.cmd_whenwrite(&args, out)?,
+            "who" => self.cmd_who(&args, out)?,
             "p" | "print" => self.print_global(arg1, out)?,
             "bt" | "backtrace" | "where" => self.print_backtrace(out)?,
             "b" | "break" => match arg1.and_then(parse_num) {
