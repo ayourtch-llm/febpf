@@ -232,5 +232,42 @@ program via `disasm::disasm_program` so it is immediately replayable with
 
 ## STATUS
 
-_Filled in by the final commit._
+**Done.** All four stages (a–d) are implemented, tested and green.
+
+- `src/kbpf.rs` — raw `bpf(2)` wrapper, capability probe, `map_create` /
+  `map_update` / `prog_load` / `test_run`, and `run_program`. The byte offsets
+  encoded here were **verified field-by-field against the running kernel's
+  `<linux/bpf.h>` via `offsetof`** (PROG_LOAD, MAP_CREATE, MAP_UPDATE_ELEM,
+  TEST_RUN all match; `sizeof(union bpf_attr) = 168`, so the 128-byte buffer is
+  safely smaller).
+- `src/fuzz.rs` — SplitMix64 PRNG + conservative generator + `interp_vs_jit`.
+- `src/conftest.rs` (bin) — `conftest`/`fuzz` commands with the exit-code
+  contract above.
+- `tests/conftest.rs` — probe/skip kernel tests + always-on interp-vs-JIT
+  differential.
+
+**Validated:** interp-vs-JIT agree over tens of thousands of generated
+programs (fuzzer + unit test + integration test). The fuzzer already caught one
+real bug — a generator off-by-one that emitted an out-of-bounds forward branch.
+
+**Kernel side NOT run at runtime on this host:** it is unprivileged
+(`kernel.unprivileged_bpf_disabled = 2`, no passwordless sudo), so
+`BPF_PROG_LOAD` returns `EPERM`. The probe correctly reports "no privilege" and
+both commands degrade as specified. The kernel path is structurally validated
+(offset check above; the syscall reaches the kernel's permission check with a
+valid attr, returning `EPERM` rather than `EINVAL`/`EFAULT`). The
+privilege-gated tests (`kernel_roundtrip_if_privileged`,
+`fuzz_kernel_differential_if_privileged`) will exercise the real round-trip and
+differential automatically when run as root / with `CAP_BPF`.
+
+**Remaining / next steps** (none blocking):
+
+1. Run the suite once as root to exercise the kernel differential for real
+   (`sudo cargo test --test conftest`); expected to pass given the offset
+   validation.
+2. Extend the generator with **guarded div/mod** (branch divisor `!= 0` before
+   dividing) to cover the div-by-zero / `INT_MIN / -1` divergence surface.
+3. Add memory ops (stack loads/stores) to the generator, and map-using
+   programs to the kernel differential (the `conftest` map path already exists;
+   the generator just doesn't emit maps yet).
 </content>
