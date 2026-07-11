@@ -146,6 +146,38 @@ address).
 
 ## STATUS
 
-_in progress_
+**Done — all four commands implemented, tested, and committed.**
+
+- `Machine::describe_addr` (`src/interp.rs`) names a virtual address' region
+  (ctx / stack frame N with fp-relative slot / map value / map object).
+- `DebugSession::build_write_log` (`src/debug.rs`) rebuilds the per-step
+  write-log by restoring the nearest checkpoint and replaying to the current
+  position — undisturbed, echo suppressed.
+- Commands: `origin <reg>` (recursive def-use trail, source-annotated),
+  `when <reg>`, `whenwrite <addr|reg> [len]` (alias `ww`), `who <addr|reg>
+  [len]`. Help text updated.
+- Tests (`tests/dataflow.rs`, driven through `handle_command`): mov->alu->
+  store->load->exit names the originating insns in order and terminates at the
+  born-constant; `whenwrite`/`who` resolve a stack slot to the writing pc and
+  value; `origin`/`who` reach a helper-updated map value. `cargo test` green
+  in both `--features jit` and `--no-default-features`; `cargo clippy
+  --all-targets` 0 warnings in both.
+
+Deliberate limitations (documented, not blocking):
+
+- The write-log covers **one replay interval** (`snapshot_interval`, default
+  10 000 steps): a def older than the nearest checkpoint is reported "not
+  written in this interval" rather than searched across the whole run. Raising
+  the checkpoint density (or a future `origin --deep` that scans earlier
+  intervals) would extend reach at a memory/time cost.
+- Atomic `STX` records only its memory write; fetch/cmpxchg register
+  destinations are not followed by `origin`.
+- `origin` follows both operands of a register-register ALU op (accumulator
+  first, then the second source), printing a DFS pre-order trail; it does not
+  deduplicate a value reachable by two paths beyond the cycle guard.
+
+Possible follow-ups: `origin` across interval boundaries; taint-style forward
+"who reads this" queries; wiring the four commands into a one-shot CLI
+(`febpf origin …`) in addition to the interactive REPL.
 </content>
 </invoke>
