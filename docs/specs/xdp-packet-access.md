@@ -2,7 +2,9 @@
 
 febpf models the XDP `data` / `data_end` contract without exposing host
 addresses. Verification is enabled with `verifier::Config { xdp: true, .. }`;
-execution uses `Vm::run_xdp(&mut packet)`.
+execution uses `Vm::run_xdp(&mut packet)`. The CLI recognizes ELF entry
+sections named `xdp` or `xdp/*` automatically; `--packet <file>` also selects
+XDP semantics for assembler/raw programs and supplies raw packet bytes.
 
 ## Verifier model
 
@@ -40,7 +42,7 @@ constructs the `xdp_md` internally; the interpreter synthesizes full febpf
 virtual addresses when the ABI's 32-bit `data` fields are loaded. Packet
 writes are copied back to the caller on exit or runtime error.
 
-This first slice covers verifier semantics and deterministic interpreter
-execution. Automatic selection from an ELF `xdp/` section, JIT execution,
-pcap/replay containers, and kernel `BPF_PROG_TEST_RUN` differential validation
-are follow-up layers.
+This slice covers verifier semantics, deterministic interpreter execution,
+automatic ELF program-type selection, and raw packet-file CLI runs. JIT
+execution, pcap/replay containers, and kernel `BPF_PROG_TEST_RUN` differential
+validation are follow-up layers.

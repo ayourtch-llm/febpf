@@ -33,6 +33,10 @@ const SHT_NOBITS: u32 = 8;
 const SHF_ALLOC: u64 = 0x2;
 const SHF_EXECINSTR: u64 = 0x4;
 
+fn is_xdp_section(name: &str) -> bool {
+    name == "xdp" || name.starts_with("xdp/")
+}
+
 // BPF relocation types.
 const R_BPF_64_64: u32 = 1;
 const R_BPF_64_32: u32 = 10;
@@ -56,6 +60,8 @@ const DEFAULT_MAX_ENTRIES: u32 = 10240;
 pub struct LoadedProgram {
     pub name: String,
     pub insns: Vec<Insn>,
+    /// True for `xdp` / `xdp/*` ELF entry sections.
+    pub xdp: bool,
     /// Source-level debug info from `.BTF`/`.BTF.ext`, if the object had any.
     pub debug: Option<DebugInfo>,
     /// BTF typing of the ctx for `tp_btf`/`fentry`-style sections, resolved
@@ -292,6 +298,7 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
             LoadedProgram {
                 name: sec.name.clone(),
                 insns,
+                xdp: is_xdp_section(&sec.name),
                 debug: None,
                 btf_ctx: None,
             },
@@ -310,6 +317,7 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
                 LoadedProgram {
                     name: "text".into(),
                     insns,
+                    xdp: false,
                     debug: None,
                     btf_ctx: None,
                 },
@@ -1305,7 +1313,15 @@ mod btf_maps {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_kind, map_type_name};
+    use super::{is_xdp_section, map_kind, map_type_name};
+
+    #[test]
+    fn xdp_section_classification_is_exact() {
+        assert!(is_xdp_section("xdp"));
+        assert!(is_xdp_section("xdp/firewall"));
+        assert!(!is_xdp_section("xdp_devmap"));
+        assert!(!is_xdp_section("fentry/xdp_do_redirect"));
+    }
 
     #[test]
     fn map_kind_names_unsupported_type() {

@@ -36,6 +36,7 @@ commands:
 
 options:
   --ctx <hex|@file>    context memory contents (hex string or file)
+  --packet <file>      run an XDP program over raw packet bytes from file
   --ctx-size <n>       context size in bytes (default 4096, or data length)
   --no-verify          run without verifying first (still memory-safe)
   --no-explain         don't print the counterexample trace when rejected
@@ -72,6 +73,7 @@ struct Opts {
     out: Option<String>,
     stats: bool,
     ctx_hex: Option<String>,
+    packet: Option<String>,
     ctx_size: Option<usize>,
     no_verify: bool,
     no_explain: bool,
@@ -101,6 +103,7 @@ fn parse_args() -> Result<Opts, String> {
         out: None,
         stats: false,
         ctx_hex: None,
+        packet: None,
         ctx_size: None,
         no_verify: false,
         no_explain: false,
@@ -123,6 +126,7 @@ fn parse_args() -> Result<Opts, String> {
         match a.as_str() {
             "-o" => o.out = Some(args.next().ok_or("-o needs a value")?),
             "--ctx" => o.ctx_hex = Some(args.next().ok_or("--ctx needs a value")?),
+            "--packet" => o.packet = Some(args.next().ok_or("--packet needs a value")?),
             "--ctx-size" => {
                 o.ctx_size = Some(
                     args.next()
@@ -238,7 +242,7 @@ fn load_program(
     path: &str,
     prog: Option<&str>,
     target_btf: Option<&str>,
-) -> Result<(Program, Option<DebugInfo>), String> {
+) -> Result<(Program, Option<DebugInfo>, bool), String> {
     let is_source = [".s", ".asm", ".bpf"]
         .iter()
         .any(|ext| path.ends_with(ext));
@@ -253,6 +257,7 @@ fn load_program(
                 btf_ctx: None,
             },
             None,
+            false,
         ));
     }
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
@@ -294,6 +299,7 @@ fn load_program(
         }
         let mut programs = obj.programs;
         let chosen = programs.swap_remove(idx);
+        let xdp = chosen.xdp;
         Ok((
             Program {
                 insns: chosen.insns,
@@ -301,6 +307,7 @@ fn load_program(
                 btf_ctx: chosen.btf_ctx,
             },
             chosen.debug,
+            xdp,
         ))
     } else {
         let insns = insn::decode_program(&bytes)?;
@@ -311,6 +318,7 @@ fn load_program(
                 btf_ctx: None,
             },
             None,
+            false,
         ))
     }
 }
@@ -342,11 +350,20 @@ fn make_ctx(o: &Opts) -> Result<Vec<u8>, String> {
     Ok(ctx)
 }
 
-fn verifier_config(o: &Opts, ctx_len: usize) -> verifier::Config {
+fn read_packet(o: &Opts) -> Result<Vec<u8>, String> {
+    let path = o
+        .packet
+        .as_deref()
+        .ok_or("XDP execution needs --packet <raw-packet-file>")?;
+    std::fs::read(path).map_err(|e| format!("cannot read packet {path}: {e}"))
+}
+
+fn verifier_config(o: &Opts, ctx_len: usize, xdp: bool) -> verifier::Config {
     verifier::Config {
         ctx_size: ctx_len,
         ctx_writable: !o.readonly_ctx,
         strict_alignment: o.strict_align,
+        xdp,
         ..Default::default()
     }
 }
@@ -456,7 +473,7 @@ fn cmd_race(o: &Opts, prog: Program) -> Result<ExitCode, String> {
     // --no-verify, mirroring `run`.
     if !o.no_verify {
         let mut vm = Vm::new(prog.clone())?;
-        vm.verify(verifier_config(o, ctx.len())).map_err(|e| {
+        vm.verify(verifier_config(o, ctx.len(), false)).map_err(|e| {
             format!(
                 "verification failed: {e}\n{}(use --no-verify to race anyway)",
                 explain(vm.insns(), &e, o)
@@ -520,8 +537,8 @@ fn cmd_equiv(o: &Opts) -> Result<ExitCode, String> {
         .file2
         .as_deref()
         .ok_or("equiv needs two programs: febpf equiv <a> <b>")?;
-    let (pa, _) = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
-    let (pb, _) = load_program(file_b, o.prog.as_deref(), o.target_btf.as_deref())?;
+    let (pa, _, _) = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
+    let (pb, _, _) = load_program(file_b, o.prog.as_deref(), o.target_btf.as_deref())?;
     let opts = equiv_options(o)?;
     let verdict = equiv::check(&pa, &pb, &opts)?;
     match &verdict {
@@ -548,7 +565,7 @@ fn cmd_equiv(o: &Opts) -> Result<ExitCode, String> {
 fn cmd_optimize(o: &Opts, prog: Program) -> Result<ExitCode, String> {
     use febpf::equiv::Verdict;
     let ctx = make_ctx(o)?;
-    let cfg = verifier_config(o, ctx.len());
+    let cfg = verifier_config(o, ctx.len(), false);
     let equiv_opts = equiv_options(o)?;
     let result = febpf::optimize::optimize(&prog, cfg, &equiv_opts)?;
     let s = &result.stats;
@@ -621,7 +638,20 @@ fn run() -> Result<ExitCode, String> {
     if o.cmd == "equiv" {
         return cmd_equiv(&o);
     }
-    let (prog, debug) = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
+    let (prog, debug, elf_xdp) =
+        load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
+    let xdp = elf_xdp || o.packet.is_some();
+    if xdp
+        && !matches!(
+            o.cmd.as_str(),
+            "asm" | "disasm" | "verify" | "analyze" | "dot" | "run" | "profile"
+        )
+    {
+        return Err(format!(
+            "{} does not support XDP packet context yet; use verify, analyze, run, or profile",
+            o.cmd
+        ));
+    }
     if o.cmd == "record" {
         return cmd_record(&o, prog);
     }
@@ -659,7 +689,7 @@ fn run() -> Result<ExitCode, String> {
         "verify" => {
             let ctx = make_ctx(&o)?;
             let mut vm = Vm::new(prog.clone())?;
-            match vm.verify(verifier_config(&o, ctx.len())) {
+            match vm.verify(verifier_config(&o, ctx.len(), xdp)) {
                 Ok(ok) => {
                     println!("verification PASSED");
                     print_verify_stats(&ok);
@@ -701,7 +731,7 @@ fn run() -> Result<ExitCode, String> {
                 );
             }
             let mut vm = Vm::new(prog.clone())?;
-            match vm.verify(verifier_config(&o, ctx.len())) {
+            match vm.verify(verifier_config(&o, ctx.len(), xdp)) {
                 Ok(ok) => {
                     println!("\n== verifier ==");
                     println!("  PASSED");
@@ -727,21 +757,32 @@ fn run() -> Result<ExitCode, String> {
             let mut ctx = make_ctx(&o)?;
             let mut vm = Vm::new(prog)?;
             vm.echo_printk = true;
+            if xdp && o.no_verify {
+                return Err("XDP execution currently requires verification".into());
+            }
             if o.no_verify {
                 vm.insn_limit = 100_000_000;
             } else {
-                vm.verify(verifier_config(&o, ctx.len())).map_err(|e| {
+                vm.verify(verifier_config(&o, ctx.len(), xdp)).map_err(|e| {
                     format!(
                         "verification failed: {e}\n{}(use --no-verify to run anyway)",
                         explain(vm.insns(), &e, &o)
                     )
                 })?;
             }
+            if xdp && o.jit {
+                return Err("XDP packet execution is interpreter-only for now (--jit unsupported)".into());
+            }
             if o.jit {
                 jit_compile(&mut vm)?;
             }
             let t0 = Instant::now();
-            let r0 = run_maybe_jit(&mut vm, &mut ctx, o.jit).map_err(|e| e.to_string())?;
+            let r0 = if xdp {
+                let mut packet = read_packet(&o)?;
+                vm.run_xdp(&mut packet).map_err(|e| e.to_string())?
+            } else {
+                run_maybe_jit(&mut vm, &mut ctx, o.jit).map_err(|e| e.to_string())?
+            };
             let dt = t0.elapsed();
             let how = if o.jit { "jit" } else { "interp" };
             println!("r0 = {r0} ({r0:#x})   [{how}, {dt:?}]");
@@ -751,14 +792,19 @@ fn run() -> Result<ExitCode, String> {
             let mut vm = Vm::new(prog.clone())?;
             vm.echo_printk = true;
             if !o.no_verify {
-                vm.verify(verifier_config(&o, ctx.len())).map_err(|e| {
+                vm.verify(verifier_config(&o, ctx.len(), xdp)).map_err(|e| {
                     format!("verification failed: {e}\n{}", explain(vm.insns(), &e, &o))
                 })?;
             } else {
                 vm.insn_limit = 100_000_000;
             }
             vm.enable_profiling();
-            let r0 = vm.run(&mut ctx).map_err(|e| e.to_string())?;
+            let r0 = if xdp {
+                let mut packet = read_packet(&o)?;
+                vm.run_xdp(&mut packet).map_err(|e| e.to_string())?
+            } else {
+                vm.run(&mut ctx).map_err(|e| e.to_string())?
+            };
             let counts = vm.profile.take().unwrap();
             print!(
                 "{}",
@@ -773,7 +819,7 @@ fn run() -> Result<ExitCode, String> {
                 vm.set_debug(di);
             }
             if !o.no_verify {
-                match vm.verify(verifier_config(&o, ctx.len())) {
+                match vm.verify(verifier_config(&o, ctx.len(), xdp)) {
                     Ok(_) => println!("verifier: PASSED"),
                     Err(e) => {
                         println!("verifier: FAILED: {e} (debugging anyway)");
@@ -788,7 +834,7 @@ fn run() -> Result<ExitCode, String> {
             let mut ctx = make_ctx(&o)?;
             let mut vm = Vm::new(prog)?;
             if !o.no_verify {
-                vm.verify(verifier_config(&o, ctx.len())).map_err(|e| {
+                vm.verify(verifier_config(&o, ctx.len(), xdp)).map_err(|e| {
                     format!("verification failed: {e}\n{}", explain(vm.insns(), &e, &o))
                 })?;
             }
