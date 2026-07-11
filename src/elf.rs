@@ -1113,13 +1113,14 @@ mod tests {
     #[test]
     fn map_kind_names_unsupported_type() {
         // Supported types resolve; unsupported ones name the type crisply so
-        // the corpus coverage histogram can bucket by name (RINGBUF, etc.).
-        assert!(map_kind(1).is_ok());
-        assert!(map_kind(2).is_ok());
-        let e = map_kind(27).unwrap_err();
-        assert!(e.contains("unsupported map type 27"), "{e}");
-        assert!(e.contains("RINGBUF"), "{e}");
-        assert_eq!(map_type_name(5), "PERCPU_HASH");
+        // the corpus coverage histogram can bucket by name (PERF_EVENT_ARRAY, etc.).
+        assert!(map_kind(1).is_ok()); // HASH
+        assert!(map_kind(2).is_ok()); // ARRAY
+        assert!(map_kind(27).is_ok()); // RINGBUF (now supported)
+        let e = map_kind(4).unwrap_err(); // PERF_EVENT_ARRAY (still unsupported)
+        assert!(e.contains("unsupported map type 4"), "{e}");
+        assert!(e.contains("PERF_EVENT_ARRAY"), "{e}");
+        assert_eq!(map_type_name(8), "CGROUP_ARRAY");
         assert_eq!(map_type_name(999), "unknown");
     }
 }
