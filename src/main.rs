@@ -5,6 +5,8 @@ use febpf::{analysis, asm, debug, disasm, insn, verifier, Program, Vm};
 use std::process::ExitCode;
 use std::time::Instant;
 
+mod conftest;
+
 const USAGE: &str = "\
 febpf — fast userland eBPF engine with verifier, debugger and analyzer
 
@@ -20,6 +22,8 @@ commands:
   debug <file>                interactive debugger (breakpoints, stepping)
   profile <file>              run and show a per-instruction heatmap
   bench <file>                measure interpreter throughput
+  conftest <file>             run under interp, JIT and the real kernel; diff r0
+  fuzz                        differential fuzzer: interp vs JIT (vs --kernel)
 
 options:
   --ctx <hex|@file>    context memory contents (hex string or file)
@@ -29,7 +33,9 @@ options:
   --jit                compile to native code (run/bench; x86-64 Linux)
   --strict-align       verifier: require aligned memory accesses
   --readonly-ctx       verifier: forbid stores to the context
-  --iters <n>          bench: iterations (default 1000)
+  --iters <n>          bench/fuzz: iterations (default 1000)
+  --seed <n>           fuzz: PRNG seed (random if omitted; printed on failure)
+  --kernel             conftest/fuzz: also diff against the real kernel (root)
   --prog <name>        select a program from a multi-program ELF object
   --target-btf <path>  CO-RE: relocate against this BTF (raw blob or ELF with
                        a .BTF section); defaults to /sys/kernel/btf/vmlinux
@@ -55,6 +61,8 @@ struct Opts {
     jit: bool,
     prog: Option<String>,
     target_btf: Option<String>,
+    seed: Option<u64>,
+    kernel: bool,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -74,6 +82,8 @@ fn parse_args() -> Result<Opts, String> {
         jit: false,
         prog: None,
         target_btf: None,
+        seed: None,
+        kernel: false,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -94,6 +104,15 @@ fn parse_args() -> Result<Opts, String> {
                     .parse()
                     .map_err(|e| format!("bad --iters: {e}"))?
             }
+            "--seed" => {
+                o.seed = Some(
+                    args.next()
+                        .ok_or("--seed needs a value")?
+                        .parse()
+                        .map_err(|e| format!("bad --seed: {e}"))?,
+                )
+            }
+            "--kernel" => o.kernel = true,
             "--no-verify" => o.no_verify = true,
             "--no-explain" => o.no_explain = true,
             "--jit" => o.jit = true,
@@ -107,7 +126,7 @@ fn parse_args() -> Result<Opts, String> {
             other => return Err(format!("unknown option '{other}'")),
         }
     }
-    if o.file.is_empty() && o.cmd != "help" {
+    if o.file.is_empty() && o.cmd != "help" && o.cmd != "fuzz" {
         return Err("missing input file".into());
     }
     Ok(o)
@@ -234,7 +253,13 @@ fn run() -> Result<ExitCode, String> {
         print!("{USAGE}");
         return Ok(ExitCode::SUCCESS);
     }
+    if o.cmd == "fuzz" {
+        return conftest::fuzz(&o);
+    }
     let prog = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
+    if o.cmd == "conftest" {
+        return conftest::conftest(&o, prog);
+    }
 
     match o.cmd.as_str() {
         "asm" => {
