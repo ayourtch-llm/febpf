@@ -153,9 +153,19 @@ on libbpf to fill them still load. Unknown/unsupported map types still error
 ## STATUS
 
 - Spec + plan: **done**.
-- Stage 1 (PERF_EVENT_ARRAY + helper 25): _pending_.
-- Stage 2 (CGROUP_ARRAY): _pending_.
-- Stage 3 (STACK_TRACE + helper 27): _pending_.
-- Stage 4 (helpers 14/15/16/35): _pending_.
-</content>
-</invoke>
+- Stage 1 (PERF_EVENT_ARRAY + helper 25): **done**.
+- Stage 2 (CGROUP_ARRAY): **done**.
+- Stage 3 (STACK_TRACE + helper 27): **done**.
+- Stage 4 (helpers 14/15/16/35): **done**.
+
+Implementation notes vs. the plan above:
+- `get_current_comm` NUL-fills the whole buffer first and writes at most
+  `size - 1` name bytes, so the result is always NUL-terminated (matches the
+  kernel's `strscpy_pad` behaviour).
+- `get_stackid` hashes the backtrace pcs' LE bytes with FNV-1a-64 and masks to
+  31 bits; the runtime ignores a failed store into a full map (the id is still
+  returned). The verifier enforces that the map arg is a `stack_trace` map
+  (same mechanism as `perf_event_output`'s perf-array check).
+- Assembler gotcha (bit the first attempt at the cgroup test): `.map`
+  declarations are single-pass — the `.map` line must appear BEFORE the first
+  `map[name]` reference in the source.

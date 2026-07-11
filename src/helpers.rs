@@ -10,7 +10,12 @@ pub mod id {
     pub const TRACE_PRINTK: u32 = 6;
     pub const GET_PRANDOM_U32: u32 = 7;
     pub const GET_SMP_PROCESSOR_ID: u32 = 8;
+    pub const GET_CURRENT_PID_TGID: u32 = 14;
+    pub const GET_CURRENT_UID_GID: u32 = 15;
+    pub const GET_CURRENT_COMM: u32 = 16;
     pub const PERF_EVENT_OUTPUT: u32 = 25;
+    pub const GET_STACKID: u32 = 27;
+    pub const GET_CURRENT_TASK: u32 = 35;
     pub const RINGBUF_OUTPUT: u32 = 130;
     pub const RINGBUF_RESERVE: u32 = 131;
     pub const RINGBUF_SUBMIT: u32 = 132;
@@ -103,6 +108,33 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [None, None, None, None, None],
             ret: RetKind::Scalar,
         },
+        id::GET_CURRENT_PID_TGID => HelperSig {
+            name: "get_current_pid_tgid",
+            args: [None, None, None, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::GET_CURRENT_UID_GID => HelperSig {
+            name: "get_current_uid_gid",
+            args: [None, None, None, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::GET_CURRENT_COMM => HelperSig {
+            name: "get_current_comm",
+            // (buf, size); buf must be writable for `size` bytes.
+            args: [MemWrite { size_arg: 1 }, Size, None, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::GET_CURRENT_TASK => HelperSig {
+            name: "get_current_task",
+            args: [None, None, None, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::GET_STACKID => HelperSig {
+            name: "get_stackid",
+            // (ctx, map, flags); ctx accepted loosely like perf_event_output.
+            args: [Any, ConstMapPtr, Scalar, None, None],
+            ret: RetKind::Scalar,
+        },
         id::PERF_EVENT_OUTPUT => HelperSig {
             name: "perf_event_output",
             // (ctx, map, flags, data, size); data is a readable region of `size`
@@ -153,6 +185,11 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::TRACE_PRINTK,
         id::GET_PRANDOM_U32,
         id::GET_SMP_PROCESSOR_ID,
+        id::GET_CURRENT_PID_TGID,
+        id::GET_CURRENT_UID_GID,
+        id::GET_CURRENT_COMM,
+        id::GET_CURRENT_TASK,
+        id::GET_STACKID,
         id::PERF_EVENT_OUTPUT,
         id::RINGBUF_OUTPUT,
         id::RINGBUF_RESERVE,

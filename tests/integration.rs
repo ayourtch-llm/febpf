@@ -667,6 +667,129 @@ fn lru_evicts_least_recently_used_deterministically() {
     assert_eq!(run_lru(), entries);
 }
 
+// --------------------------------------------------------- cgroup_array
+
+/// A cgroup_array is modelled as a plain array (a lookup map). The point is
+/// that it LOADS, verifies and its element is readable — the corpus blocker is
+/// the map type at load time. Cgroup-membership helpers are out of scope.
+#[test]
+fn cgroup_array_loads_and_looks_up() {
+    let src = "
+        .map cg cgroup_array 4 4 8
+        w1 = 0
+        *(u32 *)(r10 - 4) = r1
+        r1 = map[cg]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        if r0 == 0 goto miss
+        r0 = *(u32 *)(r0 + 0)
+        exit
+    miss:
+        r0 = 123
+        exit";
+    // Element 0 is zero-initialised, so the lookup hits and returns 0.
+    assert_eq!(run_src(src), 0);
+}
+
+// --------------------------------------------------------- stack_trace
+
+/// get_stackid returns a deterministic 31-bit id and stores the captured
+/// stack under it, so an immediate lookup with that id must hit.
+#[test]
+fn get_stackid_stores_retrievable_stack() {
+    let src = "
+        .map st stack_trace 4 16 8
+        r1 = 0
+        r2 = map[st]
+        r3 = 0
+        call get_stackid
+        *(u32 *)(r10 - 4) = r0
+        r1 = map[st]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        if r0 == 0 goto miss
+        r0 = 1
+        exit
+    miss:
+        r0 = 0
+        exit";
+    assert_eq!(run_src(src), 1);
+}
+
+/// Two different call sites have different stacks, hence different ids.
+#[test]
+fn get_stackid_distinguishes_call_sites() {
+    let src = "
+        .map st stack_trace 4 16 8
+        r1 = 0
+        r2 = map[st]
+        r3 = 0
+        call get_stackid
+        r6 = r0
+        r1 = 0
+        r2 = map[st]
+        r3 = 0
+        call get_stackid
+        if r0 == r6 goto same
+        r0 = 1
+        exit
+    same:
+        r0 = 0
+        exit";
+    assert_eq!(run_src(src), 1);
+}
+
+/// get_stackid rejects (at verification) a map that is not a stack_trace map.
+#[test]
+fn get_stackid_requires_stack_trace_map() {
+    let src = "
+        .map a array 4 8 4
+        r1 = 0
+        r2 = map[a]
+        r3 = 0
+        call get_stackid
+        exit";
+    let err = verify_err(src);
+    assert!(err.contains("stack_trace"), "{err}");
+}
+
+// ------------------------------------------------- core tracing helpers
+
+/// The tracing identity helpers return fixed, documented constants
+/// (febpf has no processes): tgid=pid=1, uid=gid=0, task = opaque nonzero.
+#[test]
+fn tracing_identity_helpers_are_deterministic_constants() {
+    let src = "
+        call get_current_pid_tgid
+        r6 = r0
+        call get_current_uid_gid
+        if r0 != 0 goto bad
+        call get_current_task
+        if r0 == 0 goto bad
+        r0 = r6
+        exit
+    bad:
+        r0 = 0
+        exit";
+    assert_eq!(run_src(src), 0x0000_0001_0000_0001);
+}
+
+/// get_current_comm fills the buffer with \"febpf\" NUL-padded and marks the
+/// stack initialized (the read-back below would fail verification otherwise).
+#[test]
+fn get_current_comm_writes_fixed_name() {
+    let src = "
+        r1 = r10
+        r1 += -8
+        r2 = 8
+        call get_current_comm
+        r0 = *(u64 *)(r10 - 8)
+        exit";
+    assert_eq!(run_src(src), 0x66_7062_6566); // \"febpf\\0\\0\\0\" little-endian
+}
+
 // ------------------------------------------------------------------ calls
 
 #[test]
