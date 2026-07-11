@@ -136,6 +136,9 @@
       pre .ok { color: #3fb950; }
       pre .bad { color: #ff7b72; }
       .dbg-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+      .verdict { display: inline-block; font-weight: 700; padding: 2px 10px; border-radius: 6px; margin-bottom: 8px; }
+      .verdict.race { background: rgba(255,123,114,0.18); color: #ff7b72; border: 1px solid #ff7b72; }
+      .verdict.safe { background: rgba(63,185,80,0.18); color: #3fb950; border: 1px solid #3fb950; }
       footer { padding: 0 24px 40px; color: var(--muted); font-size: 12px; }
       code { font-family: var(--mono); background: rgba(127,127,127,0.15); padding: 1px 5px; border-radius: 4px; }
     </style>
@@ -153,8 +156,6 @@
         <div class="row">
           <button id="demo-good">Demo: map + loop</button>
           <button id="demo-bad">Demo: fails the verifier</button>
-          <button id="demo-race">Demo: data race</button>
-          <button id="demo-race-fixed">Demo: race-free (atomic)</button>
           <label class="file">Load .o…<input type="file" id="objfile" accept=".o,.bpf,application/octet-stream" /></label>
         </div>
         <textarea id="src" spellcheck="false"></textarea>
@@ -171,11 +172,6 @@
             <option value="0">annotated listing</option>
             <option value="1">CFG (Graphviz DOT)</option>
             <option value="2">execution heatmap</option>
-          </select>
-          <button id="btn-race" title="Run N instances sharing maps across all interleavings and report data races">Race check</button>
-          <select id="race-procs" title="concurrent instances">
-            <option value="2">2 instances</option>
-            <option value="3">3 instances</option>
           </select>
         </div>
       </section>
@@ -205,6 +201,32 @@
         </div>
         <div class="dbg-grid">
           <pre id="dbg-out" class="short">No session. Click “New session”.</pre>
+        </div>
+      </section>
+
+      <section class="panel" style="grid-column: 1 / -1">
+        <h2>Concurrency race detector</h2>
+        <p class="muted" style="margin:0 0 10px">
+          Runs several instances of the program concurrently against one shared map set,
+          deterministically explores every interleaving, and reports data races — lost
+          updates, stale read-modify-write. Every racing schedule is replayable. This is
+          something kernel eBPF developers cannot do; febpf gets it from deterministic replay.
+        </p>
+        <div class="row">
+          <button id="demo-race">Load racy demo (non-atomic counter)</button>
+          <button id="demo-race-fixed">Load race-free demo (atomic)</button>
+        </div>
+        <div class="row">
+          <button class="primary" id="btn-race" title="Explore interleavings of N instances sharing maps">Race check ▶</button>
+          <select id="race-procs" title="concurrent instances">
+            <option value="2">2 instances</option>
+            <option value="3">3 instances</option>
+            <option value="4">4 instances</option>
+          </select>
+          <span class="muted">runs on the program in the editor above</span>
+        </div>
+        <div class="dbg-grid">
+          <pre id="race-out" class="short">Load a demo, then hit “Race check”. Try the racy one (finds a lost update) and the atomic one (proven race-free).</pre>
         </div>
       </section>
     </main>
@@ -318,6 +340,7 @@ out:
       const $ = (id) => document.getElementById(id);
       const out = $("out");
       const dbgOut = $("dbg-out");
+      const raceOut = $("race-out");
       let objBytes = null; // set when a .o file is loaded
       let session = null;
 
@@ -338,8 +361,8 @@ out:
       // --- wiring ---
       $("demo-good").onclick = () => { clearObject(); $("src").value = DEMO_GOOD; show(out, "Loaded demo. Hit Verify or Run."); };
       $("demo-bad").onclick = () => { clearObject(); $("src").value = DEMO_BAD; show(out, "Loaded a program that fails verification. Hit Verify."); };
-      $("demo-race").onclick = () => { clearObject(); $("src").value = DEMO_RACE; show(out, "Loaded a racy shared-counter program. Hit “Race check” — it loses an update under some interleaving."); };
-      $("demo-race-fixed").onclick = () => { clearObject(); $("src").value = DEMO_RACE_FIXED; show(out, "Loaded the atomic (race-free) version. Hit “Race check” — all interleavings agree."); };
+      $("demo-race").onclick = () => { clearObject(); $("src").value = DEMO_RACE; show(raceOut, "Loaded a racy shared-counter program (see editor above). Hit “Race check”."); };
+      $("demo-race-fixed").onclick = () => { clearObject(); $("src").value = DEMO_RACE_FIXED; show(raceOut, "Loaded the atomic (race-free) version (see editor above). Hit “Race check”."); };
 
       $("objfile").onchange = async (e) => {
         const f = e.target.files[0];
@@ -361,11 +384,26 @@ out:
       $("btn-analyze").onclick = guard(() =>
         show(out, Febpf.analyze(source(), parseInt($("analyze-mode").value, 10))),
       );
+      function showRace(text) {
+        // Prepend a colored verdict badge based on the report's RESULT line.
+        raceOut.textContent = "";
+        const m = /RESULT: (RACE-FREE|RACE)/.exec(text);
+        if (m) {
+          const badge = document.createElement("span");
+          const isRace = m[1] === "RACE";
+          badge.className = "verdict " + (isRace ? "race" : "safe");
+          badge.textContent = isRace ? "⚠ DATA RACE FOUND" : "✓ RACE-FREE";
+          raceOut.appendChild(badge);
+          raceOut.appendChild(document.createTextNode("\n" + text));
+        } else {
+          raceOut.textContent = text;
+        }
+      }
       $("btn-race").onclick = guard(() => {
-        if (usingObject()) { show(out, "Race check runs on assembly source, not a loaded .o — pick a race demo."); return; }
+        if (usingObject()) { showRace("Race check runs on assembly source, not a loaded .o — load a race demo."); return; }
         const procs = parseInt($("race-procs").value, 10);
-        show(out, "exploring interleavings…");
-        show(out, Febpf.race(source(), procs, 0));
+        showRace("exploring interleavings…");
+        showRace(Febpf.race(source(), procs, 0));
       });
 
       // --- debugger ---
