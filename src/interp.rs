@@ -16,7 +16,33 @@
 use crate::helpers::{self, MemBus, UserHelpers};
 use crate::insn::*;
 use crate::maps::{Map, MapDef, MapSnapshot, ValueRef};
-use std::time::Instant;
+
+/// Monotonic clock for the `ktime_get_ns` helper. `std::time::Instant` panics
+/// on `wasm32-unknown-unknown` (no time source), so that target gets a stub
+/// that reports 0 — deterministic, and fine for the browser playground.
+struct Clock {
+    #[cfg(not(target_arch = "wasm32"))]
+    start: std::time::Instant,
+}
+
+impl Clock {
+    fn start() -> Clock {
+        Clock {
+            #[cfg(not(target_arch = "wasm32"))]
+            start: std::time::Instant::now(),
+        }
+    }
+    fn elapsed_nanos(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.start.elapsed().as_nanos() as u64
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct EbpfError {
@@ -67,7 +93,7 @@ pub struct Vm {
     pub user_helpers: UserHelpers,
     regions: Vec<Region>,
     stack: Vec<u8>,
-    start: Instant,
+    start: Clock,
     prandom: u64,
     /// Lines emitted by trace_printk.
     pub printk: Vec<String>,
@@ -80,6 +106,7 @@ pub struct Vm {
     pub profile: Option<Vec<u64>>,
     /// Compiled native code, if this VM was JIT-compiled. Taken out during
     /// execution (like `user_helpers`) to satisfy the borrow checker.
+    #[cfg(feature = "jit")]
     pub jit: Option<crate::jit::JitProgram>,
     /// Source-level debug info (from `.BTF.ext`/`.BTF`), when the program was
     /// loaded from a `-g` ELF object. Static across a run, so not snapshotted.
@@ -112,12 +139,13 @@ impl Vm {
             user_helpers: UserHelpers::new(),
             regions,
             stack: vec![0u8; MAX_CALL_FRAMES * STACK_SIZE],
-            start: Instant::now(),
+            start: Clock::start(),
             prandom: 0x853c49e6748fea9b,
             printk: Vec::new(),
             echo_printk: false,
             insn_limit: u64::MAX,
             profile: None,
+            #[cfg(feature = "jit")]
             jit: None,
             debug: None,
         };
@@ -225,6 +253,7 @@ impl Vm {
 
     /// Compile the program to native code (idempotent). Requires a supported
     /// host architecture; see [`crate::jit`].
+    #[cfg(feature = "jit")]
     pub fn compile(&mut self) -> Result<(), String> {
         if self.jit.is_none() {
             self.jit = Some(crate::jit::compile(&self.exec)?);
@@ -234,6 +263,7 @@ impl Vm {
 
     /// Execute via the JIT, compiling on first use. Falls back with an error
     /// if the host architecture is unsupported.
+    #[cfg(feature = "jit")]
     pub fn run_jit(&mut self, ctx: &mut [u8]) -> Result<u64, EbpfError> {
         if let Err(e) = self.compile() {
             return Err(EbpfError { pc: 0, msg: e });
@@ -300,6 +330,7 @@ pub struct Machine<'a> {
     /// reverse execution when this is nonzero.
     pub nondet_calls: u64,
     /// Set by the JIT trampoline when a deferred instruction faults.
+    #[cfg(feature = "jit")]
     jit_fault: Option<EbpfError>,
 }
 
@@ -380,6 +411,7 @@ impl<'a> Machine<'a> {
             frames: Vec::new(),
             insn_count: 0,
             nondet_calls: 0,
+            #[cfg(feature = "jit")]
             jit_fault: None,
         }
     }
@@ -418,7 +450,10 @@ impl<'a> Machine<'a> {
         self.vm.printk = s.printk.clone();
         self.vm.profile = s.profile.clone();
         self.nondet_calls = s.nondet_calls;
-        self.jit_fault = None;
+        #[cfg(feature = "jit")]
+        {
+            self.jit_fault = None;
+        }
     }
 
     /// Step until `insn_count` reaches `target` (used to replay after a
@@ -440,6 +475,7 @@ impl<'a> Machine<'a> {
 
     /// A pointer to the register file, for the JIT prologue to load from and
     /// spill to. Stable for the machine's lifetime.
+    #[cfg(feature = "jit")]
     pub fn regs_ptr(&mut self) -> *mut u64 {
         self.regs.as_mut_ptr()
     }
@@ -448,6 +484,7 @@ impl<'a> Machine<'a> {
     /// `pc`, then report where the JIT should resume. Returns
     /// [`crate::jit::abi::STOP`]-tagged value on program exit or fault
     /// (distinguish via [`Machine::take_jit_fault`]); otherwise the next pc.
+    #[cfg(feature = "jit")]
     pub fn jit_step_at(&mut self, pc: usize) -> u64 {
         self.pc = pc;
         match self.step() {
@@ -460,11 +497,13 @@ impl<'a> Machine<'a> {
         }
     }
 
+    #[cfg(feature = "jit")]
     pub fn take_jit_fault(&mut self) -> Option<EbpfError> {
         self.jit_fault.take()
     }
 
     /// Run to completion using precompiled native code.
+    #[cfg(feature = "jit")]
     fn run_native(&mut self, jit: &crate::jit::JitProgram) -> Result<u64, EbpfError> {
         // Safety: `jit.enter` runs native code that only touches this
         // machine's register file (via the pointer we hand it) and calls
@@ -912,7 +951,7 @@ impl<'a> Machine<'a> {
             }
             helpers::id::KTIME_GET_NS => {
                 self.nondet_calls += 1; // wall clock: replay cannot reproduce it
-                self.vm.start.elapsed().as_nanos() as u64
+                self.vm.start.elapsed_nanos()
             }
             helpers::id::TRACE_PRINTK => {
                 let fmt = self.read_bytes(args[0], args[1] as usize)?;

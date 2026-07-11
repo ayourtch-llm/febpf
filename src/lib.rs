@@ -30,12 +30,17 @@ pub mod fuzz;
 pub mod helpers;
 pub mod insn;
 pub mod interp;
+#[cfg(feature = "jit")]
 pub mod jit;
 pub mod kbpf;
 pub mod maps;
+pub mod playground;
 pub mod relo;
 pub mod tnum;
 pub mod verifier;
+
+#[cfg(target_arch = "wasm32")]
+mod wasm;
 
 pub use interp::{EbpfError, Machine, Program, Vm};
 pub use verifier::{Config as VerifierConfig, VerifyError};

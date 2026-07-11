@@ -21,14 +21,22 @@ fn run_febpf(prog: &Program, ctx: &[u8]) -> Result<(u64, Option<u64>), String> {
     let mut vm_i = Vm::new(prog.clone())?;
     let r_interp = vm_i.run(&mut ctx_i).map_err(|e| e.to_string())?;
 
-    let mut ctx_j = ctx.to_vec();
-    let mut vm_j = Vm::new(prog.clone())?;
-    let r_jit = match vm_j.run_jit(&mut ctx_j) {
-        Ok(r) => Some(r),
-        Err(e) => {
-            eprintln!("note: JIT unavailable ({e}); comparing interpreter only");
-            None
+    #[cfg(feature = "jit")]
+    let r_jit = {
+        let mut ctx_j = ctx.to_vec();
+        let mut vm_j = Vm::new(prog.clone())?;
+        match vm_j.run_jit(&mut ctx_j) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("note: JIT unavailable ({e}); comparing interpreter only");
+                None
+            }
         }
+    };
+    #[cfg(not(feature = "jit"))]
+    let r_jit = {
+        eprintln!("note: this build has no JIT; comparing interpreter only");
+        None
     };
     Ok((r_interp, r_jit))
 }

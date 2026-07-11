@@ -133,6 +133,30 @@ fn parse_args() -> Result<Opts, String> {
     Ok(o)
 }
 
+/// Compile the VM to native code, or report that this build has no JIT.
+#[cfg(feature = "jit")]
+fn jit_compile(vm: &mut Vm) -> Result<(), String> {
+    vm.compile().map_err(|e| format!("JIT compile failed: {e}"))
+}
+#[cfg(not(feature = "jit"))]
+fn jit_compile(_vm: &mut Vm) -> Result<(), String> {
+    Err("this build has no JIT (rebuilt with --no-default-features)".into())
+}
+
+/// Run the VM, via the JIT when `jit` is set and this build supports it.
+#[cfg(feature = "jit")]
+fn run_maybe_jit(vm: &mut Vm, ctx: &mut [u8], jit: bool) -> Result<u64, febpf::EbpfError> {
+    if jit {
+        vm.run_jit(ctx)
+    } else {
+        vm.run(ctx)
+    }
+}
+#[cfg(not(feature = "jit"))]
+fn run_maybe_jit(vm: &mut Vm, ctx: &mut [u8], _jit: bool) -> Result<u64, febpf::EbpfError> {
+    vm.run(ctx)
+}
+
 /// Read a target BTF for CO-RE: either a raw BTF blob (e.g.
 /// /sys/kernel/btf/vmlinux) or an ELF object carrying a .BTF section.
 fn read_target_btf(path: &str) -> Result<Vec<u8>, String> {
@@ -376,15 +400,10 @@ fn run() -> Result<ExitCode, String> {
                 })?;
             }
             if o.jit {
-                vm.compile().map_err(|e| format!("JIT compile failed: {e}"))?;
+                jit_compile(&mut vm)?;
             }
             let t0 = Instant::now();
-            let r0 = if o.jit {
-                vm.run_jit(&mut ctx)
-            } else {
-                vm.run(&mut ctx)
-            }
-            .map_err(|e| e.to_string())?;
+            let r0 = run_maybe_jit(&mut vm, &mut ctx, o.jit).map_err(|e| e.to_string())?;
             let dt = t0.elapsed();
             let how = if o.jit { "jit" } else { "interp" };
             println!("r0 = {r0} ({r0:#x})   [{how}, {dt:?}]");
@@ -445,16 +464,11 @@ fn run() -> Result<ExitCode, String> {
             let per_run = m.insn_count;
             drop(m);
             if o.jit {
-                vm.compile().map_err(|e| format!("JIT compile failed: {e}"))?;
+                jit_compile(&mut vm)?;
             }
             let t0 = Instant::now();
             for _ in 0..o.iters {
-                if o.jit {
-                    vm.run_jit(&mut ctx)
-                } else {
-                    vm.run(&mut ctx)
-                }
-                .map_err(|e| e.to_string())?;
+                run_maybe_jit(&mut vm, &mut ctx, o.jit).map_err(|e| e.to_string())?;
             }
             let dt = t0.elapsed();
             let total_insns = per_run.saturating_mul(o.iters);

@@ -162,7 +162,12 @@ pub fn interp_vs_jit(insns: &[Insn]) -> Result<(u64, u64), String> {
 
     let mut ctx_j = vec![0u8; 16];
     let mut vm_j = crate::Vm::new(prog)?;
+    // Without the jit feature this degrades to interp-vs-interp (still a
+    // determinism check, but not a codegen differential).
+    #[cfg(feature = "jit")]
     let r_jit = vm_j.run_jit(&mut ctx_j).map_err(|e| e.to_string())?;
+    #[cfg(not(feature = "jit"))]
+    let r_jit = vm_j.run(&mut ctx_j).map_err(|e| e.to_string())?;
     Ok((r_interp, r_jit))
 }
 
@@ -173,6 +178,7 @@ mod tests {
     /// The core invariant: over many seeds, the interpreter and the JIT agree
     /// on `r0` for every generated program. This is the differential test that
     /// makes the fuzzer meaningful.
+    #[cfg(feature = "jit")]
     #[test]
     fn interp_and_jit_agree() {
         // Only meaningful where the JIT exists; elsewhere run_jit errors and

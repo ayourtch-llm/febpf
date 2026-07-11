@@ -40,6 +40,7 @@ fn run_prog(obj: &elf::Object, prog_name: &str, ctx: &mut [u8]) -> u64 {
         .iter()
         .find(|p| p.name == prog_name)
         .unwrap_or_else(|| panic!("no program '{prog_name}'"));
+    #[cfg_attr(not(feature = "jit"), allow(unused_mut))]
     let mut vm = Vm::new(Program {
         insns: prog.insns.clone(),
         maps: obj.maps.clone(),
@@ -113,6 +114,7 @@ fn global_data_object() {
     // run 1 (idx 0): bss = 10, scale = 4  -> 10 + 400 = 410
     // run 2 (idx 0): bss = 20, scale = 5  -> 20 + 500 = 520
     let prog = obj.programs.iter().find(|p| p.name == "socket").unwrap();
+    #[cfg_attr(not(feature = "jit"), allow(unused_mut))]
     let mut vm = Vm::new(Program {
         insns: prog.insns.clone(),
         maps: obj.maps.clone(),
@@ -144,6 +146,7 @@ fn global_data_object() {
     assert_eq!(vm2.run(&mut ctx).unwrap(), 440);
 }
 
+#[cfg(feature = "jit")]
 #[test]
 fn jit_matches_interpreter_on_objects() {
     for (file, prog, ctx_len) in [
@@ -211,6 +214,7 @@ fn core_relocations_against_shifted_target() {
 
     // JIT/interpreter parity on the relocated program.
     let prog = &obj.programs[0];
+    #[cfg_attr(not(feature = "jit"), allow(unused_mut))]
     let mut vm = Vm::new(Program {
         insns: prog.insns.clone(),
         maps: obj.maps.clone(),
@@ -221,11 +225,14 @@ fn core_relocations_against_shifted_target() {
         ..Default::default()
     })
     .unwrap();
-    let mut jit_ctx = [0u8; 64];
-    jit_ctx[4..8].copy_from_slice(&100i32.to_le_bytes());
-    jit_ctx[12..16].copy_from_slice(&20i32.to_le_bytes());
-    jit_ctx[16..24].copy_from_slice(&3i64.to_le_bytes());
-    assert_eq!(vm.run_jit(&mut jit_ctx).unwrap(), 123);
+    #[cfg(feature = "jit")]
+    {
+        let mut jit_ctx = [0u8; 64];
+        jit_ctx[4..8].copy_from_slice(&100i32.to_le_bytes());
+        jit_ctx[12..16].copy_from_slice(&20i32.to_le_bytes());
+        jit_ctx[16..24].copy_from_slice(&3i64.to_le_bytes());
+        assert_eq!(vm.run_jit(&mut jit_ctx).unwrap(), 123);
+    }
 }
 
 /// Differential against the running kernel: relocate a FIELD_BYTE_OFFSET on

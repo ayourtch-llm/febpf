@@ -21,6 +21,7 @@ fn probe_is_well_behaved() {
 
 /// Interp vs JIT must agree on a batch of generated programs. Determinism of
 /// the PRNG makes this a fixed, reproducible corpus.
+#[cfg(feature = "jit")]
 #[test]
 fn fuzz_interp_matches_jit() {
     // Skip where the JIT is unavailable (non-x86-64-Linux): run_jit errors.
