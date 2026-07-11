@@ -1673,16 +1673,24 @@ impl<'a> Verifier<'a> {
                 return Ok(Some((frame, off)));
             }
             PtrKind::Ctx => {
-                // The kernel forbids dereferencing a ctx pointer once it has a
-                // *variable* (non-constant) offset — i.e. after pointer arith
-                // with a register/unknown operand. Fixed constant-offset ctx
-                // field access (e.g. `*(u32*)(r1 + 8)`) stays legal.
-                if !p.var.is_const() {
+                // The kernel requires a PTR_TO_CTX to have its OWN accumulated
+                // offset == 0 at dereference time — the access offset must come
+                // only from the load instruction's immediate (`disp`), never
+                // from arithmetic folded into the pointer register. So
+                // `*(u32*)(r1 + 8)` (pointer off 0, immediate 8) stays legal,
+                // but `r2 = r1; r2 += 8; *(u32*)(r2 + 0)` (pointer off 8) is
+                // rejected, as is any variable/unknown pointer offset.
+                if p.off != 0 || !p.var.is_const() || p.var.umin != 0 {
                     return Err(self.err(
                         pc,
                         format!(
-                            "dereference of modified ctx ptr off={}+{} disallowed",
-                            p.off, p.var
+                            "dereference of modified ctx ptr off={}{} disallowed",
+                            p.off,
+                            if p.var.is_const() && p.var.umin == 0 {
+                                String::new()
+                            } else {
+                                format!("+{}", p.var)
+                            }
                         ),
                     ));
                 }

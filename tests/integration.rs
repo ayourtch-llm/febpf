@@ -506,8 +506,12 @@ fn reject_ctx_oob() {
 
 #[test]
 fn reject_modified_ctx_ptr_deref() {
-    // Give the ctx pointer a *variable* offset (register arithmetic with an
-    // unknown value), then dereference it. The kernel rejects this; so must we.
+    // The kernel requires a PTR_TO_CTX to have its own accumulated offset == 0
+    // at dereference time; the access offset must come only from the load
+    // instruction's immediate. Both of these bake an offset into the pointer
+    // register and are rejected.
+
+    // (a) VARIABLE offset: pointer arithmetic with an unknown value.
     let e = verify_err_ctx(
         "
         r2 = *(u8 *)(r1 + 0)
@@ -518,11 +522,24 @@ fn reject_modified_ctx_ptr_deref() {
         16,
     );
     assert!(e.contains("modified ctx ptr"), "{e}");
+
+    // (b) CONSTANT offset baked into the pointer: r2 = r1; r2 += 4; *(r2+0).
+    // Kernel shows R2=ctx(off=4) and rejects the deref.
+    let e = verify_err_ctx(
+        "
+        r2 = r1
+        r2 += 4
+        r0 = *(u32 *)(r2 + 0)
+        exit",
+        16,
+    );
+    assert!(e.contains("modified ctx ptr"), "{e}");
 }
 
 #[test]
 fn accept_fixed_offset_ctx_access() {
-    // A *constant*-offset ctx field access must stay legal (not over-tightened).
+    // Offset in the LOAD INSTRUCTION's immediate — pointer's own offset is 0.
+    // This must stay legal (not over-tightened into FEBPF-STRICT).
     let vm = Vm::new(program("r0 = *(u32 *)(r1 + 8)\n exit")).unwrap();
     vm.verify(Config {
         ctx_size: 16,
