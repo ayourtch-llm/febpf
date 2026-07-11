@@ -73,6 +73,9 @@ enum Region {
     /// Map object pointer; only meaningful as a helper argument.
     MapObj(u32),
     MapValue { map: u32, vref: ValueRef },
+    /// A ringbuf record reserved by `ringbuf_reserve` (writable until it is
+    /// submitted or discarded, which marks the reservation consumed).
+    RingReserved { map: u32, res: u32 },
 }
 
 const CTX_HANDLE: u32 = 1;
@@ -224,6 +227,14 @@ impl Vm {
 
     pub fn insns(&self) -> &[Insn] {
         &self.insns
+    }
+
+    /// Records submitted/output to a named ringbuf map (for tests and tooling).
+    pub fn ringbuf_records(&self, name: &str) -> Option<&[Vec<u8>]> {
+        self.maps
+            .iter()
+            .find(|m| m.def.name == name)
+            .map(|m| m.ringbuf_records())
     }
 
     /// Current `get_prandom_u32` state. Before a run this is the seed the next
@@ -491,6 +502,11 @@ fn resolve_slice<'s>(
             }
             m.value_mut(vref)
         }
+        Region::RingReserved { map, res } => maps[map as usize]
+            .ringbuf_reservation_mut(res)
+            .ok_or_else(|| {
+                format!("ringbuf record {addr:#x} was already submitted/discarded")
+            })?,
     };
     buf.get_mut(off..off + len)
         .ok_or_else(|| format!("access out of bounds: {addr:#x} len {len}"))
@@ -818,6 +834,9 @@ impl<'a> Machine<'a> {
             }
             Some(Region::MapValue { map, .. }) => {
                 format!("map '{}' value +{off}", self.vm.maps[*map as usize].def.name)
+            }
+            Some(Region::RingReserved { map, .. }) => {
+                format!("ringbuf '{}' record +{off}", self.vm.maps[*map as usize].def.name)
             }
             Some(Region::Invalid) | None => format!("<addr {addr:#x}>"),
         }
@@ -1209,6 +1228,39 @@ impl<'a> Machine<'a> {
         Ok(self.mem(addr, len, false)?.to_vec())
     }
 
+    /// `bpf_ringbuf_reserve`: mint a fresh writable record region of `size`
+    /// bytes, or return NULL (0) if `size` is 0 or exceeds the capacity.
+    fn ringbuf_reserve(&mut self, map: usize, size: u32) -> u64 {
+        let cap = match self.vm.maps[map].ringbuf_capacity() {
+            Some(c) => c,
+            None => return 0,
+        };
+        if size == 0 || size > cap {
+            return 0;
+        }
+        let res = self.vm.maps[map].ringbuf_next_res();
+        self.vm.regions.push(Region::RingReserved {
+            map: map as u32,
+            res,
+        });
+        let handle = (self.vm.regions.len() - 1) as u32;
+        self.vm.maps[map].ringbuf_add_reservation(size, handle);
+        mkaddr(handle, 0)
+    }
+
+    /// `bpf_ringbuf_submit`/`_discard`: consume the reservation `addr` points to.
+    fn ringbuf_consume(&mut self, addr: u64, submit: bool) -> Result<(), EbpfError> {
+        let handle = (addr >> 32) as usize;
+        match self.vm.regions.get(handle).copied() {
+            Some(Region::RingReserved { map, res }) => self.vm.maps[map as usize]
+                .ringbuf_consume(res, submit)
+                .map_err(|_| self.err("ringbuf record already submitted/discarded")),
+            _ => Err(self.err(format!(
+                "ringbuf submit/discard: {addr:#x} is not a reserved record"
+            ))),
+        }
+    }
+
     fn helper_call(&mut self, hid: u32) -> Result<(), EbpfError> {
         let args = [self.regs[1], self.regs[2], self.regs[3], self.regs[4], self.regs[5]];
         let r0 = match hid {
@@ -1216,7 +1268,11 @@ impl<'a> Machine<'a> {
                 let m = self.map_from_ptr(args[0])?;
                 let key = self.read_bytes(args[1], self.vm.maps[m].def.key_size as usize)?;
                 match self.vm.maps[m].lookup(&key) {
-                    Some(vref) => self.vm.value_addr(m as u32, vref),
+                    Some(vref) => {
+                        // LRU maps: mark the entry recently used (no-op for others).
+                        self.vm.maps[m].touch(&key);
+                        self.vm.value_addr(m as u32, vref)
+                    }
                     None => 0,
                 }
             }
@@ -1261,6 +1317,26 @@ impl<'a> Machine<'a> {
                 (x.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u32 as u64
             }
             helpers::id::GET_SMP_PROCESSOR_ID => 0,
+            helpers::id::RINGBUF_RESERVE => {
+                let m = self.map_from_ptr(args[0])?;
+                self.ringbuf_reserve(m, args[1] as u32)
+            }
+            helpers::id::RINGBUF_SUBMIT => {
+                self.ringbuf_consume(args[0], true)?;
+                0
+            }
+            helpers::id::RINGBUF_DISCARD => {
+                self.ringbuf_consume(args[0], false)?;
+                0
+            }
+            helpers::id::RINGBUF_OUTPUT => {
+                let m = self.map_from_ptr(args[0])?;
+                let data = self.read_bytes(args[1], args[2] as usize)?;
+                match self.vm.maps[m].ringbuf_output(data) {
+                    Ok(()) => 0,
+                    Err(e) => e as u64,
+                }
+            }
             0xbad2310 => {
                 // CO-RE poison value: the loader replaced an instruction
                 // whose relocation had no match in the target BTF.

@@ -189,6 +189,76 @@ fn jit_hash_counter_loop() {
 }
 
 #[test]
+fn jit_ringbuf_matches_interpreter() {
+    // ringbuf reserve/write/submit through the (deferred) helper path under
+    // both engines; the captured record must be identical.
+    let src = "
+        .map rb ringbuf 0 0 4096
+        r1 = map[rb]
+        r2 = 8
+        r3 = 0
+        call ringbuf_reserve
+        if r0 == 0 goto out
+        r6 = r0
+        r1 = 0x1122334455667788 ll
+        *(u64 *)(r6 + 0) = r1
+        r1 = r6
+        r2 = 0
+        call ringbuf_submit
+        r0 = 0
+        exit
+    out:
+        r0 = 1
+        exit";
+    let records = |jit: bool| -> Vec<Vec<u8>> {
+        let a = asm::assemble(src).unwrap();
+        let mut vm = Vm::new(Program {
+            insns: a.insns,
+            maps: a.maps,
+        })
+        .unwrap();
+        vm.verify(Config::default()).unwrap();
+        if jit {
+            vm.run_jit(&mut []).unwrap();
+        } else {
+            vm.run(&mut []).unwrap();
+        }
+        vm.ringbuf_records("rb").unwrap().to_vec()
+    };
+    assert_eq!(records(false), records(true));
+    assert_eq!(records(true), vec![0x1122334455667788u64.to_le_bytes().to_vec()]);
+}
+
+#[test]
+fn jit_percpu_array_matches_interpreter() {
+    let src = "
+        .map pa percpu_array 4 8 4
+        w1 = 2
+        *(u32 *)(r10 - 4) = r1
+        r1 = 555
+        *(u64 *)(r10 - 16) = r1
+        r1 = map[pa]
+        r2 = r10
+        r2 += -4
+        r3 = r10
+        r3 += -16
+        r4 = 0
+        call map_update_elem
+        r1 = map[pa]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        if r0 == 0 goto miss
+        r0 = *(u64 *)(r0)
+        exit
+    miss:
+        r0 = 0
+        exit";
+    assert_eq!(interp_run(src, &mut []), jit_run(src, &mut []));
+    assert_eq!(jit_run(src, &mut []), 555);
+}
+
+#[test]
 fn jit_runtime_fault_is_caught() {
     // dividing is deferred, but an out-of-bounds stack access must fault
     // cleanly under the JIT (not corrupt memory or crash).

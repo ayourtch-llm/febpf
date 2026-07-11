@@ -345,6 +345,283 @@ fn hash_map_counter_loop() {
     assert_eq!(run_src(src), 999); // first iteration inserts 0, then 999 increments
 }
 
+// --------------------------------------------------------------- ringbuf
+
+/// Verify + run a program, returning the whole Vm so the caller can inspect
+/// captured ringbuf records.
+fn build_run(src: &str) -> Vm {
+    let mut vm = Vm::new(program(src)).unwrap();
+    vm.verify(Config::default()).expect("verification failed");
+    vm.run(&mut []).expect("run failed");
+    vm
+}
+
+#[test]
+fn ringbuf_reserve_submit_captures_record() {
+    let src = "
+        .map rb ringbuf 0 0 4096
+        r1 = map[rb]
+        r2 = 8
+        r3 = 0
+        call ringbuf_reserve
+        if r0 == 0 goto out
+        r6 = r0
+        r1 = 0x1122334455667788 ll
+        *(u64 *)(r6 + 0) = r1
+        r1 = r6
+        r2 = 0
+        call ringbuf_submit
+        r0 = 0
+        exit
+    out:
+        r0 = 1
+        exit";
+    let vm = build_run(src);
+    let recs = vm.ringbuf_records("rb").expect("ringbuf map");
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0], 0x1122334455667788u64.to_le_bytes());
+}
+
+#[test]
+fn ringbuf_reserve_null_check_path() {
+    // capacity 8 but request 16 -> reserve returns NULL at runtime; the
+    // program takes the null branch and emits nothing.
+    let src = "
+        .map rb ringbuf 0 0 8
+        r1 = map[rb]
+        r2 = 16
+        r3 = 0
+        call ringbuf_reserve
+        if r0 == 0 goto null
+        r6 = r0
+        r1 = r6
+        r2 = 0
+        call ringbuf_submit
+        r0 = 1
+        exit
+    null:
+        r0 = 200
+        exit";
+    let mut vm = Vm::new(program(src)).unwrap();
+    vm.verify(Config::default()).expect("verification failed");
+    let r = vm.run(&mut []).expect("run failed");
+    assert_eq!(r, 200);
+    assert_eq!(vm.ringbuf_records("rb").unwrap().len(), 0);
+}
+
+#[test]
+fn ringbuf_use_after_submit_rejected() {
+    let src = "
+        .map rb ringbuf 0 0 64
+        r1 = map[rb]
+        r2 = 8
+        r3 = 0
+        call ringbuf_reserve
+        if r0 == 0 goto out
+        r6 = r0
+        r1 = r6
+        r2 = 0
+        call ringbuf_submit
+        r1 = *(u64 *)(r6 + 0)
+        r0 = 0
+        exit
+    out:
+        r0 = 1
+        exit";
+    let e = verify_err(src);
+    assert!(
+        e.contains("submitted/discarded"),
+        "unexpected error: {e}"
+    );
+}
+
+#[test]
+fn ringbuf_reserve_without_nullcheck_rejected() {
+    let src = "
+        .map rb ringbuf 0 0 64
+        r1 = map[rb]
+        r2 = 8
+        r3 = 0
+        call ringbuf_reserve
+        r1 = *(u64 *)(r0 + 0)
+        r0 = 0
+        exit";
+    let e = verify_err(src);
+    assert!(e.contains("may be NULL"), "unexpected error: {e}");
+}
+
+#[test]
+fn ringbuf_output_captures_from_stack() {
+    let src = "
+        .map rb ringbuf 0 0 4096
+        r1 = 0x11223344
+        *(u32 *)(r10 - 8) = r1
+        r1 = map[rb]
+        r2 = r10
+        r2 += -8
+        r3 = 4
+        r4 = 0
+        call ringbuf_output
+        r0 = 0
+        exit";
+    let vm = build_run(src);
+    let recs = vm.ringbuf_records("rb").expect("ringbuf map");
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0], 0x11223344u32.to_le_bytes());
+}
+
+// -------------------------------------------------------------- per-CPU
+
+#[test]
+fn percpu_array_roundtrip_and_independent_slots() {
+    let src = "
+        .map pa percpu_array 4 8 4
+        w1 = 1
+        *(u32 *)(r10 - 4) = r1
+        r1 = 777
+        *(u64 *)(r10 - 16) = r1
+        r1 = map[pa]
+        r2 = r10
+        r2 += -4
+        r3 = r10
+        r3 += -16
+        r4 = 0
+        call map_update_elem
+        r1 = map[pa]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        if r0 == 0 goto miss
+        r0 = *(u64 *)(r0)
+        exit
+    miss:
+        r0 = -1
+        exit";
+    let mut vm = Vm::new(program(src)).unwrap();
+    vm.verify(Config::default()).expect("verification failed");
+    let r = vm.run(&mut []).expect("run failed");
+    // The in-program view (CPU 0) round-trips.
+    assert_eq!(r, 777);
+    // CPU 0 has 777; the other CPUs' slots stay independent (zero).
+    let m = vm.maps.iter().find(|m| m.def.name == "pa").unwrap();
+    let vref = m.lookup(&1u32.to_ne_bytes()).unwrap();
+    assert_eq!(m.value_cpu(vref, 0), 777u64.to_le_bytes());
+    for cpu in 1..febpf::maps::NR_CPUS {
+        assert_eq!(m.value_cpu(vref, cpu), [0u8; 8], "cpu {cpu} must be independent");
+    }
+}
+
+#[test]
+fn percpu_hash_roundtrip() {
+    let src = "
+        .map ph percpu_hash 4 8 16
+        w1 = 42
+        *(u32 *)(r10 - 4) = r1
+        r1 = 0xdead
+        *(u64 *)(r10 - 16) = r1
+        r1 = map[ph]
+        r2 = r10
+        r2 += -4
+        r3 = r10
+        r3 += -16
+        r4 = 0
+        call map_update_elem
+        r1 = map[ph]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        if r0 == 0 goto miss
+        r0 = *(u64 *)(r0)
+        exit
+    miss:
+        r0 = -1
+        exit";
+    let mut vm = Vm::new(program(src)).unwrap();
+    vm.verify(Config::default()).expect("verification failed");
+    assert_eq!(vm.run(&mut []).expect("run failed"), 0xdead);
+    let m = vm.maps.iter().find(|m| m.def.name == "ph").unwrap();
+    let vref = m.lookup(&42u32.to_ne_bytes()).unwrap();
+    assert_eq!(m.value_cpu(vref, 0), 0xdeadu64.to_le_bytes());
+    assert_eq!(m.value_cpu(vref, 1), [0u8; 8]);
+}
+
+// ------------------------------------------------------------------ LRU
+
+/// Insert k1,k2 (fills a capacity-2 LRU), touch k1 via a lookup, then insert
+/// k3. The least-recently-used live entry (k2) must be the one evicted.
+const LRU_PROG: &str = "
+    .map lru lru_hash 4 8 2
+    w1 = 1
+    *(u32 *)(r10 - 4) = r1
+    r1 = 10
+    *(u64 *)(r10 - 16) = r1
+    r1 = map[lru]
+    r2 = r10
+    r2 += -4
+    r3 = r10
+    r3 += -16
+    r4 = 0
+    call map_update_elem
+    w1 = 2
+    *(u32 *)(r10 - 4) = r1
+    r1 = 20
+    *(u64 *)(r10 - 16) = r1
+    r1 = map[lru]
+    r2 = r10
+    r2 += -4
+    r3 = r10
+    r3 += -16
+    r4 = 0
+    call map_update_elem
+    w1 = 1
+    *(u32 *)(r10 - 4) = r1
+    r1 = map[lru]
+    r2 = r10
+    r2 += -4
+    call map_lookup_elem
+    w1 = 3
+    *(u32 *)(r10 - 4) = r1
+    r1 = 30
+    *(u64 *)(r10 - 16) = r1
+    r1 = map[lru]
+    r2 = r10
+    r2 += -4
+    r3 = r10
+    r3 += -16
+    r4 = 0
+    call map_update_elem
+    r0 = 0
+    exit";
+
+fn run_lru() -> Vec<(u32, u64)> {
+    let mut vm = Vm::new(program(LRU_PROG)).unwrap();
+    vm.verify(Config::default()).expect("verification failed");
+    vm.run(&mut []).expect("run failed");
+    let m = vm.maps.iter().find(|m| m.def.name == "lru").unwrap();
+    let mut out: Vec<(u32, u64)> = m
+        .iter_entries()
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                u32::from_ne_bytes(k.try_into().unwrap()),
+                u64::from_le_bytes(v.try_into().unwrap()),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn lru_evicts_least_recently_used_deterministically() {
+    let entries = run_lru();
+    // k2 was the LRU (k1 was touched after both inserts), so it is evicted;
+    // k1 and k3 remain.
+    assert_eq!(entries, vec![(1, 10), (3, 30)]);
+    // Deterministic: a second identical run evicts exactly the same entry.
+    assert_eq!(run_lru(), entries);
+}
+
 // ------------------------------------------------------------------ calls
 
 #[test]
