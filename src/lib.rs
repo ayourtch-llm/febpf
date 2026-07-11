@@ -44,6 +44,9 @@ pub mod replay;
 pub mod tnum;
 pub mod verifier;
 
+#[cfg(test)]
+mod soundness;
+
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 

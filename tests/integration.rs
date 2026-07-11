@@ -1855,3 +1855,97 @@ fn explain_too_complex_has_trace() {
     let text = febpf::verifier::render_trace(&prog.insns, &e);
     assert!(text.contains("if r0 != 0 goto"), "{text}");
 }
+
+// ------------------------------------- operator-soundness regressions
+// Found by the exhaustive small-width soundness harness (src/soundness.rs,
+// docs/specs/operator-soundness.md). Each program routes its concretely
+// executed path through code the buggy verifier pruned as dead, so the
+// (correct) verdict must be a rejection of the violation on that path.
+
+#[test]
+fn jmp32_signed_compare_uses_s32_bounds() {
+    // w0 = 0x80000000 is INT_MIN as s32, so `w0 s> 1` is FALSE and the
+    // fall-through (which reads uninitialized r2) executes. The unsound
+    // verifier compared the zero-extended 32-bit values (2^31 > 1), decided
+    // the branch always-taken, and pruned the executed path. Kernel parity:
+    // is_branch32_taken uses dedicated s32 bounds (kernel/bpf/verifier.c).
+    let e = verify_err(
+        "w0 = -2147483648
+         if w0 s> 1 goto ok
+         r0 = r2
+        ok:
+         exit",
+    );
+    assert!(e.contains("uninitialized"), "expected uninit rejection: {e}");
+    // same shape for the other three signed 32-bit compares
+    for cmp in ["s>=", "s<", "s<="] {
+        let (bad_val, rhs) = match cmp {
+            "s>=" => ("-2147483648", "0"),  // INT_MIN >= 0 is false
+            "s<" => ("0x7fffffff", "0"),   // INT_MAX < 0 is false
+            _ => ("0x7fffffff", "-1"),     // INT_MAX <= -1 is false
+        };
+        let src = format!(
+            "w0 = {bad_val}
+             if w0 {cmp} {rhs} goto ok
+             r0 = r2
+            ok:
+             exit"
+        );
+        let e = verify_err(&src);
+        assert!(e.contains("uninitialized"), "{cmp}: {e}");
+    }
+}
+
+#[test]
+fn jmp32_signed_refinement_keeps_sign_range() {
+    // r1 is unknown-32-bit; on the `w1 s<= 5` path values with the 32-bit
+    // sign bit set (e.g. 0x80000000) survive. The unsound refinement clamped
+    // the range to [0, 5], so `w1 == 0x80000000` afterwards was decided
+    // always-false and its target pruned even though it concretely executes.
+    let e = verify_err_ctx(
+        "r1 = *(u32 *)(r1 + 0)
+         if w1 s<= 5 goto le
+         r0 = 0
+         exit
+        le:
+         if w1 == -2147483648 goto bad
+         r0 = 0
+         exit
+        bad:
+         r0 = r2
+         exit",
+        8,
+    );
+    assert!(e.contains("uninitialized"), "expected uninit rejection: {e}");
+}
+
+#[test]
+fn alu32_signed_div_mod_fold_as_i32() {
+    // 1 s/ -1 in 32 bits is -1 (0xffffffff); the unsound fold computed
+    // 1 / 4294967295 = 0, so the verifier believed `w0 == -1` impossible
+    // and pruned the concretely executed branch. Same for s% (1 s% -1 = 0).
+    let e = verify_err(
+        "w0 = 1
+         w1 = -1
+         w0 s/= w1
+         if w0 == -1 goto bad
+         r0 = 0
+         exit
+        bad:
+         r0 = r2
+         exit",
+    );
+    assert!(e.contains("uninitialized"), "sdiv32: {e}");
+    let e = verify_err(
+        "w0 = 1
+         w1 = -1
+         w0 s%= w1
+         if w0 == 0 goto bad
+         r0 = 0
+         exit
+        bad:
+         r0 = r2
+         exit",
+    );
+    assert!(e.contains("uninitialized"), "smod32: {e}");
+}

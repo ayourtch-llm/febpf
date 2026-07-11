@@ -179,26 +179,43 @@ impl Scalar {
 
     /// Reconcile tnum and range information; false if contradictory
     /// (the state is unreachable).
+    ///
+    /// The derivations run to a fixpoint: tightening the tnum from the
+    /// u-range can re-tighten u, which can re-tighten s (and vice versa) —
+    /// a single pass is not idempotent, which broke canonical-form
+    /// assumptions downstream (join/is_subset_of interplay; found by the
+    /// operator-soundness harness). The kernel's reg_bounds_sync()
+    /// (kernel/bpf/verifier.c) likewise runs __update_reg_bounds both
+    /// before and after __reg_bound_offset. Every step only tightens, so
+    /// the loop terminates.
     pub fn sync(&mut self) -> bool {
-        // bounds from tnum
-        self.umin = self.umin.max(self.tnum.umin());
-        self.umax = self.umax.min(self.tnum.umax());
-        // signed from unsigned when the range doesn't cross the sign boundary
-        if (self.umin as i64) <= (self.umax as i64) {
-            self.smin = self.smin.max(self.umin as i64);
-            self.smax = self.smax.min(self.umax as i64);
+        loop {
+            let before = *self;
+            // bounds from tnum
+            self.umin = self.umin.max(self.tnum.umin());
+            self.umax = self.umax.min(self.tnum.umax());
+            // signed from unsigned when the range doesn't cross the sign boundary
+            if (self.umin as i64) <= (self.umax as i64) {
+                self.smin = self.smin.max(self.umin as i64);
+                self.smax = self.smax.min(self.umax as i64);
+            }
+            // unsigned from signed when the range doesn't cross zero
+            // when the signed range doesn't cross zero, its u64 view is ordered
+            if self.smin >= 0 || self.smax < 0 {
+                self.umin = self.umin.max(self.smin as u64);
+                self.umax = self.umax.min(self.smax as u64);
+            }
+            // tnum from unsigned range
+            self.tnum = self.tnum.intersect(Tnum::range(self.umin, self.umax));
+            self.umin = self.umin.max(self.tnum.umin());
+            self.umax = self.umax.min(self.tnum.umax());
+            if self.umin > self.umax || self.smin > self.smax {
+                return false;
+            }
+            if *self == before {
+                return true;
+            }
         }
-        // unsigned from signed when the range doesn't cross zero
-        // when the signed range doesn't cross zero, its u64 view is ordered
-        if self.smin >= 0 || self.smax < 0 {
-            self.umin = self.umin.max(self.smin as u64);
-            self.umax = self.umax.min(self.smax as u64);
-        }
-        // tnum from unsigned range
-        self.tnum = self.tnum.intersect(Tnum::range(self.umin, self.umax));
-        self.umin = self.umin.max(self.tnum.umin());
-        self.umax = self.umax.min(self.tnum.umax());
-        self.umin <= self.umax && self.smin <= self.smax
     }
 
     pub(crate) fn from_tnum(t: Tnum) -> Scalar {
@@ -225,6 +242,67 @@ impl Scalar {
         } else {
             Scalar::from_tnum(self.tnum.cast(4))
         }
+    }
+
+    /// The signed-32 view of a scalar already truncated to 32 bits
+    /// (γ ⊆ [0, u32::MAX], zero-extended): a scalar containing
+    /// `{ sign_extend_32(x) : x ∈ γ(self) }`.
+    ///
+    /// The kernel keeps dedicated 32-bit bounds (`s32_min_value` /
+    /// `s32_max_value`, kernel/bpf/verifier.c) that JMP32 signed decisions
+    /// and refinement use directly (`is_branch32_taken`, `reg_set_min_max`).
+    /// febpf tracks only 64-bit bounds, so the s32 view is derived on
+    /// demand: exact when the 32-bit range does not cross the i32 sign
+    /// boundary, conservative (`[i32::MIN, i32::MAX]`) when it does.
+    fn sext32_view(&self) -> Scalar {
+        let t = self.tnum.cast(4);
+        let tnum = if t.mask & 0x8000_0000 != 0 {
+            // sign bit unknown: all high bits unknown
+            Tnum {
+                value: t.value,
+                mask: t.mask | 0xffff_ffff_0000_0000,
+            }
+        } else if t.value & 0x8000_0000 != 0 {
+            // sign bit known set: high bits known one
+            Tnum {
+                value: t.value | 0xffff_ffff_0000_0000,
+                mask: t.mask,
+            }
+        } else {
+            t
+        };
+        let (umin, umax, smin, smax) = if self.umax <= i32::MAX as u64 {
+            // non-negative as i32: sign-extension is the identity
+            (self.umin, self.umax, self.umin as i64, self.umax as i64)
+        } else if self.umin >= 1 << 31 {
+            // negative as i32: sign-extension is monotone on [2^31, 2^32)
+            let lo = self.umin as u32 as i32 as i64;
+            let hi = self.umax as u32 as i32 as i64;
+            (lo as u64, hi as u64, lo, hi)
+        } else {
+            // range crosses the i32 sign boundary: only the sign-extended
+            // magnitude is known
+            (0, u64::MAX, i32::MIN as i64, i32::MAX as i64)
+        };
+        let mut r = Scalar {
+            tnum,
+            umin,
+            umax,
+            smin,
+            smax,
+        };
+        if !r.sync() {
+            // cannot happen for a consistent truncated input; never return
+            // an empty (unsound) state
+            return Scalar {
+                tnum: Tnum::unknown(),
+                umin: 0,
+                umax: u64::MAX,
+                smin: i32::MIN as i64,
+                smax: i32::MAX as i64,
+            };
+        }
+        r
     }
 
     pub fn is_subset_of(&self, o: &Scalar) -> bool {
@@ -769,9 +847,18 @@ pub(crate) fn alu_scalar(
         alu::DIV => {
             if signed_off {
                 if a.is_const() && b.is_const() {
-                    let (av, bv) = (a.umin as i64, b.umin as i64);
-                    let v = if bv == 0 { 0 } else { av.wrapping_div(bv) as u64 };
-                    Scalar::constant(if is32 { v as u32 as u64 } else { v })
+                    // signed division is width-sensitive: fold ALU32 in i32
+                    // (interpreting the truncated operands as i64 was
+                    // unsound, e.g. 1 s/ -1 folded to 0 instead of -1;
+                    // found by the operator-soundness harness)
+                    let v = if is32 {
+                        let (av, bv) = (a.umin as u32 as i32, b.umin as u32 as i32);
+                        (if bv == 0 { 0 } else { av.wrapping_div(bv) }) as u32 as u64
+                    } else {
+                        let (av, bv) = (a.umin as i64, b.umin as i64);
+                        if bv == 0 { 0 } else { av.wrapping_div(bv) as u64 }
+                    };
+                    Scalar::constant(v)
                 } else {
                     Scalar::unknown()
                 }
@@ -782,13 +869,19 @@ pub(crate) fn alu_scalar(
         alu::MOD => {
             if signed_off {
                 if a.is_const() && b.is_const() {
-                    let (av, bv) = (a.umin as i64, b.umin as i64);
-                    let v = if bv == 0 {
-                        a.umin
+                    // width-sensitive like DIV above; x s% 0 leaves dst
+                    let v = if is32 {
+                        let (av, bv) = (a.umin as u32 as i32, b.umin as u32 as i32);
+                        (if bv == 0 { av } else { av.wrapping_rem(bv) }) as u32 as u64
                     } else {
-                        av.wrapping_rem(bv) as u64
+                        let (av, bv) = (a.umin as i64, b.umin as i64);
+                        if bv == 0 {
+                            a.umin
+                        } else {
+                            av.wrapping_rem(bv) as u64
+                        }
                     };
-                    Scalar::constant(if is32 { v as u32 as u64 } else { v })
+                    Scalar::constant(v)
                 } else {
                     Scalar::unknown()
                 }
@@ -1015,6 +1108,7 @@ pub(crate) fn refine(op: u8, taken: bool, a: &mut Scalar, b: &mut Scalar) -> boo
 
 /// Outcome of analyzing a conditional jump over two scalars.
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::large_enum_variant)] // Copy on the hot path beats boxing
 pub(crate) enum CondOutcome {
     /// The ranges force the comparison: only this outcome is possible.
     Decided(bool),
@@ -1029,10 +1123,21 @@ pub(crate) enum CondOutcome {
 /// the single entry point used by the verifier's jump step (and the soundness
 /// harness), so the truncation/refinement composition is tested as deployed.
 pub(crate) fn analyze_cond_jmp(op: u8, is32: bool, sa: Scalar, sb: Scalar) -> CondOutcome {
+    let signed_op = matches!(op, jmp::JSGT | jmp::JSGE | jmp::JSLT | jmp::JSLE);
     // 32-bit compares refine only when values fit in 32 bits
     let refinable = !is32 || (sa.umax <= u32::MAX as u64 && sb.umax <= u32::MAX as u64);
     let (ca, cb) = if is32 {
-        (sa.truncate32(), sb.truncate32())
+        let (ta, tb) = (sa.truncate32(), sb.truncate32());
+        if signed_op {
+            // JMP32 signed compares are decided over the s32 view. Deciding
+            // them on the zero-extended truncation was unsound (a 32-bit
+            // value with the sign bit set looked like a large positive):
+            // found by the operator-soundness harness. Kernel:
+            // is_branch32_taken / reg_set_min_max use dedicated s32 bounds.
+            (ta.sext32_view(), tb.sext32_view())
+        } else {
+            (ta, tb)
+        }
     } else {
         (sa, sb)
     };
@@ -1046,6 +1151,13 @@ pub(crate) fn analyze_cond_jmp(op: u8, is32: bool, sa: Scalar, sb: Scalar) -> Co
         for (slot, taken) in [(0usize, false), (1usize, true)] {
             let (mut ra, mut rb) = (ca, cb);
             if refine(op, taken, &mut ra, &mut rb) {
+                // refinement of a 32-bit signed compare happened in the
+                // sign-extended domain; map back to the zero-extended values
+                // the register holds
+                if is32 && signed_op {
+                    ra = ra.truncate32();
+                    rb = rb.truncate32();
+                }
                 out[slot] = Some((ra, rb));
             } else {
                 out[slot] = None; // contradictory: path is dead
