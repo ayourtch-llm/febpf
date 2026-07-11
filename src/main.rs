@@ -31,6 +31,9 @@ options:
   --readonly-ctx       verifier: forbid stores to the context
   --iters <n>          bench: iterations (default 1000)
   --prog <name>        select a program from a multi-program ELF object
+  --target-btf <path>  CO-RE: relocate against this BTF (raw blob or ELF with
+                       a .BTF section); defaults to /sys/kernel/btf/vmlinux
+                       when present and the object has CO-RE relocations
   -o <file>            output file (asm)
 
 input files ending in .s/.asm/.bpf are assembled; ELF objects from
@@ -51,6 +54,7 @@ struct Opts {
     iters: u64,
     jit: bool,
     prog: Option<String>,
+    target_btf: Option<String>,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -69,6 +73,7 @@ fn parse_args() -> Result<Opts, String> {
         iters: 1000,
         jit: false,
         prog: None,
+        target_btf: None,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -93,6 +98,9 @@ fn parse_args() -> Result<Opts, String> {
             "--no-explain" => o.no_explain = true,
             "--jit" => o.jit = true,
             "--prog" => o.prog = Some(args.next().ok_or("--prog needs a value")?),
+            "--target-btf" => {
+                o.target_btf = Some(args.next().ok_or("--target-btf needs a value")?)
+            }
             "--strict-align" => o.strict_align = true,
             "--readonly-ctx" => o.readonly_ctx = true,
             f if !f.starts_with('-') && o.file.is_empty() => o.file = f.to_string(),
@@ -105,7 +113,23 @@ fn parse_args() -> Result<Opts, String> {
     Ok(o)
 }
 
-fn load_program(path: &str, prog: Option<&str>) -> Result<Program, String> {
+/// Read a target BTF for CO-RE: either a raw BTF blob (e.g.
+/// /sys/kernel/btf/vmlinux) or an ELF object carrying a .BTF section.
+fn read_target_btf(path: &str) -> Result<Vec<u8>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    if bytes.len() >= 4 && &bytes[0..4] == b"\x7fELF" {
+        match febpf::elf::read_section(&bytes, ".BTF").map_err(|e| format!("{path}: {e}"))? {
+            Some((btf, _)) => Ok(btf),
+            None => Err(format!("{path}: no .BTF section")),
+        }
+    } else {
+        Ok(bytes) // raw BTF blob; endianness is detected from its magic
+    }
+}
+
+const VMLINUX_BTF: &str = "/sys/kernel/btf/vmlinux";
+
+fn load_program(path: &str, prog: Option<&str>, target_btf: Option<&str>) -> Result<Program, String> {
     let is_source = [".s", ".asm", ".bpf"]
         .iter()
         .any(|ext| path.ends_with(ext));
@@ -121,7 +145,20 @@ fn load_program(path: &str, prog: Option<&str>) -> Result<Program, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     // ELF object (clang -target bpf) vs raw bytecode.
     if bytes.len() >= 4 && &bytes[0..4] == b"\x7fELF" {
-        let obj = febpf::elf::load(&bytes).map_err(|e| format!("{path}: {e}"))?;
+        // CO-RE: an explicit --target-btf wins; otherwise default to the
+        // running kernel's BTF when the object actually has relocations.
+        let target = match target_btf {
+            Some(p) => Some(read_target_btf(p)?),
+            None if febpf::elf::has_core_relocations(&bytes)
+                && std::path::Path::new(VMLINUX_BTF).exists() =>
+            {
+                eprintln!("note: applying CO-RE relocations against {VMLINUX_BTF} (--target-btf to override)");
+                Some(read_target_btf(VMLINUX_BTF)?)
+            }
+            None => None,
+        };
+        let obj = febpf::elf::load_with_target_btf(&bytes, target.as_deref())
+            .map_err(|e| format!("{path}: {e}"))?;
         let chosen = match prog {
             Some(name) => obj
                 .programs
@@ -197,7 +234,7 @@ fn run() -> Result<ExitCode, String> {
         print!("{USAGE}");
         return Ok(ExitCode::SUCCESS);
     }
-    let prog = load_program(&o.file, o.prog.as_deref())?;
+    let prog = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
 
     match o.cmd.as_str() {
         "asm" => {

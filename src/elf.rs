@@ -8,9 +8,10 @@
 //! - map definitions from either the legacy `maps` section
 //!   (`struct bpf_map_def`) or a minimal parse of BTF-defined `.maps`.
 //!
-//! It does not implement the full BTF type system — only the standard libbpf
-//! `.maps` idiom (`__uint`/`__type` members encoded as pointer-to-array and
-//! pointer-to-type). See `docs/specs/elf-loading.md`.
+//! BTF-defined maps are read through the full BTF type graph in
+//! [`crate::btf`], using the standard libbpf `.maps` idiom (`__uint`/`__type`
+//! members encoded as pointer-to-array and pointer-to-type).
+//! See `docs/specs/elf-loading.md`.
 
 use crate::insn::{self, Insn};
 use crate::maps::{MapDef, MapKind};
@@ -125,8 +126,8 @@ struct Relocation {
     kind: u32,
 }
 
-/// Parse and relocate a BPF object file.
-pub fn load(bytes: &[u8]) -> Result<Object, String> {
+/// Validate the ELF64/EM_BPF header and parse the section table.
+fn parse_elf(bytes: &[u8]) -> Result<(Reader<'_>, Vec<Section>), String> {
     if bytes.len() < 64 || &bytes[0..4] != ELF_MAGIC {
         return Err("not an ELF file".into());
     }
@@ -178,6 +179,32 @@ pub fn load(bytes: &[u8]) -> Result<Object, String> {
             entsize: r.u64(base + 56)? as usize,
         });
     }
+    Ok((r, sections))
+}
+
+/// Extract a named section's payload from a BPF ELF object (e.g. `.BTF`,
+/// `.BTF.ext`). Returns `Ok(None)` if the section is absent. The second
+/// element of the pair reports the object's endianness (little = true).
+pub fn read_section(bytes: &[u8], name: &str) -> Result<Option<(Vec<u8>, bool)>, String> {
+    let (r, sections) = parse_elf(bytes)?;
+    match sections.iter().position(|s| s.name == name && s.size > 0) {
+        Some(i) => Ok(Some((section_bytes(bytes, &sections, i)?.to_vec(), r.le))),
+        None => Ok(None),
+    }
+}
+
+/// Parse and relocate a BPF object file (no CO-RE target: any CO-RE
+/// relocations are left at the layout the compiler baked in).
+pub fn load(bytes: &[u8]) -> Result<Object, String> {
+    load_with_target_btf(bytes, None)
+}
+
+/// Parse and relocate a BPF object file, applying CO-RE relocations from
+/// `.BTF.ext` against `target_btf` (a raw BTF blob: a `.BTF` section payload
+/// or a kernel BTF file such as `/sys/kernel/btf/vmlinux`) when given.
+pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<Object, String> {
+    let (r, sections) = parse_elf(bytes)?;
+    let bytes = r.buf;
 
     // symbol table + its string table
     let symtab_idx = sections
@@ -218,10 +245,12 @@ pub fn load(bytes: &[u8]) -> Result<Object, String> {
         .map(|(i, _)| i)
         .collect();
 
-    let mut programs = Vec::new();
+    // (program, its ELF section name, where `.text` was stitched in — needed
+    // to map per-section CO-RE relocations onto the flat instruction stream)
+    let mut programs: Vec<(LoadedProgram, String, Option<usize>)> = Vec::new();
     for idx in &entry_sections {
         let sec = &sections[*idx];
-        let insns = build_program(
+        let (insns, text_base) = build_program(
             &r,
             bytes,
             &sections,
@@ -231,33 +260,212 @@ pub fn load(bytes: &[u8]) -> Result<Object, String> {
             &symbols,
             &map_by_symval,
         )?;
-        programs.push(LoadedProgram {
-            name: sec.name.clone(),
-            insns,
-        });
+        programs.push((
+            LoadedProgram {
+                name: sec.name.clone(),
+                insns,
+            },
+            sec.name.clone(),
+            text_base,
+        ));
     }
 
     // If there are no SEC()-annotated entry programs, expose `.text` itself.
     if programs.is_empty() {
         if let Some(ti) = text_idx {
-            let insns = build_program(
+            let (insns, text_base) = build_program(
                 &r, bytes, &sections, ti, text_idx, &text_insns, &symbols, &map_by_symval,
             )?;
-            programs.push(LoadedProgram {
-                name: "text".into(),
-                insns,
-            });
+            programs.push((
+                LoadedProgram {
+                    name: "text".into(),
+                    insns,
+                },
+                ".text".into(),
+                text_base,
+            ));
         }
     }
     if programs.is_empty() {
         return Err("no executable program sections found".into());
     }
 
-    Ok(Object { programs, maps })
+    if let Some(target) = target_btf {
+        apply_core_relocations(r.le, bytes, &sections, &mut programs, target)?;
+    }
+
+    Ok(Object {
+        programs: programs.into_iter().map(|(p, _, _)| p).collect(),
+        maps,
+    })
+}
+
+/// Does this object carry CO-RE relocations (a `.BTF.ext` with a non-empty
+/// core_relo sub-section)? Used by callers to decide whether a target BTF
+/// (e.g. `/sys/kernel/btf/vmlinux`) should be supplied.
+pub fn has_core_relocations(bytes: &[u8]) -> bool {
+    let Ok(Some((ext_raw, le))) = read_section(bytes, ".BTF.ext") else {
+        return false;
+    };
+    crate::btf::BtfExt::parse(le, &ext_raw)
+        .map(|e| e.num_core_relos() > 0)
+        .unwrap_or(false)
+}
+
+/// Resolve every CO-RE relocation against the target BTF and patch the
+/// affected instructions in place (see `docs/specs/core-relocations.md` §3).
+///
+/// Relocations are grouped per ELF section; a program consists of its entry
+/// section (at instruction 0) plus, possibly, a stitched copy of `.text` (at
+/// `text_base`), so `.text` relocations are re-applied at that offset in
+/// every program that embeds it.
+fn apply_core_relocations(
+    le: bool,
+    bytes: &[u8],
+    sections: &[Section],
+    programs: &mut [(LoadedProgram, String, Option<usize>)],
+    target_btf: &[u8],
+) -> Result<(), String> {
+    use crate::btf::{Btf, BtfExt};
+
+    let Some(btf_idx) = sections.iter().position(|s| s.name == ".BTF" && s.size > 0) else {
+        return Ok(()); // no local BTF, nothing to relocate
+    };
+    let Some(ext_idx) = sections
+        .iter()
+        .position(|s| s.name == ".BTF.ext" && s.size > 0)
+    else {
+        return Ok(());
+    };
+    let local = Btf::parse(le, section_bytes(bytes, sections, btf_idx)?)?;
+    let ext = BtfExt::parse(le, section_bytes(bytes, sections, ext_idx)?)?;
+    if ext.num_core_relos() == 0 {
+        return Ok(());
+    }
+
+    // A raw BTF blob declares its own byte order via the magic.
+    let target_le = match target_btf.first_chunk::<2>() {
+        Some(&[0x9f, 0xeb]) => true,
+        Some(&[0xeb, 0x9f]) => false,
+        _ => return Err("target BTF: bad magic".into()),
+    };
+    let target = Btf::parse(target_le, target_btf)?;
+    let index = crate::relo::CandidateIndex::new(&target);
+
+    for (prog, sec_name, text_base) in programs.iter_mut() {
+        for ext_sec in &ext.core_relos {
+            let relo_sec = local.str_at(ext_sec.sec_name_off);
+            // Where does this section's code live inside this program?
+            let code_base = if relo_sec == sec_name {
+                0
+            } else if relo_sec == ".text" {
+                match text_base {
+                    Some(base) => *base,
+                    None => continue, // program didn't stitch .text in
+                }
+            } else {
+                continue; // relocations for some other program's section
+            };
+            for relo in &ext_sec.recs {
+                let res = crate::relo::calc_relo(&local, relo, &target, &index)
+                    .map_err(|e| format!("{}+{}: {e}", relo_sec, relo.insn_off))?;
+                let idx = code_base + relo.insn_off as usize / insn::INSN_SIZE;
+                patch_core_insn(&mut prog.insns, idx, &res).map_err(|e| {
+                    format!(
+                        "{}+{}: CO-RE {}: {e}",
+                        relo_sec,
+                        relo.insn_off,
+                        crate::btf::relo_kind::name(relo.kind)
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Patch one relocated instruction with the computed target value, mirroring
+/// libbpf's `bpf_core_patch_insn`: memory-class instructions take the value
+/// in `off`, immediate ALU ops in `imm`, and `lddw` across both `imm` slots.
+fn patch_core_insn(
+    insns: &mut [Insn],
+    idx: usize,
+    res: &crate::relo::ReloResult,
+) -> Result<(), String> {
+    use crate::insn::{class, jmp};
+    let insn = *insns
+        .get(idx)
+        .ok_or_else(|| format!("relocated instruction {idx} out of range"))?;
+
+    if res.poison {
+        // Like libbpf: replace with a call to an invalid helper (0xbad2310)
+        // so the program still loads and only fails verification if the
+        // (presumably existence-guarded) path is actually reachable.
+        insns[idx] = Insn {
+            opcode: class::JMP | jmp::CALL,
+            dst: 0,
+            src: 0,
+            off: 0,
+            imm: 0xbad2310,
+        };
+        return Ok(());
+    }
+
+    match insn.class() {
+        class::LDX | class::ST | class::STX => {
+            if res.validate && insn.off as i64 != res.orig_val as i64 {
+                return Err(format!(
+                    "insn {idx} off {} does not match expected {}",
+                    insn.off, res.orig_val
+                ));
+            }
+            if res.new_val > i16::MAX as u64 {
+                return Err(format!("new offset {} does not fit in i16", res.new_val));
+            }
+            insns[idx].off = res.new_val as i16;
+        }
+        class::ALU | class::ALU64 => {
+            if insn.is_src_reg() {
+                return Err(format!("insn {idx}: relocation on register-source ALU op"));
+            }
+            if res.validate && insn.imm as u32 as u64 != res.orig_val {
+                return Err(format!(
+                    "insn {idx} imm {} does not match expected {}",
+                    insn.imm, res.orig_val
+                ));
+            }
+            if res.new_val > u32::MAX as u64 {
+                return Err(format!("new value {} does not fit in imm", res.new_val));
+            }
+            insns[idx].imm = res.new_val as u32 as i32;
+        }
+        class::LD if insn.is_wide() => {
+            if idx + 1 >= insns.len() {
+                return Err(format!("relocated lddw at {idx} truncated"));
+            }
+            if res.validate && insn::wide_imm(insns, idx) != res.orig_val {
+                return Err(format!(
+                    "insn {idx} lddw {} does not match expected {}",
+                    insn::wide_imm(insns, idx),
+                    res.orig_val
+                ));
+            }
+            insns[idx].imm = res.new_val as u32 as i32;
+            insns[idx + 1].imm = (res.new_val >> 32) as u32 as i32;
+        }
+        other => {
+            return Err(format!(
+                "insn {idx}: unsupported instruction class {other:#x} for relocation"
+            ))
+        }
+    }
+    Ok(())
 }
 
 /// Build one runnable program from entry section `idx`, appending `.text`
 /// subprograms and fixing up call targets when the entry calls into `.text`.
+/// Also returns the instruction offset at which `.text` was stitched in (if
+/// it was), so CO-RE relocations on `.text` can be applied there.
 #[allow(clippy::too_many_arguments)]
 fn build_program(
     r: &Reader,
@@ -268,7 +476,7 @@ fn build_program(
     text_insns: &[Insn],
     symbols: &[Symbol],
     map_by_symval: &MapIndex,
-) -> Result<Vec<Insn>, String> {
+) -> Result<(Vec<Insn>, Option<usize>), String> {
     let raw = section_bytes(bytes, sections, idx)?;
     let mut insns = insn::decode_program(raw)?;
 
@@ -298,7 +506,7 @@ fn build_program(
             )?;
         }
     }
-    Ok(insns)
+    Ok((insns, text_base))
 }
 
 /// Does section `sec_idx`'s relocation table reference any symbol defined in
@@ -489,7 +697,7 @@ fn load_maps(
     if let Some(dotmaps_idx) = sections.iter().position(|s| s.name == ".maps") {
         if let Some(btf_idx) = sections.iter().position(|s| s.name == ".BTF") {
             let btf = section_bytes(bytes, sections, btf_idx)?;
-            return btf::load_btf_maps(r.le, btf, sections, symbols, dotmaps_idx);
+            return btf_maps::load_btf_maps(r.le, btf, sections, symbols, dotmaps_idx);
         }
     }
     // Legacy `maps` section.
@@ -623,270 +831,77 @@ fn cstr(strtab: &[u8], off: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal BTF `.maps` parsing
+// BTF `.maps` parsing (on the full type graph in `crate::btf`)
 // ---------------------------------------------------------------------------
 
-mod btf {
+mod btf_maps {
     use super::{map_kind, MapIndex, Section, Symbol};
+    use crate::btf::{Btf, Kind};
     use crate::maps::MapDef;
 
-    const BTF_MAGIC: u16 = 0xEB9F;
-    const KIND_INT: u32 = 1;
-    const KIND_PTR: u32 = 2;
-    const KIND_ARRAY: u32 = 3;
-    const KIND_STRUCT: u32 = 4;
-    const KIND_UNION: u32 = 5;
-    const KIND_ENUM: u32 = 6;
-    const KIND_FUNC_PROTO: u32 = 13;
-    const KIND_VAR: u32 = 14;
-    const KIND_DATASEC: u32 = 15;
-    const KIND_DECL_TAG: u32 = 17;
-    const KIND_ENUM64: u32 = 19;
-
-    struct B<'a> {
-        buf: &'a [u8],
-        le: bool,
-    }
-    impl B<'_> {
-        fn u32(&self, off: usize) -> Result<u32, String> {
-            let b: [u8; 4] = self
-                .buf
-                .get(off..off + 4)
-                .ok_or("truncated BTF")?
-                .try_into()
-                .unwrap();
-            Ok(if self.le {
-                u32::from_le_bytes(b)
-            } else {
-                u32::from_be_bytes(b)
-            })
-        }
-        fn u16(&self, off: usize) -> Result<u16, String> {
-            let b: [u8; 2] = self
-                .buf
-                .get(off..off + 2)
-                .ok_or("truncated BTF")?
-                .try_into()
-                .unwrap();
-            Ok(if self.le {
-                u16::from_le_bytes(b)
-            } else {
-                u16::from_be_bytes(b)
-            })
-        }
-    }
-
-    #[derive(Clone)]
-    struct BtfType {
-        name: String,
-        kind: u32,
-        vlen: u32,
-        /// size (INT/STRUCT) or referenced type id (PTR/ARRAY elem / VAR).
-        size_or_type: u32,
-        /// members (STRUCT) or secinfo (DATASEC) or array meta (ARRAY).
-        extra: Extra,
-    }
-
-    #[derive(Clone)]
-    enum Extra {
-        None,
-        Members(Vec<(String, u32)>),         // (name, type_id)
-        Array { nelems: u32 },               // ARRAY
-        Secinfo(Vec<(u32, u32, u32)>),        // (type_id, offset, size)
-    }
-
+    /// Read libbpf-style BTF map definitions out of the `.maps` DATASEC.
+    ///
+    /// Each DATASEC entry points at a `VAR` whose type is the map's anonymous
+    /// struct; `__uint(name, VAL)` members are encoded as `int (*)[VAL]`
+    /// (value = the array's nelems) and `__type(name, T)` as `T *`
+    /// (size = sizeof(T)). See `docs/specs/elf-loading.md`.
     pub(super) fn load_btf_maps(
         le: bool,
-        btf: &[u8],
+        btf_bytes: &[u8],
         _sections: &[Section],
         symbols: &[Symbol],
         dotmaps_idx: usize,
     ) -> Result<(Vec<MapDef>, MapIndex), String> {
-        let b = B { buf: btf, le };
-        if b.u16(0)? != BTF_MAGIC {
-            return Err("bad BTF magic".into());
-        }
-        // btf_header: magic(u16) version(u8) flags(u8) hdr_len(u32)
-        //             type_off(u32) type_len(u32) str_off(u32) str_len(u32)
-        let hdr_len = b.u32(4)? as usize;
-        let type_off = b.u32(8)? as usize;
-        let type_len = b.u32(12)? as usize;
-        let str_off = b.u32(16)? as usize;
-        let str_len = b.u32(20)? as usize;
-        let base = hdr_len; // section offsets are relative to end of header
-        let types_start = base + type_off;
-        let types_end = types_start + type_len;
-        let strs = btf
-            .get(base + str_off..base + str_off + str_len)
-            .ok_or("bad BTF string section")?;
+        let btf = Btf::parse(le, btf_bytes)?;
 
-        // Parse all types; ids start at 1 (0 = void).
-        let mut types = vec![BtfType {
-            name: String::new(),
-            kind: 0,
-            vlen: 0,
-            size_or_type: 0,
-            extra: Extra::None,
-        }];
-        let mut off = types_start;
-        while off < types_end {
-            let name_off = b.u32(off)? as usize;
-            let info = b.u32(off + 4)?;
-            let size_or_type = b.u32(off + 8)?;
-            let vlen = info & 0xffff;
-            let kind = (info >> 24) & 0x1f;
-            off += 12;
-            let extra = match kind {
-                KIND_STRUCT => {
-                    let mut members = Vec::with_capacity(vlen as usize);
-                    for _ in 0..vlen {
-                        let m_name = b.u32(off)? as usize;
-                        let m_type = b.u32(off + 4)?;
-                        // offset (u32) — skip
-                        members.push((super::cstr(strs, m_name), m_type));
-                        off += 12;
-                    }
-                    Extra::Members(members)
-                }
-                KIND_ARRAY => {
-                    // btf_array { type, index_type, nelems }
-                    let nelems = b.u32(off + 8)?;
-                    off += 12;
-                    Extra::Array { nelems }
-                }
-                KIND_DATASEC => {
-                    let mut info = Vec::with_capacity(vlen as usize);
-                    for _ in 0..vlen {
-                        let t = b.u32(off)?;
-                        let o = b.u32(off + 4)?;
-                        let s = b.u32(off + 8)?;
-                        info.push((t, o, s));
-                        off += 12;
-                    }
-                    Extra::Secinfo(info)
-                }
-                KIND_INT => {
-                    off += 4; // int encoding word
-                    Extra::None
-                }
-                KIND_VAR => {
-                    off += 4; // linkage word
-                    Extra::None
-                }
-                // Kinds we don't interpret but must still skip past so the
-                // next type header is read at the right offset.
-                KIND_UNION => {
-                    off += vlen as usize * 12; // btf_member[]
-                    Extra::None
-                }
-                KIND_ENUM => {
-                    off += vlen as usize * 8; // btf_enum[]
-                    Extra::None
-                }
-                KIND_FUNC_PROTO => {
-                    off += vlen as usize * 8; // btf_param[]
-                    Extra::None
-                }
-                KIND_ENUM64 => {
-                    off += vlen as usize * 12; // btf_enum64[]
-                    Extra::None
-                }
-                KIND_DECL_TAG => {
-                    off += 4; // btf_decl_tag { component_idx }
-                    Extra::None
-                }
-                // PTR, FWD, TYPEDEF, VOLATILE, CONST, RESTRICT, FUNC, FLOAT,
-                // TYPE_TAG have no trailing data.
-                _ => Extra::None,
-            };
-            types.push(BtfType {
-                name: super::cstr(strs, name_off),
-                kind,
-                vlen,
-                size_or_type,
-                extra,
-            });
-        }
-
-        let type_size = |id: u32| -> Result<u32, String> {
-            let t = types.get(id as usize).ok_or("bad BTF type id")?;
-            match t.kind {
-                KIND_INT | KIND_STRUCT => Ok(t.size_or_type),
-                KIND_PTR => Ok(8),
-                _ => Ok(t.size_or_type),
-            }
-        };
-        // For `__uint(name, VAL)` libbpf encodes VAL as `int (*)[VAL]`:
-        // member type = PTR -> ARRAY(nelems = VAL).
         let ptr_array_nelems = |id: u32| -> Result<u32, String> {
-            let ptr = types.get(id as usize).ok_or("bad member type")?;
-            if ptr.kind != KIND_PTR {
+            let Kind::Ptr { type_id } = btf.ty(btf.resolve(id)?)?.kind else {
                 return Err("expected pointer-encoded __uint member".into());
-            }
-            let arr = types
-                .get(ptr.size_or_type as usize)
-                .ok_or("bad pointee type")?;
-            match arr.extra {
-                Extra::Array { nelems } => Ok(nelems),
+            };
+            match btf.ty(btf.resolve(type_id)?)?.kind {
+                Kind::Array { nelems, .. } => Ok(nelems),
                 _ => Err("expected pointer-to-array __uint encoding".into()),
             }
         };
-        // For `__type(key, T)` the member is PTR -> T; size = sizeof(T).
         let ptr_pointee_size = |id: u32| -> Result<u32, String> {
-            let ptr = types.get(id as usize).ok_or("bad member type")?;
-            if ptr.kind != KIND_PTR {
+            let Kind::Ptr { type_id } = btf.ty(btf.resolve(id)?)?.kind else {
                 return Err("expected pointer-encoded __type member".into());
-            }
-            type_size(ptr.size_or_type)
+            };
+            btf.type_size(type_id)
         };
 
-        // Find the `.maps` DATASEC.
-        let datasec = types
-            .iter()
-            .find(|t| t.kind == KIND_DATASEC && t.name == ".maps")
-            .ok_or("no .maps DATASEC in BTF")?
-            .clone();
-        let secinfo = match &datasec.extra {
-            Extra::Secinfo(v) => v.clone(),
-            _ => unreachable!(),
-        };
+        let secinfo = btf.datasec(".maps").ok_or("no .maps DATASEC in BTF")?;
+        let mut ordered: Vec<_> = secinfo.to_vec();
+        ordered.sort_by_key(|si| si.offset);
 
         let mut maps = Vec::new();
         let mut index = Vec::new();
-        // secinfo entries are (var_type_id, offset, size); offset matches the
-        // symbol value of the map variable in the `.maps` section.
-        let mut ordered = secinfo.clone();
-        ordered.sort_by_key(|(_, o, _)| *o);
-        for (var_tid, offset, _sz) in ordered {
-            let var = types.get(var_tid as usize).ok_or("bad var type id")?;
-            if var.kind != KIND_VAR {
+        // secinfo entries point at VARs; the DATASEC offset matches the map
+        // variable's symbol value in the `.maps` section.
+        for si in &ordered {
+            let var = btf.ty(si.type_id)?;
+            let Kind::Var { type_id, .. } = var.kind else {
                 continue;
-            }
-            let map_name = var.name.clone();
-            let st = types
-                .get(var.size_or_type as usize)
-                .ok_or("map var has no struct type")?;
-            if st.kind != KIND_STRUCT {
-                return Err(format!("map '{map_name}' is not a struct"));
-            }
-            let members = match &st.extra {
-                Extra::Members(m) => m,
-                _ => unreachable!(),
             };
-            let (mut kind, mut key_size, mut value_size, mut max_entries) = (None, None, None, None);
-            for (mname, mtype) in members {
-                match mname.as_str() {
-                    "type" => kind = Some(map_kind(ptr_array_nelems(*mtype)?)?),
-                    "max_entries" => max_entries = Some(ptr_array_nelems(*mtype)?),
+            let map_name = btf.str_at(var.name_off).to_string();
+            let st_id = btf.resolve(type_id)?;
+            let Kind::Struct { members, .. } = &btf.ty(st_id)?.kind else {
+                return Err(format!("map '{map_name}' is not a struct"));
+            };
+            let (mut kind, mut key_size, mut value_size, mut max_entries) =
+                (None, None, None, None);
+            for m in members {
+                match btf.str_at(m.name_off) {
+                    "type" => kind = Some(map_kind(ptr_array_nelems(m.type_id)?)?),
+                    "max_entries" => max_entries = Some(ptr_array_nelems(m.type_id)?),
                     "map_flags" => {}
-                    "key_size" => key_size = Some(ptr_array_nelems(*mtype)?),
-                    "value_size" => value_size = Some(ptr_array_nelems(*mtype)?),
-                    "key" => key_size = Some(ptr_pointee_size(*mtype)?),
-                    "value" => value_size = Some(ptr_pointee_size(*mtype)?),
+                    "key_size" => key_size = Some(ptr_array_nelems(m.type_id)?),
+                    "value_size" => value_size = Some(ptr_array_nelems(m.type_id)?),
+                    "key" => key_size = Some(ptr_pointee_size(m.type_id)?),
+                    "value" => value_size = Some(ptr_pointee_size(m.type_id)?),
                     _ => {}
                 }
             }
-            let _ = st.vlen;
             maps.push(MapDef {
                 name: map_name.clone(),
                 kind: kind.ok_or_else(|| format!("map '{map_name}': missing type"))?,
@@ -899,14 +914,15 @@ mod btf {
                 readonly: false,
                 init: Vec::new(),
             });
-            // symbol value equals the DATASEC offset
-            let map_idx = maps.len() - 1;
-            index.push((offset as u64, dotmaps_idx as u16, map_idx));
+            index.push((si.offset as u64, dotmaps_idx as u16, maps.len() - 1));
         }
         // Map symbols may not be at DATASEC offsets in every toolchain; also
         // index by symbol order as a fallback.
         for sym in symbols.iter().filter(|s| s.shndx as usize == dotmaps_idx) {
-            if !index.iter().any(|(v, sh, _)| *v == sym.value && *sh == sym.shndx) {
+            if !index
+                .iter()
+                .any(|(v, sh, _)| *v == sym.value && *sh == sym.shndx)
+            {
                 if let Some(pos) = maps.iter().position(|m| m.name == sym.name) {
                     index.push((sym.value, sym.shndx, pos));
                 }

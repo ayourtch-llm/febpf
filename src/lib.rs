@@ -21,6 +21,7 @@
 
 pub mod analysis;
 pub mod asm;
+pub mod btf;
 pub mod debug;
 pub mod disasm;
 pub mod elf;
@@ -29,6 +30,7 @@ pub mod insn;
 pub mod interp;
 pub mod jit;
 pub mod maps;
+pub mod relo;
 pub mod tnum;
 pub mod verifier;
 
