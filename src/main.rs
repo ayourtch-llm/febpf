@@ -25,6 +25,7 @@ commands:
   bench <file>                measure interpreter throughput
   conftest <file>             run under interp, JIT and the real kernel; diff r0
   fuzz                        differential fuzzer: interp vs JIT (vs --kernel)
+  vfuzz                       verifier differential: febpf vs kernel verdicts
 
 options:
   --ctx <hex|@file>    context memory contents (hex string or file)
@@ -36,7 +37,9 @@ options:
   --readonly-ctx       verifier: forbid stores to the context
   --iters <n>          bench/fuzz: iterations (default 1000)
   --seed <n>           fuzz: PRNG seed (random if omitted; printed on failure)
-  --kernel             conftest/fuzz: also diff against the real kernel (root)
+  --kernel             conftest/fuzz/vfuzz: also diff against the real kernel (root)
+  --frontier           vfuzz: use the verification-frontier generator (default)
+  --conservative       vfuzz: use the conservative (fuzz) generator instead
   --prog <name>        select a program from a multi-program ELF object
   --target-btf <path>  CO-RE: relocate against this BTF (raw blob or ELF with
                        a .BTF section); defaults to /sys/kernel/btf/vmlinux
@@ -64,6 +67,7 @@ struct Opts {
     target_btf: Option<String>,
     seed: Option<u64>,
     kernel: bool,
+    conservative: bool,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -85,6 +89,7 @@ fn parse_args() -> Result<Opts, String> {
         target_btf: None,
         seed: None,
         kernel: false,
+        conservative: false,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -114,6 +119,8 @@ fn parse_args() -> Result<Opts, String> {
                 )
             }
             "--kernel" => o.kernel = true,
+            "--frontier" => o.conservative = false,
+            "--conservative" => o.conservative = true,
             "--no-verify" => o.no_verify = true,
             "--no-explain" => o.no_explain = true,
             "--jit" => o.jit = true,
@@ -127,7 +134,7 @@ fn parse_args() -> Result<Opts, String> {
             other => return Err(format!("unknown option '{other}'")),
         }
     }
-    if o.file.is_empty() && o.cmd != "help" && o.cmd != "fuzz" {
+    if o.file.is_empty() && o.cmd != "help" && o.cmd != "fuzz" && o.cmd != "vfuzz" {
         return Err("missing input file".into());
     }
     Ok(o)
@@ -291,6 +298,9 @@ fn run() -> Result<ExitCode, String> {
     }
     if o.cmd == "fuzz" {
         return conftest::fuzz(&o);
+    }
+    if o.cmd == "vfuzz" {
+        return conftest::vfuzz(&o);
     }
     let (prog, debug) = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
     if o.cmd == "conftest" {

@@ -172,6 +172,136 @@ pub fn fuzz(o: &Opts) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Verifier differential fuzzer: compare febpf's verifier *verdict* against the
+/// kernel's. See docs/specs/verifier-diff.md for the classification taxonomy
+/// and the soundness-vs-completeness asymmetry.
+pub fn vfuzz(o: &Opts) -> Result<ExitCode, String> {
+    use febpf::fuzz::{
+        check_self_consistency, febpf_verdict, gen_frontier_program, gen_program, random_seed,
+        Prng, SelfConsistency,
+    };
+
+    let base_seed = o.seed.unwrap_or_else(random_seed);
+    let iters = o.iters;
+    let frontier = !o.conservative;
+
+    // Kernel mode is opt-in and degrades gracefully (probe + skip).
+    let use_kernel = if o.kernel {
+        match kbpf::has_privilege() {
+            Ok(true) => true,
+            Ok(false) => {
+                eprintln!(
+                    "skipped: no bpf privilege — kernel verdicts disabled, self-consistency only"
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("skipped: bpf probe error ({e}) — self-consistency only");
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    println!(
+        "verifier-fuzzing {iters} programs, base seed {base_seed:#x}, {} generator{}",
+        if frontier { "frontier" } else { "conservative" },
+        if use_kernel { ", +kernel" } else { "" }
+    );
+
+    // Four-cell classification (kernel path) + self-consistency (always).
+    let (mut both_accept, mut both_reject) = (0u64, 0u64);
+    let mut febpf_lax = 0u64; // febpf ACCEPT / kernel REJECT — soundness signal
+    let mut febpf_strict = 0u64; // kernel ACCEPT / febpf REJECT — completeness
+    let mut self_faults = 0u64;
+    let mut strict_samples: Vec<u64> = Vec::new();
+
+    for i in 0..iters {
+        let seed = base_seed.wrapping_add(i);
+        let mut rng = Prng::new(seed);
+        let prog = if frontier {
+            gen_frontier_program(&mut rng)
+        } else {
+            gen_program(&mut rng)
+        };
+
+        // (1) Kernel-free self-consistency: verify-accepted must run cleanly.
+        if let SelfConsistency::AcceptedSafetyFault(m) = check_self_consistency(&prog, &[]) {
+            self_faults += 1;
+            println!(
+                "\n### SELF-CONSISTENCY FAILURE (seed {seed} — reproduce with --seed {seed})"
+            );
+            println!("febpf verifier ACCEPTED, but the interpreter raised: {m}");
+            println!("--- program ---");
+            print!("{}", disasm::disasm_program(&prog));
+        }
+
+        let febpf = febpf_verdict(&prog, &[]);
+
+        if !use_kernel {
+            continue;
+        }
+
+        // (2) Kernel verdict.
+        let mut log = String::new();
+        let kernel_ok = kbpf::verdict(&prog, Some(&mut log)).is_ok();
+
+        match (febpf.is_ok(), kernel_ok) {
+            (true, true) => both_accept += 1,
+            (false, false) => both_reject += 1,
+            (true, false) => {
+                // FEBPF-LAX: the high-value soundness signal. Dump in full.
+                febpf_lax += 1;
+                println!(
+                    "\n>>> FEBPF-LAX (soundness gap) — febpf ACCEPTS, kernel REJECTS"
+                );
+                println!(">>> seed {seed} — reproduce with --seed {seed} --iters 1");
+                println!("--- program ---");
+                print!("{}", disasm::disasm_program(&prog));
+                if !log.trim().is_empty() {
+                    println!("--- kernel verifier log ---\n{}", log.trim_end());
+                }
+            }
+            (false, true) => {
+                // FEBPF-STRICT: expected in bulk; sample a few for the summary.
+                febpf_strict += 1;
+                if strict_samples.len() < 5 {
+                    strict_samples.push(seed);
+                }
+            }
+        }
+    }
+
+    // ---- summary -----------------------------------------------------------
+    println!("\n=== summary ({iters} programs) ===");
+    println!("self-consistency failures : {self_faults}");
+    if use_kernel {
+        println!("BOTH-accept (agree)       : {both_accept}");
+        println!("BOTH-reject (agree)       : {both_reject}");
+        println!("FEBPF-STRICT (completeness): {febpf_strict}  (expected; kernel is far stricter)");
+        println!("FEBPF-LAX  (SOUNDNESS)    : {febpf_lax}  <-- the signal");
+        if !strict_samples.is_empty() {
+            let s: Vec<String> = strict_samples.iter().map(|x| x.to_string()).collect();
+            println!("  sample FEBPF-STRICT seeds: {}", s.join(", "));
+        }
+    } else {
+        println!("(kernel verdicts not collected; run as root with --kernel)");
+    }
+
+    // Exit-code contract: soundness problems -> 1; kernel-requested-but-no-priv
+    // -> 2; otherwise 0. A soundness problem always wins.
+    if febpf_lax > 0 || self_faults > 0 {
+        println!("\nRESULT: soundness problem(s) found — see FEBPF-LAX / self-consistency dumps above");
+        Ok(ExitCode::from(1))
+    } else if o.kernel && !use_kernel {
+        Ok(ExitCode::from(2))
+    } else {
+        println!("\nRESULT: no soundness problem (agreement or only expected FEBPF-STRICT)");
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
 fn fail(seed: u64, prog: &[febpf::insn::Insn], why: &str) -> ExitCode {
     println!("FAIL (seed {seed:#x} — reproduce with --seed {seed}): {why}");
     println!("--- program ---");

@@ -288,6 +288,19 @@ pub fn has_privilege() -> KResult<bool> {
     }
 }
 
+/// The kernel verifier's *verdict* for a map-free program: `Ok(())` = the
+/// kernel accepted (loaded) it, `Err(KError)` = it rejected the program (a
+/// load/verify error). On rejection, if `log` is `Some`, the kernel verifier's
+/// message is captured into it for triage.
+///
+/// This reuses [`imp::prog_load`], so the `bpf(2)` attr keeps mutable
+/// provenance all the way to the syscall (the kernel writes back into it — a
+/// shared reference miscompiles in release builds). On acceptance the returned
+/// fd is dropped immediately, closing the loaded program.
+pub fn verdict(insns: &[Insn], log: Option<&mut String>) -> KResult<()> {
+    imp::prog_load(insns, log).map(|_fd| ())
+}
+
 /// Load a program (creating its maps and rewriting map-reference `lddw`
 /// instructions to kernel fds), TEST_RUN it on `data_in`, and return the
 /// kernel `retval`. The created fds live until the returned value drops — but
