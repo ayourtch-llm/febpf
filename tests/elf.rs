@@ -10,23 +10,41 @@ use febpf::{elf, Program, Vm};
 use std::path::Path;
 use std::process::Command;
 
+/// True when the local clang can actually emit BPF objects. Finding `clang` is
+/// not enough: Apple clang ships no BPF backend, and running it anyway fails
+/// *after* it has already truncated the output — which would destroy the
+/// committed fixture.
+pub fn clang_targets_bpf() -> bool {
+    Command::new("clang")
+        .arg("--print-targets")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("bpf"))
+        .unwrap_or(false)
+}
+
 fn maybe_compile(src: &str, out: &str) {
-    if Command::new("clang").arg("--version").output().is_err() {
-        return; // no clang; use the committed fixture
+    if !clang_targets_bpf() {
+        return; // no BPF-capable clang; use the committed fixture
     }
     let src_path = format!("examples/c/{src}");
     if !Path::new(&src_path).exists() {
         return;
     }
     let opt = if src == "subprog.c" { "-O0" } else { "-O2" };
+    // Build to a temp path and install on success, so a clang that fails
+    // partway can never leave the committed fixture damaged.
+    let tmp = format!("tests/{out}.tmp");
     let status = Command::new("clang")
         .args([opt, "-g", "-target", "bpf", "-c", &src_path, "-o"])
-        .arg(format!("tests/{out}"))
+        .arg(&tmp)
         .status();
-    assert!(
-        status.map(|s| s.success()).unwrap_or(false),
-        "clang failed to compile {src}"
-    );
+    let ok = status.map(|s| s.success()).unwrap_or(false);
+    if ok {
+        std::fs::rename(&tmp, format!("tests/{out}")).expect("install fixture");
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    assert!(ok, "clang failed to compile {src}");
 }
 
 fn load(path: &str) -> elf::Object {

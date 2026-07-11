@@ -8,22 +8,34 @@ use febpf::{elf, Program, Vm};
 use std::path::Path;
 use std::process::Command;
 
+/// Regenerate a fixture only when clang can actually target BPF (Apple clang
+/// cannot, and a failed run would destroy the committed .o), and install it
+/// from a temp file so a partial failure leaves the fixture intact.
 fn maybe_compile(src: &str, out: &str, opt: &str) {
-    if Command::new("clang").arg("--version").output().is_err() {
+    let bpf_capable = Command::new("clang")
+        .arg("--print-targets")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("bpf"))
+        .unwrap_or(false);
+    if !bpf_capable {
         return;
     }
     let src_path = format!("examples/c/{src}");
     if !Path::new(&src_path).exists() {
         return;
     }
+    let tmp = format!("tests/{out}.tmp");
     let status = Command::new("clang")
         .args([opt, "-g", "-target", "bpf", "-c", &src_path, "-o"])
-        .arg(format!("tests/{out}"))
+        .arg(&tmp)
         .status();
-    assert!(
-        status.map(|s| s.success()).unwrap_or(false),
-        "clang failed to compile {src}"
-    );
+    let ok = status.map(|s| s.success()).unwrap_or(false);
+    if ok {
+        std::fs::rename(&tmp, format!("tests/{out}")).expect("install fixture");
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    assert!(ok, "clang failed to compile {src}");
 }
 
 fn debug_of<'a>(obj: &'a elf::Object, prog: &str) -> &'a DebugInfo {

@@ -11,18 +11,32 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-/// Recompile the fixture when clang is available (mirrors tests/elf.rs).
+/// Recompile the fixture when a BPF-capable clang is available (mirrors
+/// tests/elf.rs). Apple clang has no BPF backend — running it would fail and
+/// destroy the committed fixture, so probe first and build via a temp file.
 fn maybe_compile() {
-    if Command::new("clang").arg("--version").output().is_err() {
+    let bpf_capable = Command::new("clang")
+        .arg("--print-targets")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("bpf"))
+        .unwrap_or(false);
+    if !bpf_capable {
         return;
     }
     if !Path::new("examples/c/btfctx.c").exists() {
         return;
     }
+    let tmp = "tests/btfctx.o.tmp";
     let status = Command::new("clang")
-        .args(["-O2", "-g", "-target", "bpf", "-c", "examples/c/btfctx.c", "-o", "tests/btfctx.o"])
+        .args(["-O2", "-g", "-target", "bpf", "-c", "examples/c/btfctx.c", "-o", tmp])
         .status();
-    assert!(status.map(|s| s.success()).unwrap_or(false));
+    let ok = status.map(|s| s.success()).unwrap_or(false);
+    if ok {
+        std::fs::rename(tmp, "tests/btfctx.o").expect("install fixture");
+    } else {
+        let _ = std::fs::remove_file(tmp);
+    }
+    assert!(ok, "clang failed to compile btfctx.c");
 }
 
 fn fixture_bytes() -> Vec<u8> {

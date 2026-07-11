@@ -38,6 +38,13 @@ impl KError {
     pub fn is_permission(&self) -> bool {
         self.errno == 1 || self.errno == 13 // EPERM / EACCES
     }
+
+    /// True when `bpf(2)` does not exist on this platform at all — the
+    /// non-Linux stub reports ENOSYS. Distinct from the kernel *refusing* the
+    /// call: there is no kernel BPF here to refuse it.
+    pub fn is_unsupported(&self) -> bool {
+        self.errno == 38 // ENOSYS
+    }
 }
 
 fn errno_str(e: i32) -> &'static str {
@@ -49,6 +56,7 @@ fn errno_str(e: i32) -> &'static str {
         14 => "EFAULT",
         22 => "EINVAL",
         28 => "ENOSPC",
+        38 => "ENOSYS",
         _ => "?",
     }
 }
@@ -297,7 +305,9 @@ pub use imp::Fd;
 pub fn has_privilege() -> KResult<bool> {
     match imp::probe() {
         Ok(()) => Ok(true),
-        Err(e) if e.is_permission() => Ok(false),
+        // Unprivileged, or a platform with no bpf(2) whatsoever (macOS): both
+        // are definite "no", which is what callers need in order to skip.
+        Err(e) if e.is_permission() || e.is_unsupported() => Ok(false),
         Err(e) => Err(e),
     }
 }
