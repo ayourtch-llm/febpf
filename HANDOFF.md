@@ -21,12 +21,37 @@ the JIT is now behind `default = ["jit"]`, so always run `cargo test` AND
 `cargo test --no-default-features` (and clippy in both) before calling
 anything done.
 
-**Nothing in flight.** `feat/map-types-2` (perf/cgroup/stack maps + core
-tracing helpers) and `feat/probe-read-helpers` (probe_read family #4/#45/#112–115
-+ current_task_under_cgroup #37, spec `docs/specs/tracing-helpers.md`) are both
-finished and merged (2026-07-11). Corpus coverage after the two batches:
-**loads 92.9%, verifies 67.9%** (38/56) — up from 30% / 5.4%. Zero map-type
-blockers remain; the next work is named under "Known limitations" below.
+**⚠ IN-FLIGHT AT LAST CONTEXT CHECKPOINT (2026-07-11, session 3):** a
+background agent is implementing **BTF-typed ctx pointers** (kernel
+PTR_TO_BTF_ID for `tp_btf`/`fentry` ctx args — the last fixable corpus class)
+in a worktree; its branch will be `worktree-agent-*`. FIRST THING ON REFRESH:
+`git worktree list` + `git branch -a`. If the branch exists with commits,
+REVIEW BEFORE MERGING — this is the largest verifier surface change since
+conformance hardening. Review checklist: (1) new PtrKind must join/subsume
+correctly in pruning (a typed pointer must never widen to scalar); (2) runtime
+must stay inside the virtual-address model — expect a synthetic
+"kernel-memory-reads-as-zero" region, writes must fault; (3) every acceptance
+should cite the kernel rule (`btf_ctx_access`/`btf_struct_access`); (4) run
+BOTH test configs + clippy, `cargo build --release`, `./scripts/scan-corpus.sh`
+— expect **55/56** (ksnoop stays rejected BY DESIGN, see "DO NOT 'FIX'" note).
+If the worktree has uncommitted work, check `git -C <worktree> status` — a
+previous agent once left a finished-but-uncommitted test (fix: `.map` before
+first use).
+
+**QUEUED NEXT (user-approved, do after the BTF merge to avoid verifier.rs
+conflicts):** an agent batch for exhaustive small-bit-width soundness checks
+of the verifier's abstract operators (tnum + ranges) — see "Formal methods"
+in `docs/ideas.md` item 1. After that, pick from the user-endorsed roadmap in
+`docs/ideas.md` (extension-mechanism packaging ≥ XDP/packet-access >
+CI/LSP packaging; `febpf snapshot-kernel` as migration phase 1; GPUs parked).
+
+Merged earlier this session (all on main): map-types-2 (perf/cgroup/stack
+maps, tracing helpers #14–16/#35, get_stackid #27), probe_read family
+(#4/#45/#112–115) + task_under_cgroup #37, get_stack #67, kconfig externs,
+max_entries default, subprog pointer returns (kernel-exact:
+`prepare_func_exit`), rodata DCE (`src/dce.rs`), get_socket_cookie #46 +
+get_func_ip #173, scan-corpus helper-name fix. Corpus: **100% loads / 91.1%
+verified (51/56)**, from 30%/5.4% at session start.
 
 ## The big picture (data flow)
 
@@ -185,6 +210,30 @@ buggy program replays identically under the debugger. Keep it that way.
   W^X), plus `sys_icache_invalidate` for i-cache flush. The `JitBackend` trait
   split means x64.rs stays untouched; budget real time for the exec-mem layer,
   not just the encoder.
+
+## Agent-orchestration lessons (session 3 — these all actually bit me)
+
+- The user likes the pattern: delegate well-scoped corpus batches to parallel
+  worktree agents; SEQUENCE anything touching `verifier.rs` (two parallel
+  batches once "fixed" the same subprog-return rule differently — the
+  kernel-exact version won). Review every verifier diff personally before
+  merging; the soundness bar is "cite the kernel rule you mirror".
+- The Bash shell's `cd` into a worktree PERSISTS across commands: a `git
+  merge` once silently ran inside the agent's worktree ("Already up to date")
+  instead of main. Always `cd /home/ayourtch/rust/febpf` first or check
+  `git worktree list` output paths.
+- `tests/*.o` fixtures: clang `-g` embeds the compilation directory, so
+  fixtures regenerated inside a worktree differ byte-wise from main-checkout
+  builds. Commit fixture `.o` files ONLY from the main checkout; worktree `.o`
+  churn in `git status` is expected noise (tell agents not to commit
+  regenerated pre-existing fixtures).
+- After merging an agent branch: run both test configs + clippy FROM MAIN,
+  `cargo build --release` (the corpus scan uses the release binary), rescan,
+  then `git worktree remove --force <path>` + delete the branch.
+- ksnoop is a CORRECT rejection (kernel verdict parity, proven via upstream
+  bcc commit 0ae562c) — see the DO NOT "FIX" note under Production coverage.
+- Strategy/roadmap ponderings live in `docs/ideas.md` (user endorsed the
+  ranking there); don't re-litigate direction, extend it.
 
 ## How to verify you haven't broken anything
 ```
