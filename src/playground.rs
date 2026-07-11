@@ -203,6 +203,28 @@ pub fn analyze_text(bytes: &[u8], mode: u32) -> String {
     }
 }
 
+/// Deterministic concurrency race exploration. Runs `procs` instances of the
+/// program sharing one map set across all interleavings (capped at
+/// `schedules`), and renders the report — divergent outcomes / lost updates,
+/// each with a replayable interleaving. `procs`/`schedules` of 0 fall back to
+/// sensible defaults (2 instances, 2000 schedules).
+pub fn race_text(bytes: &[u8], procs: u32, schedules: u32) -> String {
+    let prog = match load_program(bytes) {
+        Ok(p) => p,
+        Err(e) => return format!("load error: {e}"),
+    };
+    let ctx = vec![0u8; 4096];
+    let cfg = crate::race::ExploreConfig {
+        procs: if procs == 0 { 2 } else { procs as usize },
+        schedules: if schedules == 0 { 2000 } else { schedules as usize },
+        seed: None,
+    };
+    match crate::race::explore(&prog, &ctx, &cfg) {
+        Ok(rep) => crate::race::render_report(&rep, "program", true),
+        Err(e) => format!("race error: {e}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Debugger session (replay-based time travel)
 // ---------------------------------------------------------------------------

@@ -76,6 +76,16 @@ const Febpf = (() => {
       exports.febpf_free(c.ptr, c.len);
       return out;
     },
+    // Deterministic race exploration: `procs` instances sharing maps, up to
+    // `schedules` interleavings (0 => defaults 2 / 2000). Returns the report.
+    race: (src, procs, schedules) => {
+      const a = writeBytes(asBytes(src));
+      const out = readResult(
+        exports.febpf_race(a.ptr, a.len, (procs >>> 0), (schedules >>> 0)),
+      );
+      exports.febpf_free(a.ptr, a.len);
+      return out;
+    },
 
     // Debugger: returns a handle, or throws with the error text.
     dbgNew: (src, ctxHex) => {

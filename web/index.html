@@ -153,6 +153,8 @@
         <div class="row">
           <button id="demo-good">Demo: map + loop</button>
           <button id="demo-bad">Demo: fails the verifier</button>
+          <button id="demo-race">Demo: data race</button>
+          <button id="demo-race-fixed">Demo: race-free (atomic)</button>
           <label class="file">Load .o…<input type="file" id="objfile" accept=".o,.bpf,application/octet-stream" /></label>
         </div>
         <textarea id="src" spellcheck="false"></textarea>
@@ -169,6 +171,11 @@
             <option value="0">annotated listing</option>
             <option value="1">CFG (Graphviz DOT)</option>
             <option value="2">execution heatmap</option>
+          </select>
+          <button id="btn-race" title="Run N instances sharing maps across all interleavings and report data races">Race check</button>
+          <select id="race-procs" title="concurrent instances">
+            <option value="2">2 instances</option>
+            <option value="3">3 instances</option>
           </select>
         </div>
       </section>
@@ -261,6 +268,53 @@ miss:
     exit
 `;
 
+      const DEMO_RACE = `; DATA RACE: a shared counter incremented with a non-atomic
+; read-modify-write. Each instance does lookup -> read -> +1 -> update.
+; Hit "Race check": two instances sharing this map can lose an update
+; under some interleaving (final count = 1 instead of 2).
+.map counter array 4 8 1
+
+    r0 = 0
+    *(u32 *)(r10 - 4) = r0          ; key = 0
+    r1 = map[counter]
+    r2 = r10
+    r2 += -4
+    call map_lookup_elem            ; array[0] is always present
+    if r0 == 0 goto out
+    r6 = *(u64 *)(r0 + 0)           ; READ current count (staleness window)
+    r6 += 1
+    *(u64 *)(r10 - 16) = r6         ; new count on the stack
+    r1 = map[counter]
+    r2 = r10
+    r2 += -4
+    r3 = r10
+    r3 += -16
+    r4 = 0
+    call map_update_elem            ; WRITE it back (may clobber a peer)
+out:
+    r0 = 0
+    exit
+`;
+
+      const DEMO_RACE_FIXED = `; RACE-FREE: the same counter, but incremented with an ATOMIC add
+; on the shared map value. Every interleaving commits the same final
+; count, so "Race check" reports RACE-FREE across all schedules.
+.map counter array 4 8 1
+
+    r0 = 0
+    *(u32 *)(r10 - 4) = r0          ; key = 0
+    r1 = map[counter]
+    r2 = r10
+    r2 += -4
+    call map_lookup_elem            ; array[0] is always present
+    if r0 == 0 goto out
+    r1 = 1
+    lock *(u64 *)(r0 + 0) += r1     ; atomic RMW: no lost update possible
+out:
+    r0 = 0
+    exit
+`;
+
       const $ = (id) => document.getElementById(id);
       const out = $("out");
       const dbgOut = $("dbg-out");
@@ -284,6 +338,8 @@ miss:
       // --- wiring ---
       $("demo-good").onclick = () => { clearObject(); $("src").value = DEMO_GOOD; show(out, "Loaded demo. Hit Verify or Run."); };
       $("demo-bad").onclick = () => { clearObject(); $("src").value = DEMO_BAD; show(out, "Loaded a program that fails verification. Hit Verify."); };
+      $("demo-race").onclick = () => { clearObject(); $("src").value = DEMO_RACE; show(out, "Loaded a racy shared-counter program. Hit “Race check” — it loses an update under some interleaving."); };
+      $("demo-race-fixed").onclick = () => { clearObject(); $("src").value = DEMO_RACE_FIXED; show(out, "Loaded the atomic (race-free) version. Hit “Race check” — all interleavings agree."); };
 
       $("objfile").onchange = async (e) => {
         const f = e.target.files[0];
@@ -305,6 +361,12 @@ miss:
       $("btn-analyze").onclick = guard(() =>
         show(out, Febpf.analyze(source(), parseInt($("analyze-mode").value, 10))),
       );
+      $("btn-race").onclick = guard(() => {
+        if (usingObject()) { show(out, "Race check runs on assembly source, not a loaded .o — pick a race demo."); return; }
+        const procs = parseInt($("race-procs").value, 10);
+        show(out, "exploring interleavings…");
+        show(out, Febpf.race(source(), procs, 0));
+      });
 
       // --- debugger ---
       const dbgButtons = ["dbg-step","dbg-step10","dbg-rstep","dbg-continue","dbg-reset","dbg-regs","dbg-stack","dbg-maps","dbg-send"];

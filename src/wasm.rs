@@ -93,6 +93,20 @@ pub unsafe extern "C" fn febpf_analyze(src: *const u8, src_len: usize, mode: u32
     ret(playground::analyze_text(slice(src, src_len), mode))
 }
 
+/// Deterministic race exploration: `procs` instances sharing maps, up to
+/// `schedules` interleavings. Returns the rendered report.
+///
+/// # Safety: `src` must describe a live buffer of `src_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn febpf_race(
+    src: *const u8,
+    src_len: usize,
+    procs: u32,
+    schedules: u32,
+) -> u64 {
+    ret(playground::race_text(slice(src, src_len), procs, schedules))
+}
+
 /// Create a debug session under a host-chosen `handle`. Returns "OK" or an
 /// error string.
 ///
