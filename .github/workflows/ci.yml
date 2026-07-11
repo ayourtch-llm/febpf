@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # One job per (arch, OS) that has a JIT backend. The point of the matrix is
+  # that the JIT is the only part of febpf that is not portable Rust: each
+  # runner executes machine code this repo generated for that exact CPU, so a
+  # bad encoding shows up as a wrong answer or a crash, not a compile error.
+  #
+  # `ubuntu-24.04-arm` is GitHub's aarch64 Linux runner — free for public
+  # repositories. If this repo is ever made private, that entry needs a paid
+  # plan (the other two are free either way).
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86-64 Linux
+            runner: ubuntu-latest
+          - name: aarch64 Linux
+            runner: ubuntu-24.04-arm
+          - name: aarch64 macOS
+            runner: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc -vV
+
+      # The ELF/BTF/debuginfo tests rebuild their .o fixtures from examples/c
+      # when — and only when — clang can actually target BPF. Linux clang can,
+      # so these runners exercise the real compile path; Apple clang has no BPF
+      # backend, so on macOS the tests fall back to the committed fixtures
+      # (see maybe_compile in tests/). Both paths are worth covering.
+      - name: Install clang (BPF-capable)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang
+          clang --print-targets | grep -q bpf && echo "clang can target BPF"
+
+      - name: Build
+        run: cargo build --all-targets
+
+      # Both feature configs must stay green: `jit` is on by default, and the
+      # wasm build depends on the crate compiling without it.
+      - name: Test (jit)
+        run: cargo test
+
+      - name: Test (no jit)
+        run: cargo test --no-default-features
+
+      - name: Clippy (jit)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (no jit)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      # The differential fuzzer is the real test of the JIT: it runs random
+      # programs under the interpreter and the JIT and requires identical r0.
+      # `cargo test` already runs 4k seeds; this adds a much wider sweep with a
+      # seed that varies per run, so CI keeps exploring new programs over time.
+      # Both generators run (gen_program is memory-free and covers the natively
+      # compiled core; gen_mem_program drives the deferred/trampoline path).
+      - name: Differential fuzz (interp vs JIT)
+        run: cargo run --release -- fuzz --iters 1000000
+
+      # A JIT that is correct but slower than the interpreter is a bug worth
+      # noticing. This is a smoke check, not a benchmark gate: CI runners are
+      # far too noisy for timing assertions, so it only prints the numbers.
+      - name: Bench (informational)
+        run: |
+          cargo run --release -- bench examples/sum_loop.s --iters 20000
+          cargo run --release -- bench examples/sum_loop.s --iters 20000 --jit
+
+      # Fixtures are committed binaries, and a test run must never DELETE one.
+      # It did once: clang was invoked without checking it could target BPF, so
+      # on a toolchain without the BPF backend it failed *after* truncating the
+      # output, silently destroying 10 committed .o files on every `cargo test`.
+      #
+      # Regenerating them is fine and expected on Linux (CI's clang differs
+      # from whoever last committed them), so only deletions are an error there.
+      # On macOS the compile is skipped entirely, so nothing may change at all.
+      - name: Fixtures not destroyed
+        if: runner.os == 'Linux'
+        run: git diff --exit-code --diff-filter=D -- 'tests/*.o'
+
+      - name: Fixtures untouched (no BPF-capable clang)
+        if: runner.os == 'macOS'
+        run: git diff --exit-code -- 'tests/*.o'
+
+  # The wasm build has no JIT (pure interpreter + verifier + analysis) and is
+  # the reason the crate must keep compiling with --no-default-features.
+  wasm:
+    name: wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+      - name: Build
+        run: cargo build --target wasm32-unknown-unknown --no-default-features --release
+      - name: Clippy
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features -- -D warnings

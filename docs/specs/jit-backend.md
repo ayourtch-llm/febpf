@@ -5,10 +5,10 @@ It is written so that an implementer (human or model) can add an **aarch64** or
 **riscv64** backend by implementing one trait — `JitBackend` — without touching
 any eBPF logic.
 
-> Status: x86-64/Linux (`src/jit/x64.rs`) and aarch64/macOS
-> (`src/jit/aarch64.rs`) backends are implemented. riscv64 is **not yet
-> written**; this spec is its blueprint, and §5 is now also a record of how
-> aarch64 actually went.
+> Status: x86-64/Linux (`src/jit/x64.rs`) and aarch64 — **both macOS and
+> Linux** — (`src/jit/aarch64.rs`) are implemented, and CI executes each on a
+> runner of that architecture. riscv64 is **not yet written**; this spec is its
+> blueprint, and §5 is now also a record of how aarch64 actually went.
 
 ---
 
@@ -25,6 +25,7 @@ The JIT is split so that everything eBPF-specific is written once:
                  ┌───────────────────────────────────▼──────────────────────────────────────┐
                  │ backend (arch-specific): pure instruction encoder                          │
                  │ x64.rs  ·  aarch64.rs  ·  riscv64.rs (todo)                                  │
+                 │ (the encoder is OS-independent; only exec-memory differs per OS)             │
                  └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -235,16 +236,27 @@ just the `ExecMem` half of step 6.
 4. **Absolute pointers.** A 16-byte literal pool sits just past the epilogue
    (`[trampoline u64][table u64]`, 8-byte aligned); `patch_absolutes` writes
    both, and the deferred glue reaches them with `LDR (literal)`.
-5. **Executable memory** (`macsys` in `mod.rs`). Apple Silicon enforces strict
-   W^X, so this is *not* the Linux mmap/mprotect dance: allocate with
-   `MAP_JIT`, open the calling thread's write gate with
-   `pthread_jit_write_protect_np(0)`, let the frontend copy and patch, then
-   close the gate and call `sys_icache_invalidate` (an **i-cache flush is
-   mandatory on ARM**; x86-64 needs none). These come from libSystem, which
-   every macOS process already links — raw syscalls are not a stable ABI on
-   Darwin, so this keeps the crate dependency-free without pinning syscall
-   numbers. An aarch64-**Linux** port instead uses mmap=222/mprotect=226 plus
-   `__clear_cache`.
+5. **Executable memory.** The A64 encoder is OS-independent; *this* is the only
+   part that is not, so `mod.rs` has one module per platform (`arm_macos`,
+   `arm_linux`, `x86_linux`), each exposing `alloc_rw` / `seal_rx` / `free`.
+
+   - **macOS** (`arm_macos`): Apple Silicon enforces strict W^X, so this is
+     *not* the Linux mmap/mprotect dance. Allocate with `MAP_JIT`, open the
+     calling thread's write gate with `pthread_jit_write_protect_np(0)`, let
+     the frontend copy and patch, then close the gate and call
+     `sys_icache_invalidate`. These come from libSystem, which every macOS
+     process already links — raw syscalls are **not** a stable ABI on Darwin,
+     so this keeps the crate dependency-free without pinning syscall numbers.
+   - **Linux** (`arm_linux`): raw syscalls like the x86-64 path, but note the
+     numbers differ (mmap=222, mprotect=226, munmap=215 — asm-generic, not
+     x86-64's), and the i-cache must be flushed by hand: `DC CVAU` over the
+     range, `DSB ISH`, `IC IVAU`, `DSB ISH`, `ISB`, with line sizes read from
+     `CTR_EL0`. (That is what libgcc's `__clear_cache` expands to; doing it
+     inline avoids assuming anything about linkage.)
+
+   An **i-cache flush is mandatory on ARM** in both cases — x86-64 keeps the
+   caches coherent and needs none. Skip it and the CPU executes whatever bytes
+   previously occupied those lines, which looks like random corruption.
 6. **Wiring.** `#[cfg]` `mod aarch64;` plus a `compile()` branch — as promised,
    nothing else in the frontend changed.
 7. **Validation.** `tests/jit.rs` (differential vs the interpreter) passes

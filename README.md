@@ -1,5 +1,7 @@
 # febpf — fast userland eBPF engine
 
+[![CI](https://github.com/ayourtch-llm/febpf/actions/workflows/ci.yml/badge.svg)](https://github.com/ayourtch-llm/febpf/actions/workflows/ci.yml)
+
 A **zero-dependency** eBPF virtual machine in Rust with its own kernel-style
 **verifier**, an **assembler/disassembler**, **program analysis** tooling and
 an **interactive debugger**. Made for developing, debugging and understanding
@@ -46,7 +48,7 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
   (`map_lookup_elem`, `map_update_elem`, `map_delete_elem`,
   `ktime_get_ns`, `trace_printk`, `get_prandom_u32`, …), plus an API to
   register **custom helpers** with verifier-checked signatures.
-- **JIT compiler** (x86-64 Linux and arm64 macOS, zero-dependency):
+- **JIT compiler** (x86-64 Linux, aarch64 Linux and macOS; zero-dependency):
   hand-rolled native codegen for the ALU + branch core (~45× on tight loops on
   x86-64, ~26× on aarch64), with memory ops, calls and atomics deferred to the
   interpreter — so the JIT keeps the interpreter's exact memory-safety
@@ -197,6 +199,9 @@ including time-travel `rstep`.
   debugger.
 - **JIT**: `docs/specs/jit-backend.md` — architecture-independent frontend +
   `JitBackend` trait; x86-64 and aarch64 done, riscv64 documented as drop-in.
+- **CI**: `.github/workflows/ci.yml` runs the suite, clippy (`-D warnings`) and
+  the differential fuzzer on all three JIT platforms — each runner executes
+  machine code generated for that exact CPU.
 - **ELF loading**: `docs/specs/elf-loading.md`.
 - **Not implemented (yet)**: full BTF (CO-RE, func/line info), kfuncs,
   per-CPU/ringbuf map types, legacy packet-access instructions, aarch64/riscv

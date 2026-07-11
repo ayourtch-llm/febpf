@@ -21,6 +21,39 @@ the JIT is now behind `default = ["jit"]`, so always run `cargo test` AND
 `cargo test --no-default-features` (and clippy in both) before calling
 anything done.
 
+**DONE (2026-07-11, session 7): aarch64 Linux JIT + CI on all three
+platforms.** `.github/workflows/ci.yml` runs the suite, both feature configs,
+clippy `-D warnings`, and a **1M-program differential fuzz** (~5s) on
+`ubuntu-latest`, `ubuntu-24.04-arm` and `macos-latest`. This matters more than
+usual CI: the JIT is the only part of febpf that isn't portable Rust, and each
+runner *executes machine code generated for that exact CPU* — a bad encoding
+surfaces as a wrong answer, not a compile error. It also finally gives the
+**x86-64 backend real execution coverage**, which sessions 5-6 could not (all
+that work was done on an arm64 Mac).
+
+- **aarch64 Linux** is now a JIT platform. The A64 encoder was already
+  OS-independent, so this was purely an exec-memory layer: `mod.rs` now has one
+  module per platform (`x86_linux` / `arm_linux` / `arm_macos`), each exposing
+  `alloc_rw` / `seal_rx` / `free`. Watch out for two things — the aarch64
+  syscall numbers are *not* x86-64's (mmap=222, mprotect=226, munmap=215), and
+  Linux gives you no `sys_icache_invalidate`, so the i-cache flush is written
+  out by hand (`DC CVAU` / `DSB ISH` / `IC IVAU` / `DSB ISH` / `ISB`, line
+  sizes from `CTR_EL0`).
+- **The repo is now clippy-clean under `-D warnings` on every target**, which
+  it was not: `kbpf.rs`'s UAPI constants are used only by the x86-64-Linux
+  syscall path and read as dead code everywhere else (now gated together in a
+  `uapi` module), and the stub `Fd` had no `Drop`, so `drop(fd)` tripped a lint
+  off-Linux. Without those fixes CI could not have enforced `-D warnings`, and
+  a warning gate nobody can turn on is worthless.
+- **CI checks the fixtures survive** (`git diff --diff-filter=D -- tests/`) —
+  the regression that destroyed them in session 5 would now fail the build.
+  Note Linux CI *regenerates* the `.o` files (its clang can target BPF, so the
+  `maybe_compile` path actually runs) while macOS skips them, so only deletions
+  are an error on Linux; on macOS nothing may change at all. Both paths get
+  covered, which is why the matrix is worth having.
+- No benchmark *gate* — CI runners are far too noisy for timing assertions, so
+  `bench` runs informationally only.
+
 **DONE (2026-07-11, session 6): shrank the JIT's trampoline tax ~60%** — the
 work §4 flagged as highest-value. Memory-heavy programs went from **0.96×
 (slower than the interpreter!) to 1.22×**, and the store+load loop from 1.29×
@@ -49,12 +82,13 @@ glue indexed one past the end and branched to whatever it read. **That was a
 memory-safety hole in the one component whose whole premise is memory safety.**
 The table now has `n + 1` entries, the last pointing at the epilogue.
 
-⚠️ **The x86-64 backend changes are compile-checked, not executed** — this was
-developed on an arm64 Mac with no x86 machine or container available. The delta
-there is small and adds *no new byte encodings* (it only omits emissions), but
-**run `cargo test` and `febpf fuzz` on the x86-64 Linux box before trusting
-it**. The shared masks — the genuinely risky part — are validated by 100k
-differential programs on aarch64.
+⚠️ **The x86-64 backend changes were compile-checked, not executed** — sessions
+5-6 were done on an arm64 Mac with no x86 machine or container available. The
+delta adds *no new byte encodings* (it only omits emissions), and the shared
+masks — the genuinely risky part — were validated by 100k differential programs
+on aarch64. **Session 7's CI closes this**: `ubuntu-latest` now runs the suite
+and a 1M-program fuzz against the real x86-64 backend. If that job is green,
+this caveat is discharged; if it is red, look here first.
 
 Validation: `fuzz::gen_mem_program` is new and exists because **`gen_program`
 is memory-free** — it emits no deferred instructions at all, so the old 100k-
