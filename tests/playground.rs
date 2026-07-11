@@ -73,3 +73,27 @@ fn debug_help_and_bad_command() {
     assert!(s.command("help").contains("time travel"));
     assert!(s.command("frobnicate").contains("unknown command"));
 }
+
+#[test]
+fn replay_session_opens_at_cursor() {
+    // Record a run with a cursor, then open it through the playground entry
+    // and confirm the session starts positioned at the recorded instruction
+    // count and reproduces the run.
+    use febpf::playground::replay_session;
+    use febpf::replay::Replay;
+    use febpf::{asm, Program};
+
+    let a = asm::assemble(std::str::from_utf8(SUM_LOOP).unwrap()).unwrap();
+    let prog = Program { insns: a.insns, maps: a.maps };
+    let r = Replay::record(&prog, vec![], febpf::interp::DEFAULT_PRANDOM_SEED, Some(4), Vec::new())
+        .unwrap();
+    let bytes = r.to_bytes();
+
+    let mut s = replay_session(&bytes).unwrap();
+    let regs = s.command("regs");
+    assert!(regs.contains("insns executed = 4"), "should open at cursor:\n{regs}");
+    assert!(s.command("continue").contains("r0 = 55"));
+
+    // A corrupt file is rejected cleanly (no panic).
+    assert!(replay_session(b"not a replay").is_err());
+}
