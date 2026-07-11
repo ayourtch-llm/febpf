@@ -470,6 +470,81 @@ fn ringbuf_output_captures_from_stack() {
     assert_eq!(recs[0], 0x11223344u32.to_le_bytes());
 }
 
+// -------------------------------------------------------------- per-CPU
+
+#[test]
+fn percpu_array_roundtrip_and_independent_slots() {
+    let src = "
+        .map pa percpu_array 4 8 4
+        w1 = 1
+        *(u32 *)(r10 - 4) = r1
+        r1 = 777
+        *(u64 *)(r10 - 16) = r1
+        r1 = map[pa]
+        r2 = r10
+        r2 += -4
+        r3 = r10
+        r3 += -16
+        r4 = 0
+        call map_update_elem
+        r1 = map[pa]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        if r0 == 0 goto miss
+        r0 = *(u64 *)(r0)
+        exit
+    miss:
+        r0 = -1
+        exit";
+    let mut vm = Vm::new(program(src)).unwrap();
+    vm.verify(Config::default()).expect("verification failed");
+    let r = vm.run(&mut []).expect("run failed");
+    // The in-program view (CPU 0) round-trips.
+    assert_eq!(r, 777);
+    // CPU 0 has 777; the other CPUs' slots stay independent (zero).
+    let m = vm.maps.iter().find(|m| m.def.name == "pa").unwrap();
+    let vref = m.lookup(&1u32.to_ne_bytes()).unwrap();
+    assert_eq!(m.value_cpu(vref, 0), 777u64.to_le_bytes());
+    for cpu in 1..febpf::maps::NR_CPUS {
+        assert_eq!(m.value_cpu(vref, cpu), [0u8; 8], "cpu {cpu} must be independent");
+    }
+}
+
+#[test]
+fn percpu_hash_roundtrip() {
+    let src = "
+        .map ph percpu_hash 4 8 16
+        w1 = 42
+        *(u32 *)(r10 - 4) = r1
+        r1 = 0xdead
+        *(u64 *)(r10 - 16) = r1
+        r1 = map[ph]
+        r2 = r10
+        r2 += -4
+        r3 = r10
+        r3 += -16
+        r4 = 0
+        call map_update_elem
+        r1 = map[ph]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        if r0 == 0 goto miss
+        r0 = *(u64 *)(r0)
+        exit
+    miss:
+        r0 = -1
+        exit";
+    let mut vm = Vm::new(program(src)).unwrap();
+    vm.verify(Config::default()).expect("verification failed");
+    assert_eq!(vm.run(&mut []).expect("run failed"), 0xdead);
+    let m = vm.maps.iter().find(|m| m.def.name == "ph").unwrap();
+    let vref = m.lookup(&42u32.to_ne_bytes()).unwrap();
+    assert_eq!(m.value_cpu(vref, 0), 0xdeadu64.to_le_bytes());
+    assert_eq!(m.value_cpu(vref, 1), [0u8; 8]);
+}
+
 // ------------------------------------------------------------------ calls
 
 #[test]

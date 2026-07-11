@@ -154,5 +154,7 @@ merely *mentions* an unsupported type in one map can still be inspected.
 - Stage 1 (ringbuf): **done** — helpers 130-133, `Region::RingReserved`, verifier
   reserved-pointer type + null-check/consume refinement, ELF/BTF type 27,
   `.map ... ringbuf`, 5 integration tests.
-- Stage 2 (per-CPU): _pending_.
+- Stage 2 (per-CPU): **done** — `PerCpuArray`/`PerCpuHash` (types 6/5), NR_CPUS=4
+  storage, CPU-0 in-program view, `Map::value_cpu` for inspection, ELF/BTF +
+  `.map` keywords, 2 integration tests (round-trip + slot independence).
 - Stage 3 (LRU hash): _pending_.
