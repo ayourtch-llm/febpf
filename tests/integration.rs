@@ -6,6 +6,7 @@ fn program(src: &str) -> Program {
     Program {
         insns: a.insns,
         maps: a.maps,
+        btf_ctx: None,
     }
 }
 
@@ -28,7 +29,7 @@ fn verify_err(src: &str) -> String {
 }
 
 fn verify_err_ctx(src: &str, ctx_size: usize) -> String {
-    let vm = Vm::new(program(src)).unwrap();
+    let mut vm = Vm::new(program(src)).unwrap();
     let cfg = Config {
         ctx_size,
         ..Default::default()
@@ -1335,7 +1336,7 @@ fn reject_modified_ctx_ptr_deref() {
 fn accept_fixed_offset_ctx_access() {
     // Offset in the LOAD INSTRUCTION's immediate — pointer's own offset is 0.
     // This must stay legal (not over-tightened into FEBPF-STRICT).
-    let vm = Vm::new(program("r0 = *(u32 *)(r1 + 8)\n exit")).unwrap();
+    let mut vm = Vm::new(program("r0 = *(u32 *)(r1 + 8)\n exit")).unwrap();
     vm.verify(Config {
         ctx_size: 16,
         ..Default::default()
@@ -1357,7 +1358,7 @@ fn reject_misaligned_stack_store() {
 #[test]
 fn accept_aligned_stack_access() {
     // Naturally aligned stack accesses must still verify (not over-tightened).
-    let vm = Vm::new(program(
+    let mut vm = Vm::new(program(
         "
         r1 = 1
         *(u64 *)(r10 - 8) = r1
@@ -1641,7 +1642,7 @@ fn map_value_lddw_with_offset() {
 
 /// Like `verify_err` but returns the whole error (with counterexample trace).
 fn verify_err_full(src: &str) -> febpf::VerifyError {
-    let vm = Vm::new(program(src)).unwrap();
+    let mut vm = Vm::new(program(src)).unwrap();
     match vm.verify(Config::default()) {
         Ok(_) => panic!("expected verification to fail"),
         Err(e) => e,
@@ -1678,7 +1679,7 @@ fn trace_records_branch_decisions() {
     bad:
         r2 = *(u64 *)(r1 + 8000)
         exit";
-    let vm = Vm::new(program(src)).unwrap();
+    let mut vm = Vm::new(program(src)).unwrap();
     let e = match vm.verify(Config {
         ctx_size: 64,
         ..Default::default()
@@ -1749,7 +1750,7 @@ fn trace_long_path_is_truncated() {
 // Assemble, verify (expecting failure), and render the explanation.
 fn explain_err(src: &str) -> (febpf::VerifyError, String) {
     let prog = program(src);
-    let vm = Vm::new(prog.clone()).unwrap();
+    let mut vm = Vm::new(prog.clone()).unwrap();
     let e = match vm.verify(Config::default()) {
         Ok(_) => panic!("expected verification to fail"),
         Err(e) => e,
@@ -1839,7 +1840,7 @@ fn explain_too_complex_has_trace() {
         if r0 != 0 goto loop
         exit",
     );
-    let vm = Vm::new(prog.clone()).unwrap();
+    let mut vm = Vm::new(prog.clone()).unwrap();
     let e = match vm.verify(Config {
         insn_budget: 10_000,
         ..Default::default()

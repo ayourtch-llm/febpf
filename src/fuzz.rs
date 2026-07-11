@@ -323,6 +323,7 @@ pub fn interp_vs_jit(insns: &[Insn]) -> Result<(u64, u64), String> {
     let prog = crate::Program {
         insns: insns.to_vec(),
         maps: Vec::new(),
+        btf_ctx: None,
     };
     let mut ctx_i = vec![0u8; 16];
     let mut vm_i = crate::Vm::new(prog.clone())?;
@@ -355,10 +356,11 @@ pub fn febpf_verdict(insns: &[Insn], maps: &[MapDef]) -> Result<(), String> {
     let prog = crate::Program {
         insns: insns.to_vec(),
         maps: maps.to_vec(),
+        btf_ctx: None,
     };
     // Vm::new can fail for a structurally-malformed program (e.g. a truncated
     // lddw); treat that as a rejection — the verifier would reject it too.
-    let vm = crate::Vm::new(prog).map_err(|e| format!("malformed: {e}"))?;
+    let mut vm = crate::Vm::new(prog).map_err(|e| format!("malformed: {e}"))?;
     vm.verify(Config::default()).map(|_| ()).map_err(|e| e.to_string())
 }
 
@@ -398,6 +400,7 @@ pub fn check_self_consistency(insns: &[Insn], maps: &[MapDef]) -> SelfConsistenc
     let prog = crate::Program {
         insns: insns.to_vec(),
         maps: maps.to_vec(),
+        btf_ctx: None,
     };
     // Size the runtime ctx to the verifier's assumed ctx size (see the const).
     let mut ctx = vec![0u8; VFUZZ_CTX_SIZE];

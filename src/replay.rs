@@ -106,6 +106,7 @@ impl Replay {
         Program {
             insns: self.insns.clone(),
             maps: self.maps.clone(),
+            btf_ctx: None,
         }
     }
 
@@ -445,6 +446,7 @@ mod tests {
         Program {
             insns: a.insns,
             maps: a.maps,
+            btf_ctx: None,
         }
     }
 

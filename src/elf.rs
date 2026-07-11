@@ -58,12 +58,19 @@ pub struct LoadedProgram {
     pub insns: Vec<Insn>,
     /// Source-level debug info from `.BTF`/`.BTF.ext`, if the object had any.
     pub debug: Option<DebugInfo>,
+    /// BTF typing of the ctx for `tp_btf`/`fentry`-style sections, resolved
+    /// against the target BTF (see `crate::btf::resolve_ctx_args`). `None`
+    /// for non-BTF-typed program types or when no target BTF was supplied.
+    pub btf_ctx: Option<crate::btf::BtfCtx>,
 }
 
 /// The result of loading an object file.
 pub struct Object {
     pub programs: Vec<LoadedProgram>,
     pub maps: Vec<MapDef>,
+    /// Non-fatal loader notes (e.g. a BTF-typed section whose attach target
+    /// is missing from the target BTF and fell back to an untyped ctx).
+    pub warnings: Vec<String>,
 }
 
 /// Little/big-endian aware byte reader over a borrowed buffer.
@@ -268,6 +275,7 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
     // (program, its ELF section name, where `.text` was stitched in — needed
     // to map per-section CO-RE relocations onto the flat instruction stream)
     let mut programs: Vec<(LoadedProgram, String, Option<usize>)> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     for idx in &entry_sections {
         let sec = &sections[*idx];
         let (insns, text_base) = build_program(
@@ -285,6 +293,7 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
                 name: sec.name.clone(),
                 insns,
                 debug: None,
+                btf_ctx: None,
             },
             sec.name.clone(),
             text_base,
@@ -302,6 +311,7 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
                     name: "text".into(),
                     insns,
                     debug: None,
+                    btf_ctx: None,
                 },
                 ".text".into(),
                 text_base,
@@ -313,7 +323,37 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
     }
 
     if let Some(target) = target_btf {
-        apply_core_relocations(r.le, bytes, &sections, &mut programs, target)?;
+        // A raw BTF blob declares its own byte order via the magic.
+        let target_le = match target.first_chunk::<2>() {
+            Some(&[0x9f, 0xeb]) => true,
+            Some(&[0xeb, 0x9f]) => false,
+            _ => return Err("target BTF: bad magic".into()),
+        };
+        let target = std::sync::Arc::new(Btf::parse(target_le, target)?);
+        apply_core_relocations(r.le, bytes, &sections, &mut programs, &target)?;
+        // BTF-typed program types (tp_btf/fentry/...): resolve the ctx's
+        // argument typing from the section name, like the kernel does at
+        // load time. A missing attach target is NOT fatal: libbpf's
+        // bpf_object__open succeeds too (real tools carry `fentry/dummy_*`
+        // placeholders retargeted at runtime, or targets that exist only on
+        // some kernel versions) — such a program keeps the untyped flat-ctx
+        // model, with a warning, and would only fail on a real kernel when
+        // actually loaded against that target.
+        for (prog, sec_name, _) in programs.iter_mut() {
+            match crate::btf::resolve_ctx_args(&target, sec_name) {
+                Ok(Some(args)) => {
+                    prog.btf_ctx = Some(crate::btf::BtfCtx {
+                        args,
+                        btf: Some(target.clone()),
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => warnings.push(format!(
+                    "{sec_name}: {e}; verifying with an untyped ctx \
+                     (the kernel would reject loading against this target)"
+                )),
+            }
+        }
     }
 
     // Surface source-level debug info (line/func/globals) for each program.
@@ -340,6 +380,7 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
     Ok(Object {
         programs: programs.into_iter().map(|(p, _, _)| p).collect(),
         maps,
+        warnings,
     })
 }
 
@@ -355,6 +396,25 @@ pub fn has_core_relocations(bytes: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// Should the caller supply a kernel BTF (`--target-btf`) for this object?
+/// True when it carries CO-RE relocations or has BTF-typed program sections
+/// (`tp_btf/`, `fentry/`, ...) whose ctx typing must be resolved against the
+/// target's types.
+pub fn needs_kernel_btf(bytes: &[u8]) -> bool {
+    if has_core_relocations(bytes) {
+        return true;
+    }
+    let Ok((_, sections)) = parse_elf(bytes) else {
+        return false;
+    };
+    sections.iter().any(|s| {
+        s.kind == SHT_PROGBITS
+            && s.flags & SHF_EXECINSTR != 0
+            && s.size > 0
+            && crate::btf::is_btf_ctx_section(&s.name)
+    })
+}
+
 /// Resolve every CO-RE relocation against the target BTF and patch the
 /// affected instructions in place (see `docs/specs/core-relocations.md` §3).
 ///
@@ -367,7 +427,7 @@ fn apply_core_relocations(
     bytes: &[u8],
     sections: &[Section],
     programs: &mut [(LoadedProgram, String, Option<usize>)],
-    target_btf: &[u8],
+    target: &Btf,
 ) -> Result<(), String> {
     let Some(btf_idx) = sections.iter().position(|s| s.name == ".BTF" && s.size > 0) else {
         return Ok(()); // no local BTF, nothing to relocate
@@ -384,14 +444,7 @@ fn apply_core_relocations(
         return Ok(());
     }
 
-    // A raw BTF blob declares its own byte order via the magic.
-    let target_le = match target_btf.first_chunk::<2>() {
-        Some(&[0x9f, 0xeb]) => true,
-        Some(&[0xeb, 0x9f]) => false,
-        _ => return Err("target BTF: bad magic".into()),
-    };
-    let target = Btf::parse(target_le, target_btf)?;
-    let index = crate::relo::CandidateIndex::new(&target);
+    let index = crate::relo::CandidateIndex::new(target);
 
     for (prog, sec_name, text_base) in programs.iter_mut() {
         for ext_sec in &ext.core_relos {
@@ -408,7 +461,7 @@ fn apply_core_relocations(
                 continue; // relocations for some other program's section
             };
             for relo in &ext_sec.recs {
-                let res = crate::relo::calc_relo(&local, relo, &target, &index)
+                let res = crate::relo::calc_relo(&local, relo, target, &index)
                     .map_err(|e| format!("{}+{}: {e}", relo_sec, relo.insn_off))?;
                 let idx = code_base + relo.insn_off as usize / insn::INSN_SIZE;
                 patch_core_insn(&mut prog.insns, idx, &res).map_err(|e| {

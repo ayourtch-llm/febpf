@@ -250,6 +250,7 @@ fn load_program(
             Program {
                 insns: a.insns,
                 maps: a.maps,
+                btf_ctx: None,
             },
             None,
         ));
@@ -257,20 +258,24 @@ fn load_program(
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     // ELF object (clang -target bpf) vs raw bytecode.
     if bytes.len() >= 4 && &bytes[0..4] == b"\x7fELF" {
-        // CO-RE: an explicit --target-btf wins; otherwise default to the
-        // running kernel's BTF when the object actually has relocations.
+        // An explicit --target-btf wins; otherwise default to the running
+        // kernel's BTF when the object has CO-RE relocations or BTF-typed
+        // (tp_btf/fentry/...) program sections.
         let target = match target_btf {
             Some(p) => Some(read_target_btf(p)?),
-            None if febpf::elf::has_core_relocations(&bytes)
+            None if febpf::elf::needs_kernel_btf(&bytes)
                 && std::path::Path::new(VMLINUX_BTF).exists() =>
             {
-                eprintln!("note: applying CO-RE relocations against {VMLINUX_BTF} (--target-btf to override)");
+                eprintln!("note: resolving CO-RE/BTF-typed sections against {VMLINUX_BTF} (--target-btf to override)");
                 Some(read_target_btf(VMLINUX_BTF)?)
             }
             None => None,
         };
         let obj = febpf::elf::load_with_target_btf(&bytes, target.as_deref())
             .map_err(|e| format!("{path}: {e}"))?;
+        for w in &obj.warnings {
+            eprintln!("warning: {w}");
+        }
         let idx = match prog {
             Some(name) => obj.programs.iter().position(|p| p.name == name).ok_or_else(|| {
                 let names: Vec<&str> = obj.programs.iter().map(|p| p.name.as_str()).collect();
@@ -293,6 +298,7 @@ fn load_program(
             Program {
                 insns: chosen.insns,
                 maps: obj.maps,
+                btf_ctx: chosen.btf_ctx,
             },
             chosen.debug,
         ))
@@ -302,6 +308,7 @@ fn load_program(
             Program {
                 insns,
                 maps: Vec::new(),
+                btf_ctx: None,
             },
             None,
         ))
@@ -448,7 +455,7 @@ fn cmd_race(o: &Opts, prog: Program) -> Result<ExitCode, String> {
     // Verify once (a race is not a verifier error); require pass unless
     // --no-verify, mirroring `run`.
     if !o.no_verify {
-        let vm = Vm::new(prog.clone())?;
+        let mut vm = Vm::new(prog.clone())?;
         vm.verify(verifier_config(o, ctx.len())).map_err(|e| {
             format!(
                 "verification failed: {e}\n{}(use --no-verify to race anyway)",
@@ -651,7 +658,7 @@ fn run() -> Result<ExitCode, String> {
         },
         "verify" => {
             let ctx = make_ctx(&o)?;
-            let vm = Vm::new(prog.clone())?;
+            let mut vm = Vm::new(prog.clone())?;
             match vm.verify(verifier_config(&o, ctx.len())) {
                 Ok(ok) => {
                     println!("verification PASSED");
@@ -693,7 +700,7 @@ fn run() -> Result<ExitCode, String> {
                     m.name, m.kind, m.key_size, m.value_size, m.max_entries
                 );
             }
-            let vm = Vm::new(prog.clone())?;
+            let mut vm = Vm::new(prog.clone())?;
             match vm.verify(verifier_config(&o, ctx.len())) {
                 Ok(ok) => {
                     println!("\n== verifier ==");

@@ -12,6 +12,7 @@ fn prog(src: &str) -> Program {
     Program {
         insns: a.insns,
         maps: a.maps,
+        btf_ctx: None,
     }
 }
 
@@ -136,7 +137,7 @@ fn optimize_output_reverifies() {
     );
     let o = optimize_ok(&p);
     // The optimized program must still pass the verifier (kernel-loadable).
-    let vm = Vm::new(o.program.clone()).unwrap();
+    let mut vm = Vm::new(o.program.clone()).unwrap();
     assert!(vm.verify(Config::default()).is_ok());
 }
 

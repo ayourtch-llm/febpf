@@ -14,7 +14,7 @@
 //!     if r2 != 0 goto loop
 //!     exit
 //! "#).unwrap();
-//! let mut vm = febpf::Vm::new(febpf::Program { insns: prog.insns, maps: prog.maps }).unwrap();
+//! let mut vm = febpf::Vm::new(febpf::Program { insns: prog.insns, maps: prog.maps, btf_ctx: None }).unwrap();
 //! vm.verify(febpf::verifier::Config::default()).unwrap();
 //! assert_eq!(vm.run(&mut []).unwrap(), 55);
 //! ```

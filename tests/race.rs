@@ -15,6 +15,7 @@ fn prog(src: &str) -> Program {
     Program {
         insns: a.insns,
         maps: a.maps,
+        btf_ctx: None,
     }
 }
 

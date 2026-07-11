@@ -519,7 +519,7 @@ pub fn optimize(input: &Program, cfg: Config, equiv_opts: &equiv::Options) -> Re
 
     const MAX_ROUNDS: usize = 16;
     for _ in 0..MAX_ROUNDS {
-        let vres = match Vm::new(current.clone()).and_then(|vm| {
+        let vres = match Vm::new(current.clone()).and_then(|mut vm| {
             vm.verify(cfg.clone()).map_err(|e| e.to_string())
         }) {
             Ok(v) => v,
@@ -538,6 +538,7 @@ pub fn optimize(input: &Program, cfg: Config, equiv_opts: &equiv::Options) -> Re
         current = Program {
             insns: new_insns,
             maps: current.maps,
+            btf_ctx: current.btf_ctx,
         };
     }
     total.insns_after = current.insns.len();
@@ -578,6 +579,7 @@ mod tests {
         Program {
             insns: a.insns,
             maps: a.maps,
+            btf_ctx: None,
         }
     }
 

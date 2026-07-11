@@ -32,6 +32,7 @@ pub fn load_program(bytes: &[u8]) -> Result<Program, String> {
         Ok(Program {
             insns: prog.insns,
             maps: obj.maps,
+            btf_ctx: None,
         })
     } else {
         let src = std::str::from_utf8(bytes)
@@ -40,6 +41,7 @@ pub fn load_program(bytes: &[u8]) -> Result<Program, String> {
         Ok(Program {
             insns: a.insns,
             maps: a.maps,
+            btf_ctx: None,
         })
     }
 }
@@ -76,7 +78,7 @@ pub fn verify_text(bytes: &[u8]) -> String {
         Ok(p) => p,
         Err(e) => return format!("load error: {e}"),
     };
-    let vm = match Vm::new(prog.clone()) {
+    let mut vm = match Vm::new(prog.clone()) {
         Ok(v) => v,
         Err(e) => return format!("load error: {e}"),
     };
@@ -181,7 +183,7 @@ pub fn analyze_text(bytes: &[u8], mode: u32) -> String {
             out
         }
         _ => {
-            let vm = match Vm::new(prog.clone()) {
+            let mut vm = match Vm::new(prog.clone()) {
                 Ok(v) => v,
                 Err(e) => return format!("load error: {e}"),
             };

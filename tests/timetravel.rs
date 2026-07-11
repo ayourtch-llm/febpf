@@ -9,6 +9,7 @@ fn vm(src: &str) -> Vm {
     Vm::new(Program {
         insns: a.insns,
         maps: a.maps,
+        btf_ctx: None,
     })
     .unwrap()
 }

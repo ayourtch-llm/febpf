@@ -84,7 +84,7 @@ fn replay_session_opens_at_cursor() {
     use febpf::{asm, Program};
 
     let a = asm::assemble(std::str::from_utf8(SUM_LOOP).unwrap()).unwrap();
-    let prog = Program { insns: a.insns, maps: a.maps };
+    let prog = Program { insns: a.insns, maps: a.maps, btf_ctx: None };
     let r = Replay::record(&prog, vec![], febpf::interp::DEFAULT_PRANDOM_SEED, Some(4), Vec::new())
         .unwrap();
     let bytes = r.to_bytes();

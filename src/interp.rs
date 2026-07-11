@@ -58,11 +58,14 @@ impl std::fmt::Display for EbpfError {
 impl std::error::Error for EbpfError {}
 
 /// A program ready to be loaded into a [`Vm`]: instructions plus map
-/// definitions referenced by `lddw` pseudo instructions.
+/// definitions referenced by `lddw` pseudo instructions, plus — for
+/// `tp_btf`/`fentry`-style programs — the BTF typing of the context (see
+/// docs/specs/btf-ctx-pointers.md).
 #[derive(Clone)]
 pub struct Program {
     pub insns: Vec<Insn>,
     pub maps: Vec<MapDef>,
+    pub btf_ctx: Option<crate::btf::BtfCtx>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -76,10 +79,16 @@ enum Region {
     /// A ringbuf record reserved by `ringbuf_reserve` (writable until it is
     /// submitted or discarded, which marks the reservation consumed).
     RingReserved { map: u32, res: u32 },
+    /// Synthetic kernel memory for BTF-typed pointers (`tp_btf`/`fentry`
+    /// ctx arguments): every read returns zeroes, every write faults. This is
+    /// the deterministic stand-in for the kernel's fault-tolerant
+    /// `BPF_PROBE_MEM` reads — see docs/specs/btf-ctx-pointers.md.
+    KernelMem,
 }
 
 const CTX_HANDLE: u32 = 1;
 const STACK0_HANDLE: u32 = 2;
+const KMEM_HANDLE: u32 = STACK0_HANDLE + MAX_CALL_FRAMES as u32;
 
 /// Seed for the deterministic `get_prandom_u32` xorshift. A run is a pure
 /// function of (program, ctx, this seed, map preload), which is what makes
@@ -119,6 +128,19 @@ pub struct Vm {
     /// Source-level debug info (from `.BTF.ext`/`.BTF`), when the program was
     /// loaded from a `-g` ELF object. Static across a run, so not snapshotted.
     debug: Option<crate::debuginfo::DebugInfo>,
+    /// BTF typing of the ctx (`tp_btf`/`fentry` programs, set by the ELF
+    /// loader path): pointer slots are prefilled with kernel-memory addresses
+    /// on run, and `Vm::verify` verifies under the BTF ctx rules. Static
+    /// across a run, like `debug`.
+    btf_ctx: Option<crate::btf::BtfCtx>,
+    /// Per-insn: loads the verifier proved go through a BTF pointer, executed
+    /// as fault-tolerant probe reads (kernel `BPF_PROBE_MEM`: a bad address
+    /// reads as zero). Armed by [`Vm::verify`]; empty when unverified, in
+    /// which case such loads fault cleanly instead. Static per program.
+    probe_mem: Vec<bool>,
+    /// Scratch backing for [`Region::KernelMem`] reads; logically an
+    /// all-zeroes region, re-zeroed on every resolve. Not run state.
+    kmem: Vec<u8>,
 }
 
 impl Vm {
@@ -127,6 +149,7 @@ impl Vm {
         for f in 0..MAX_CALL_FRAMES as u32 {
             regions.push(Region::Stack(f));
         }
+        regions.push(Region::KernelMem); // KMEM_HANDLE
         let maps: Vec<Map> = prog
             .maps
             .iter()
@@ -141,6 +164,7 @@ impl Vm {
 
         let mut vm = Vm {
             exec: prog.insns.clone(),
+            btf_ctx: prog.btf_ctx,
             insns: prog.insns,
             maps,
             map_defs: prog.maps,
@@ -156,6 +180,8 @@ impl Vm {
             #[cfg(feature = "jit")]
             jit: None,
             debug: None,
+            probe_mem: Vec::new(),
+            kmem: Vec::new(),
         };
 
         // Patch map-reference lddw instructions into plain 64-bit immediates.
@@ -218,11 +244,37 @@ impl Vm {
     }
 
     /// Verify the loaded program (uses registered user-helper signatures).
+    ///
+    /// When this VM carries a BTF-typed ctx (see [`Vm::set_btf_ctx`]) it is
+    /// injected into the config, and on success the VM is armed with the
+    /// verifier's probe-read bitmap — the kernel does the same in
+    /// convert_ctx_accesses(), rewriting BTF-pointer loads to BPF_PROBE_MEM.
+    /// An unverified (`--no-verify`) run of a BTF program therefore faults
+    /// cleanly on kernel-pointer derefs instead of reading zeroes.
     pub fn verify(
-        &self,
-        cfg: crate::verifier::Config,
+        &mut self,
+        mut cfg: crate::verifier::Config,
     ) -> Result<crate::verifier::VerifyOk, crate::verifier::VerifyError> {
-        crate::verifier::verify(&self.insns, &self.map_defs, self.user_helpers.sigs(), cfg)
+        if cfg.btf_ctx.is_none() {
+            cfg.btf_ctx = self.btf_ctx.clone();
+        }
+        let ok =
+            crate::verifier::verify(&self.insns, &self.map_defs, self.user_helpers.sigs(), cfg)?;
+        self.probe_mem = ok.probe_mem.clone();
+        Ok(ok)
+    }
+
+    /// Attach BTF typing of the ctx (set by the ELF loader for
+    /// `tp_btf`/`fentry`-style programs). Pointer ctx slots are prefilled
+    /// with kernel-memory addresses on each run, and [`Vm::verify`] verifies
+    /// under the kernel's `btf_ctx_access()` rules.
+    pub fn set_btf_ctx(&mut self, bc: crate::btf::BtfCtx) {
+        self.btf_ctx = Some(bc);
+    }
+
+    /// BTF typing of the ctx, if any (see [`Vm::set_btf_ctx`]).
+    pub fn btf_ctx(&self) -> Option<&crate::btf::BtfCtx> {
+        self.btf_ctx.as_ref()
     }
 
     pub fn insns(&self) -> &[Insn] {
@@ -477,13 +529,16 @@ struct Bus<'b> {
     maps: &'b mut [Map],
     stack: &'b mut [u8],
     ctx: &'b mut [u8],
+    kmem: &'b mut Vec<u8>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_slice<'s>(
     regions: &[Region],
     maps: &'s mut [Map],
     stack: &'s mut [u8],
     ctx: &'s mut [u8],
+    kmem: &'s mut Vec<u8>,
     addr: u64,
     len: usize,
     write: bool,
@@ -496,6 +551,19 @@ fn resolve_slice<'s>(
         .ok_or_else(|| format!("bad pointer {addr:#x} (no such region)"))?;
     let buf: &mut [u8] = match region {
         Region::Invalid => return Err(format!("dereference of invalid pointer {addr:#x}")),
+        Region::KernelMem => {
+            // Deterministic stand-in for kernel memory: any offset reads as
+            // zero, all writes fault. The scratch buffer is re-zeroed on each
+            // resolve so it is indistinguishable from a true zero region.
+            if write {
+                return Err(format!("write to kernel memory {addr:#x} is not allowed"));
+            }
+            if kmem.len() < len {
+                kmem.resize(len, 0);
+            }
+            kmem[..len].fill(0);
+            return Ok(&mut kmem[..len]);
+        }
         Region::Ctx => ctx,
         Region::Stack(f) => &mut stack[f as usize * STACK_SIZE..(f as usize + 1) * STACK_SIZE],
         Region::MapObj(_) => {
@@ -524,14 +592,14 @@ fn resolve_slice<'s>(
 impl MemBus for Bus<'_> {
     fn read(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), String> {
         let s = resolve_slice(
-            self.regions, self.maps, self.stack, self.ctx, addr, buf.len(), false,
+            self.regions, self.maps, self.stack, self.ctx, self.kmem, addr, buf.len(), false,
         )?;
         buf.copy_from_slice(s);
         Ok(())
     }
     fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), String> {
         let s = resolve_slice(
-            self.regions, self.maps, self.stack, self.ctx, addr, data.len(), true,
+            self.regions, self.maps, self.stack, self.ctx, self.kmem, addr, data.len(), true,
         )?;
         s.copy_from_slice(data);
         Ok(())
@@ -541,6 +609,21 @@ impl MemBus for Bus<'_> {
 impl<'a> Machine<'a> {
     fn new(vm: &'a mut Vm, ctx: &'a mut [u8]) -> Machine<'a> {
         vm.stack.iter_mut().for_each(|b| *b = 0);
+        // BTF-typed programs: the ctx is an array of 8-byte arguments, and
+        // pointer arguments must hold kernel-memory addresses. Prefill each
+        // pointer slot with a distinct deterministic address in the
+        // reads-as-zero kernel region (1 MiB apart so distinct arguments
+        // compare unequal, like real kernel pointers would).
+        if let Some(bc) = &vm.btf_ctx {
+            for (i, slot) in bc.args.iter().enumerate() {
+                if matches!(slot, crate::btf::CtxSlot::Ptr { .. }) {
+                    if let Some(b) = ctx.get_mut(i * 8..i * 8 + 8) {
+                        let addr = mkaddr(KMEM_HANDLE, (i as u32 + 1) << 20);
+                        b.copy_from_slice(&addr.to_le_bytes());
+                    }
+                }
+            }
+        }
         let mut regs = [0u64; NUM_REGS];
         regs[1] = mkaddr(CTX_HANDLE, 0);
         regs[2] = ctx.len() as u64;
@@ -847,6 +930,7 @@ impl<'a> Machine<'a> {
             Some(Region::RingReserved { map, .. }) => {
                 format!("ringbuf '{}' record +{off}", self.vm.maps[*map as usize].def.name)
             }
+            Some(Region::KernelMem) => format!("kernel memory +{off} (reads as zero)"),
             Some(Region::Invalid) | None => format!("<addr {addr:#x}>"),
         }
     }
@@ -866,6 +950,7 @@ impl<'a> Machine<'a> {
             &mut self.vm.maps,
             &mut self.vm.stack,
             self.ctx,
+            &mut self.vm.kmem,
             addr,
             len,
             write,
@@ -1051,7 +1136,14 @@ impl<'a> Machine<'a> {
             class::LDX => {
                 let addr = self.regs[src].wrapping_add(ins.off as i64 as u64);
                 let size = ins.mem_size();
-                let v = self.load(addr, size)?;
+                // Loads the verifier marked as BTF probe reads mirror the
+                // kernel's BPF_PROBE_MEM: an unresolvable address reads as
+                // zero instead of faulting (e.g. chasing a pointer loaded
+                // from zeroed kernel memory, i.e. NULL).
+                let v = match self.load(addr, size) {
+                    Err(_) if self.vm.probe_mem.get(self.pc) == Some(&true) => 0,
+                    r => r?,
+                };
                 self.regs[dst] = if ins.mem_mode() == mode::MEMSX {
                     match size {
                         1 => v as u8 as i8 as i64 as u64,
@@ -1521,6 +1613,7 @@ impl<'a> Machine<'a> {
                     maps: &mut self.vm.maps,
                     stack: &mut self.vm.stack,
                     ctx: self.ctx,
+                    kmem: &mut self.vm.kmem,
                 };
                 let result = helper.call(args, &mut bus);
                 self.vm.user_helpers.put_back(hid, helper);

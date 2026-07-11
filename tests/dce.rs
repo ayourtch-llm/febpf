@@ -12,6 +12,7 @@ fn program(src: &str) -> Program {
     Program {
         insns: a.insns,
         maps: a.maps,
+        btf_ctx: None,
     }
 }
 
@@ -20,6 +21,7 @@ fn dced(p: &Program) -> Program {
     Program {
         insns: res.insns,
         maps: p.maps.clone(),
+        btf_ctx: None,
     }
 }
 

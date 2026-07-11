@@ -80,6 +80,7 @@ fn interp_run(src: &str, ctx: &mut [u8]) -> u64 {
     let mut vm = Vm::new(Program {
         insns: a.insns,
         maps: a.maps,
+        btf_ctx: None,
     })
     .unwrap();
     vm.verify(Config {
@@ -95,6 +96,7 @@ fn jit_run(src: &str, ctx: &mut [u8]) -> u64 {
     let mut vm = Vm::new(Program {
         insns: a.insns,
         maps: a.maps,
+        btf_ctx: None,
     })
     .unwrap();
     vm.verify(Config {
@@ -215,6 +217,7 @@ fn jit_ringbuf_matches_interpreter() {
         let mut vm = Vm::new(Program {
             insns: a.insns,
             maps: a.maps,
+            btf_ctx: None,
         })
         .unwrap();
         vm.verify(Config::default()).unwrap();
@@ -266,6 +269,7 @@ fn jit_runtime_fault_is_caught() {
     let mut vm = Vm::new(Program {
         insns: a.insns,
         maps: a.maps,
+        btf_ctx: None,
     })
     .unwrap();
     // skip verification so the bad access reaches the runtime

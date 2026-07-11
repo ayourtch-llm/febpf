@@ -396,6 +396,7 @@ mod tests {
         Program {
             insns: a.insns,
             maps: a.maps,
+            btf_ctx: None,
         }
     }
 

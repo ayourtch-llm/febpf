@@ -50,6 +50,7 @@ fn vm_of(path: &str, prog: &str) -> Vm {
     let mut vm = Vm::new(Program {
         insns: p.insns,
         maps: obj.maps,
+        btf_ctx: None,
     })
     .unwrap();
     if let Some(di) = p.debug {

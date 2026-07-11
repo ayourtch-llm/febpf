@@ -44,6 +44,7 @@ fn run_prog(obj: &elf::Object, prog_name: &str, ctx: &mut [u8]) -> u64 {
     let mut vm = Vm::new(Program {
         insns: prog.insns.clone(),
         maps: obj.maps.clone(),
+        btf_ctx: None,
     })
     .unwrap();
     vm.verify(Config {
@@ -141,6 +142,7 @@ fn global_data_object() {
     let mut vm = Vm::new(Program {
         insns: prog.insns.clone(),
         maps: obj.maps.clone(),
+        btf_ctx: None,
     })
     .unwrap();
     vm.verify(Config {
@@ -157,6 +159,7 @@ fn global_data_object() {
     let mut vm2 = Vm::new(Program {
         insns: prog.insns.clone(),
         maps: obj.maps.clone(),
+        btf_ctx: None,
     })
     .unwrap();
     vm2.verify(Config {
@@ -219,6 +222,7 @@ fn jit_matches_interpreter_on_objects() {
         let mut vm = Vm::new(Program {
             insns: p.insns.clone(),
             maps: obj.maps.clone(),
+            btf_ctx: None,
         })
         .unwrap();
         vm.verify(Config {
@@ -274,6 +278,7 @@ fn core_relocations_against_shifted_target() {
     let mut vm = Vm::new(Program {
         insns: prog.insns.clone(),
         maps: obj.maps.clone(),
+        btf_ctx: None,
     })
     .unwrap();
     vm.verify(Config {

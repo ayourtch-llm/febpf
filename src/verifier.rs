@@ -36,6 +36,12 @@ pub struct Config {
     pub insn_budget: usize,
     /// Bound on remembered states per prune point.
     pub max_states_per_pc: usize,
+    /// BTF typing of the context, for `tp_btf`/`fentry`-style programs whose
+    /// ctx is an array of typed u64 arguments (the kernel's `btf_ctx_access()`
+    /// model). When set, ctx loads follow the kernel's BTF rules instead of
+    /// the flat `ctx_size` byte-buffer model: 8-byte-slot reads only, pointer
+    /// slots yield [`PtrKind::BtfId`] pointers, and writes are rejected.
+    pub btf_ctx: Option<crate::btf::BtfCtx>,
 }
 
 impl Default for Config {
@@ -46,6 +52,7 @@ impl Default for Config {
             strict_alignment: false,
             insn_budget: 1_000_000,
             max_states_per_pc: 4096,
+            btf_ctx: None,
         }
     }
 }
@@ -118,6 +125,12 @@ pub struct VerifyOk {
     /// sound to optimize on (see `docs/specs/equiv-optimizer.md` §4). Indexed
     /// by instruction slot; the second slot of a `lddw` is `None`.
     pub pc_regs: Vec<Option<[RegState; NUM_REGS]>>,
+    /// Per-insn: `true` for loads that go through a BTF-typed kernel pointer.
+    /// The kernel rewrites these to `BPF_PROBE_MEM` (fault-tolerant, a bad
+    /// address reads as zero) in convert_ctx_accesses(); febpf's runtime does
+    /// the same when the VM is armed with this bitmap (`Vm::verify` arms it
+    /// automatically). Indexed by instruction slot.
+    pub probe_mem: Vec<bool>,
 }
 
 impl VerifyOk {
@@ -294,6 +307,12 @@ pub enum PtrKind {
     /// A ringbuf record already submitted/discarded; any further use is an
     /// error (use-after-consume).
     RingbufConsumed { id: u32 },
+    /// A BTF-typed kernel pointer (the kernel's `PTR_TO_BTF_ID`): points at a
+    /// struct/union of BTF type id `btf_id` in the target BTF (`Config::
+    /// btf_ctx`). Read-only; loads are typed by `Btf::read_kind` (pointer
+    /// members chase to another `BtfId`, everything else is a scalar) and are
+    /// executed as fault-tolerant probe reads (kernel `BPF_PROBE_MEM`).
+    BtfId { btf_id: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,6 +394,7 @@ impl std::fmt::Display for RegState {
                         write!(f, "ringbuf_mem_or_null[{size}]")?
                     }
                     PtrKind::RingbufConsumed { .. } => write!(f, "ringbuf_consumed")?,
+                    PtrKind::BtfId { btf_id } => write!(f, "kptr(btf{btf_id})")?,
                 }
                 if p.off != 0 {
                     write!(f, "{:+}", p.off)?;
@@ -1012,6 +1032,13 @@ pub struct Verifier<'a> {
     /// [`VerifyOk::pc_regs`]).
     pc_regs: Vec<Option<[RegState; NUM_REGS]>>,
     next_null_id: u32,
+    /// Per-insn: loads that go through a BTF pointer and must execute as
+    /// fault-tolerant probe reads (kernel `BPF_PROBE_MEM`). See
+    /// [`VerifyOk::probe_mem`].
+    probe_mem: Vec<bool>,
+    /// Per-insn pointer class of LDX instructions (0 = unseen, 1 = BTF
+    /// probe read, 2 = ordinary memory) — see [`Verifier::note_ldx_class`].
+    mem_class: Vec<u8>,
     /// Path arena: one node per successor of every multi-successor step,
     /// forming a tree of branch decisions rooted at program entry. Used to
     /// replay the failing path when verification is rejected.
@@ -1055,6 +1082,8 @@ impl<'a> Verifier<'a> {
             insn_state: Vec::new(),
             pc_regs: Vec::new(),
             next_null_id: 1,
+            probe_mem: Vec::new(),
+            mem_class: Vec::new(),
             path_nodes: Vec::new(),
             replay_null_origin: None,
         }
@@ -1085,6 +1114,8 @@ impl<'a> Verifier<'a> {
         self.compute_prune_points();
         self.insn_state = vec![None; self.insns.len()];
         self.pc_regs = vec![None; self.insns.len()];
+        self.probe_mem = vec![false; self.insns.len()];
+        self.mem_class = vec![0u8; self.insns.len()];
 
         // work items: (pc, state, last path node, steps taken from entry)
         let mut pending: Vec<(usize, VState, Option<u32>, u32)> =
@@ -1197,6 +1228,7 @@ impl<'a> Verifier<'a> {
             warnings: self.warnings,
             insn_state: self.insn_state,
             pc_regs: self.pc_regs,
+            probe_mem: self.probe_mem,
         })
     }
 
@@ -1205,7 +1237,7 @@ impl<'a> Verifier<'a> {
     /// Initial abstract state: r1 = ctx (if any), r10 = fp.
     fn initial_state(&self) -> VState {
         let mut frame = Frame::new(0);
-        if self.cfg.ctx_size > 0 {
+        if self.cfg.ctx_size > 0 || self.cfg.btf_ctx.is_some() {
             frame.regs[1] = RegState::Ptr(Ptr::new(PtrKind::Ctx));
         }
         frame.regs[REG_FP as usize] = RegState::Ptr(Ptr::new(PtrKind::Stack { frame: 0 }));
@@ -1783,6 +1815,49 @@ impl<'a> Verifier<'a> {
                         ),
                     ));
                 }
+                if let Some(bc) = &self.cfg.btf_ctx {
+                    // BTF-typed ctx: an array of 8-byte typed arguments. The
+                    // kernel's btf_ctx_access() (kernel/bpf/btf.c) requires
+                    // the offset to be a multiple of 8, within the argument
+                    // count, and rejects all writes for tracing programs.
+                    if write {
+                        return Err(self.err(pc, "BTF-typed context is read-only"));
+                    }
+                    if disp % 8 != 0 {
+                        return Err(self.err(
+                            pc,
+                            format!("BTF ctx access at offset {disp} is not a multiple of 8"),
+                        ));
+                    }
+                    let arg = disp / 8;
+                    if arg < 0 || arg as usize >= bc.args.len() {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "BTF ctx access at offset {disp} is beyond the {} typed \
+                                 argument slots",
+                                bc.args.len()
+                            ),
+                        ));
+                    }
+                    // A pointer slot must be read whole (the kernel types the
+                    // full 8-byte load as PTR_TO_BTF_ID; a narrower read of a
+                    // pointer is meaningless and rejected).
+                    if size != 8
+                        && matches!(bc.args[arg as usize], crate::btf::CtxSlot::Ptr { .. })
+                    {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "BTF ctx pointer argument {arg} must be loaded with an \
+                                 8-byte read (got {size})"
+                            ),
+                        ));
+                    }
+                    // off%8==0 and size in {1,2,4,8} make the access naturally
+                    // aligned and slot-contained; nothing left to bounds-check.
+                    return Ok(None);
+                }
                 if write && !self.cfg.ctx_writable {
                     return Err(self.err(pc, "context is read-only"));
                 }
@@ -1820,6 +1895,51 @@ impl<'a> Verifier<'a> {
             PtrKind::Map { .. } => {
                 return Err(self.err(pc, "map object pointers cannot be dereferenced"));
             }
+            PtrKind::BtfId { btf_id } => {
+                // The kernel's check_ptr_to_btf_access() (kernel/bpf/verifier.c):
+                // PTR_TO_BTF_ID supports only reads, at a constant offset,
+                // bounds-checked against the BTF type's size via
+                // btf_struct_access().
+                if write {
+                    return Err(self.err(
+                        pc,
+                        "writes through a BTF pointer are not allowed (only read is supported)",
+                    ));
+                }
+                if !p.var.is_const() || p.var.umin != 0 {
+                    return Err(self.err(
+                        pc,
+                        "variable offset access on a BTF pointer is not allowed",
+                    ));
+                }
+                let btf = self
+                    .cfg
+                    .btf_ctx
+                    .as_ref()
+                    .and_then(|bc| bc.btf.as_deref())
+                    .ok_or_else(|| {
+                        self.err(pc, "BTF pointer access without a BTF type graph")
+                    })?;
+                let tsize = btf.type_size(btf_id).map_err(|e| self.err(pc, e))? as i64;
+                let off = p.off + disp;
+                if off < 0 || off + size as i64 > tsize {
+                    return Err(self.err(
+                        pc,
+                        format!(
+                            "access at offset {off} size {size} is outside BTF type \
+                             '{}' (size {tsize})",
+                            btf.type_name(btf_id)
+                        ),
+                    ));
+                }
+                if self.cfg.strict_alignment && size > 1 && off.rem_euclid(size as i64) != 0 {
+                    return Err(self.err(
+                        pc,
+                        format!("misaligned BTF pointer access off {off} size {size}"),
+                    ));
+                }
+                return Ok(None);
+            }
         };
         let lo = p.off + disp + p.var.smin;
         let hi = p.off + disp + p.var.smax;
@@ -1852,6 +1972,70 @@ impl<'a> Verifier<'a> {
             }
         }
         Ok(None)
+    }
+
+    /// What a non-stack load through `p` puts in the destination register.
+    /// Plain regions read unknown scalars; BTF-typed ctx slots and BTF
+    /// pointer fields read typed pointers (the kernel's `btf_ctx_access()` /
+    /// `btf_struct_access()` result typing). Assumes `check_mem_access`
+    /// already validated the access.
+    fn typed_load(
+        &self,
+        pc: usize,
+        p: &Ptr,
+        disp: i64,
+        size: u64,
+    ) -> Result<RegState, VerifyError> {
+        match p.kind {
+            PtrKind::Ctx => {
+                if let Some(bc) = &self.cfg.btf_ctx {
+                    if size == 8 {
+                        if let crate::btf::CtxSlot::Ptr { btf_id } = bc.args[(disp / 8) as usize]
+                        {
+                            return Ok(RegState::Ptr(Ptr::new(PtrKind::BtfId { btf_id })));
+                        }
+                    }
+                }
+            }
+            PtrKind::BtfId { btf_id } => {
+                let btf = self
+                    .cfg
+                    .btf_ctx
+                    .as_ref()
+                    .and_then(|bc| bc.btf.as_deref())
+                    .expect("checked by check_mem_access");
+                let off = (p.off + disp) as u32; // >= 0, checked
+                if let Some(pointee) = btf
+                    .read_kind(btf_id, off, size as u32)
+                    .map_err(|e| self.err(pc, e))?
+                {
+                    return Ok(RegState::Ptr(Ptr::new(PtrKind::BtfId { btf_id: pointee })));
+                }
+            }
+            _ => {}
+        }
+        Ok(RegState::Scalar(Scalar::unknown()))
+    }
+
+    /// Record whether the load at `pc` goes through a BTF pointer (and so
+    /// must execute as a fault-tolerant probe read, kernel `BPF_PROBE_MEM`)
+    /// or through ordinary memory. The kernel rewrites the instruction one
+    /// way or the other at load time, so a single insn reached with both
+    /// pointer classes on different paths is rejected — same rule and message
+    /// as the kernel's do_check().
+    fn note_ldx_class(&mut self, pc: usize, probe: bool) -> Result<(), VerifyError> {
+        let cls = if probe { 1u8 } else { 2 };
+        match self.mem_class[pc] {
+            0 => {
+                self.mem_class[pc] = cls;
+                if probe {
+                    self.probe_mem[pc] = true;
+                }
+                Ok(())
+            }
+            c if c == cls => Ok(()),
+            _ => Err(self.err(pc, "same insn cannot be used with different pointers")),
+        }
     }
 
     fn stack_store(
@@ -1929,6 +2113,16 @@ impl<'a> Verifier<'a> {
     ) -> Result<(), VerifyError> {
         if len == 0 {
             return Ok(());
+        }
+        // The kernel's ARG_PTR_TO_MEM family never accepts PTR_TO_BTF_ID (a
+        // BTF pointer targets unreadable-in-place kernel memory; only probe
+        // reads and direct typed loads may touch it).
+        if matches!(p.kind, PtrKind::BtfId { .. }) {
+            return Err(self.err(
+                pc,
+                "a BTF pointer cannot be passed as a helper memory buffer \
+                 (use probe_read_kernel)",
+            ));
         }
         if let Some((frame, off)) = self.check_mem_access(state, pc, p, 0, len, write, false)? {
             if write {
@@ -2353,11 +2547,13 @@ impl<'a> Verifier<'a> {
                     RegState::Uninit => unreachable!(),
                 };
                 let size = ins.mem_size() as u64;
-                let loaded =
-                    match self.check_mem_access(&state, pc, &p, ins.off as i64, size, false, true)? {
-                        Some((frame, off)) => self.stack_load(&state, pc, frame, off, size)?,
-                        None => RegState::Scalar(Scalar::unknown()),
-                    };
+                let stack =
+                    self.check_mem_access(&state, pc, &p, ins.off as i64, size, false, true)?;
+                self.note_ldx_class(pc, matches!(p.kind, PtrKind::BtfId { .. }))?;
+                let loaded = match stack {
+                    Some((frame, off)) => self.stack_load(&state, pc, frame, off, size)?,
+                    None => self.typed_load(pc, &p, ins.off as i64, size)?,
+                };
                 let loaded = if ins.mem_mode() == mode::MEMSX {
                     match loaded {
                         RegState::Scalar(s) => {

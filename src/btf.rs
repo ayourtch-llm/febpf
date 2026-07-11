@@ -545,6 +545,210 @@ impl Btf {
             }
         })
     }
+
+    /// What a `size`-byte read at byte offset `off` inside type `id` yields:
+    /// `Some(pointee)` when the read covers exactly a pointer-to-struct/union
+    /// member (8 bytes at the member's offset) — the resolved pointee type id —
+    /// and `None` for anything else (the read is a plain scalar). Walks nested
+    /// structs, unions and arrays like the kernel's `btf_struct_walk()`
+    /// (kernel/bpf/btf.c), simplified: bounds against the type size are the
+    /// caller's job, bitfield members never produce pointers, and reads that
+    /// match no pointer member are scalars rather than errors (any read within
+    /// the object is data). See docs/specs/btf-ctx-pointers.md.
+    pub fn read_kind(&self, id: u32, off: u32, size: u32) -> Result<Option<u32>, String> {
+        self.read_kind_rec(id, off, size, 0)
+    }
+
+    fn read_kind_rec(
+        &self,
+        id: u32,
+        off: u32,
+        size: u32,
+        depth: u32,
+    ) -> Result<Option<u32>, String> {
+        if depth > 32 {
+            return Ok(None); // pathological nesting: treat as data
+        }
+        let id = self.resolve(id)?;
+        match &self.ty(id)?.kind {
+            Kind::Ptr { type_id } if off == 0 && size == 8 => {
+                let p = self.resolve(*type_id)?;
+                match self.ty(p)?.kind {
+                    // Only pointers to composite types become BTF pointers;
+                    // pointers to scalars/void read as scalar data (stricter
+                    // than the kernel, which types those too — see spec).
+                    Kind::Struct { .. } | Kind::Union { .. } => Ok(Some(p)),
+                    _ => Ok(None),
+                }
+            }
+            Kind::Struct { members, .. } | Kind::Union { members, .. } => {
+                for m in members {
+                    if m.bitfield_size != 0 || !m.bit_offset.is_multiple_of(8) {
+                        continue;
+                    }
+                    let moff = m.bit_offset / 8;
+                    let msize = match self.type_size(m.type_id) {
+                        Ok(s) => s,
+                        Err(_) => continue, // unsized member (flex array tail)
+                    };
+                    if off < moff || off.saturating_add(size) > moff.saturating_add(msize) {
+                        continue;
+                    }
+                    if let Some(p) = self.read_kind_rec(m.type_id, off - moff, size, depth + 1)? {
+                        return Ok(Some(p));
+                    }
+                }
+                Ok(None)
+            }
+            Kind::Array { elem_type, .. } => {
+                let es = self.type_size(*elem_type).unwrap_or(0);
+                if es == 0 {
+                    return Ok(None);
+                }
+                let rel = off % es;
+                if rel.saturating_add(size) > es {
+                    return Ok(None); // straddles elements: data
+                }
+                self.read_kind_rec(*elem_type, rel, size, depth + 1)
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BTF-typed program context (tp_btf / fentry / fexit / fmod_ret)
+// ---------------------------------------------------------------------------
+
+/// What a load of one 8-byte context slot yields for a program whose ctx is an
+/// array of BTF-typed u64 arguments (the kernel's `btf_ctx_access()` model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtxSlot {
+    /// An integer/enum/by-value argument (or a pointer to a non-composite
+    /// type): loads read an unknown scalar.
+    Scalar,
+    /// A pointer to the (resolved) struct/union type `btf_id` in the target
+    /// BTF: an 8-byte load yields a BTF-typed pointer.
+    Ptr { btf_id: u32 },
+}
+
+/// BTF typing of a program's context: one [`CtxSlot`] per 8-byte argument,
+/// plus the type graph the slots refer to. The graph is needed only for
+/// *verification* (field walks); the runtime uses the slots alone, which is
+/// why replay files can carry a `BtfCtx` with `btf: None`.
+/// See docs/specs/btf-ctx-pointers.md.
+#[derive(Clone)]
+pub struct BtfCtx {
+    pub args: Vec<CtxSlot>,
+    pub btf: Option<std::sync::Arc<Btf>>,
+}
+
+impl std::fmt::Debug for BtfCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The type graph can be all of vmlinux; print the slots only.
+        f.debug_struct("BtfCtx")
+            .field("args", &self.args)
+            .field("btf", &self.btf.as_ref().map(|_| ".."))
+            .finish()
+    }
+}
+
+/// Is this ELF section name a BTF-typed program type — one whose ctx is an
+/// array of BTF-typed arguments that [`resolve_ctx_args`] can resolve?
+pub fn is_btf_ctx_section(name: &str) -> bool {
+    ["tp_btf/", "fentry/", "fexit/", "fmod_ret/"]
+        .iter()
+        .any(|p| name.starts_with(p))
+}
+
+/// Resolve an ELF section name to the BTF typing of the program's ctx
+/// arguments, mirroring how the kernel types `tp_btf`/`fentry`/`fexit`
+/// programs (`btf_ctx_access()` in kernel/bpf/btf.c):
+///
+/// - `tp_btf/NAME`: the `btf_trace_NAME` typedef's func_proto, with the first
+///   `void *__data` parameter skipped (the kernel does the same for
+///   `attach_btf_trace` programs).
+/// - `fentry/NAME` / `fmod_ret/NAME`: the kernel function `NAME`'s proto.
+/// - `fexit/NAME`: like fentry plus one extra trailing slot for the return
+///   value (typed by the proto's return type).
+///
+/// Returns `Ok(None)` for section names that are not BTF-typed program types
+/// (`raw_tp/`, `kprobe/`, `tracepoint/`, ...), and `Err` when the section IS
+/// BTF-typed but the target cannot be found in `btf`.
+pub fn resolve_ctx_args(btf: &Btf, section: &str) -> Result<Option<Vec<CtxSlot>>, String> {
+    let (proto_id, skip_data_arg, ret_slot, what) =
+        if let Some(name) = section.strip_prefix("tp_btf/") {
+            let tname = format!("btf_trace_{name}");
+            let td = btf
+                .ids_by_name(&tname)
+                .iter()
+                .copied()
+                .find(|&id| matches!(btf.ty(id).map(|t| &t.kind), Ok(Kind::Typedef { .. })))
+                .ok_or_else(|| format!("no typedef '{tname}' in target BTF"))?;
+            // typedef -> ptr -> func_proto
+            let r = btf.resolve(td)?;
+            let Kind::Ptr { type_id } = btf.ty(r)?.kind else {
+                return Err(format!("'{tname}' does not resolve to a function pointer"));
+            };
+            (btf.resolve(type_id)?, true, false, tname)
+        } else if let Some(name) = section
+            .strip_prefix("fentry/")
+            .or_else(|| section.strip_prefix("fmod_ret/"))
+        {
+            (func_proto_of(btf, name)?, false, false, name.to_string())
+        } else if let Some(name) = section.strip_prefix("fexit/") {
+            (func_proto_of(btf, name)?, false, true, name.to_string())
+        } else {
+            return Ok(None);
+        };
+
+    let Kind::FuncProto { params, ret_type } = &btf.ty(proto_id)?.kind else {
+        return Err(format!("'{what}' does not resolve to a function prototype"));
+    };
+    let mut slots = Vec::new();
+    for p in params.iter().skip(skip_data_arg as usize) {
+        if p.type_id == 0 {
+            break; // trailing void / vararg marker
+        }
+        slots.push(slot_of(btf, p.type_id)?);
+    }
+    if ret_slot {
+        slots.push(if *ret_type == 0 {
+            CtxSlot::Scalar
+        } else {
+            slot_of(btf, *ret_type)?
+        });
+    }
+    Ok(Some(slots))
+}
+
+/// The func_proto type id of the named kernel function.
+fn func_proto_of(btf: &Btf, name: &str) -> Result<u32, String> {
+    let f = btf
+        .ids_by_name(name)
+        .iter()
+        .copied()
+        .find(|&id| matches!(btf.ty(id).map(|t| &t.kind), Ok(Kind::Func { .. })))
+        .ok_or_else(|| format!("no function '{name}' in target BTF"))?;
+    match btf.ty(f)?.kind {
+        Kind::Func { proto_type, .. } => Ok(btf.resolve(proto_type)?),
+        _ => unreachable!(),
+    }
+}
+
+/// Slot typing of one argument: pointer-to-struct/union becomes a BTF pointer
+/// slot (with the pointee resolved through modifiers/typedefs); everything
+/// else — ints, enums, by-value structs, pointers to scalars — reads as a
+/// scalar, matching (or, for scalar-pointees, tightening) `btf_ctx_access()`.
+fn slot_of(btf: &Btf, type_id: u32) -> Result<CtxSlot, String> {
+    let r = btf.resolve(type_id)?;
+    if let Kind::Ptr { type_id: pointee } = btf.ty(r)?.kind {
+        let p = btf.resolve(pointee)?;
+        if matches!(btf.ty(p)?.kind, Kind::Struct { .. } | Kind::Union { .. }) {
+            return Ok(CtxSlot::Ptr { btf_id: p });
+        }
+    }
+    Ok(CtxSlot::Scalar)
 }
 
 fn str_at(strs: &[u8], off: u32) -> &str {
