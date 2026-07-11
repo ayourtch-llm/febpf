@@ -172,3 +172,92 @@ fn jit_matches_interpreter_on_objects() {
         assert_eq!(interp, jit, "{file}: interp {interp} != jit {jit}");
     }
 }
+
+#[test]
+fn core_relocations_against_shifted_target() {
+    maybe_compile("core_probe.c", "core_probe.o");
+    maybe_compile("core_target.c", "core_target.o");
+    let probe = std::fs::read("tests/core_probe.o").unwrap();
+    let target_obj = std::fs::read("tests/core_target.o").unwrap();
+    let (target_btf, _) = elf::read_section(&target_obj, ".BTF")
+        .unwrap()
+        .expect("target fixture has no .BTF");
+
+    assert!(elf::has_core_relocations(&probe));
+    assert!(!elf::has_core_relocations(&std::fs::read("tests/btf_maps.o").unwrap()));
+
+    // probe computes p->x + p->y + (int)p->z over `struct point`.
+    // Unrelocated (compiler's local layout): x@0, y@4, z@8.
+    let mut ctx = [0u8; 64];
+    ctx[0..4].copy_from_slice(&11i32.to_le_bytes());
+    ctx[4..8].copy_from_slice(&22i32.to_le_bytes());
+    ctx[8..16].copy_from_slice(&33i64.to_le_bytes());
+    let obj = elf::load(&probe).unwrap();
+    assert_eq!(run_prog(&obj, "text", &mut ctx), 66);
+
+    // Relocated against the shifted target layout: x@4, y@12, z@16.
+    let mut ctx = [0u8; 64];
+    ctx[4..8].copy_from_slice(&100i32.to_le_bytes());
+    ctx[12..16].copy_from_slice(&20i32.to_le_bytes());
+    ctx[16..24].copy_from_slice(&3i64.to_le_bytes());
+    let obj = elf::load_with_target_btf(&probe, Some(&target_btf)).unwrap();
+    assert_eq!(run_prog(&obj, "text", &mut ctx), 123);
+
+    // Self-relocation (own BTF as target) must be a no-op.
+    let (own_btf, _) = elf::read_section(&probe, ".BTF").unwrap().unwrap();
+    let own = elf::load_with_target_btf(&probe, Some(&own_btf)).unwrap();
+    let plain = elf::load(&probe).unwrap();
+    assert_eq!(own.programs[0].insns, plain.programs[0].insns);
+
+    // JIT/interpreter parity on the relocated program.
+    let prog = &obj.programs[0];
+    let mut vm = Vm::new(Program {
+        insns: prog.insns.clone(),
+        maps: obj.maps.clone(),
+    })
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 64,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut jit_ctx = [0u8; 64];
+    jit_ctx[4..8].copy_from_slice(&100i32.to_le_bytes());
+    jit_ctx[12..16].copy_from_slice(&20i32.to_le_bytes());
+    jit_ctx[16..24].copy_from_slice(&3i64.to_le_bytes());
+    assert_eq!(vm.run_jit(&mut jit_ctx).unwrap(), 123);
+}
+
+/// Differential against the running kernel: relocate a FIELD_BYTE_OFFSET on
+/// an ALU immediate against /sys/kernel/btf/vmlinux and compare the patched
+/// value with what `bpftool btf dump` reports for task_struct.pid.
+#[test]
+fn core_alu_relocation_against_running_kernel() {
+    maybe_compile("core_task.c", "core_task.o");
+    let vmlinux = "/sys/kernel/btf/vmlinux";
+    let Ok(target) = std::fs::read(vmlinux) else {
+        eprintln!("skipping: no {vmlinux}");
+        return;
+    };
+    let out = Command::new("bpftool")
+        .args(["btf", "dump", "file", vmlinux])
+        .output();
+    let Ok(out) = out else {
+        eprintln!("skipping: bpftool unavailable");
+        return;
+    };
+    let dump = String::from_utf8_lossy(&out.stdout);
+    // First 'pid' member inside STRUCT task_struct.
+    let expected: u64 = dump
+        .split("STRUCT 'task_struct' size")
+        .nth(1)
+        .and_then(|s| s.lines().find(|l| l.contains("'pid' type_id")))
+        .and_then(|l| l.rsplit("bits_offset=").next())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .expect("bpftool: no task_struct.pid")
+        / 8;
+
+    let probe = std::fs::read("tests/core_task.o").unwrap();
+    let obj = elf::load_with_target_btf(&probe, Some(&target)).unwrap();
+    assert_eq!(run_prog(&obj, "text", &mut [0u8; 8]), expected);
+}

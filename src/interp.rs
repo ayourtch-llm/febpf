@@ -812,6 +812,13 @@ impl<'a> Machine<'a> {
                 (x.wrapping_mul(0x2545F4914F6CDD1D) >> 32) as u32 as u64
             }
             helpers::id::GET_SMP_PROCESSOR_ID => 0,
+            0xbad2310 => {
+                // CO-RE poison value: the loader replaced an instruction
+                // whose relocation had no match in the target BTF.
+                return Err(self.err(
+                    "unresolved CO-RE relocation (poisoned instruction) executed".to_string(),
+                ));
+            }
             _ => {
                 // user-registered helper
                 let pc = self.pc;

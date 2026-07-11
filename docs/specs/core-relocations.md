@@ -183,9 +183,11 @@ For each `bpf_core_relo`:
 
 6. **Ambiguity rule**: every candidate that matches must yield the *same*
    `new_val`; if they disagree, the relocation is ambiguous → error. If **no**
-   candidate matches: EXISTS-family relos resolve to 0; the others are a hard
-   error (libbpf "poisons" the instruction; febpf errors, which is stricter and
-   fine for a loader).
+   candidate matches: EXISTS-family relos resolve to 0; the others mark the
+   instruction for **poisoning** (like libbpf): the loader replaces it with a
+   call to invalid helper `0xbad2310`, so the program still loads and only
+   fails — with a dedicated verifier/runtime message naming the CO-RE poison —
+   if the (presumably existence-guarded) path is actually reached.
 
 ## 3. Instruction patching
 
@@ -263,15 +265,25 @@ in `src/elf.rs`, before `Vm::new` — same lifecycle stage as the existing map
   bitfields, flavors, ambiguity, missing field/type, enums incl. ENUM64,
   typedef roots) + a self-relocation differential in `tests/btf.rs` (fixture's
   own BTF as target must reproduce clang's baked-in offsets).
-- Stage 4 (patching + CLI): not started.
+- Stage 4 (patching + CLI): **done** —
+  `elf::load_with_target_btf(bytes, Option<&[u8]>)` applies every core_relo
+  to the loaded programs (per-section relos mapped onto the flat instruction
+  stream, `.text` relos re-applied at each program's `text_base`);
+  `patch_core_insn` handles mem-class `off` (i16 range + validation), ALU-K
+  `imm`, and `lddw` (both slots), and poisons unresolvable instructions with
+  `call 0xbad2310` — the verifier and interpreter report reaching one as
+  "unresolved CO-RE relocation". Target BTF endianness is auto-detected from
+  its magic. `elf::has_core_relocations` lets callers decide whether a target
+  is needed. CLI: `--target-btf <path>` (raw blob or ELF with a `.BTF`
+  section); when omitted, defaults to `/sys/kernel/btf/vmlinux` if it exists
+  and the object has core relos (with a stderr note). End-to-end tests in
+  `tests/elf.rs`: `core_probe.o` against a clang-compiled shifted-layout
+  target BTF (`examples/c/core_target.c`) under interpreter + JIT,
+  self-relocation no-op, and a running-kernel differential
+  (`examples/c/core_task.c`: FIELD_BYTE_OFFSET on an ALU imm relocated
+  against vmlinux must equal `bpftool`'s task_struct.pid offset).
 
-Next step (stage 4): instruction patching + CLI (§3, §4). In `elf.rs::load`,
-accept an optional target BTF; when the object has `.BTF.ext` core_relos for a
-loaded section, compute each relo and patch the insn at `insn_off/8` (relative
-to that section's code): mem-class → `off` (validate old off == orig_val,
-check i16 range), ALU imm → `imm`, lddw → both `imm` slots. Remember `.text`
-stitching: relos for ".text" apply at the appended `text_base` offset in every
-program that stitched it. CLI: `--target-btf <path>`, default
-`/sys/kernel/btf/vmlinux` when present and relos exist. Test: run
-`tests/core_probe.o` under interp+JIT against a hand-built shifted target BTF
-and assert the result matches the shifted ctx layout.
+All four stages complete. Possible follow-ups (not planned here): use the
+stored func_info/line_info for source-level debugging; `bpf_core_type_id`
+kernel-vs-local id spaces if kfuncs ever land; TYPE_MATCHES strictness
+corner-cases (libbpf's rules for FWD↔STRUCT matching are looser than ours).

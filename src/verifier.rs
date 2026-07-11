@@ -1535,6 +1535,15 @@ impl<'a> Verifier<'a> {
         pc: usize,
         hid: u32,
     ) -> Result<(), VerifyError> {
+        if hid == 0xbad2310 {
+            // The CO-RE loader poisons instructions whose relocation found no
+            // match in the target BTF (libbpf does the same); reaching one
+            // means the program took a path the target kernel can't support.
+            return Err(self.err(
+                pc,
+                "unresolved CO-RE relocation (poisoned instruction) is reachable",
+            ));
+        }
         let sig = self
             .sig_for(hid)
             .ok_or_else(|| self.err(pc, format!("call to unknown helper #{hid}")))?;

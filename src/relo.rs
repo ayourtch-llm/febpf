@@ -30,6 +30,10 @@ pub struct ReloResult {
     /// Number of target candidates that matched (0 for EXISTS-style misses
     /// and for relos that need no target).
     pub matched: usize,
+    /// A non-EXISTS relocation found no matching candidate: the instruction
+    /// cannot be resolved and should be poisoned (libbpf-style), so that the
+    /// program still loads and only fails if the path is actually taken.
+    pub poison: bool,
 }
 
 /// Essential-name index over a target BTF, built once and reused for every
@@ -568,6 +572,7 @@ pub fn calc_relo(
             orig_val: relo.type_id as u64,
             validate: true,
             matched: 0,
+            poison: false,
         });
     }
 
@@ -704,6 +709,7 @@ pub fn calc_relo(
                     orig_val,
                     validate,
                     matched: 1,
+                    poison: false,
                 })
             }
         }
@@ -716,10 +722,18 @@ pub fn calc_relo(
             orig_val,
             validate: false,
             matched: 0,
+            poison: false,
         }),
-        None => Err(format!(
-            "CO-RE {kindname} '{root_name}' [{access}]: no matching type in target BTF"
-        )),
+        // Nothing matched a non-EXISTS relocation: the instruction cannot be
+        // resolved. Report it for poisoning (libbpf-style) rather than
+        // failing the whole load — existence-guarded code never runs it.
+        None => Ok(ReloResult {
+            new_val: 0,
+            orig_val,
+            validate: false,
+            matched: 0,
+            poison: true,
+        }),
     }
 }
 
@@ -1174,14 +1188,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!((r.new_val, r.matched), (1, 1));
-        // BYTE_OFFSET of a missing field is a hard error.
-        assert!(calc_relo(
+        // BYTE_OFFSET of a missing field marks the instruction for poisoning.
+        let r = calc_relo(
             &local,
             &relo(&local, 3, "0:1", relo_kind::FIELD_BYTE_OFFSET),
             &target,
             &idx,
         )
-        .is_err());
+        .unwrap();
+        assert!(r.poison);
+        assert_eq!(r.matched, 0);
         // TYPE_EXISTS of a type absent from the target -> 0.
         let ls2 = ["nosuch", "0"];
         let l2 = |n| stroff(&ls2, n);

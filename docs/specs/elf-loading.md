@@ -92,9 +92,17 @@ single-entry array map (`key_size=4`, `value_size=` section size,
 This is what makes ordinary clang-compiled C — string literals, lookup
 tables, persistent counters in globals — load and run unmodified.
 
+## CO-RE relocations
+
+`elf::load_with_target_btf` applies `.BTF.ext` CO-RE relocations against a
+target BTF; the CLI exposes `--target-btf` and defaults to
+`/sys/kernel/btf/vmlinux`. Full BTF parsing lives in `src/btf.rs`, the
+relocation algorithm in `src/relo.rs` — see `docs/specs/core-relocations.md`.
+`func_info`/`line_info` are parsed and stored but not yet surfaced
+(future source-level debugging).
+
 ## Not supported (yet)
 
-- Full BTF (func/line info, CO-RE relocations, `.BTF.ext`).
 - Map types beyond hash/array (per-CPU, LRU, ringbuf, maps-of-maps, …).
 - `R_BPF_64_ABS64`/`ABS32`/`NODYLD32` relocations.
 - Static linking of multiple objects.

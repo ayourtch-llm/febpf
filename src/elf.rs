@@ -193,8 +193,16 @@ pub fn read_section(bytes: &[u8], name: &str) -> Result<Option<(Vec<u8>, bool)>,
     }
 }
 
-/// Parse and relocate a BPF object file.
+/// Parse and relocate a BPF object file (no CO-RE target: any CO-RE
+/// relocations are left at the layout the compiler baked in).
 pub fn load(bytes: &[u8]) -> Result<Object, String> {
+    load_with_target_btf(bytes, None)
+}
+
+/// Parse and relocate a BPF object file, applying CO-RE relocations from
+/// `.BTF.ext` against `target_btf` (a raw BTF blob: a `.BTF` section payload
+/// or a kernel BTF file such as `/sys/kernel/btf/vmlinux`) when given.
+pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<Object, String> {
     let (r, sections) = parse_elf(bytes)?;
     let bytes = r.buf;
 
@@ -237,10 +245,12 @@ pub fn load(bytes: &[u8]) -> Result<Object, String> {
         .map(|(i, _)| i)
         .collect();
 
-    let mut programs = Vec::new();
+    // (program, its ELF section name, where `.text` was stitched in — needed
+    // to map per-section CO-RE relocations onto the flat instruction stream)
+    let mut programs: Vec<(LoadedProgram, String, Option<usize>)> = Vec::new();
     for idx in &entry_sections {
         let sec = &sections[*idx];
-        let insns = build_program(
+        let (insns, text_base) = build_program(
             &r,
             bytes,
             &sections,
@@ -250,33 +260,212 @@ pub fn load(bytes: &[u8]) -> Result<Object, String> {
             &symbols,
             &map_by_symval,
         )?;
-        programs.push(LoadedProgram {
-            name: sec.name.clone(),
-            insns,
-        });
+        programs.push((
+            LoadedProgram {
+                name: sec.name.clone(),
+                insns,
+            },
+            sec.name.clone(),
+            text_base,
+        ));
     }
 
     // If there are no SEC()-annotated entry programs, expose `.text` itself.
     if programs.is_empty() {
         if let Some(ti) = text_idx {
-            let insns = build_program(
+            let (insns, text_base) = build_program(
                 &r, bytes, &sections, ti, text_idx, &text_insns, &symbols, &map_by_symval,
             )?;
-            programs.push(LoadedProgram {
-                name: "text".into(),
-                insns,
-            });
+            programs.push((
+                LoadedProgram {
+                    name: "text".into(),
+                    insns,
+                },
+                ".text".into(),
+                text_base,
+            ));
         }
     }
     if programs.is_empty() {
         return Err("no executable program sections found".into());
     }
 
-    Ok(Object { programs, maps })
+    if let Some(target) = target_btf {
+        apply_core_relocations(r.le, bytes, &sections, &mut programs, target)?;
+    }
+
+    Ok(Object {
+        programs: programs.into_iter().map(|(p, _, _)| p).collect(),
+        maps,
+    })
+}
+
+/// Does this object carry CO-RE relocations (a `.BTF.ext` with a non-empty
+/// core_relo sub-section)? Used by callers to decide whether a target BTF
+/// (e.g. `/sys/kernel/btf/vmlinux`) should be supplied.
+pub fn has_core_relocations(bytes: &[u8]) -> bool {
+    let Ok(Some((ext_raw, le))) = read_section(bytes, ".BTF.ext") else {
+        return false;
+    };
+    crate::btf::BtfExt::parse(le, &ext_raw)
+        .map(|e| e.num_core_relos() > 0)
+        .unwrap_or(false)
+}
+
+/// Resolve every CO-RE relocation against the target BTF and patch the
+/// affected instructions in place (see `docs/specs/core-relocations.md` §3).
+///
+/// Relocations are grouped per ELF section; a program consists of its entry
+/// section (at instruction 0) plus, possibly, a stitched copy of `.text` (at
+/// `text_base`), so `.text` relocations are re-applied at that offset in
+/// every program that embeds it.
+fn apply_core_relocations(
+    le: bool,
+    bytes: &[u8],
+    sections: &[Section],
+    programs: &mut [(LoadedProgram, String, Option<usize>)],
+    target_btf: &[u8],
+) -> Result<(), String> {
+    use crate::btf::{Btf, BtfExt};
+
+    let Some(btf_idx) = sections.iter().position(|s| s.name == ".BTF" && s.size > 0) else {
+        return Ok(()); // no local BTF, nothing to relocate
+    };
+    let Some(ext_idx) = sections
+        .iter()
+        .position(|s| s.name == ".BTF.ext" && s.size > 0)
+    else {
+        return Ok(());
+    };
+    let local = Btf::parse(le, section_bytes(bytes, sections, btf_idx)?)?;
+    let ext = BtfExt::parse(le, section_bytes(bytes, sections, ext_idx)?)?;
+    if ext.num_core_relos() == 0 {
+        return Ok(());
+    }
+
+    // A raw BTF blob declares its own byte order via the magic.
+    let target_le = match target_btf.first_chunk::<2>() {
+        Some(&[0x9f, 0xeb]) => true,
+        Some(&[0xeb, 0x9f]) => false,
+        _ => return Err("target BTF: bad magic".into()),
+    };
+    let target = Btf::parse(target_le, target_btf)?;
+    let index = crate::relo::CandidateIndex::new(&target);
+
+    for (prog, sec_name, text_base) in programs.iter_mut() {
+        for ext_sec in &ext.core_relos {
+            let relo_sec = local.str_at(ext_sec.sec_name_off);
+            // Where does this section's code live inside this program?
+            let code_base = if relo_sec == sec_name {
+                0
+            } else if relo_sec == ".text" {
+                match text_base {
+                    Some(base) => *base,
+                    None => continue, // program didn't stitch .text in
+                }
+            } else {
+                continue; // relocations for some other program's section
+            };
+            for relo in &ext_sec.recs {
+                let res = crate::relo::calc_relo(&local, relo, &target, &index)
+                    .map_err(|e| format!("{}+{}: {e}", relo_sec, relo.insn_off))?;
+                let idx = code_base + relo.insn_off as usize / insn::INSN_SIZE;
+                patch_core_insn(&mut prog.insns, idx, &res).map_err(|e| {
+                    format!(
+                        "{}+{}: CO-RE {}: {e}",
+                        relo_sec,
+                        relo.insn_off,
+                        crate::btf::relo_kind::name(relo.kind)
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Patch one relocated instruction with the computed target value, mirroring
+/// libbpf's `bpf_core_patch_insn`: memory-class instructions take the value
+/// in `off`, immediate ALU ops in `imm`, and `lddw` across both `imm` slots.
+fn patch_core_insn(
+    insns: &mut [Insn],
+    idx: usize,
+    res: &crate::relo::ReloResult,
+) -> Result<(), String> {
+    use crate::insn::{class, jmp};
+    let insn = *insns
+        .get(idx)
+        .ok_or_else(|| format!("relocated instruction {idx} out of range"))?;
+
+    if res.poison {
+        // Like libbpf: replace with a call to an invalid helper (0xbad2310)
+        // so the program still loads and only fails verification if the
+        // (presumably existence-guarded) path is actually reachable.
+        insns[idx] = Insn {
+            opcode: class::JMP | jmp::CALL,
+            dst: 0,
+            src: 0,
+            off: 0,
+            imm: 0xbad2310,
+        };
+        return Ok(());
+    }
+
+    match insn.class() {
+        class::LDX | class::ST | class::STX => {
+            if res.validate && insn.off as i64 != res.orig_val as i64 {
+                return Err(format!(
+                    "insn {idx} off {} does not match expected {}",
+                    insn.off, res.orig_val
+                ));
+            }
+            if res.new_val > i16::MAX as u64 {
+                return Err(format!("new offset {} does not fit in i16", res.new_val));
+            }
+            insns[idx].off = res.new_val as i16;
+        }
+        class::ALU | class::ALU64 => {
+            if insn.is_src_reg() {
+                return Err(format!("insn {idx}: relocation on register-source ALU op"));
+            }
+            if res.validate && insn.imm as u32 as u64 != res.orig_val {
+                return Err(format!(
+                    "insn {idx} imm {} does not match expected {}",
+                    insn.imm, res.orig_val
+                ));
+            }
+            if res.new_val > u32::MAX as u64 {
+                return Err(format!("new value {} does not fit in imm", res.new_val));
+            }
+            insns[idx].imm = res.new_val as u32 as i32;
+        }
+        class::LD if insn.is_wide() => {
+            if idx + 1 >= insns.len() {
+                return Err(format!("relocated lddw at {idx} truncated"));
+            }
+            if res.validate && insn::wide_imm(insns, idx) != res.orig_val {
+                return Err(format!(
+                    "insn {idx} lddw {} does not match expected {}",
+                    insn::wide_imm(insns, idx),
+                    res.orig_val
+                ));
+            }
+            insns[idx].imm = res.new_val as u32 as i32;
+            insns[idx + 1].imm = (res.new_val >> 32) as u32 as i32;
+        }
+        other => {
+            return Err(format!(
+                "insn {idx}: unsupported instruction class {other:#x} for relocation"
+            ))
+        }
+    }
+    Ok(())
 }
 
 /// Build one runnable program from entry section `idx`, appending `.text`
 /// subprograms and fixing up call targets when the entry calls into `.text`.
+/// Also returns the instruction offset at which `.text` was stitched in (if
+/// it was), so CO-RE relocations on `.text` can be applied there.
 #[allow(clippy::too_many_arguments)]
 fn build_program(
     r: &Reader,
@@ -287,7 +476,7 @@ fn build_program(
     text_insns: &[Insn],
     symbols: &[Symbol],
     map_by_symval: &MapIndex,
-) -> Result<Vec<Insn>, String> {
+) -> Result<(Vec<Insn>, Option<usize>), String> {
     let raw = section_bytes(bytes, sections, idx)?;
     let mut insns = insn::decode_program(raw)?;
 
@@ -317,7 +506,7 @@ fn build_program(
             )?;
         }
     }
-    Ok(insns)
+    Ok((insns, text_base))
 }
 
 /// Does section `sec_idx`'s relocation table reference any symbol defined in
