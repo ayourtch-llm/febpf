@@ -29,6 +29,8 @@ commands:
   record <file> -o <out>      write a self-contained .febpf replay file
   replay <file.febpf>         load a replay file into the time-travel debugger
                               (or --run to just reproduce r0)
+  equiv <a> <b>               decide observable equivalence of two programs
+  optimize <file> [-o out]    verifier-guided, equivalence-checked optimizer
 
 options:
   --ctx <hex|@file>    context memory contents (hex string or file)
@@ -59,7 +61,10 @@ treated as raw little-endian eBPF bytecode.
 struct Opts {
     cmd: String,
     file: String,
+    /// Second positional file (for `equiv <a> <b>`).
+    file2: Option<String>,
     out: Option<String>,
+    stats: bool,
     ctx_hex: Option<String>,
     ctx_size: Option<usize>,
     no_verify: bool,
@@ -83,7 +88,9 @@ fn parse_args() -> Result<Opts, String> {
     let mut o = Opts {
         cmd,
         file: String::new(),
+        file2: None,
         out: None,
+        stats: false,
         ctx_hex: None,
         ctx_size: None,
         no_verify: false,
@@ -148,7 +155,9 @@ fn parse_args() -> Result<Opts, String> {
             }
             "--strict-align" => o.strict_align = true,
             "--readonly-ctx" => o.readonly_ctx = true,
+            "--stats" => o.stats = true,
             f if !f.starts_with('-') && o.file.is_empty() => o.file = f.to_string(),
+            f if !f.starts_with('-') && o.file2.is_none() => o.file2 = Some(f.to_string()),
             other => return Err(format!("unknown option '{other}'")),
         }
     }
@@ -402,6 +411,56 @@ fn check_determinism(recorded: Option<&febpf::replay::Outcome>, reproduced: &feb
     }
 }
 
+/// Build equivalence-checker options from CLI flags. A `--ctx` value becomes a
+/// fixed input always tested; `--ctx-size` (or the `--ctx` length, else 64)
+/// sizes the generated inputs.
+fn equiv_options(o: &Opts) -> Result<febpf::equiv::Options, String> {
+    let fixed = if o.ctx_hex.is_some() {
+        Some(make_ctx(o)?)
+    } else {
+        None
+    };
+    let ctx_size = o
+        .ctx_size
+        .or_else(|| fixed.as_ref().map(|c| c.len()))
+        .unwrap_or(64);
+    Ok(febpf::equiv::Options {
+        ctx_size,
+        fixed_ctx: fixed,
+        iters: o.iters as usize,
+        seed: o.seed.unwrap_or(0x5eed_1234),
+        insn_limit: 2_000_000,
+    })
+}
+
+/// `febpf equiv <a> <b> [--ctx ...] [--ctx-size n] [--iters N] [--seed N]`.
+fn cmd_equiv(o: &Opts) -> Result<ExitCode, String> {
+    use febpf::equiv::{self, Verdict};
+    let file_b = o
+        .file2
+        .as_deref()
+        .ok_or("equiv needs two programs: febpf equiv <a> <b>")?;
+    let (pa, _) = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
+    let (pb, _) = load_program(file_b, o.prog.as_deref(), o.target_btf.as_deref())?;
+    let opts = equiv_options(o)?;
+    let verdict = equiv::check(&pa, &pb, &opts)?;
+    match &verdict {
+        Verdict::ProvenEquivalent(reason) => {
+            println!("PROVEN-EQUIVALENT (abstract)");
+            println!("  {reason}");
+        }
+        Verdict::Equivalent { inputs } => {
+            println!("EQUIVALENT ({inputs} inputs, no counterexample found)");
+            println!("  empirical: differential falsification found no separating input");
+        }
+        Verdict::NotEquivalent(w) => {
+            println!("NOT-EQUIVALENT");
+            print!("{}", equiv::render_witness(w));
+        }
+    }
+    Ok(ExitCode::from(verdict.exit_code()))
+}
+
 fn run() -> Result<ExitCode, String> {
     let o = parse_args().map_err(|e| format!("{e}\n\n{USAGE}"))?;
     if o.cmd == "help" {
@@ -416,6 +475,9 @@ fn run() -> Result<ExitCode, String> {
     }
     if o.cmd == "replay" {
         return cmd_replay(&o);
+    }
+    if o.cmd == "equiv" {
+        return cmd_equiv(&o);
     }
     let (prog, debug) = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
     if o.cmd == "record" {
