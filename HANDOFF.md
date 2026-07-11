@@ -334,7 +334,10 @@ PERF_EVENT_ARRAY for this corpus). Coverage progression (loads / verifies):
 - + probe_read family + task_under_cgroup (`tracing-helpers.md`): 92.9% / 67.9%
 - + get_stack (#67) + kconfig externs + missing-max_entries default + subprog
   pointer returns (batch appended to `tracing-helpers.md` / `elf-loading.md`):
-  **100% / 78.6%** (44/56). Zero load failures remain.
+  100% / 78.6%. Zero load failures remain.
+- + load-time rodata DCE (`rodata-dce.md`), merged on top of the above:
+  **100% / TBD-after-merge-scan** (the two batches were developed in parallel;
+  each measured 78.6% alone and their fixes are disjoint).
 **Workflow: merge a coverage batch → `./scripts/scan-corpus.sh` → the histogram
 names the next batch.** febpf is an analysis/test/CI/debug engine, NOT a datapath
 runtime — "production useful" means verify/explain/differential-test/debug real
@@ -346,23 +349,21 @@ measure the previous build; and helper names in the histogram come from the
 uapi header now — the old hardcoded table had wrong ids (#113 was labelled
 ringbuf_output; it is probe_read_kernel).
 
-What blocks the remaining 12 objects (all VERIFY-REJECT:other; the previous
-LOAD-FAIL and helper-#67 items below are FIXED — kconfig externs +
-max_entries default in `elf-loading.md`, get_stack + subprog pointer returns
-in `tracing-helpers.md`):
-1. **12 × VERIFY-REJECT:other, two root causes.** (a) "unreachable
-   instruction": libbpf performs dead-code elimination using frozen `.rodata`
-   config values before the kernel ever sees the program; febpf verifies the
-   object as-is, so `if (cfg_flag)` branches over unloaded code trip the
-   unreachable check. Fix = a load-time rodata-driven branch-elimination pass
-   (mirror libbpf's). (b) scalar-deref like `r1 = *(u32*)(r6+2804)` where r6
-   came from a `tp_btf` ctx load: real kernels type that as PTR_TO_BTF_ID and
-   allow direct kernel-memory reads. Fix = model BTF-typed ctx pointers
-   (bigger; verifier + a deterministic "kernel memory reads as zero" story).
-2. ~~3 × LOAD-FAIL:relocation + 1 LOAD-FAIL:other~~ **FIXED**: these were not
-   CO-RE at all — kconfig externs (`LINUX_KERNEL_VERSION`) and a BTF map def
-   omitting `max_entries` (plus, downstream, subprog pointer returns).
-3. ~~1 × helper #67 get_stack (biostacks)~~ **FIXED**.
+What blocks the remaining objects (post-merge of BOTH parallel batches —
+get_stack/kconfig/subprog-returns AND rodata DCE; re-run the scan for the
+authoritative per-object list):
+1. **BTF-typed ctx scalar-derefs** — `r1 = *(u32*)(r6+2804)` where r6 came
+   from a `tp_btf` ctx load: real kernels type that as PTR_TO_BTF_ID and
+   allow direct kernel-memory reads (`offcputime`, `runqlat`, `runqslower`,
+   `bitesize`). Fix = model BTF-typed ctx pointers (bigger; verifier + a
+   deterministic "kernel memory reads as zero" story). This is now the main
+   remaining class.
+2. **helper #46 bpf_get_socket_cookie** (`tcppktlat`) — small, deterministic
+   constant model would do.
+3. Note: the DCE branch's "subprogram may not return a pointer" list
+   (`filetop`, `ksnoop`, `tcpsynbl`) was fixed in parallel by the
+   subprog-pointer-return change in `tracing-helpers.md`'s batch; the two
+   batches' fixes compound.
 
 ## Known limitations / where to go next (roughly prioritized)
 

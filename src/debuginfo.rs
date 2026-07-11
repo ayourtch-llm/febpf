@@ -75,6 +75,38 @@ impl DebugInfo {
         }
     }
 
+    /// Remap instruction indices after a load-time instruction rewrite (the
+    /// rodata DCE pass — see `docs/specs/rodata-dce.md`). `pc_map[old]` is the
+    /// new index of the first surviving slot at or after `old`, with length
+    /// `old_len + 1` and `pc_map[old_len]` = the new program length. Records
+    /// pointing past the surviving code are dropped; when several records
+    /// collapse onto one new index the one with the greatest old index wins
+    /// (it is the record covering that instruction).
+    pub fn remap_insns(&mut self, pc_map: &[usize]) {
+        let Some(&new_len) = pc_map.last() else {
+            return;
+        };
+        fn remap<T>(recs: &mut Vec<T>, pc_map: &[usize], new_len: usize, insn: fn(&mut T) -> &mut usize) {
+            let mut out: Vec<T> = Vec::with_capacity(recs.len());
+            for mut r in recs.drain(..) {
+                let Some(&np) = pc_map.get(*insn(&mut r)) else {
+                    continue;
+                };
+                if np >= new_len {
+                    continue;
+                }
+                *insn(&mut r) = np;
+                if out.last_mut().map(|l| *insn(l)) == Some(np) {
+                    out.pop();
+                }
+                out.push(r);
+            }
+            *recs = out;
+        }
+        remap(&mut self.lines, pc_map, new_len, |l| &mut l.insn);
+        remap(&mut self.funcs, pc_map, new_len, |f| &mut f.insn);
+    }
+
     /// True when there is nothing useful to show.
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty() && self.funcs.is_empty() && self.globals.is_empty()

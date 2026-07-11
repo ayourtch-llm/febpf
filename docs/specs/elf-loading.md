@@ -28,7 +28,8 @@ instruction stream per program, the loader:
 
 1. detects that an entry section's relocations reference a `.text` symbol,
 2. appends the **entire** `.text` after the entry program's instructions
-   (dead subprograms are harmless — the verifier only explores reachable code),
+   (dead subprograms are removed again by the load-time rodata DCE pass —
+   see below — before the verifier's unreachable-instruction check sees them),
 3. retargets the caller's `call` to the appended offset, and applies `.text`'s
    own relocations (its map references and internal calls) at that offset.
 
@@ -130,6 +131,17 @@ loader app sets it via `bpf_map__set_max_entries` before load — bcc's
 `cpudist` does this). febpf defaults it to `DEFAULT_MAX_ENTRIES` (10240,
 bcc's usual value) instead of rejecting the object. This was the
 `LOAD-FAIL:other` corpus failure ("map 'start': missing max_entries").
+
+## Load-time dead-code elimination (rodata DCE)
+
+After CO-RE relocation, each program runs through the frozen-`.rodata`
+dead-code-elimination pass (`src/dce.rs`, `docs/specs/rodata-dce.md`) —
+febpf's equivalent of what libbpf does before handing a program to the
+kernel. Branches decided by `const volatile` config values in frozen
+`.rodata` are resolved and the code they prove dead is removed — including
+subprograms stitched in from `.text` that the entry point never calls, which
+would otherwise trip the verifier's unreachable-instruction check. Line/func
+debug info is remapped through the pass's old→new pc map.
 
 ## CO-RE relocations
 

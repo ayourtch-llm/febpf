@@ -169,6 +169,38 @@ fn global_data_object() {
     assert_eq!(vm2.run(&mut ctx).unwrap(), 440);
 }
 
+/// Load-time rodata DCE (docs/specs/rodata-dce.md): a `const volatile` flag
+/// left at its default 0 guards a call to a `.text` subprogram. Without the
+/// pass the stitched-in dead subprogram trips the verifier's
+/// unreachable-instruction check; with it the object loads, verifies, runs
+/// the surviving path, and carries consistently remapped line info.
+#[test]
+fn rodata_dce_object() {
+    maybe_compile("rodata_dce.c", "rodata_dce.o");
+    let obj = load("tests/rodata_dce.o");
+    let prog = &obj.programs[0];
+    // The dead `slow_path` body (x * 0xdead) must be gone.
+    assert!(
+        !prog.insns.iter().any(|i| i.imm == 0xdead),
+        "dead subprogram survived DCE"
+    );
+    // No local calls survive either (the only call was rodata-dead).
+    assert!(!prog
+        .insns
+        .iter()
+        .any(|i| i.class() == 0x05 && i.op() == 0x80));
+    // Remapped debug info stays in range.
+    if let Some(d) = &prog.debug {
+        for l in d.lines() {
+            assert!(l.insn < prog.insns.len());
+        }
+    }
+    // v = 5 (u32 at ctx[0]), flag off: returns v * scale = 20.
+    let mut ctx = [0u8; 64];
+    ctx[..4].copy_from_slice(&5u32.to_le_bytes());
+    assert_eq!(run_prog(&obj, "socket", &mut ctx), 20);
+}
+
 #[cfg(feature = "jit")]
 #[test]
 fn jit_matches_interpreter_on_objects() {
@@ -177,6 +209,7 @@ fn jit_matches_interpreter_on_objects() {
         ("tests/btf_maps.o", "xdp", 64),
         ("tests/subprog.o", "socket", 8),
         ("tests/global_data.o", "socket", 64),
+        ("tests/rodata_dce.o", "socket", 64),
     ] {
         let obj = load(file);
         let mut i_ctx = vec![0u8; ctx_len];
