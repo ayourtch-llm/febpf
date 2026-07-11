@@ -5,6 +5,10 @@ addresses. Verification is enabled with `verifier::Config { xdp: true, .. }`;
 execution uses `Vm::run_xdp(&mut packet)`. The CLI recognizes ELF entry
 sections named `xdp` or `xdp/*` automatically; `--packet <file>` also selects
 XDP semantics for assembler/raw programs and supplies raw packet bytes.
+`--pcap <file>` runs every record in a classic libpcap capture through one VM
+(maps persist between packets) and prints `ABORTED`/`DROP`/`PASS`/`TX`/
+`REDIRECT` verdicts with packet indices and timestamps. Both byte orders and
+microsecond/nanosecond pcap variants are accepted; pcapng is rejected clearly.
 
 ## Verifier model
 
@@ -43,6 +47,7 @@ virtual addresses when the ABI's 32-bit `data` fields are loaded. Packet
 writes are copied back to the caller on exit or runtime error.
 
 This slice covers verifier semantics, deterministic interpreter execution,
-automatic ELF program-type selection, and raw packet-file CLI runs. JIT
-execution, pcap/replay containers, and kernel `BPF_PROG_TEST_RUN` differential
+automatic ELF program-type selection, raw packet-file CLI runs, and a
+pcap-in/verdict-out harness. JIT execution, putting packet captures into the
+`.febpf` replay container, and kernel `BPF_PROG_TEST_RUN` differential
 validation are follow-up layers.

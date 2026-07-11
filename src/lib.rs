@@ -37,6 +37,7 @@ pub mod jit;
 pub mod kbpf;
 pub mod maps;
 pub mod optimize;
+pub mod pcap;
 pub mod playground;
 pub mod race;
 pub mod relo;

@@ -37,6 +37,7 @@ commands:
 options:
   --ctx <hex|@file>    context memory contents (hex string or file)
   --packet <file>      run an XDP program over raw packet bytes from file
+  --pcap <file>        run an XDP program over every packet in classic pcap
   --ctx-size <n>       context size in bytes (default 4096, or data length)
   --no-verify          run without verifying first (still memory-safe)
   --no-explain         don't print the counterexample trace when rejected
@@ -74,6 +75,7 @@ struct Opts {
     stats: bool,
     ctx_hex: Option<String>,
     packet: Option<String>,
+    pcap: Option<String>,
     ctx_size: Option<usize>,
     no_verify: bool,
     no_explain: bool,
@@ -104,6 +106,7 @@ fn parse_args() -> Result<Opts, String> {
         stats: false,
         ctx_hex: None,
         packet: None,
+        pcap: None,
         ctx_size: None,
         no_verify: false,
         no_explain: false,
@@ -127,6 +130,7 @@ fn parse_args() -> Result<Opts, String> {
             "-o" => o.out = Some(args.next().ok_or("-o needs a value")?),
             "--ctx" => o.ctx_hex = Some(args.next().ok_or("--ctx needs a value")?),
             "--packet" => o.packet = Some(args.next().ok_or("--packet needs a value")?),
+            "--pcap" => o.pcap = Some(args.next().ok_or("--pcap needs a value")?),
             "--ctx-size" => {
                 o.ctx_size = Some(
                     args.next()
@@ -356,6 +360,50 @@ fn read_packet(o: &Opts) -> Result<Vec<u8>, String> {
         .as_deref()
         .ok_or("XDP execution needs --packet <raw-packet-file>")?;
     std::fs::read(path).map_err(|e| format!("cannot read packet {path}: {e}"))
+}
+
+fn xdp_verdict(r0: u64) -> &'static str {
+    match r0 {
+        0 => "ABORTED",
+        1 => "DROP",
+        2 => "PASS",
+        3 => "TX",
+        4 => "REDIRECT",
+        _ => "UNKNOWN",
+    }
+}
+
+fn run_pcap(vm: &mut Vm, path: &str) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read pcap {path}: {e}"))?;
+    let capture = febpf::pcap::parse(&bytes)?;
+    println!(
+        "pcap: {} packet(s), linktype {}, snaplen {}, {:?} timestamps",
+        capture.packets.len(),
+        capture.link_type,
+        capture.snaplen,
+        capture.resolution
+    );
+    for (i, record) in capture.packets.iter().enumerate() {
+        let mut packet = record.data.to_vec();
+        let r0 = vm.run_xdp(&mut packet).map_err(|e| {
+            format!(
+                "packet {} at {}.{}: {e}",
+                i + 1,
+                record.timestamp_secs,
+                record.timestamp_fraction
+            )
+        })?;
+        println!(
+            "packet {:>6}  ts {}.{}  len {}/{}  verdict {} ({r0})",
+            i + 1,
+            record.timestamp_secs,
+            record.timestamp_fraction,
+            record.data.len(),
+            record.original_len,
+            xdp_verdict(r0)
+        );
+    }
+    Ok(())
 }
 
 fn verifier_config(o: &Opts, ctx_len: usize, xdp: bool) -> verifier::Config {
@@ -640,7 +688,13 @@ fn run() -> Result<ExitCode, String> {
     }
     let (prog, debug, elf_xdp) =
         load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
-    let xdp = elf_xdp || o.packet.is_some();
+    if o.packet.is_some() && o.pcap.is_some() {
+        return Err("--packet and --pcap are mutually exclusive".into());
+    }
+    if o.pcap.is_some() && o.cmd != "run" {
+        return Err("--pcap is currently supported by the run command".into());
+    }
+    let xdp = elf_xdp || o.packet.is_some() || o.pcap.is_some();
     if xdp
         && !matches!(
             o.cmd.as_str(),
@@ -777,6 +831,12 @@ fn run() -> Result<ExitCode, String> {
                 jit_compile(&mut vm)?;
             }
             let t0 = Instant::now();
+            if let Some(path) = &o.pcap {
+                run_pcap(&mut vm, path)?;
+                let dt = t0.elapsed();
+                println!("completed pcap in {dt:?} [interp]");
+                return Ok(ExitCode::SUCCESS);
+            }
             let r0 = if xdp {
                 let mut packet = read_packet(&o)?;
                 vm.run_xdp(&mut packet).map_err(|e| e.to_string())?
