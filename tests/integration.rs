@@ -470,6 +470,51 @@ fn ringbuf_output_captures_from_stack() {
     assert_eq!(recs[0], 0x11223344u32.to_le_bytes());
 }
 
+// ------------------------------------------------------- perf_event_array
+
+#[test]
+fn perf_event_output_emits_record() {
+    // Build an 8-byte event on the stack and stream it to userspace via
+    // bpf_perf_event_output(ctx, map, BPF_F_CURRENT_CPU, data, 8).
+    let src = "
+        .map ev perf_event_array 4 4 4
+        r1 = 0x1122334455667788 ll
+        *(u64 *)(r10 - 8) = r1
+        r1 = 0
+        r2 = map[ev]
+        r3 = 0xffffffff ll
+        r4 = r10
+        r4 += -8
+        r5 = 8
+        call perf_event_output
+        r0 = 0
+        exit";
+    let vm = build_run(src);
+    let recs = vm.perf_records("ev").expect("perf map");
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0], 0x1122334455667788u64.to_le_bytes());
+}
+
+#[test]
+fn perf_event_output_wrong_map_kind_rejected() {
+    // A plain array is not a PERF_EVENT_ARRAY; the verifier must reject it.
+    let src = "
+        .map ev array 4 4 4
+        r1 = 0
+        *(u64 *)(r10 - 8) = r1
+        r1 = 0
+        r2 = map[ev]
+        r3 = 0
+        r4 = r10
+        r4 += -8
+        r5 = 8
+        call perf_event_output
+        r0 = 0
+        exit";
+    let e = verify_err(src);
+    assert!(e.contains("requires a perf_event_array"), "unexpected error: {e}");
+}
+
 // -------------------------------------------------------------- per-CPU
 
 #[test]

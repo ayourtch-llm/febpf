@@ -237,6 +237,15 @@ impl Vm {
             .map(|m| m.ringbuf_records())
     }
 
+    /// Records emitted via `bpf_perf_event_output` to a named perf-event array
+    /// map (for tests and tooling), mirroring [`Vm::ringbuf_records`].
+    pub fn perf_records(&self, name: &str) -> Option<&[Vec<u8>]> {
+        self.maps
+            .iter()
+            .find(|m| m.def.name == name)
+            .map(|m| m.perf_records())
+    }
+
     /// Current `get_prandom_u32` state. Before a run this is the seed the next
     /// run will start from; recorded into replay files for reproducibility.
     pub fn prandom_seed(&self) -> u64 {
@@ -1333,6 +1342,20 @@ impl<'a> Machine<'a> {
                 let m = self.map_from_ptr(args[0])?;
                 let data = self.read_bytes(args[1], args[2] as usize)?;
                 match self.vm.maps[m].ringbuf_output(data) {
+                    Ok(()) => 0,
+                    Err(e) => e as u64,
+                }
+            }
+            helpers::id::PERF_EVENT_OUTPUT => {
+                // (ctx, map, flags, data, size). Low 32 bits of flags select a
+                // CPU index; BPF_F_CURRENT_CPU (0xffffffff) = current = CPU 0.
+                let m = self.map_from_ptr(args[1])?;
+                let cpu = match args[2] as u32 {
+                    0xffff_ffff => 0,
+                    c => c,
+                };
+                let data = self.read_bytes(args[3], args[4] as usize)?;
+                match self.vm.maps[m].perf_output(cpu, data) {
                     Ok(()) => 0,
                     Err(e) => e as u64,
                 }

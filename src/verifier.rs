@@ -2162,6 +2162,22 @@ impl<'a> Verifier<'a> {
                     ),
                 ));
             }
+            // Helpers that require a specific map kind (see docs/specs/map-types-2.md).
+            let required = match hid {
+                crate::helpers::id::PERF_EVENT_OUTPUT => Some(crate::maps::MapKind::PerfEventArray),
+                _ => None,
+            };
+            if let Some(k) = required {
+                if def.kind != k {
+                    return Err(self.err(
+                        pc,
+                        format!(
+                            "helper {} requires a {k} map, but '{}' is a {} map",
+                            sig.name, def.name, def.kind
+                        ),
+                    ));
+                }
+            }
         }
 
         // effects: r1-r5 clobbered, r0 = return value

@@ -16,6 +16,10 @@ use std::collections::HashMap;
 /// the spec for the rationale.
 pub const NR_CPUS: u32 = 4;
 
+/// Default captured stack depth for STACK_TRACE maps whose ELF omits
+/// `value_size` (kernel's `PERF_MAX_STACK_DEPTH`).
+pub const PERF_MAX_STACK_DEPTH: u32 = 127;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapKind {
     Array,
@@ -24,6 +28,13 @@ pub enum MapKind {
     PerCpuHash,
     LruHash,
     RingBuf,
+    /// Per-CPU array of perf-event output slots (`bpf_perf_event_output`).
+    PerfEventArray,
+    /// Array of cgroup fd/id values (a lookup map for cgroup-membership
+    /// helpers). Modelled as a plain array — see `docs/specs/map-types-2.md`.
+    CgroupArray,
+    /// Map from a u32 stack-id to a captured stack (`bpf_get_stackid`).
+    StackTrace,
 }
 
 impl MapKind {
@@ -36,11 +47,17 @@ impl MapKind {
     }
     /// Whether this kind is backed by array (index) storage.
     fn is_arraylike(self) -> bool {
-        matches!(self, MapKind::Array | MapKind::PerCpuArray)
+        matches!(
+            self,
+            MapKind::Array | MapKind::PerCpuArray | MapKind::CgroupArray
+        )
     }
     /// Whether this kind is backed by hash (slab) storage.
     fn is_hashlike(self) -> bool {
-        matches!(self, MapKind::Hash | MapKind::PerCpuHash | MapKind::LruHash)
+        matches!(
+            self,
+            MapKind::Hash | MapKind::PerCpuHash | MapKind::LruHash | MapKind::StackTrace
+        )
     }
 }
 
@@ -53,6 +70,9 @@ impl std::fmt::Display for MapKind {
             MapKind::PerCpuHash => "percpu_hash",
             MapKind::LruHash => "lru_hash",
             MapKind::RingBuf => "ringbuf",
+            MapKind::PerfEventArray => "perf_event_array",
+            MapKind::CgroupArray => "cgroup_array",
+            MapKind::StackTrace => "stack_trace",
         };
         write!(f, "{s}")
     }
@@ -123,6 +143,9 @@ enum Storage {
         /// Submitted / output records, captured for userspace inspection.
         emitted: Vec<Vec<u8>>,
     },
+    /// Perf-event array: no readable values, only captured output records
+    /// (`bpf_perf_event_output`). All CPU lanes capture into one list.
+    PerfEvent { emitted: Vec<Vec<u8>> },
 }
 
 /// A point-in-time copy of a map's contents *and* its VM region-handle
@@ -137,11 +160,52 @@ pub struct MapSnapshot {
 }
 
 impl Map {
-    pub fn new(def: MapDef) -> Result<Map, String> {
+    pub fn new(mut def: MapDef) -> Result<Map, String> {
+        // Tolerant defaults for corpus map kinds whose ELF defs frequently omit
+        // sizes / max_entries (libbpf fills these from nr_cpus at load time).
+        // See docs/specs/map-types-2.md.
+        match def.kind {
+            MapKind::PerfEventArray => {
+                if def.key_size == 0 {
+                    def.key_size = 4;
+                }
+                if def.value_size == 0 {
+                    def.value_size = 4;
+                }
+                if def.max_entries == 0 {
+                    def.max_entries = NR_CPUS;
+                }
+            }
+            MapKind::CgroupArray => {
+                if def.key_size == 0 {
+                    def.key_size = 4;
+                }
+                if def.value_size == 0 {
+                    def.value_size = 4;
+                }
+                if def.max_entries == 0 {
+                    def.max_entries = 1;
+                }
+            }
+            MapKind::StackTrace => {
+                if def.key_size == 0 {
+                    def.key_size = 4;
+                }
+                if def.value_size == 0 {
+                    def.value_size = PERF_MAX_STACK_DEPTH * 8;
+                }
+                if def.max_entries == 0 {
+                    def.max_entries = 1024;
+                }
+            }
+            _ => {}
+        }
         if def.max_entries == 0 {
             return Err(format!("map '{}': zero max_entries", def.name));
         }
-        if def.value_size == 0 && def.kind != MapKind::RingBuf {
+        if def.value_size == 0
+            && !matches!(def.kind, MapKind::RingBuf | MapKind::PerfEventArray)
+        {
             return Err(format!("map '{}': zero value_size", def.name));
         }
         let per_cpu = def.kind.per_cpu() as usize;
@@ -176,7 +240,7 @@ impl Map {
                 },
                 Vec::new(),
             )
-        } else {
+        } else if def.kind == MapKind::RingBuf {
             // RingBuf: max_entries is the byte capacity (power of two expected;
             // not enforced so odd corpus objects still load).
             if !def.init.is_empty() {
@@ -190,6 +254,15 @@ impl Map {
                 },
                 Vec::new(),
             )
+        } else {
+            // PerfEventArray: no readable values, only captured output records.
+            if !def.init.is_empty() {
+                return Err(format!(
+                    "perf_event_array '{}' cannot have initial data",
+                    def.name
+                ));
+            }
+            (Storage::PerfEvent { emitted: Vec::new() }, Vec::new())
         };
         Ok(Map {
             def,
@@ -213,7 +286,7 @@ impl Map {
                     .then(|| ValueRef::ArrayElem(idx * self.def.kind.per_cpu()))
             }
             Storage::Hash { index, .. } => index.get(key).map(|&i| ValueRef::Slab(i)),
-            Storage::RingBuf { .. } => None,
+            Storage::RingBuf { .. } | Storage::PerfEvent { .. } => None,
         }
     }
 
@@ -263,8 +336,8 @@ impl Map {
         if self.def.readonly {
             return Err(-1); // EPERM: frozen map
         }
-        if self.def.kind == MapKind::RingBuf {
-            return Err(-22); // EINVAL: ringbufs have no key/value update
+        if matches!(self.def.kind, MapKind::RingBuf | MapKind::PerfEventArray) {
+            return Err(-22); // EINVAL: no key/value update path
         }
         if key.len() != self.def.key_size as usize || value.len() != self.def.value_size as usize {
             return Err(-22); // EINVAL
@@ -339,7 +412,7 @@ impl Map {
                 index.insert(key.to_vec(), i);
                 Ok(ValueRef::Slab(i))
             }
-            Storage::RingBuf { .. } => unreachable!(),
+            Storage::RingBuf { .. } | Storage::PerfEvent { .. } => unreachable!(),
         }
     }
 
@@ -369,7 +442,7 @@ impl Map {
         }
         match &mut self.storage {
             Storage::Array(_) => Err(-22), // EINVAL: array elements cannot be deleted
-            Storage::RingBuf { .. } => Err(-22),
+            Storage::RingBuf { .. } | Storage::PerfEvent { .. } => Err(-22),
             Storage::Hash { index, free, .. } => match index.remove(key) {
                 Some(i) => {
                     free.push(i);
@@ -465,6 +538,32 @@ impl Map {
         }
     }
 
+    // -- perf event array ---------------------------------------------------
+
+    /// `bpf_perf_event_output`: capture `data` as a record on the perf-event
+    /// array. `cpu` is the CPU index selected by the helper's `flags`; it must
+    /// be `< NR_CPUS` (all lanes capture into one list — see the spec).
+    pub fn perf_output(&mut self, cpu: u32, data: Vec<u8>) -> Result<(), i64> {
+        if cpu >= NR_CPUS {
+            return Err(-22); // EINVAL: no such CPU in our model
+        }
+        match &mut self.storage {
+            Storage::PerfEvent { emitted } => {
+                emitted.push(data);
+                Ok(())
+            }
+            _ => Err(-22),
+        }
+    }
+
+    /// Records emitted so far via `bpf_perf_event_output` (perf-event arrays).
+    pub fn perf_records(&self) -> &[Vec<u8>] {
+        match &self.storage {
+            Storage::PerfEvent { emitted } => emitted,
+            _ => &[],
+        }
+    }
+
     /// Capture contents + region-handle state (see [`MapSnapshot`]).
     pub fn snapshot(&self) -> MapSnapshot {
         MapSnapshot {
@@ -510,7 +609,7 @@ impl Map {
                 .iter()
                 .map(|(k, &i)| (k.clone(), slab[i as usize][..vs].to_vec()))
                 .collect(),
-            Storage::RingBuf { .. } => Vec::new(),
+            Storage::RingBuf { .. } | Storage::PerfEvent { .. } => Vec::new(),
         }
     }
 }

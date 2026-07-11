@@ -40,8 +40,11 @@ const R_BPF_64_32: u32 = 10;
 // BPF map types we support.
 const BPF_MAP_TYPE_HASH: u32 = 1;
 const BPF_MAP_TYPE_ARRAY: u32 = 2;
+const BPF_MAP_TYPE_PERF_EVENT_ARRAY: u32 = 4;
 const BPF_MAP_TYPE_PERCPU_HASH: u32 = 5;
 const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
+const BPF_MAP_TYPE_STACK_TRACE: u32 = 7;
+const BPF_MAP_TYPE_CGROUP_ARRAY: u32 = 8;
 const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
 const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 
@@ -918,13 +921,17 @@ fn map_kind(ty: u32) -> Result<MapKind, String> {
     match ty {
         BPF_MAP_TYPE_HASH => Ok(MapKind::Hash),
         BPF_MAP_TYPE_ARRAY => Ok(MapKind::Array),
+        BPF_MAP_TYPE_PERF_EVENT_ARRAY => Ok(MapKind::PerfEventArray),
         BPF_MAP_TYPE_PERCPU_HASH => Ok(MapKind::PerCpuHash),
         BPF_MAP_TYPE_PERCPU_ARRAY => Ok(MapKind::PerCpuArray),
+        BPF_MAP_TYPE_STACK_TRACE => Ok(MapKind::StackTrace),
+        BPF_MAP_TYPE_CGROUP_ARRAY => Ok(MapKind::CgroupArray),
         BPF_MAP_TYPE_LRU_HASH => Ok(MapKind::LruHash),
         BPF_MAP_TYPE_RINGBUF => Ok(MapKind::RingBuf),
         other => Err(format!(
-            "unsupported map type {other} ({}); supported: \
-             hash/array/percpu_hash/percpu_array/lru_hash/ringbuf",
+            "unsupported map type {other} ({}); supported: hash/array/\
+             perf_event_array/percpu_hash/percpu_array/stack_trace/cgroup_array/\
+             lru_hash/ringbuf",
             map_type_name(other)
         )),
     }
@@ -1067,7 +1074,16 @@ mod btf_maps {
             }
             let kind = kind.ok_or_else(|| format!("map '{map_name}': missing type"))?;
             // Ringbufs have no key/value; libbpf omits those members entirely.
-            let no_kv = kind == crate::maps::MapKind::RingBuf;
+            // Perf-event/cgroup/stack-trace maps also frequently omit key/value/
+            // max_entries (libbpf fills them from nr_cpus); default to 0 here and
+            // let `Map::new` apply sensible defaults. See docs/specs/map-types-2.md.
+            let no_kv = matches!(
+                kind,
+                crate::maps::MapKind::RingBuf
+                    | crate::maps::MapKind::PerfEventArray
+                    | crate::maps::MapKind::CgroupArray
+                    | crate::maps::MapKind::StackTrace
+            );
             maps.push(MapDef {
                 name: map_name.clone(),
                 kind,
@@ -1078,6 +1094,7 @@ mod btf_maps {
                     .or(no_kv.then_some(0))
                     .ok_or_else(|| format!("map '{map_name}': missing value size"))?,
                 max_entries: max_entries
+                    .or(no_kv.then_some(0))
                     .ok_or_else(|| format!("map '{map_name}': missing max_entries"))?,
                 readonly: false,
                 init: Vec::new(),
@@ -1117,9 +1134,12 @@ mod tests {
         assert!(map_kind(1).is_ok()); // HASH
         assert!(map_kind(2).is_ok()); // ARRAY
         assert!(map_kind(27).is_ok()); // RINGBUF (now supported)
-        let e = map_kind(4).unwrap_err(); // PERF_EVENT_ARRAY (still unsupported)
-        assert!(e.contains("unsupported map type 4"), "{e}");
-        assert!(e.contains("PERF_EVENT_ARRAY"), "{e}");
+        assert!(map_kind(4).is_ok()); // PERF_EVENT_ARRAY (now supported)
+        assert!(map_kind(8).is_ok()); // CGROUP_ARRAY (now supported)
+        assert!(map_kind(7).is_ok()); // STACK_TRACE (now supported)
+        let e = map_kind(11).unwrap_err(); // LPM_TRIE (still unsupported)
+        assert!(e.contains("unsupported map type 11"), "{e}");
+        assert!(e.contains("LPM_TRIE"), "{e}");
         assert_eq!(map_type_name(8), "CGROUP_ARRAY");
         assert_eq!(map_type_name(999), "unknown");
     }

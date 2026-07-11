@@ -10,6 +10,7 @@ pub mod id {
     pub const TRACE_PRINTK: u32 = 6;
     pub const GET_PRANDOM_U32: u32 = 7;
     pub const GET_SMP_PROCESSOR_ID: u32 = 8;
+    pub const PERF_EVENT_OUTPUT: u32 = 25;
     pub const RINGBUF_OUTPUT: u32 = 130;
     pub const RINGBUF_RESERVE: u32 = 131;
     pub const RINGBUF_SUBMIT: u32 = 132;
@@ -102,6 +103,13 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [None, None, None, None, None],
             ret: RetKind::Scalar,
         },
+        id::PERF_EVENT_OUTPUT => HelperSig {
+            name: "perf_event_output",
+            // (ctx, map, flags, data, size); data is a readable region of `size`
+            // bytes. ctx/flags accepted loosely to keep corpus objects loading.
+            args: [Any, ConstMapPtr, Scalar, MemRead { size_arg: 4 }, Size],
+            ret: RetKind::Scalar,
+        },
         id::RINGBUF_OUTPUT => HelperSig {
             name: "ringbuf_output",
             // (map, data, size, flags)
@@ -145,6 +153,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::TRACE_PRINTK,
         id::GET_PRANDOM_U32,
         id::GET_SMP_PROCESSOR_ID,
+        id::PERF_EVENT_OUTPUT,
         id::RINGBUF_OUTPUT,
         id::RINGBUF_RESERVE,
         id::RINGBUF_SUBMIT,
