@@ -505,6 +505,62 @@ fn reject_ctx_oob() {
 }
 
 #[test]
+fn reject_modified_ctx_ptr_deref() {
+    // Give the ctx pointer a *variable* offset (register arithmetic with an
+    // unknown value), then dereference it. The kernel rejects this; so must we.
+    let e = verify_err_ctx(
+        "
+        r2 = *(u8 *)(r1 + 0)
+        r2 &= 4
+        r1 += r2
+        r0 = *(u8 *)(r1 + 0)
+        exit",
+        16,
+    );
+    assert!(e.contains("modified ctx ptr"), "{e}");
+}
+
+#[test]
+fn accept_fixed_offset_ctx_access() {
+    // A *constant*-offset ctx field access must stay legal (not over-tightened).
+    let vm = Vm::new(program("r0 = *(u32 *)(r1 + 8)\n exit")).unwrap();
+    vm.verify(Config {
+        ctx_size: 16,
+        ..Default::default()
+    })
+    .expect("fixed-offset ctx access must verify");
+}
+
+#[test]
+fn reject_misaligned_stack_store() {
+    // 8-byte store at a non-8-aligned stack offset: kernel always rejects,
+    // regardless of the --strict-align policy (strict_alignment defaults off).
+    let e = verify_err("r1 = 1\n *(u64 *)(r10 - 12) = r1\n r0 = 0\n exit");
+    assert!(e.contains("misaligned stack access"), "{e}");
+    // a 4-byte store at a 2-aligned-but-not-4 offset is also rejected
+    let e = verify_err("r1 = 1\n *(u32 *)(r10 - 6) = r1\n r0 = 0\n exit");
+    assert!(e.contains("misaligned stack access"), "{e}");
+}
+
+#[test]
+fn accept_aligned_stack_access() {
+    // Naturally aligned stack accesses must still verify (not over-tightened).
+    let vm = Vm::new(program(
+        "
+        r1 = 1
+        *(u64 *)(r10 - 8) = r1
+        *(u32 *)(r10 - 12) = r1
+        *(u16 *)(r10 - 14) = r1
+        *(u8 *)(r10 - 15) = r1
+        r0 = 0
+        exit",
+    ))
+    .unwrap();
+    vm.verify(Config::default())
+        .expect("aligned stack accesses must verify");
+}
+
+#[test]
 fn reject_scalar_deref() {
     let e = verify_err("r1 = 1000\n r0 = *(u64 *)(r1)\n exit");
     assert!(e.contains("scalar"), "{e}");
