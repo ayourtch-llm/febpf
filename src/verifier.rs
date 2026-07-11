@@ -201,7 +201,7 @@ impl Scalar {
         self.umin <= self.umax && self.smin <= self.smax
     }
 
-    fn from_tnum(t: Tnum) -> Scalar {
+    pub(crate) fn from_tnum(t: Tnum) -> Scalar {
         let mut s = Scalar {
             tnum: t,
             umin: t.umin(),
@@ -214,7 +214,7 @@ impl Scalar {
     }
 
     /// Zero-extended 32-bit view. Result ranges lie within [0, u32::MAX].
-    fn truncate32(&self) -> Scalar {
+    pub(crate) fn truncate32(&self) -> Scalar {
         if self.umax <= u32::MAX as u64 {
             let mut s = *self;
             s.tnum = s.tnum.cast(4);
@@ -547,7 +547,7 @@ impl VState {
 // Scalar ALU transfer functions
 // ---------------------------------------------------------------------------
 
-fn scalar_add(a: Scalar, b: Scalar) -> Scalar {
+pub(crate) fn scalar_add(a: Scalar, b: Scalar) -> Scalar {
     let mut r = Scalar {
         tnum: a.tnum.add(b.tnum),
         ..Scalar::unknown()
@@ -566,7 +566,7 @@ fn scalar_add(a: Scalar, b: Scalar) -> Scalar {
     r
 }
 
-fn scalar_sub(a: Scalar, b: Scalar) -> Scalar {
+pub(crate) fn scalar_sub(a: Scalar, b: Scalar) -> Scalar {
     let mut r = Scalar {
         tnum: a.tnum.sub(b.tnum),
         ..Scalar::unknown()
@@ -583,7 +583,7 @@ fn scalar_sub(a: Scalar, b: Scalar) -> Scalar {
     r
 }
 
-fn scalar_mul(a: Scalar, b: Scalar) -> Scalar {
+pub(crate) fn scalar_mul(a: Scalar, b: Scalar) -> Scalar {
     let mut r = Scalar {
         tnum: a.tnum.mul(b.tnum),
         ..Scalar::unknown()
@@ -601,7 +601,7 @@ fn scalar_mul(a: Scalar, b: Scalar) -> Scalar {
 }
 
 /// Unsigned division; division by zero yields 0 (ISA-defined).
-fn scalar_div(a: Scalar, b: Scalar) -> Scalar {
+pub(crate) fn scalar_div(a: Scalar, b: Scalar) -> Scalar {
     if a.is_const() && b.is_const() {
         let v = if b.umin == 0 { 0 } else { a.umin / b.umin };
         return Scalar::constant(v);
@@ -614,7 +614,7 @@ fn scalar_div(a: Scalar, b: Scalar) -> Scalar {
 }
 
 /// Unsigned modulo; x % 0 leaves dst unchanged (ISA-defined).
-fn scalar_mod(a: Scalar, b: Scalar) -> Scalar {
+pub(crate) fn scalar_mod(a: Scalar, b: Scalar) -> Scalar {
     if a.is_const() && b.is_const() {
         let v = if b.umin == 0 { a.umin } else { a.umin % b.umin };
         return Scalar::constant(v);
@@ -631,7 +631,7 @@ fn scalar_mod(a: Scalar, b: Scalar) -> Scalar {
     r
 }
 
-fn scalar_bitop(op: u8, a: Scalar, b: Scalar) -> Scalar {
+pub(crate) fn scalar_bitop(op: u8, a: Scalar, b: Scalar) -> Scalar {
     let t = match op {
         alu::AND => a.tnum.and(b.tnum),
         alu::OR => a.tnum.or(b.tnum),
@@ -647,7 +647,7 @@ fn scalar_bitop(op: u8, a: Scalar, b: Scalar) -> Scalar {
     r
 }
 
-fn scalar_shift(op: u8, is32: bool, a: Scalar, b: Scalar) -> Result<Scalar, String> {
+pub(crate) fn scalar_shift(op: u8, is32: bool, a: Scalar, b: Scalar) -> Result<Scalar, String> {
     let width: u64 = if is32 { 32 } else { 64 };
     if b.is_const() {
         let sh = b.umin;
@@ -696,7 +696,7 @@ fn scalar_shift(op: u8, is32: bool, a: Scalar, b: Scalar) -> Result<Scalar, Stri
     }
 }
 
-fn scalar_endian(is_swap: bool, width_bits: i32, a: Scalar) -> Scalar {
+pub(crate) fn scalar_endian(is_swap: bool, width_bits: i32, a: Scalar) -> Scalar {
     let bytes = (width_bits / 8) as u8;
     if a.is_const() {
         let v = a.umin;
@@ -724,7 +724,7 @@ fn scalar_endian(is_swap: bool, width_bits: i32, a: Scalar) -> Scalar {
 }
 
 /// Sign-extend a scalar known to hold a value representable in `bits`.
-fn scalar_movsx(b: Scalar, bits: u16) -> Scalar {
+pub(crate) fn scalar_movsx(b: Scalar, bits: u16) -> Scalar {
     let half = 1u64 << (bits - 1);
     if b.umax < half {
         // non-negative in the narrow type: sext == zext == identity
@@ -750,7 +750,7 @@ fn scalar_movsx(b: Scalar, bits: u16) -> Scalar {
     r
 }
 
-fn alu_scalar(
+pub(crate) fn alu_scalar(
     op: u8,
     is32: bool,
     signed_off: bool,
@@ -836,7 +836,7 @@ fn cond_branch_info(ins: Insn, pc: usize, npc: usize) -> Option<(bool, usize)> {
 }
 
 /// Decide a comparison if the ranges force it. `None` = could go either way.
-fn branch_taken(op: u8, a: &Scalar, b: &Scalar) -> Option<bool> {
+pub(crate) fn branch_taken(op: u8, a: &Scalar, b: &Scalar) -> Option<bool> {
     match op {
         jmp::JEQ => {
             if a.is_const() && b.is_const() {
@@ -905,7 +905,7 @@ fn branch_taken(op: u8, a: &Scalar, b: &Scalar) -> Option<bool> {
 
 /// Refine `a` and `b` under the assumption `a OP b` is `taken`.
 /// Returns false if the assumption is contradictory (dead path).
-fn refine(op: u8, taken: bool, a: &mut Scalar, b: &mut Scalar) -> bool {
+pub(crate) fn refine(op: u8, taken: bool, a: &mut Scalar, b: &mut Scalar) -> bool {
     // Reduce "not taken" to the inverse op where cleanly possible.
     let (op, taken) = match (op, taken) {
         (jmp::JEQ, false) => (jmp::JNE, true),
@@ -1011,6 +1011,48 @@ fn refine(op: u8, taken: bool, a: &mut Scalar, b: &mut Scalar) -> bool {
         _ => {}
     }
     a.sync() && b.sync()
+}
+
+/// Outcome of analyzing a conditional jump over two scalars.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CondOutcome {
+    /// The ranges force the comparison: only this outcome is possible.
+    Decided(bool),
+    /// Both outcomes possible. Per outcome (`[not-taken, taken]`): `None` if
+    /// refinement proved the outcome contradictory (dead path), else the
+    /// refined `(dst, src)` scalars to continue with.
+    Both([Option<(Scalar, Scalar)>; 2]),
+}
+
+/// Analyze `dst OP src` for a conditional jump: decide it if the abstract
+/// values force it, otherwise refine the scalars under each outcome. This is
+/// the single entry point used by the verifier's jump step (and the soundness
+/// harness), so the truncation/refinement composition is tested as deployed.
+pub(crate) fn analyze_cond_jmp(op: u8, is32: bool, sa: Scalar, sb: Scalar) -> CondOutcome {
+    // 32-bit compares refine only when values fit in 32 bits
+    let refinable = !is32 || (sa.umax <= u32::MAX as u64 && sb.umax <= u32::MAX as u64);
+    let (ca, cb) = if is32 {
+        (sa.truncate32(), sb.truncate32())
+    } else {
+        (sa, sb)
+    };
+
+    if let Some(taken) = branch_taken(op, &ca, &cb) {
+        return CondOutcome::Decided(taken);
+    }
+
+    let mut out: [Option<(Scalar, Scalar)>; 2] = [Some((sa, sb)), Some((sa, sb))];
+    if refinable {
+        for (slot, taken) in [(0usize, false), (1usize, true)] {
+            let (mut ra, mut rb) = (ca, cb);
+            if refine(op, taken, &mut ra, &mut rb) {
+                out[slot] = Some((ra, rb));
+            } else {
+                out[slot] = None; // contradictory: path is dead
+            }
+        }
+    }
+    CondOutcome::Both(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -2946,33 +2988,24 @@ impl<'a> Verifier<'a> {
                     }
                 };
 
-                // 32-bit compares refine only when values fit in 32 bits
-                let refinable =
-                    !is32 || (sa.umax <= u32::MAX as u64 && sb.umax <= u32::MAX as u64);
-                let (ca, cb) = if is32 {
-                    (sa.truncate32(), sb.truncate32())
-                } else {
-                    (sa, sb)
+                let refined = match analyze_cond_jmp(op, is32, sa, sb) {
+                    CondOutcome::Decided(taken) => {
+                        let t = if taken { target } else { pc + 1 };
+                        return Ok(StepOutcome::Next(vec![(t, state)]));
+                    }
+                    CondOutcome::Both(refined) => refined,
                 };
 
-                if let Some(taken) = branch_taken(op, &ca, &cb) {
-                    let t = if taken { target } else { pc + 1 };
-                    return Ok(StepOutcome::Next(vec![(t, state)]));
-                }
-
                 let mut succs: Vec<(usize, VState)> = Vec::with_capacity(2);
-                for (taken, npc) in [(false, pc + 1), (true, target)] {
+                for (slot, npc) in [(0usize, pc + 1), (1usize, target)] {
+                    let Some((ra, rb)) = refined[slot] else {
+                        continue; // contradictory: path is dead
+                    };
                     let mut ns = state.clone();
-                    if refinable {
-                        let (mut ra, mut rb) = (ca, cb);
-                        if !refine(op, taken, &mut ra, &mut rb) {
-                            continue; // contradictory: path is dead
-                        }
-                        let f = ns.cur_mut();
-                        f.regs[ins.dst as usize] = RegState::Scalar(ra);
-                        if ins.is_src_reg() {
-                            f.regs[ins.src as usize] = RegState::Scalar(rb);
-                        }
+                    let f = ns.cur_mut();
+                    f.regs[ins.dst as usize] = RegState::Scalar(ra);
+                    if ins.is_src_reg() {
+                        f.regs[ins.src as usize] = RegState::Scalar(rb);
                     }
                     succs.push((npc, ns));
                 }
