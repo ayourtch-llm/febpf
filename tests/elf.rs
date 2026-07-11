@@ -144,6 +144,7 @@ fn global_data_object() {
     assert_eq!(vm2.run(&mut ctx).unwrap(), 440);
 }
 
+#[cfg(feature = "jit")]
 #[test]
 fn jit_matches_interpreter_on_objects() {
     for (file, prog, ctx_len) in [

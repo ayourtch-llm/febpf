@@ -80,6 +80,7 @@ pub struct Vm {
     pub profile: Option<Vec<u64>>,
     /// Compiled native code, if this VM was JIT-compiled. Taken out during
     /// execution (like `user_helpers`) to satisfy the borrow checker.
+    #[cfg(feature = "jit")]
     pub jit: Option<crate::jit::JitProgram>,
 }
 
@@ -115,6 +116,7 @@ impl Vm {
             echo_printk: false,
             insn_limit: u64::MAX,
             profile: None,
+            #[cfg(feature = "jit")]
             jit: None,
         };
 
@@ -211,6 +213,7 @@ impl Vm {
 
     /// Compile the program to native code (idempotent). Requires a supported
     /// host architecture; see [`crate::jit`].
+    #[cfg(feature = "jit")]
     pub fn compile(&mut self) -> Result<(), String> {
         if self.jit.is_none() {
             self.jit = Some(crate::jit::compile(&self.exec)?);
@@ -220,6 +223,7 @@ impl Vm {
 
     /// Execute via the JIT, compiling on first use. Falls back with an error
     /// if the host architecture is unsupported.
+    #[cfg(feature = "jit")]
     pub fn run_jit(&mut self, ctx: &mut [u8]) -> Result<u64, EbpfError> {
         if let Err(e) = self.compile() {
             return Err(EbpfError { pc: 0, msg: e });
@@ -247,6 +251,7 @@ pub struct Machine<'a> {
     frames: Vec<SavedFrame>,
     pub insn_count: u64,
     /// Set by the JIT trampoline when a deferred instruction faults.
+    #[cfg(feature = "jit")]
     jit_fault: Option<EbpfError>,
 }
 
@@ -326,12 +331,14 @@ impl<'a> Machine<'a> {
             pc: 0,
             frames: Vec::new(),
             insn_count: 0,
+            #[cfg(feature = "jit")]
             jit_fault: None,
         }
     }
 
     /// A pointer to the register file, for the JIT prologue to load from and
     /// spill to. Stable for the machine's lifetime.
+    #[cfg(feature = "jit")]
     pub fn regs_ptr(&mut self) -> *mut u64 {
         self.regs.as_mut_ptr()
     }
@@ -340,6 +347,7 @@ impl<'a> Machine<'a> {
     /// `pc`, then report where the JIT should resume. Returns
     /// [`crate::jit::abi::STOP`]-tagged value on program exit or fault
     /// (distinguish via [`Machine::take_jit_fault`]); otherwise the next pc.
+    #[cfg(feature = "jit")]
     pub fn jit_step_at(&mut self, pc: usize) -> u64 {
         self.pc = pc;
         match self.step() {
@@ -352,11 +360,13 @@ impl<'a> Machine<'a> {
         }
     }
 
+    #[cfg(feature = "jit")]
     pub fn take_jit_fault(&mut self) -> Option<EbpfError> {
         self.jit_fault.take()
     }
 
     /// Run to completion using precompiled native code.
+    #[cfg(feature = "jit")]
     fn run_native(&mut self, jit: &crate::jit::JitProgram) -> Result<u64, EbpfError> {
         // Safety: `jit.enter` runs native code that only touches this
         // machine's register file (via the pointer we hand it) and calls

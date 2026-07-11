@@ -27,6 +27,7 @@ pub mod elf;
 pub mod helpers;
 pub mod insn;
 pub mod interp;
+#[cfg(feature = "jit")]
 pub mod jit;
 pub mod maps;
 pub mod tnum;

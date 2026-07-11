@@ -178,7 +178,8 @@ host. Serving needs a real server for the `application/wasm` MIME type
 ## Status
 
 - [x] Spec written
-- [ ] Stage 1 — JIT feature gate
+- [x] Stage 1 — JIT feature gate (tests green with & without `jit`, clippy
+      clean both ways, `bench --jit` = 9.5 GIPS)
 - [ ] Stage 2 — playground + wasm ABI
 - [ ] Stage 3 — web page
 - [ ] Stage 4 — Makefile, docs, smoke test
