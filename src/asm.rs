@@ -224,12 +224,9 @@ impl<'a> Parser<'a> {
 
 /// Parse `rN`/`wN`; returns (reg, is32).
 fn parse_reg_name(s: &str) -> Option<(u8, bool)> {
-    let (is32, rest) = if let Some(r) = s.strip_prefix('r') {
-        (false, r)
-    } else if let Some(r) = s.strip_prefix('w') {
-        (true, r)
-    } else {
-        return None;
+    let (is32, rest) = match s.strip_prefix('r') {
+        Some(r) => (false, r),
+        None => (true, s.strip_prefix('w')?),
     };
     let n: u8 = rest.parse().ok()?;
     (n < NUM_REGS as u8).then_some((n, is32))

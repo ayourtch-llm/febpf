@@ -13,7 +13,7 @@
 //! Everything here is gated to x86-64 Linux; on other targets the public API
 //! degrades to "kernel unavailable" so the rest of the crate still builds.
 
-use crate::insn::{encode_program, Insn};
+use crate::insn::Insn;
 use crate::maps::{MapDef, MapKind};
 
 /// Outcome of a `bpf(2)` operation: an fd/return value, or a raw `-errno`.
@@ -61,26 +61,42 @@ fn errno_str(e: i32) -> &'static str {
     }
 }
 
-// ---- bpf_cmd ordinals (stable UAPI) --------------------------------------
-const BPF_MAP_CREATE: i32 = 0;
-const BPF_MAP_UPDATE_ELEM: i32 = 2;
-const BPF_PROG_LOAD: i32 = 5;
-const BPF_PROG_TEST_RUN: i32 = 10;
+/// The `bpf(2)` UAPI constants. Only the x86-64-Linux `imp` below issues the
+/// syscall — everywhere else it is a stub — so gate them as a unit rather than
+/// letting them read as dead code on macOS and aarch64 (`imp` picks them up
+/// through its `use super::*`).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use uapi::*;
 
-// ---- program & map types --------------------------------------------------
-/// `BPF_PROG_TYPE_SOCKET_FILTER`: loadable and TEST_RUN-able unprivileged of
-/// attachment, and its TEST_RUN returns the program's `r0` as `retval`.
-const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
-const BPF_MAP_TYPE_HASH: u32 = 1;
-const BPF_MAP_TYPE_ARRAY: u32 = 2;
-const BPF_MAP_TYPE_PERF_EVENT_ARRAY: u32 = 4;
-const BPF_MAP_TYPE_PERCPU_HASH: u32 = 5;
-const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
-const BPF_MAP_TYPE_STACK_TRACE: u32 = 7;
-const BPF_MAP_TYPE_CGROUP_ARRAY: u32 = 8;
-const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
-const BPF_MAP_TYPE_RINGBUF: u32 = 27;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod uapi {
+    // ---- bpf_cmd ordinals (stable UAPI) ----------------------------------
+    pub const BPF_MAP_CREATE: i32 = 0;
+    pub const BPF_MAP_UPDATE_ELEM: i32 = 2;
+    pub const BPF_PROG_LOAD: i32 = 5;
+    pub const BPF_PROG_TEST_RUN: i32 = 10;
 
+    // ---- program & map types ---------------------------------------------
+    /// `BPF_PROG_TYPE_SOCKET_FILTER`: loadable and TEST_RUN-able unprivileged
+    /// of attachment, and its TEST_RUN returns the program's `r0` as `retval`.
+    pub const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
+    pub const BPF_MAP_TYPE_HASH: u32 = 1;
+    pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
+    pub const BPF_MAP_TYPE_PERF_EVENT_ARRAY: u32 = 4;
+    pub const BPF_MAP_TYPE_PERCPU_HASH: u32 = 5;
+    pub const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
+    pub const BPF_MAP_TYPE_STACK_TRACE: u32 = 7;
+    pub const BPF_MAP_TYPE_CGROUP_ARRAY: u32 = 8;
+    pub const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
+    pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
+
+    /// Fixed attr buffer size: covers every field offset used below and is
+    /// well under the kernel's `sizeof(union bpf_attr)`.
+    pub const ATTR_SIZE: usize = 128;
+}
+
+// These three are used by the map-`lddw` rewriting, which is plain data
+// munging compiled on every platform — so they are not part of `uapi`.
 // ---- lddw pseudo src_reg values the kernel understands --------------------
 const BPF_PSEUDO_MAP_FD: u8 = 1;
 const BPF_PSEUDO_MAP_VALUE: u8 = 3;
@@ -88,16 +104,13 @@ const BPF_PSEUDO_MAP_VALUE: u8 = 3;
 /// The eBPF ISA `lddw` opcode (`BPF_LD | BPF_IMM | BPF_DW`).
 const LDDW_OPCODE: u8 = 0x18;
 
-/// Fixed attr buffer size: covers every field offset used below and is well
-/// under the kernel's `sizeof(union bpf_attr)`.
-const ATTR_SIZE: usize = 128;
-
 // ===========================================================================
 // x86-64 Linux implementation
 // ===========================================================================
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod imp {
     use super::*;
+    use crate::insn::encode_program;
     use std::arch::asm;
 
     /// Raw `bpf(2)`: `syscall(321, cmd, attr, size)`. Returns the kernel's
@@ -272,6 +285,13 @@ mod imp {
     use super::*;
 
     pub struct Fd(pub i32);
+
+    /// No descriptor is ever opened here (every call returns ENOSYS), but the
+    /// type must still be droppable the same way as the real one so shared
+    /// callers can `drop(fd)` without a `#[cfg]`.
+    impl Drop for Fd {
+        fn drop(&mut self) {}
+    }
 
     fn unsupported(what: &str) -> KError {
         KError {
