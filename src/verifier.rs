@@ -1627,6 +1627,7 @@ impl<'a> Verifier<'a> {
     /// Check an access of `size` bytes through pointer `p`, at additional
     /// constant displacement `disp`. Returns the resolved constant stack
     /// offset when the target is the stack.
+    #[allow(clippy::too_many_arguments)]
     fn check_mem_access(
         &mut self,
         state: &VState,
@@ -1635,6 +1636,10 @@ impl<'a> Verifier<'a> {
         disp: i64,
         size: u64,
         write: bool,
+        // True for a real BPF_LDX/STX/ST/atomic access (natural alignment is
+        // required); false for a helper argument buffer whose `size` is just
+        // the byte length and carries no alignment constraint.
+        align: bool,
     ) -> Result<Option<(usize, i64)>, VerifyError> {
         let (region_size, what): (u64, &str) = match p.kind {
             PtrKind::Stack { frame } => {
@@ -1651,8 +1656,14 @@ impl<'a> Verifier<'a> {
                         ),
                     ));
                 }
-                if self.cfg.strict_alignment && (off.rem_euclid(size as i64)) != 0 {
-                    return Err(self.err(pc, format!("misaligned stack access at off {off}")));
+                // The kernel ALWAYS enforces natural alignment on stack
+                // (PTR_TO_STACK) accesses — a size-N access must be N-byte
+                // aligned — independent of the general --strict-align policy.
+                if align && size > 1 && (off.rem_euclid(size as i64)) != 0 {
+                    return Err(self.err(
+                        pc,
+                        format!("misaligned stack access off {off} size {size}"),
+                    ));
                 }
                 let depth = (-off) as usize;
                 // depth relative to that frame; global max is fine for stats
@@ -1809,7 +1820,7 @@ impl<'a> Verifier<'a> {
         if len == 0 {
             return Ok(());
         }
-        if let Some((frame, off)) = self.check_mem_access(state, pc, p, 0, len, write)? {
+        if let Some((frame, off)) = self.check_mem_access(state, pc, p, 0, len, write, false)? {
             if write {
                 self.stack_store(state, pc, frame, off, len, RegState::Scalar(Scalar::unknown()))?;
             } else {
@@ -2086,7 +2097,7 @@ impl<'a> Verifier<'a> {
                 };
                 let size = ins.mem_size() as u64;
                 let loaded =
-                    match self.check_mem_access(&state, pc, &p, ins.off as i64, size, false)? {
+                    match self.check_mem_access(&state, pc, &p, ins.off as i64, size, false, true)? {
                         Some((frame, off)) => self.stack_load(&state, pc, frame, off, size)?,
                         None => RegState::Scalar(Scalar::unknown()),
                     };
@@ -2145,7 +2156,7 @@ impl<'a> Verifier<'a> {
                         "pointers may only be stored to the stack (pointer leak)",
                     ));
                 }
-                if let Some((frame, off)) = self.check_mem_access(&state, pc, &p, ins.off as i64, size, true)? {
+                if let Some((frame, off)) = self.check_mem_access(&state, pc, &p, ins.off as i64, size, true, true)? {
                     self.stack_store(&mut state, pc, frame, off, size, val)?
                 }
                 Ok(StepOutcome::Next(vec![(pc + 1, state)]))
@@ -2165,9 +2176,9 @@ impl<'a> Verifier<'a> {
     ) -> Result<StepOutcome, VerifyError> {
         use crate::insn::atomic as a;
         // atomics read and write the target
-        self.check_mem_access(&state, pc, &p, ins.off as i64, size, true)?;
+        self.check_mem_access(&state, pc, &p, ins.off as i64, size, true, true)?;
         if let Some((frame, off)) =
-            self.check_mem_access(&state, pc, &p, ins.off as i64, size, false)?
+            self.check_mem_access(&state, pc, &p, ins.off as i64, size, false, true)?
         {
             // target must be initialized; result of RMW is an unknown scalar
             self.stack_load(&state, pc, frame, off, size)?;
