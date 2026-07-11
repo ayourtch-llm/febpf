@@ -42,6 +42,10 @@ pub struct Config {
     /// the flat `ctx_size` byte-buffer model: 8-byte-slot reads only, pointer
     /// slots yield [`PtrKind::BtfId`] pointers, and writes are rejected.
     pub btf_ctx: Option<crate::btf::BtfCtx>,
+    /// Treat the context as `struct xdp_md`: 32-bit loads at offsets 0 and 4
+    /// yield the packet start and end pointers. Packet memory may only be
+    /// accessed after a comparison against `data_end` proves the range safe.
+    pub xdp: bool,
 }
 
 impl Default for Config {
@@ -53,6 +57,7 @@ impl Default for Config {
             insn_budget: 1_000_000,
             max_states_per_pc: 4096,
             btf_ctx: None,
+            xdp: false,
         }
     }
 }
@@ -371,6 +376,11 @@ pub enum PtrKind {
     Stack { frame: usize },
     /// Pointer into the context region.
     Ctx,
+    /// Direct packet pointer loaded from `xdp_md.data`. `range` is the number
+    /// of bytes from packet start proven accessible by a data_end comparison.
+    Packet { range: u32 },
+    /// Sentinel pointer loaded from `xdp_md.data_end`; never dereferenceable.
+    PacketEnd,
     /// A map object pointer (not dereferenceable).
     Map { map: u32 },
     /// Pointer into a map value.
@@ -464,6 +474,8 @@ impl std::fmt::Display for RegState {
                 match p.kind {
                     PtrKind::Stack { frame } => write!(f, "fp{frame}")?,
                     PtrKind::Ctx => write!(f, "ctx")?,
+                    PtrKind::Packet { range } => write!(f, "packet[r={range}]")?,
+                    PtrKind::PacketEnd => write!(f, "packet_end")?,
                     PtrKind::Map { map } => write!(f, "map{map}")?,
                     PtrKind::MapValue { map } => write!(f, "map{map}_value")?,
                     PtrKind::MapValueOrNull { map, .. } => write!(f, "map{map}_value_or_null")?,
@@ -1969,6 +1981,18 @@ impl<'a> Verifier<'a> {
                         ),
                     ));
                 }
+                if self.cfg.xdp {
+                    if write {
+                        return Err(self.err(pc, "XDP context is read-only"));
+                    }
+                    if !matches!((disp, size), (0 | 4, 4)) {
+                        return Err(self.err(
+                            pc,
+                            format!("invalid XDP context access at offset {disp} size {size}"),
+                        ));
+                    }
+                    return Ok(None);
+                }
                 if let Some(bc) = &self.cfg.btf_ctx {
                     // BTF-typed ctx: an array of 8-byte typed arguments. The
                     // kernel's btf_ctx_access() (kernel/bpf/btf.c) requires
@@ -2045,6 +2069,31 @@ impl<'a> Verifier<'a> {
                     pc,
                     "use of a ringbuf record after it was submitted/discarded",
                 ));
+            }
+            PtrKind::Packet { range } => {
+                // XDP permits both reads and writes after the same proof.
+                let lo = p.off.saturating_add(disp).saturating_add(p.var.smin);
+                let hi = i64::try_from(p.var.umax)
+                    .ok()
+                    .and_then(|v| p.off.checked_add(disp)?.checked_add(v));
+                if lo < 0
+                    || hi.is_none_or(|hi| {
+                        hi < lo || hi.saturating_add(size as i64) > range as i64
+                    })
+                {
+                    return Err(self.err(
+                        pc,
+                        format!(
+                            "packet access out of bounds: off {}{} size {size}, only {range} bytes proven by data_end check",
+                            p.off + disp,
+                            if p.var.is_const() { String::new() } else { format!("+{}", p.var) }
+                        ),
+                    ));
+                }
+                (range as u64, "packet")
+            }
+            PtrKind::PacketEnd => {
+                return Err(self.err(pc, "data_end pointer cannot be dereferenced"));
             }
             PtrKind::Map { .. } => {
                 return Err(self.err(pc, "map object pointers cannot be dereferenced"));
@@ -2142,6 +2191,13 @@ impl<'a> Verifier<'a> {
     ) -> Result<RegState, VerifyError> {
         match p.kind {
             PtrKind::Ctx => {
+                if self.cfg.xdp && size == 4 {
+                    return match disp {
+                        0 => Ok(RegState::Ptr(Ptr::new(PtrKind::Packet { range: 0 }))),
+                        4 => Ok(RegState::Ptr(Ptr::new(PtrKind::PacketEnd))),
+                        _ => unreachable!("validated XDP ctx offset"),
+                    };
+                }
                 if let Some(bc) = &self.cfg.btf_ctx {
                     if size == 8 {
                         if let crate::btf::CtxSlot::Ptr { btf_id } = bc.args[(disp / 8) as usize]
@@ -2646,6 +2702,60 @@ impl<'a> Verifier<'a> {
         }
     }
 
+    /// A successful `data`/`data_end` comparison proves a prefix of the
+    /// packet accessible. Propagate it to every alias, like the kernel's
+    /// packet-pointer id/range tracking.
+    fn mark_packet_range(state: &mut VState, range: u32) {
+        for frame in &mut state.frames {
+            let fix = |r: &mut RegState| {
+                if let RegState::Ptr(p) = r {
+                    if let PtrKind::Packet { range: old } = p.kind {
+                        p.kind = PtrKind::Packet {
+                            range: old.max(range),
+                        };
+                    }
+                }
+            };
+            for r in frame.regs.iter_mut() {
+                fix(r);
+            }
+            for s in frame.stack.iter_mut() {
+                if let SlotState::Spill(r) = s {
+                    fix(r);
+                }
+            }
+        }
+    }
+
+    /// Return `(safe_when_taken, proven_prefix)` for an unsigned comparison
+    /// between a packet pointer and its data_end sentinel.
+    fn packet_bound(op: u8, a: RegState, b: RegState) -> Option<(bool, u32)> {
+        let endpoint = |p: Ptr, strict: bool| -> Option<u32> {
+            let end = p.off.checked_add(p.var.umax.try_into().ok()?)?;
+            let end = end.checked_add(i64::from(strict))?;
+            u32::try_from(end).ok()
+        };
+        match (a, b) {
+            (RegState::Ptr(p @ Ptr { kind: PtrKind::Packet { .. }, .. }),
+             RegState::Ptr(Ptr { kind: PtrKind::PacketEnd, .. })) => match op {
+                jmp::JGT => endpoint(p, false).map(|r| (false, r)),
+                jmp::JGE => endpoint(p, true).map(|r| (false, r)),
+                jmp::JLT => endpoint(p, true).map(|r| (true, r)),
+                jmp::JLE => endpoint(p, false).map(|r| (true, r)),
+                _ => None,
+            },
+            (RegState::Ptr(Ptr { kind: PtrKind::PacketEnd, .. }),
+             RegState::Ptr(p @ Ptr { kind: PtrKind::Packet { .. }, .. })) => match op {
+                jmp::JLT => endpoint(p, false).map(|r| (false, r)),
+                jmp::JLE => endpoint(p, true).map(|r| (false, r)),
+                jmp::JGT => endpoint(p, true).map(|r| (true, r)),
+                jmp::JGE => endpoint(p, false).map(|r| (true, r)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     // -- single-step ----------------------------------------------------------
 
     fn step(&mut self, pc: usize, mut state: VState) -> Result<StepOutcome, VerifyError> {
@@ -2728,8 +2838,10 @@ impl<'a> Verifier<'a> {
                             s.sync();
                             RegState::Scalar(s)
                         }
-                        // narrow load can't restore a pointer spill
-                        _ => RegState::Scalar(Scalar::unknown()),
+                        // XDP's u32 data/data_end context fields are typed as
+                        // pointers by the program-type access callback.
+                        RegState::Ptr(p) => RegState::Ptr(p),
+                        RegState::Uninit => unreachable!(),
                     }
                 } else {
                     loaded
@@ -2943,6 +3055,7 @@ impl<'a> Verifier<'a> {
                 | PtrKind::MapValueOrNull { .. }
                 | PtrKind::RingbufMemOrNull { .. }
                 | PtrKind::RingbufConsumed { .. }
+                | PtrKind::PacketEnd
         ) {
             return Err(self.err(
                 pc,
@@ -3088,7 +3201,23 @@ impl<'a> Verifier<'a> {
                     }
                 }
 
-                // pointer comparisons: allowed, no refinement
+                if !is32 {
+                    if let Some((safe_taken, range)) = Self::packet_bound(op, a, b) {
+                        let mut on_target = state.clone();
+                        if safe_taken {
+                            Self::mark_packet_range(&mut on_target, range);
+                        } else {
+                            Self::mark_packet_range(&mut state, range);
+                        }
+                        self.stats.states_explored += 1;
+                        return Ok(StepOutcome::Next(vec![
+                            (pc + 1, state),
+                            (target, on_target),
+                        ]));
+                    }
+                }
+
+                // Other pointer comparisons are allowed, with no refinement.
                 let (sa, sb) = match (a, b) {
                     (RegState::Scalar(x), RegState::Scalar(y)) => (x, y),
                     _ => {

@@ -84,11 +84,14 @@ enum Region {
     /// the deterministic stand-in for the kernel's fault-tolerant
     /// `BPF_PROBE_MEM` reads — see docs/specs/btf-ctx-pointers.md.
     KernelMem,
+    /// Mutable bytes of the packet supplied to [`Vm::run_xdp`].
+    Packet,
 }
 
 const CTX_HANDLE: u32 = 1;
 const STACK0_HANDLE: u32 = 2;
 const KMEM_HANDLE: u32 = STACK0_HANDLE + MAX_CALL_FRAMES as u32;
+const PACKET_HANDLE: u32 = KMEM_HANDLE + 1;
 
 /// Seed for the deterministic `get_prandom_u32` xorshift. A run is a pure
 /// function of (program, ctx, this seed, map preload), which is what makes
@@ -141,6 +144,11 @@ pub struct Vm {
     /// Scratch backing for [`Region::KernelMem`] reads; logically an
     /// all-zeroes region, re-zeroed on every resolve. Not run state.
     kmem: Vec<u8>,
+    /// Backing for the direct-packet-access virtual region.
+    packet: Vec<u8>,
+    /// Set after verification with [`crate::verifier::Config::xdp`]; causes
+    /// xdp_md data/data_end loads to synthesize full virtual addresses.
+    xdp: bool,
 }
 
 impl Vm {
@@ -150,6 +158,7 @@ impl Vm {
             regions.push(Region::Stack(f));
         }
         regions.push(Region::KernelMem); // KMEM_HANDLE
+        regions.push(Region::Packet); // PACKET_HANDLE
         let maps: Vec<Map> = prog
             .maps
             .iter()
@@ -182,6 +191,8 @@ impl Vm {
             debug: None,
             probe_mem: Vec::new(),
             kmem: Vec::new(),
+            packet: Vec::new(),
+            xdp: false,
         };
 
         // Patch map-reference lddw instructions into plain 64-bit immediates.
@@ -258,8 +269,10 @@ impl Vm {
         if cfg.btf_ctx.is_none() {
             cfg.btf_ctx = self.btf_ctx.clone();
         }
+        let xdp = cfg.xdp;
         let ok =
             crate::verifier::verify(&self.insns, &self.map_defs, self.user_helpers.sigs(), cfg)?;
+        self.xdp = xdp;
         self.probe_mem = ok.probe_mem.clone();
         Ok(ok)
     }
@@ -335,6 +348,30 @@ impl Vm {
         }
     }
 
+    /// Execute an XDP program over `packet`. The method constructs the
+    /// virtual `xdp_md` context internally and copies packet writes back to
+    /// the caller on both successful exit and runtime error.
+    pub fn run_xdp(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
+        if !self.xdp {
+            return Err(EbpfError {
+                pc: 0,
+                msg: "run_xdp requires successful verification with Config::xdp".to_string(),
+            });
+        }
+        if packet.len() > u32::MAX as usize {
+            return Err(EbpfError {
+                pc: 0,
+                msg: "packet is too large for xdp_md data/data_end".to_string(),
+            });
+        }
+        self.packet.clear();
+        self.packet.extend_from_slice(packet);
+        let mut ctx = [0u8; 24];
+        let result = self.run(&mut ctx);
+        packet.copy_from_slice(&self.packet);
+        result
+    }
+
     /// Create a single-stepping execution (for the debugger).
     pub fn machine<'a>(&'a mut self, ctx: &'a mut [u8]) -> Machine<'a> {
         Machine::new(self, ctx)
@@ -387,6 +424,7 @@ pub struct Snapshot {
     frames: Vec<SavedFrame>,
     stack: Vec<u8>,
     ctx: Vec<u8>,
+    packet: Vec<u8>,
     /// Region table: map-value regions are created lazily in execution order,
     /// so replay must resume handle allocation from the snapshotted state or
     /// guest-visible virtual addresses would diverge from the original run.
@@ -530,6 +568,7 @@ struct Bus<'b> {
     stack: &'b mut [u8],
     ctx: &'b mut [u8],
     kmem: &'b mut Vec<u8>,
+    packet: &'b mut [u8],
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -539,6 +578,7 @@ fn resolve_slice<'s>(
     stack: &'s mut [u8],
     ctx: &'s mut [u8],
     kmem: &'s mut Vec<u8>,
+    packet: &'s mut [u8],
     addr: u64,
     len: usize,
     write: bool,
@@ -564,6 +604,7 @@ fn resolve_slice<'s>(
             kmem[..len].fill(0);
             return Ok(&mut kmem[..len]);
         }
+        Region::Packet => packet,
         Region::Ctx => ctx,
         Region::Stack(f) => &mut stack[f as usize * STACK_SIZE..(f as usize + 1) * STACK_SIZE],
         Region::MapObj(_) => {
@@ -592,14 +633,16 @@ fn resolve_slice<'s>(
 impl MemBus for Bus<'_> {
     fn read(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), String> {
         let s = resolve_slice(
-            self.regions, self.maps, self.stack, self.ctx, self.kmem, addr, buf.len(), false,
+            self.regions, self.maps, self.stack, self.ctx, self.kmem, self.packet, addr, buf.len(),
+            false,
         )?;
         buf.copy_from_slice(s);
         Ok(())
     }
     fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), String> {
         let s = resolve_slice(
-            self.regions, self.maps, self.stack, self.ctx, self.kmem, addr, data.len(), true,
+            self.regions, self.maps, self.stack, self.ctx, self.kmem, self.packet, addr, data.len(),
+            true,
         )?;
         s.copy_from_slice(data);
         Ok(())
@@ -650,6 +693,7 @@ impl<'a> Machine<'a> {
             frames: self.frames.clone(),
             stack: self.vm.stack.clone(),
             ctx: self.ctx.to_vec(),
+            packet: self.vm.packet.clone(),
             regions: self.vm.regions.clone(),
             maps: self.vm.maps.iter().map(Map::snapshot).collect(),
             prandom: self.vm.prandom,
@@ -667,6 +711,7 @@ impl<'a> Machine<'a> {
         self.frames = s.frames.clone();
         self.vm.stack.copy_from_slice(&s.stack);
         self.ctx.copy_from_slice(&s.ctx);
+        self.vm.packet.clone_from(&s.packet);
         self.vm.regions = s.regions.clone();
         for (m, ms) in self.vm.maps.iter_mut().zip(&s.maps) {
             m.restore(ms);
@@ -931,6 +976,7 @@ impl<'a> Machine<'a> {
                 format!("ringbuf '{}' record +{off}", self.vm.maps[*map as usize].def.name)
             }
             Some(Region::KernelMem) => format!("kernel memory +{off} (reads as zero)"),
+            Some(Region::Packet) => format!("packet+{off}"),
             Some(Region::Invalid) | None => format!("<addr {addr:#x}>"),
         }
     }
@@ -951,6 +997,7 @@ impl<'a> Machine<'a> {
             &mut self.vm.stack,
             self.ctx,
             &mut self.vm.kmem,
+            &mut self.vm.packet,
             addr,
             len,
             write,
@@ -1136,13 +1183,30 @@ impl<'a> Machine<'a> {
             class::LDX => {
                 let addr = self.regs[src].wrapping_add(ins.off as i64 as u64);
                 let size = ins.mem_size();
+                // xdp_md stores data/data_end as u32 kernel ABI fields, but
+                // febpf virtual addresses are 64-bit region handles. Once the
+                // verifier has typed this as XDP, synthesize those full
+                // addresses at the load boundary.
+                let xdp_ptr = if self.vm.xdp && size == 4 && addr >> 32 == CTX_HANDLE as u64 {
+                    match addr as u32 {
+                        0 => Some(mkaddr(PACKET_HANDLE, 0)),
+                        4 => Some(mkaddr(PACKET_HANDLE, self.vm.packet.len() as u32)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 // Loads the verifier marked as BTF probe reads mirror the
                 // kernel's BPF_PROBE_MEM: an unresolvable address reads as
                 // zero instead of faulting (e.g. chasing a pointer loaded
                 // from zeroed kernel memory, i.e. NULL).
-                let v = match self.load(addr, size) {
-                    Err(_) if self.vm.probe_mem.get(self.pc) == Some(&true) => 0,
-                    r => r?,
+                let v = if let Some(ptr) = xdp_ptr {
+                    ptr
+                } else {
+                    match self.load(addr, size) {
+                        Err(_) if self.vm.probe_mem.get(self.pc) == Some(&true) => 0,
+                        r => r?,
+                    }
                 };
                 self.regs[dst] = if ins.mem_mode() == mode::MEMSX {
                     match size {
@@ -1614,6 +1678,7 @@ impl<'a> Machine<'a> {
                     stack: &mut self.vm.stack,
                     ctx: self.ctx,
                     kmem: &mut self.vm.kmem,
+                    packet: &mut self.vm.packet,
                 };
                 let result = helper.call(args, &mut bus);
                 self.vm.user_helpers.put_back(hid, helper);

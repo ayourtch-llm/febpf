@@ -40,6 +40,15 @@ fn verify_err_ctx(src: &str, ctx_size: usize) -> String {
     }
 }
 
+fn xdp_config() -> Config {
+    Config {
+        ctx_size: 24,
+        ctx_writable: false,
+        xdp: true,
+        ..Default::default()
+    }
+}
+
 // ------------------------------------------------------------------ ALU
 
 #[test]
@@ -224,6 +233,100 @@ fn ctx_access() {
         exit";
     assert_eq!(run_ctx(src, &mut ctx), 0x33);
     assert_eq!(ctx[15], 0x7f);
+}
+
+#[test]
+fn xdp_packet_access_after_data_end_check() {
+    let src = "
+        r2 = *(u32 *)(r1 + 0)
+        r3 = *(u32 *)(r1 + 4)
+        r4 = r2
+        r4 += 14
+        if r4 > r3 goto short
+        r0 = *(u16 *)(r2 + 12)
+        exit
+    short:
+        r0 = 0
+        exit";
+    let mut vm = Vm::new(program(src)).unwrap();
+    vm.verify(xdp_config()).expect("bounded packet load verifies");
+
+    let mut packet = (0u8..20).collect::<Vec<_>>();
+    assert_eq!(vm.run_xdp(&mut packet).unwrap(), 0x0d0c);
+    let mut short = vec![0u8; 13];
+    assert_eq!(vm.run_xdp(&mut short).unwrap(), 0);
+}
+
+#[test]
+fn xdp_packet_access_requires_sufficient_proof() {
+    let unchecked = "
+        r2 = *(u32 *)(r1 + 0)
+        r0 = *(u8 *)(r2 + 0)
+        exit";
+    let mut vm = Vm::new(program(unchecked)).unwrap();
+    let e = match vm.verify(xdp_config()) {
+        Ok(_) => panic!("unchecked packet access verified"),
+        Err(e) => e.to_string(),
+    };
+    assert!(e.contains("only 0 bytes proven"), "{e}");
+
+    let underchecked = "
+        r0 = 0
+        r2 = *(u32 *)(r1 + 0)
+        r3 = *(u32 *)(r1 + 4)
+        r4 = r2
+        r4 += 8
+        if r4 > r3 goto out
+        r0 = *(u8 *)(r2 + 8)
+    out:
+        exit";
+    let mut vm = Vm::new(program(underchecked)).unwrap();
+    let e = match vm.verify(xdp_config()) {
+        Ok(_) => panic!("under-checked packet access verified"),
+        Err(e) => e.to_string(),
+    };
+    assert!(e.contains("only 8 bytes proven"), "{e}");
+}
+
+#[test]
+fn xdp_packet_writes_are_bounded_and_visible() {
+    let src = "
+        r2 = *(u32 *)(r1 + 0)
+        r3 = *(u32 *)(r1 + 4)
+        r4 = r2
+        r4 += 1
+        if r4 > r3 goto out
+        *(u8 *)(r2 + 0) = 0xaa
+    out:
+        r0 = 2
+        exit";
+    let mut vm = Vm::new(program(src)).unwrap();
+    vm.verify(xdp_config()).unwrap();
+    let mut packet = vec![1, 2, 3];
+    assert_eq!(vm.run_xdp(&mut packet).unwrap(), 2);
+    assert_eq!(packet, [0xaa, 2, 3]);
+}
+
+#[test]
+fn xdp_data_end_proof_propagates_to_spilled_aliases() {
+    let src = "
+        r2 = *(u32 *)(r1 + 0)
+        r3 = *(u32 *)(r1 + 4)
+        *(u64 *)(r10 - 8) = r2
+        r2 = 0
+        r4 = *(u64 *)(r10 - 8)
+        r4 += 4
+        if r3 >= r4 goto safe
+        r0 = 0
+        exit
+    safe:
+        r2 = *(u64 *)(r10 - 8)
+        r0 = *(u32 *)(r2 + 0)
+        exit";
+    let mut vm = Vm::new(program(src)).unwrap();
+    vm.verify(xdp_config()).expect("range reaches spilled alias");
+    let mut packet = vec![0x78, 0x56, 0x34, 0x12];
+    assert_eq!(vm.run_xdp(&mut packet).unwrap(), 0x1234_5678);
 }
 
 #[test]
