@@ -345,9 +345,15 @@ fn rewrite_round(insns: &[Insn], vres: &VerifyOk) -> Result<(Vec<Insn>, bool, St
     while pc < n {
         let ins = insns[pc];
         if ins.is_wide() {
-            // Two-slot lddw: never rewritten or dropped.
-            actions.push(Action::Keep(ins));
-            actions.push(Action::Keep(insns[pc + 1]));
+            // Two-slot lddw: never rewritten, but drop it if it is unreachable
+            // (dead code — the kernel verifier rejects unreachable insns).
+            if vres.regs_at(pc).is_some() {
+                actions.push(Action::Keep(ins));
+                actions.push(Action::Keep(insns[pc + 1]));
+            } else {
+                actions.push(Action::Drop);
+                actions.push(Action::Drop);
+            }
             pc += 2;
             continue;
         }
