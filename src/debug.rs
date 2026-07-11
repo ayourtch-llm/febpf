@@ -17,7 +17,7 @@
 //! [`DebugSession::handle_command`].
 
 use crate::disasm::disasm_insn;
-use crate::insn::{call_kind, class, jmp, NUM_REGS};
+use crate::insn::{alu, call_kind, class, jmp, NUM_REGS};
 use crate::interp::{Machine, Snapshot, Vm};
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
@@ -65,6 +65,13 @@ impl MemRange {
     fn overlaps(&self, addr: u64, len: usize) -> bool {
         self.addr < addr.saturating_add(len as u64) && addr < self.addr.saturating_add(self.len as u64)
     }
+}
+
+/// A provenance source for the `origin` def-use walk.
+#[derive(Clone, Copy)]
+enum Src {
+    Reg(u8),
+    Mem(u64, usize),
 }
 
 /// One executed instruction's dataflow effect, recorded during an on-demand
@@ -883,6 +890,138 @@ impl<'a> DebugSession<'a> {
         Ok(())
     }
 
+    /// `origin <reg>`: trace a register's current value back through the
+    /// instructions that produced it, to where it was born.
+    fn cmd_origin(&mut self, arg: Option<&str>, out: &mut dyn Write) -> io::Result<()> {
+        let Some(r) = arg.and_then(parse_reg) else {
+            writeln!(out, "usage: origin <reg>")?;
+            return Ok(());
+        };
+        let cur = self.m.regs[r as usize];
+        let cutoff = self.m.insn_count + 1;
+        let log = self.build_write_log();
+        writeln!(out, "origin of r{r} = {cur:#x} ({cur}):")?;
+        let mut idx = 0usize;
+        let mut visited = HashSet::new();
+        self.trace_origin(&log, Src::Reg(r), cutoff, 0, &mut idx, &mut visited, out)
+    }
+
+    /// Recursive def-use walk for `origin` (see the spec). Prints an indented,
+    /// numbered trail; `cutoff` bounds the search to instructions executed
+    /// strictly before the one being explained; `visited` guards cycles.
+    #[allow(clippy::too_many_arguments)]
+    fn trace_origin(
+        &self,
+        log: &[Step],
+        src: Src,
+        cutoff: u64,
+        depth: usize,
+        idx: &mut usize,
+        visited: &mut HashSet<(u8, u64, u64)>,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        if depth > 64 {
+            return Ok(());
+        }
+        let insns = self.m.vm_ref().insns();
+        match src {
+            Src::Reg(r) => {
+                if !visited.insert((0, r as u64, cutoff)) {
+                    return Ok(());
+                }
+                let Some(s) = log
+                    .iter()
+                    .rev()
+                    .find(|s| s.count < cutoff && s.def_reg == Some(r))
+                else {
+                    let n = *idx;
+                    *idx += 1;
+                    let v = self.m.regs[r as usize];
+                    writeln!(
+                        out,
+                        "  #{n}  r{r} = {v:#x}  (initial / ctx value — not written in interval)"
+                    )?;
+                    return Ok(());
+                };
+                let insn = insns[s.pc];
+                let n = *idx;
+                *idx += 1;
+                let annot = match insn.class() {
+                    class::LDX => format!("loaded from {}", self.describe_load(s)),
+                    class::LD => format!("born: constant / map pointer {:#x}", s.def_val),
+                    class::JMP | class::JMP32 => format!("born: helper return {:#x}", s.def_val),
+                    class::ALU | class::ALU64 if insn.op() == alu::MOV && !insn.is_src_reg() => {
+                        format!("born: constant {:#x}", insn.imm as i64 as u64)
+                    }
+                    _ => format!("= {:#x}", s.def_val),
+                };
+                writeln!(out, "  #{n}  insn {}: {:<28} {annot}", s.pc, disasm_insn(insns, s.pc))?;
+                self.print_source_indent(out, s.pc)?;
+                // Recurse into the inputs that produced this value.
+                match insn.class() {
+                    class::ALU | class::ALU64 => {
+                        if insn.op() == alu::MOV {
+                            if insn.is_src_reg() {
+                                self.trace_origin(log, Src::Reg(insn.src), s.count, depth + 1, idx, visited, out)?;
+                            }
+                            // else: constant — leaf.
+                        } else {
+                            // Accumulator: dst is read as well as written.
+                            self.trace_origin(log, Src::Reg(insn.dst), s.count, depth + 1, idx, visited, out)?;
+                            if insn.is_src_reg() && insn.src != insn.dst {
+                                self.trace_origin(log, Src::Reg(insn.src), s.count, depth + 1, idx, visited, out)?;
+                            }
+                        }
+                    }
+                    class::LDX => {
+                        if let Some(m) = s.load {
+                            self.trace_origin(log, Src::Mem(m.addr, m.len), s.count, depth + 1, idx, visited, out)?;
+                        }
+                    }
+                    _ => {} // LD / helper call: leaf.
+                }
+            }
+            Src::Mem(addr, len) => {
+                if !visited.insert((1, addr, cutoff)) {
+                    return Ok(());
+                }
+                let region = self.m.describe_addr(addr);
+                let Some(s) = log
+                    .iter()
+                    .rev()
+                    .find(|s| s.count < cutoff && s.store.is_some_and(|m| m.overlaps(addr, len)))
+                else {
+                    let n = *idx;
+                    *idx += 1;
+                    writeln!(out, "  #{n}  {region} — not written in interval")?;
+                    return Ok(());
+                };
+                let insn = insns[s.pc];
+                let n = *idx;
+                *idx += 1;
+                let annot = if insn.class() == class::ST {
+                    format!("born: constant {:#x} stored to {region}", s.store_val)
+                } else {
+                    format!("stored to {region} (= {:#x})", s.store_val)
+                };
+                writeln!(out, "  #{n}  insn {}: {:<28} {annot}", s.pc, disasm_insn(insns, s.pc))?;
+                self.print_source_indent(out, s.pc)?;
+                if insn.class() == class::STX {
+                    self.trace_origin(log, Src::Reg(insn.src), s.count, depth + 1, idx, visited, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Describe the memory a load read from (region + address).
+    fn describe_load(&self, s: &Step) -> String {
+        match s.load {
+            Some(m) => self.m.describe_addr(m.addr),
+            None => "?".to_string(),
+        }
+    }
+
     /// `whenwrite <addr|reg> [len]`: pc of the last write to a memory location.
     fn cmd_whenwrite(&mut self, args: &[&str], out: &mut dyn Write) -> io::Result<()> {
         let Some(addr) = args.first().and_then(|a| self.resolve_mem_arg(a)) else {
@@ -987,6 +1126,7 @@ impl<'a> DebugSession<'a> {
                 }
                 None => writeln!(out, "usage: goto <instruction count>")?,
             },
+            "origin" => self.cmd_origin(arg1, out)?,
             "when" => self.cmd_when(arg1, out)?,
             "whenwrite" | "ww" => self.cmd_whenwrite(&args, out)?,
             "who" => self.cmd_who(&args, out)?,
