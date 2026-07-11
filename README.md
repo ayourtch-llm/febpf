@@ -47,13 +47,16 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
   `ktime_get_ns`, `trace_printk`, `get_prandom_u32`, …), plus an API to
   register **custom helpers** with verifier-checked signatures.
 - **JIT compiler** (x86-64 Linux and arm64 macOS, zero-dependency):
-  hand-rolled native codegen for the ALU + branch core (~45× on tight loops),
-  with memory ops, calls and atomics deferred to the interpreter — so the JIT
-  keeps the interpreter's exact memory-safety guarantee, it just removes
-  dispatch overhead. The compiler is split into an architecture-independent
-  frontend and a `JitBackend` trait; adding **riscv64** means implementing
-  that one trait (see `docs/specs/jit-backend.md`). Differentially tested
-  against the interpreter.
+  hand-rolled native codegen for the ALU + branch core (~45× on tight loops on
+  x86-64, ~26× on aarch64), with memory ops, calls and atomics deferred to the
+  interpreter — so the JIT keeps the interpreter's exact memory-safety
+  guarantee, it just removes dispatch overhead. The flip side: each deferred
+  instruction pays a trampoline round-trip, so a *memory-saturated* program can
+  run slightly slower JITed than interpreted — `--jit` is a win for
+  compute-heavy programs, not a universal one. The compiler is split into an
+  architecture-independent frontend and a `JitBackend` trait; adding **riscv64**
+  means implementing that one trait (see `docs/specs/jit-backend.md`).
+  Differentially tested against the interpreter.
 - **Execution profiler**: `febpf profile` runs the program and prints a
   per-instruction heatmap (counts, %, log-scaled bar) plus hottest-block
   summary.

@@ -51,8 +51,10 @@ Three things worth knowing:
 Validated by the `tests/jit.rs` differential suite plus `febpf fuzz` — **100k
 random programs, interpreter and JIT agree on every one** (the generator covers
 every native emitter in both widths, reg+imm, all 10 conditions and JSET, so
-that is real coverage). ~21× on a tight loop (`examples/sum_loop.s`: 18.8µs →
-0.9µs).
+that is real coverage). Perf on M-series: **~26× on an ALU-heavy loop**
+(`sum_loop`: 7.0µs → 0.27µs/run; 425 → 11100 M insn/s) — but see §4, the JIT
+*loses* on deferred-heavy code, which is worth understanding before optimizing
+anything.
 
 **Two latent macOS bugs fell out of this and are fixed** (both were invisible
 on Linux, and both would have bitten anyone who ran the suite on a Mac):
@@ -203,7 +205,35 @@ stores, atomics, `lddw`, helper calls, bpf-to-bpf calls, `exit` — is
 **deferred**: the native code spills registers, calls `Machine::jit_step_at`
 (the same interpreter, one instruction), and resumes at whatever pc it returns.
 So the JIT cannot introduce memory-unsafety the interpreter doesn't already
-prevent; it only removes dispatch overhead. ~45× on ALU-heavy loops.
+prevent; it only removes dispatch overhead.
+
+**That hybrid has a performance cliff, and it is not documented anywhere else,
+so know it before you "optimize" the JIT** (measured on M-series, aarch64;
+x86-64 will differ in magnitude, not in shape):
+
+| executed instruction | cost under interp | cost under JIT |
+|---|---|---|
+| native (ALU/branch)  | ~2.4 ns | **~0.12 ns** |
+| deferred (mem/call)  | ~2.4–3.3 ns | **~6.5 ns** |
+
+A deferred instruction is *more expensive* under the JIT than interpreted,
+because each one pays a trampoline round-trip: spill 11 registers, call,
+reload 11 registers, indirect-jump through the pc→address table (~3–4 ns of
+tax). So the JIT's win depends entirely on the **fraction of executed
+instructions that are deferred**:
+
+- ~0% deferred (`sum_loop`): **26× faster**
+- ~40% deferred (store+load in the loop): only **1.25×**
+- ~67% deferred (memory-saturated loop): **0.90× — the JIT is 10% SLOWER**
+
+Break-even is roughly 40–50% deferred. Real map/packet-heavy programs sit
+uncomfortably close to that line, so *do not assume `--jit` is always a win* —
+measure. The obvious fix is not "compile loads natively" (that would forfeit
+the safety story, see above) but to **shrink the trampoline tax**: spill/reload
+only the registers the deferred instruction actually touches instead of all 11.
+`classify.rs` already decodes each instruction, so it could hand the backend a
+register mask cheaply. Nobody has done this yet; it is the highest-value JIT
+work left, and it benefits x86-64 and aarch64 equally.
 
 The frontend (`jit/mod.rs`, `classify.rs`) is architecture-independent; the
 backends (`x64.rs`, `aarch64.rs`) are pure encoders implementing `JitBackend`.
