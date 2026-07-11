@@ -46,12 +46,12 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
   (`map_lookup_elem`, `map_update_elem`, `map_delete_elem`,
   `ktime_get_ns`, `trace_printk`, `get_prandom_u32`, …), plus an API to
   register **custom helpers** with verifier-checked signatures.
-- **JIT compiler** (x86-64 Linux, zero-dependency): hand-rolled native
-  codegen for the ALU + branch core (~45× on tight loops), with memory
-  ops, calls and atomics deferred to the interpreter — so the JIT keeps the
-  interpreter's exact memory-safety guarantee, it just removes dispatch
-  overhead. The compiler is split into an architecture-independent frontend
-  and a `JitBackend` trait; adding **aarch64/riscv64** means implementing
+- **JIT compiler** (x86-64 Linux and arm64 macOS, zero-dependency):
+  hand-rolled native codegen for the ALU + branch core (~45× on tight loops),
+  with memory ops, calls and atomics deferred to the interpreter — so the JIT
+  keeps the interpreter's exact memory-safety guarantee, it just removes
+  dispatch overhead. The compiler is split into an architecture-independent
+  frontend and a `JitBackend` trait; adding **riscv64** means implementing
   that one trait (see `docs/specs/jit-backend.md`). Differentially tested
   against the interpreter.
 - **Execution profiler**: `febpf profile` runs the program and prints a
@@ -193,7 +193,7 @@ including time-travel `rstep`.
   never move values, so buggy programs replay identically under the
   debugger.
 - **JIT**: `docs/specs/jit-backend.md` — architecture-independent frontend +
-  `JitBackend` trait; x86-64 done, aarch64/riscv64 documented as drop-in.
+  `JitBackend` trait; x86-64 and aarch64 done, riscv64 documented as drop-in.
 - **ELF loading**: `docs/specs/elf-loading.md`.
 - **Not implemented (yet)**: full BTF (CO-RE, func/line info), kfuncs,
   per-CPU/ringbuf map types, legacy packet-access instructions, aarch64/riscv

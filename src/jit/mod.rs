@@ -1,8 +1,9 @@
 //! Architecture-independent JIT frontend.
 //!
 //! The JIT is split into a **frontend** (this module) and per-architecture
-//! **backends** (e.g. [`x64`]). The frontend does everything that is pure
-//! eBPF logic and identical on every CPU:
+//! **backends** (x86-64 Linux in `x64`, arm64 macOS in `aarch64`). The
+//! frontend does everything that is pure eBPF logic and identical on every
+//! CPU:
 //!
 //! - classify each instruction as *native* (compiled to machine code) or
 //!   *deferred* (executed by the interpreter core via a trampoline),
@@ -35,6 +36,9 @@ mod classify;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod x64;
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub mod aarch64;
 
 pub use classify::{AluOp, Cc, Lowering, RegOrImm, ShiftOp, Width};
 
@@ -109,7 +113,12 @@ pub trait JitBackend {
     /// Patch relative branch fixups now that every label offset is known.
     /// `label_off[pc] == usize::MAX` marks a slot with no code (jump such
     /// targets to `epilogue_off`).
-    fn resolve_branches(&mut self, label_off: &[usize], epilogue_off: usize);
+    ///
+    /// Returns `Err` if a fixup cannot be encoded — on ISAs with short branch
+    /// displacements (aarch64's ±1MiB `B.cond`) a huge program can exceed the
+    /// range. Compilation then fails cleanly and the caller falls back to the
+    /// interpreter, rather than the backend emitting a wrong branch.
+    fn resolve_branches(&mut self, label_off: &[usize], epilogue_off: usize) -> Result<(), String>;
 
     /// The byte offset of the epilogue within [`code`](JitBackend::code).
     fn epilogue_off(&self) -> usize;
@@ -162,10 +171,19 @@ pub fn compile(insns: &[Insn]) -> Result<JitProgram, String> {
     compile_with::<x64::X64Backend>(insns)
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+/// Compile `insns` for the host architecture.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub fn compile(insns: &[Insn]) -> Result<JitProgram, String> {
+    compile_with::<aarch64::Aarch64Backend>(insns)
+}
+
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+)))]
 pub fn compile(_insns: &[Insn]) -> Result<JitProgram, String> {
-    Err("JIT is only implemented for x86-64 Linux (see docs/specs/jit-backend.md \
-         to add another architecture)"
+    Err("JIT is only implemented for x86-64 Linux and arm64 macOS (see \
+         docs/specs/jit-backend.md to add another architecture)"
         .into())
 }
 
@@ -202,7 +220,8 @@ pub fn compile_with<B: JitBackend>(insns: &[Insn]) -> Result<JitProgram, String>
     }
 
     b.epilogue();
-    b.resolve_branches(&label_off, b.epilogue_off());
+    let epi = b.epilogue_off();
+    b.resolve_branches(&label_off, epi)?;
 
     // Move the code into executable memory.
     let code = b.code().to_vec();
@@ -267,11 +286,30 @@ impl ExecMem {
         unsafe { sys::mprotect_rx(self.ptr, self.len) }
     }
 
-    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    fn new(len: usize) -> Result<ExecMem, String> {
+        let len = len.max(1);
+        let ptr = unsafe { macsys::mmap_jit(len) }?;
+        Ok(ExecMem { ptr, len })
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    fn make_executable(&mut self) -> Result<(), String> {
+        unsafe { macsys::seal_and_flush(self.ptr, self.len) };
+        Ok(())
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "macos")
+    )))]
     fn new(_len: usize) -> Result<ExecMem, String> {
         Err("executable memory allocation unsupported on this platform".into())
     }
-    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "macos")
+    )))]
     fn make_executable(&mut self) -> Result<(), String> {
         Ok(())
     }
@@ -283,6 +321,65 @@ impl Drop for ExecMem {
         unsafe {
             sys::munmap(self.ptr, self.len);
         }
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        unsafe {
+            macsys::unmap(self.ptr, self.len);
+        }
+    }
+}
+
+/// W^X JIT memory on macOS/Apple Silicon, via libSystem — which every macOS
+/// process links anyway, so this adds no crate dependency (raw syscalls are
+/// not a stable ABI on Darwin).
+///
+/// Apple Silicon enforces strict W^X: JIT code must live in a `MAP_JIT`
+/// mapping, writes are gated per-thread by `pthread_jit_write_protect_np`,
+/// and the instruction cache must be flushed before execution. `mmap_jit`
+/// leaves the calling thread's write gate open; `compile_with` performs all
+/// writes on that same thread before `seal_and_flush` closes the gate.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+mod macsys {
+    use core::ffi::c_void;
+
+    extern "C" {
+        fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
+        fn munmap(addr: *mut c_void, len: usize) -> i32;
+        fn pthread_jit_write_protect_np(enabled: i32);
+        fn sys_icache_invalidate(start: *mut c_void, len: usize);
+        fn __error() -> *mut i32;
+    }
+
+    const PROT_READ: i32 = 0x1;
+    const PROT_WRITE: i32 = 0x2;
+    const PROT_EXEC: i32 = 0x4;
+    const MAP_PRIVATE: i32 = 0x0002;
+    const MAP_ANON: i32 = 0x1000;
+    const MAP_JIT: i32 = 0x0800;
+
+    pub unsafe fn mmap_jit(len: usize) -> Result<*mut u8, String> {
+        let p = mmap(
+            core::ptr::null_mut(),
+            len,
+            PROT_READ | PROT_WRITE | PROT_EXEC,
+            MAP_PRIVATE | MAP_ANON | MAP_JIT,
+            -1,
+            0,
+        );
+        if p as isize == -1 {
+            return Err(format!("mmap(MAP_JIT) failed (errno {})", *__error()));
+        }
+        // Open this thread's write gate so the frontend can copy and patch.
+        pthread_jit_write_protect_np(0);
+        Ok(p as *mut u8)
+    }
+
+    pub unsafe fn seal_and_flush(ptr: *mut u8, len: usize) {
+        pthread_jit_write_protect_np(1);
+        sys_icache_invalidate(ptr as *mut c_void, len);
+    }
+
+    pub unsafe fn unmap(ptr: *mut u8, len: usize) {
+        munmap(ptr as *mut c_void, len);
     }
 }
 

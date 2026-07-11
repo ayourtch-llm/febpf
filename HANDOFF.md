@@ -21,6 +21,62 @@ the JIT is now behind `default = ["jit"]`, so always run `cargo test` AND
 `cargo test --no-default-features` (and clippy in both) before calling
 anything done.
 
+**DONE (2026-07-11, session 5): aarch64 JIT backend** (`src/jit/aarch64.rs`)
+— the JIT now runs natively on Apple Silicon, not just x86-64 Linux. The
+frontend was genuinely drop-in: the *only* changes outside the new file were a
+`#[cfg] mod`, a `compile()` branch, and the `ExecMem` half. Read §5 of
+`docs/specs/jit-backend.md` before touching it — it now records what was
+actually done (and where the spec's original suggestions were wrong).
+
+Three things worth knowing:
+- **Apple Silicon is not "ARM Linux".** Strict W^X means the Linux
+  mmap+mprotect dance does not work at all: code must be `MAP_JIT`, writes are
+  gated *per-thread* by `pthread_jit_write_protect_np`, and the i-cache must be
+  flushed (`sys_icache_invalidate`) or you execute stale bytes. These come from
+  libSystem (`macsys` in `jit/mod.rs`) — Darwin has no stable syscall ABI, so
+  raw `asm!` syscalls are NOT an option here. This does not break the
+  zero-dependency rule: every macOS process links libSystem anyway.
+- **eBPF r0..r10 → x0..x10, identity.** The spec suggested callee-saved
+  `x19..x29`; that was unnecessary. Native code makes exactly one call (the
+  trampoline) and the deferred glue already spills/reloads all 11 registers
+  around it, so nothing live ever crosses a call. `regs_ptr`/`machine_ptr`
+  (x19/x20) *do* need to be callee-saved.
+- **`JitBackend::resolve_branches` now returns `Result`** (x64 updated too).
+  A64's `B.cond` reaches only ±1MiB, so a program over ~1MiB of emitted code
+  can't be encoded; it now fails compilation cleanly (caller falls back to the
+  interpreter) instead of panicking or, worse, truncating a displacement into a
+  silently-wrong branch. Branch islands would lift the limit — nothing in the
+  corpus is remotely close, so it's not worth doing yet.
+
+Validated by the `tests/jit.rs` differential suite plus `febpf fuzz` — **100k
+random programs, interpreter and JIT agree on every one** (the generator covers
+every native emitter in both widths, reg+imm, all 10 conditions and JSET, so
+that is real coverage). ~21× on a tight loop (`examples/sum_loop.s`: 18.8µs →
+0.9µs).
+
+**Two latent macOS bugs fell out of this and are fixed** (both were invisible
+on Linux, and both would have bitten anyone who ran the suite on a Mac):
+1. **`maybe_compile` in the fixture tests was destroying the repo.** It checked
+   only that `clang --version` runs, then invoked `clang -target bpf -o
+   tests/X.o`. Apple clang has no BPF backend, so it failed *after* truncating
+   the output — silently deleting 10 committed `.o` fixtures on every
+   `cargo test`, which then cascaded into ~30 failures that looked
+   environmental. It now probes `--print-targets` for real BPF support and
+   builds via a temp file that is renamed into place only on success, so a
+   failing clang can never damage a fixture. (All four copies of the helper —
+   `tests/{elf,btf,btfctx,sourcedebug}.rs` — had it.)
+2. **`kbpf::has_privilege()` returned `Err` on any non-Linux host.** The stub
+   `probe()` reports ENOSYS, and only EPERM/EACCES were mapped to `Ok(false)`
+   — so the probe violated the "never panics, always a definite answer"
+   contract that `probe_is_well_behaved` asserts. ENOSYS ("no `bpf(2)` on this
+   platform at all") is now also a definite `Ok(false)`.
+
+With those fixed, **macOS is at full parity: `cargo test` is 250 green / 240
+with `--no-default-features`** — the same counts as the Linux box. Note clippy
+on macOS shows 18 dead-code warnings in `kbpf.rs` (the Linux-only `imp` module
+is `#[cfg]`'d out, so its constants look unused); that is a platform artifact,
+not a regression — it is still 0 on Linux.
+
 **DONE (2026-07-11, session 4): BTF-typed ctx pointers** (kernel
 PTR_TO_BTF_ID for `tp_btf`/`fentry`/`fexit`/`fmod_ret` ctx args) — the last
 fixable corpus class. `docs/specs/btf-ctx-pointers.md` is the contract; every
@@ -63,7 +119,7 @@ get_func_ip #173, scan-corpus helper-name fix.
                                    │
                         ┌──────────┴───────────┐
                         ▼                      ▼
-                   interpreter            JIT (x86-64)
+                   interpreter        JIT (x86-64 / aarch64)
                    Machine::step      native ALU/branch + trampoline
                         └──────────┬───────────┘   back to Machine::jit_step_at
                                    ▼                for memory/calls/exit
@@ -82,7 +138,7 @@ get_func_ip #173, scan-corpus helper-name fix.
 | `maps.rs` (516) | hash/array + per-CPU array/hash + LRU hash + ringbuf; stable value storage (safety note #5); record capture for ringbuf |
 | `helpers.rs` | helper id/name/signature registry + user-helper API |
 | `interp.rs` (1455) | the VM: `Vm`, `Machine`, virtual-address memory model, snapshot/restore (time travel), multi-instance activate/deactivate (race), JIT glue |
-| `jit/*` | arch-independent frontend + `JitBackend` trait + x86-64 encoder (aarch64 backend TODO) |
+| `jit/*` | arch-independent frontend + `JitBackend` trait + x86-64 and aarch64 encoders (riscv64 TODO) |
 | `elf.rs` (1126) | ELF64 loader + BTF `.maps` + CO-RE relocation application; `map_kind`/`map_type_name` |
 | `btf.rs` (1002) | full BTF type graph (all 19 kinds), scales to vmlinux; `.BTF.ext` |
 | `relo.rs` (1401) | CO-RE relocation algorithm (libbpf candidate matching) |
@@ -150,13 +206,16 @@ So the JIT cannot introduce memory-unsafety the interpreter doesn't already
 prevent; it only removes dispatch overhead. ~45× on ALU-heavy loops.
 
 The frontend (`jit/mod.rs`, `classify.rs`) is architecture-independent; the
-backend (`x64.rs`) is a pure encoder implementing `JitBackend`. **To add
-aarch64/riscv you implement that trait and nothing else** — the whole point of
-the split, done at the user's request. `docs/specs/jit-backend.md` is the
-step-by-step. Gotchas already written down there: instruction-cache flush on
-ARM/RISC-V (x86 doesn't need it), literal pools for absolute addresses (no
-`movabs`), and 16-byte stack alignment at call sites (this was the first JIT
-segfault — I was pushing 6 callee-saved regs and misaligning; it's now 5).
+backends (`x64.rs`, `aarch64.rs`) are pure encoders implementing `JitBackend`.
+**To add riscv you implement that trait and nothing else** — the whole point of
+the split, done at the user's request, and adding aarch64 (session 5) confirmed
+it holds: no eBPF logic moved. `docs/specs/jit-backend.md` is the step-by-step.
+Gotchas written down there, each of which has already bitten once: 16-byte
+stack alignment at call sites (the first x86 JIT segfault — 6 callee-saved
+pushes misaligned it; it's now 5), instruction-cache flush + `MAP_JIT` write
+gating on ARM (x86 needs neither), literal pools for absolute addresses (no
+`movabs` outside x86), and short branch displacements (A64 `B.cond` is ±1MiB,
+so `resolve_branches` returns `Result` — never truncate a displacement).
 
 ### 5. `maps.rs` value storage is stable on purpose
 Array maps use one flat allocation; hash maps use a slab of boxed values with a

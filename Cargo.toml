@@ -14,7 +14,7 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = ["jit"]
-# The x86-64 JIT (asm! + executable memory). Off for the wasm build, which is
+# The native JIT (x86-64 Linux, arm64 macOS). Off for the wasm build, which is
 # pure-std interpreter + verifier + analysis.
 jit = []
 

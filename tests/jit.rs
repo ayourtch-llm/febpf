@@ -1,7 +1,13 @@
 //! Differential testing of the JIT against the interpreter: every program is
 //! run both ways and the results (and map side effects) must match exactly.
 
-#![cfg(all(feature = "jit", target_arch = "x86_64", target_os = "linux"))]
+#![cfg(all(
+    feature = "jit",
+    any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "macos")
+    )
+))]
 
 use febpf::verifier::Config;
 use febpf::{asm, Program, Vm};

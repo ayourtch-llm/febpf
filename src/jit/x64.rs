@@ -401,7 +401,7 @@ impl JitBackend for X64Backend {
         self.bytes(&[0x43, 0xFF, 0x24, 0xCB]);
     }
 
-    fn resolve_branches(&mut self, label_off: &[usize], epilogue_off: usize) {
+    fn resolve_branches(&mut self, label_off: &[usize], epilogue_off: usize) -> Result<(), String> {
         for f in &self.fixups {
             let target_off = match f.kind {
                 FixKind::Epilogue => epilogue_off,
@@ -419,6 +419,7 @@ impl JitBackend for X64Backend {
             let rel = rel as i32;
             self.buf[f.at..f.at + 4].copy_from_slice(&rel.to_le_bytes());
         }
+        Ok(()) // rel32 spans ±2GiB: always in range for any emittable program
     }
 
     fn epilogue_off(&self) -> usize {
