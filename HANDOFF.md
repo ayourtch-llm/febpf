@@ -331,7 +331,8 @@ PERF_EVENT_ARRAY for this corpus). Coverage progression (loads / verifies):
 - baseline (hash+array only): 23% / 3.6%
 - + ringbuf/per-CPU/LRU (`docs/specs/map-types.md`): 30% / 5.4%
 - + perf/cgroup/stack maps + tracing helpers (`map-types-2.md`): 92.9% / 30.4%
-- + probe_read family + task_under_cgroup (`tracing-helpers.md`): 92.9% / **67.9%**
+- + probe_read family + task_under_cgroup (`tracing-helpers.md`): 92.9% / 67.9%
+- + load-time rodata DCE (`rodata-dce.md`, branch `feat/rodata-dce`): 92.9% / **78.6%**
 **Workflow: merge a coverage batch → `./scripts/scan-corpus.sh` → the histogram
 names the next batch.** febpf is an analysis/test/CI/debug engine, NOT a datapath
 runtime — "production useful" means verify/explain/differential-test/debug real
@@ -343,21 +344,22 @@ measure the previous build; and helper names in the histogram come from the
 uapi header now — the old hardcoded table had wrong ids (#113 was labelled
 ringbuf_output; it is probe_read_kernel).
 
-What blocks the remaining 18 objects (ranked by count, from the per-object
-detail in `corpus/coverage-report.txt`):
-1. **13 × VERIFY-REJECT:other, two root causes.** (a) "unreachable
-   instruction": libbpf performs dead-code elimination using frozen `.rodata`
-   config values before the kernel ever sees the program; febpf verifies the
-   object as-is, so `if (cfg_flag)` branches over unloaded code trip the
-   unreachable check. Fix = a load-time rodata-driven branch-elimination pass
-   (mirror libbpf's). (b) scalar-deref like `r1 = *(u32*)(r6+2804)` where r6
-   came from a `tp_btf` ctx load: real kernels type that as PTR_TO_BTF_ID and
-   allow direct kernel-memory reads. Fix = model BTF-typed ctx pointers
+What blocks the remaining 12 objects (after the rodata-DCE pass on
+`feat/rodata-dce` fixed the 6 "unreachable instruction" rejections plus
+`wakeuptime`; per-object detail in `corpus/coverage-report.txt`):
+1. **6 × VERIFY-REJECT:other, two root causes.** (a) scalar-deref like
+   `r1 = *(u32*)(r6+2804)` where r6 came from a `tp_btf` ctx load: real
+   kernels type that as PTR_TO_BTF_ID and allow direct kernel-memory reads
+   (`offcputime`, `runqlat`, `runqslower`). Fix = model BTF-typed ctx pointers
    (bigger; verifier + a deterministic "kernel memory reads as zero" story).
+   (b) "subprogram may not return a pointer" (`filetop`, `ksnoop`,
+   `tcpsynbl`) — febpf's subprog-return rule is stricter than whatever real
+   kernels accept for these objects; needs investigation against the kernel's
+   actual rule before changing.
 2. **3 × LOAD-FAIL:relocation + 1 LOAD-FAIL:other** — CO-RE edge cases worth a
    look (`biosnoop`, `bitesize`, `capable`, `cpudist`).
-3. **1 × helper #67 get_stack** (biostacks) — easy: same model as get_stackid
-   but writes the stack into a caller buffer.
+3. **helpers**: #67 get_stack (biostacks) — easy, same model as get_stackid
+   but writes into a caller buffer; #46 bpf_get_socket_cookie (tcppktlat).
 
 ## Known limitations / where to go next (roughly prioritized)
 
