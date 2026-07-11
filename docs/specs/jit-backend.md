@@ -142,22 +142,55 @@ spills before calling the trampoline, so this holds automatically).
   deferred instruction faulted. Fault vs clean-exit is disambiguated by the
   Rust caller via `Machine::take_jit_fault`.
 
-### Deferred glue (`deferred(pc)`) — the one non-trivial sequence
+### Deferred glue (`deferred(pc, regs)`) — the one non-trivial sequence
 Emit, in order:
-1. **Spill** all 11 eBPF registers to `[regs_ptr + 8*i]`.
+1. **Spill** the eBPF registers in `regs.spill` to `[regs_ptr + 8*i]`.
 2. Set up args: arg0 = `machine_ptr` (from its stack slot), arg1 = `pc`.
 3. **Call** the trampoline (absolute pointer, patched in `patch_absolutes`).
 4. Save the return value in a scratch register **not** used for an eBPF reg.
-5. **Reload** all 11 eBPF registers from `regs_ptr`.
+5. **Reload** the eBPF registers in `regs.reload` from `regs_ptr`.
 6. If the saved return has the STOP bit set → branch to the epilogue.
-7. Else indirect-jump to `table[next_pc]`, where `table` is the `pc→address`
-   array whose base is patched in `patch_absolutes`. On x86-64 this is
-   `jmp [table + next_pc*8]`; on aarch64/riscv, load `table` from a literal,
-   `ldr`/`ld` the target, and branch to register.
+7. Otherwise resume:
+   - if `regs.falls_through`, do **nothing** — the next instruction's code is
+     emitted immediately after this glue, and it is the only place the
+     interpreter can have landed;
+   - else indirect-jump to `table[next_pc]`, where `table` is the `pc→address`
+     array whose base is patched in `patch_absolutes`. On x86-64 this is
+     `jmp [table + next_pc*8]`; on aarch64/riscv, load `table` from a literal,
+     `ldr`/`ld` the target, and branch to register.
 
-Because control returns through this table after every deferred instruction,
-the backend never needs to know how calls/exits change frames — the interpreter
-does it and reports the resulting pc.
+Because control returns through this table after every *branching* deferred
+instruction, the backend never needs to know how calls/exits change frames —
+the interpreter does it and reports the resulting pc.
+
+The table has `n + 1` entries: a program whose last instruction is a store or
+helper call (legal to run unverified) leaves the interpreter at `pc == n`, and
+the extra slot points at the epilogue. Indexing it with `n` must not run off
+the end.
+
+#### The spill/reload masks — read this before you widen them
+`regs` ([`classify::deferred_regs`]) says which registers the interpreter
+**reads** (so their live values must reach `regs[]` before the call) and which
+it may **write** (so the physical copies must be refreshed after). Every entry
+is derived from the corresponding arm of `Machine::step` — *the interpreter is
+the specification, not the ISA doc*. Two traps that the ISA doc will not tell
+you:
+
+- a **helper call scrubs r1–r5 to zero** after writing r0, so they must be
+  reloaded even though the helper "only returns r0";
+- **`cmpxchg` reads and writes r0 implicitly**, though r0 appears nowhere in
+  the instruction's `dst`/`src` fields.
+
+CALL and EXIT keep the full spill+reload: they rearrange call frames, and the
+bookkeeping is not worth encoding as a mask. Anything not explicitly enumerated
+falls back to all-registers, i.e. to the behaviour that predates the masks.
+
+**A mask is only a saving if the eBPF register lives in a *callee-saved*
+physical register** — otherwise the call destroys it regardless and it must be
+spilled and reloaded anyway. This is why the register mapping matters so much
+(§5): aarch64 puts r0..r9 in `x19..x28` and skips almost everything, whereas
+x86-64 has too few callee-saved registers and must always carry r0..r5
+(`x64::CLOBBERED`).
 
 ---
 
@@ -167,15 +200,25 @@ Implemented for **arm64 macOS** (Apple Silicon). The *encoder* is OS-neutral —
 only the executable-memory glue is Darwin-specific, so an aarch64-Linux port is
 just the `ExecMem` half of step 6.
 
-1. **Register map.** eBPF r0..r10 → `x0..x10`, an identity map. The spec
-   originally suggested the callee-saved `x19..x29` block, but that is
-   unnecessary: the only call native code makes is the trampoline, and the
-   deferred glue already spills all 11 eBPF registers to the register file
-   before it and reloads them after, so nothing live crosses a call. Using the
-   low registers keeps the mapping trivial. `regs_ptr`→`x19` and
-   `machine_ptr`→`x20` *are* callee-saved (they must survive the trampoline);
-   scratch is `x11` (trampoline return), `x12` (table), `x15` (immediates),
-   `x16` (call target).
+1. **Register map.** eBPF r0..r9 → `x19..x28`, all **callee-saved**; r10 is
+   memory-backed; `regs_ptr`/`machine_ptr` live in stack slots. Scratch is
+   `x9` (regs_ptr), `x11` (trampoline return), `x12` (table), `x14`/`x15`
+   (materialized operands), `x16` (call target).
+
+   The spec's original advice — use the callee-saved block — was **right**, and
+   an early version of this backend ignored it in favour of an identity map
+   (r0..r10 → x0..x10), reasoning that since the deferred glue spills and
+   reloads all 11 registers anyway, nothing live crosses a call. That is true
+   but backwards: it makes the full spill/reload *mandatory*, because x0..x10
+   are caller-saved and the call destroys them. Putting the eBPF registers
+   somewhere the call preserves is what lets the masks (§4) skip the traffic
+   entirely — worth ~20% on memory-heavy programs. Don't repeat that mistake.
+
+   AAPCS64 has ten callee-saved registers and eBPF has eleven, so exactly one
+   must live elsewhere. Use **r10**: it is read-only in eBPF (`classify::lower`
+   defers any write, so even an unverified program stays correct), the
+   interpreter already owns `regs[10]` across frame changes, and native code
+   reads it only in the occasional `rX = r10` — cheap to load on demand.
 2. **Native forms.** `ADD/SUB/ORR/EOR/AND` (shifted-register), `MADD`+`xzr` for
    `MUL`, `ORR xzr,rm` for `mov_reg`, `MOVZ/MOVK`/`MOVN` for `mov_imm`,
    `SUB rd,xzr,rd` for `NEG`, `UBFM`/`SBFM` aliases for `LSL/LSR/ASR`,
@@ -205,9 +248,17 @@ just the `ExecMem` half of step 6.
 6. **Wiring.** `#[cfg]` `mod aarch64;` plus a `compile()` branch — as promised,
    nothing else in the frontend changed.
 7. **Validation.** `tests/jit.rs` (differential vs the interpreter) passes
-   unchanged, and `fuzz::interp_vs_jit` — whose generator covers every native
-   emitter in both widths, reg and imm forms, all 10 conditions and `JSET` —
-   agrees on 20k random programs.
+   unchanged, and `fuzz::interp_vs_jit` agrees on 100k random programs.
+
+   **Use both generators.** `gen_program` is memory-free by construction, so it
+   exercises only the natively-compiled core: it cannot catch a wrong
+   spill/reload mask, a clobbered scratch register, or a mis-encoded
+   trampoline, because it never emits a deferred instruction. `gen_mem_program`
+   exists for that — loads and stores at every width, atomics (including
+   `cmpxchg`'s implicit r0), helper calls, deferred ALU, and the native `rX =
+   r10` read. `febpf fuzz` alternates the two. A differential generator may
+   only call helpers that are deterministic in both engines: **not**
+   `ktime_get_ns`, which reads the wall clock.
 
 riscv64 is analogous (syscalls mmap=222/mprotect=226; `FENCE.I` for I-cache;
 branch immediates are ±4KiB for `B*` so use a compare-then-`BEQ/BNE` + `J`

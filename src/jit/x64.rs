@@ -22,7 +22,15 @@
 //!
 //! Scratch: `r9`, `r11`. Stack slots hold `regs_ptr` and `machine_ptr`.
 
-use super::{AluOp, Cc, JitBackend, RegOrImm, ShiftOp, Target, Width};
+use super::{AluOp, Cc, DeferredRegs, JitBackend, RegMask, RegOrImm, ShiftOp, Target, Width};
+
+/// eBPF registers held in *caller-saved* x86-64 registers (r0..r5 → rax, rdi,
+/// rsi, rdx, rcx, r8). The trampoline call destroys these whatever the
+/// instruction does with them, so they are always spilled and reloaded; only
+/// r6..r10 (rbx, r13, r14, r15, r12 — callee-saved) can be skipped. x86-64 has
+/// just six callee-saved registers, so it cannot do better without keeping
+/// some eBPF registers permanently in memory.
+const CLOBBERED: RegMask = 0b0011_1111;
 
 // x86-64 register numbers.
 const RAX: u8 = 0;
@@ -139,9 +147,12 @@ impl X64Backend {
         self.bytes(&[0x4C, 0x8B, 0x1C, 0x24]);
     }
 
-    fn spill_all(&mut self) {
+    fn spill(&mut self, mask: RegMask) {
         self.load_regs_ptr_r11();
         for (i, &h) in MAP.iter().enumerate() {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
             // mov [r11 + 8*i], h   (89 /r, mod=01 disp8)
             self.rex(true, h, R11);
             self.b(0x89);
@@ -150,9 +161,12 @@ impl X64Backend {
         }
     }
 
-    fn reload_all(&mut self) {
+    fn reload(&mut self, mask: RegMask) {
         self.load_regs_ptr_r11();
         for (i, &h) in MAP.iter().enumerate() {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
             // mov h, [r11 + 8*i]   (8B /r, mod=01 disp8)
             self.rex(true, h, R11);
             self.b(0x8B);
@@ -235,7 +249,7 @@ impl JitBackend for X64Backend {
         // mov [rsp+8], rsi   (machine_ptr)
         self.bytes(&[0x48, 0x89, 0x74, 0x24, 0x08]);
         // load eBPF register file from regs_ptr into physical registers
-        self.reload_all();
+        self.reload(super::ALL_REGS);
         // fall through into pc 0
     }
 
@@ -357,9 +371,13 @@ impl JitBackend for X64Backend {
         self.jcc(0x5, target); // jnz — taken when (dst & rhs) != 0
     }
 
-    fn deferred(&mut self, pc: usize) {
-        // Spill eBPF registers to the register file.
-        self.spill_all();
+    fn deferred(&mut self, pc: usize, regs: DeferredRegs) {
+        // r0..r5 live in caller-saved registers: the call destroys them, so
+        // they ride along no matter what the interpreter reads or writes.
+        let spill = regs.spill | CLOBBERED;
+        let reload = regs.reload | CLOBBERED;
+        // Spill the eBPF registers the interpreter will read.
+        self.spill(spill);
         // mov rdi, [rsp+8]   (machine_ptr = arg0)
         self.bytes(&[0x48, 0x8B, 0x7C, 0x24, 0x08]);
         // mov rsi, imm32(pc) (arg1)
@@ -379,8 +397,9 @@ impl JitBackend for X64Backend {
         self.bytes(&[0xFF, 0xD0]); // call rax
         // save trampoline return in r9 (r9 is not eBPF-mapped): mov r9, rax
         self.bytes(&[0x49, 0x89, 0xC1]);
-        // reload eBPF registers (r9 is untouched — not an eBPF-mapped reg)
-        self.reload_all();
+        // reload the eBPF registers the interpreter may have written (r9 is
+        // untouched — not an eBPF-mapped reg)
+        self.reload(reload);
         // test r9, r9 ; js epilogue   (STOP has the high bit set)
         self.bytes(&[0x4D, 0x85, 0xC9]);
         self.b(0x0F);
@@ -388,6 +407,11 @@ impl JitBackend for X64Backend {
         let at = self.buf.len();
         self.imm32(0);
         self.record_fix(at, Target::Epilogue);
+        if regs.falls_through {
+            // Next pc can only be the following instruction, whose code is
+            // emitted right here: skip the table load and indirect jump.
+            return;
+        }
         // movabs r11, table_base
         self.b(0x49);
         self.b(0xBB); // movabs r11

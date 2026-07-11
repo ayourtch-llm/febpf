@@ -50,10 +50,10 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
   hand-rolled native codegen for the ALU + branch core (~45× on tight loops on
   x86-64, ~26× on aarch64), with memory ops, calls and atomics deferred to the
   interpreter — so the JIT keeps the interpreter's exact memory-safety
-  guarantee, it just removes dispatch overhead. The flip side: each deferred
-  instruction pays a trampoline round-trip, so a *memory-saturated* program can
-  run slightly slower JITed than interpreted — `--jit` is a win for
-  compute-heavy programs, not a universal one. The compiler is split into an
+  guarantee, it just removes dispatch overhead. Each deferred instruction pays
+  a trampoline round-trip, so the speedup scales with how much of a program is
+  arithmetic: ~25× for a tight ALU loop, ~1.2–1.6× for memory-saturated code.
+  The compiler is split into an
   architecture-independent frontend and a `JitBackend` trait; adding **riscv64**
   means implementing that one trait (see `docs/specs/jit-backend.md`).
   Differentially tested against the interpreter.

@@ -21,6 +21,49 @@ the JIT is now behind `default = ["jit"]`, so always run `cargo test` AND
 `cargo test --no-default-features` (and clippy in both) before calling
 anything done.
 
+**DONE (2026-07-11, session 6): shrank the JIT's trampoline tax ~60%** — the
+work §4 flagged as highest-value. Memory-heavy programs went from **0.96×
+(slower than the interpreter!) to 1.22×**, and the store+load loop from 1.29×
+to 1.60×; pure-ALU is unchanged (~25×). Three parts:
+1. **Spill/reload masks** (`classify::deferred_regs`): the glue now moves only
+   the registers the interpreter reads/writes. Derived arm-by-arm from
+   `Machine::step` — *the interpreter is the spec here*. Two traps the ISA doc
+   won't tell you: a helper call **scrubs r1–r5 to zero** (so they must be
+   reloaded even though it "only writes r0"), and **`cmpxchg` reads and writes
+   r0 implicitly** though r0 is in neither operand field. Unenumerated forms
+   fall back to all-registers, i.e. to the old behaviour.
+2. **aarch64 register remap**, and this is the load-bearing bit: masks are
+   worthless unless the eBPF registers sit in *callee-saved* physical
+   registers, or the call destroys them anyway. Session 5's identity map
+   (r0..r10 → x0..x10) was exactly wrong for this. Now r0..r9 → **x19..x28**;
+   r10 is memory-backed (AAPCS64 has 10 callee-saved regs and eBPF has 11 —
+   r10 is read-only, so it is the one to give up).
+3. **Fall-through**: loads/stores/atomics/deferred-ALU can only resume at the
+   next instruction, so the glue skips the pc→address table lookup and its
+   indirect branch. Only CALL/EXIT/`gotol` still need it.
+
+Also fixed, found while doing this: the pc→address table had `n` entries but
+the interpreter can legitimately return `pc == n` (a program whose last
+instruction is a store or helper call, runnable via `--no-verify --jit`) — the
+glue indexed one past the end and branched to whatever it read. **That was a
+memory-safety hole in the one component whose whole premise is memory safety.**
+The table now has `n + 1` entries, the last pointing at the epilogue.
+
+⚠️ **The x86-64 backend changes are compile-checked, not executed** — this was
+developed on an arm64 Mac with no x86 machine or container available. The delta
+there is small and adds *no new byte encodings* (it only omits emissions), but
+**run `cargo test` and `febpf fuzz` on the x86-64 Linux box before trusting
+it**. The shared masks — the genuinely risky part — are validated by 100k
+differential programs on aarch64.
+
+Validation: `fuzz::gen_mem_program` is new and exists because **`gen_program`
+is memory-free** — it emits no deferred instructions at all, so the old 100k-
+program fuzz run could not have caught a bad mask. The new generator drives
+loads/stores at every width, atomics (incl. `cmpxchg`), helper calls, deferred
+ALU and the native `rX = r10` read; `febpf fuzz` alternates both. Note a
+differential generator may only call helpers that are deterministic in both
+engines — **not `ktime_get_ns`**, which reads the wall clock.
+
 **DONE (2026-07-11, session 5): aarch64 JIT backend** (`src/jit/aarch64.rs`)
 — the JIT now runs natively on Apple Silicon, not just x86-64 Linux. The
 frontend was genuinely drop-in: the *only* changes outside the new file were a
@@ -36,11 +79,12 @@ Three things worth knowing:
   libSystem (`macsys` in `jit/mod.rs`) — Darwin has no stable syscall ABI, so
   raw `asm!` syscalls are NOT an option here. This does not break the
   zero-dependency rule: every macOS process links libSystem anyway.
-- **eBPF r0..r10 → x0..x10, identity.** The spec suggested callee-saved
-  `x19..x29`; that was unnecessary. Native code makes exactly one call (the
-  trampoline) and the deferred glue already spills/reloads all 11 registers
-  around it, so nothing live ever crosses a call. `regs_ptr`/`machine_ptr`
-  (x19/x20) *do* need to be callee-saved.
+- ~~**eBPF r0..r10 → x0..x10, identity.** The spec suggested callee-saved
+  `x19..x29`; that was unnecessary.~~ **This was wrong — session 6 reversed
+  it.** The reasoning ("the glue spills/reloads all 11 anyway, so nothing live
+  crosses a call") was true but backwards: putting the eBPF registers in
+  caller-saved regs is what *forces* the full spill/reload. r0..r9 now live in
+  callee-saved x19..x28. The spec was right the first time.
 - **`JitBackend::resolve_branches` now returns `Result`** (x64 updated too).
   A64's `B.cond` reaches only ±1MiB, so a program over ~1MiB of emitted code
   can't be encoded; it now fails compilation cleanly (caller falls back to the
@@ -207,33 +251,41 @@ stores, atomics, `lddw`, helper calls, bpf-to-bpf calls, `exit` — is
 So the JIT cannot introduce memory-unsafety the interpreter doesn't already
 prevent; it only removes dispatch overhead.
 
-**That hybrid has a performance cliff, and it is not documented anywhere else,
-so know it before you "optimize" the JIT** (measured on M-series, aarch64;
-x86-64 will differ in magnitude, not in shape):
+**The hybrid still has a performance gradient — know it before you "optimize"
+the JIT.** Every deferred instruction pays a trampoline round-trip, so the win
+tracks the **fraction of executed instructions that are deferred** (M-series,
+aarch64; x86-64 differs in magnitude, not in shape):
 
 | executed instruction | cost under interp | cost under JIT |
 |---|---|---|
-| native (ALU/branch)  | ~2.4 ns | **~0.12 ns** |
-| deferred (mem/call)  | ~2.4–3.3 ns | **~6.5 ns** |
+| native (ALU/branch)  | ~2–4 ns | **~0.12 ns** |
+| deferred (mem/call)  | ~4.3 ns | **~5.3 ns** (was ~6.7) |
 
-A deferred instruction is *more expensive* under the JIT than interpreted,
-because each one pays a trampoline round-trip: spill 11 registers, call,
-reload 11 registers, indirect-jump through the pc→address table (~3–4 ns of
-tax). So the JIT's win depends entirely on the **fraction of executed
-instructions that are deferred**:
+- ~0% deferred (`sum_loop`): **~25× faster**
+- ~40% deferred (store+load loop): **1.6×** (was 1.29×)
+- ~67% deferred (memory-saturated): **1.22×** (was 0.96× — the JIT *lost*)
 
-- ~0% deferred (`sum_loop`): **26× faster**
-- ~40% deferred (store+load in the loop): only **1.25×**
-- ~67% deferred (memory-saturated loop): **0.90× — the JIT is 10% SLOWER**
+Session 6 cut the tax ~60% (details below), moving break-even from ~40-50%
+deferred to **~80%**, so realistic map/packet-heavy programs now sit
+comfortably in the winning region. It is no longer easy to construct a program
+where `--jit` loses, but a pathological one (nearly all memory ops) would still
+only break even — the trampoline cannot be cheaper than the interpreter's own
+dispatch of the same instruction.
 
-Break-even is roughly 40–50% deferred. Real map/packet-heavy programs sit
-uncomfortably close to that line, so *do not assume `--jit` is always a win* —
-measure. The obvious fix is not "compile loads natively" (that would forfeit
-the safety story, see above) but to **shrink the trampoline tax**: spill/reload
-only the registers the deferred instruction actually touches instead of all 11.
-`classify.rs` already decodes each instruction, so it could hand the backend a
-register mask cheaply. Nobody has done this yet; it is the highest-value JIT
-work left, and it benefits x86-64 and aarch64 equally.
+What made it faster, and what is left:
+- **Spill/reload masks** (`classify::deferred_regs`): move only the registers
+  the interpreter actually reads/writes, not all 11. This *only pays off if the
+  eBPF registers live in callee-saved physical registers* — otherwise the call
+  destroys them anyway. That is why aarch64 maps r0..r9 → x19..x28; x86-64 has
+  too few callee-saved registers and must always carry r0..r5.
+- **Fall-through**: a load/store/atomic/ALU can only continue at the next
+  instruction, so the glue skips the pc→address table lookup and its indirect
+  branch entirely. Only CALL/EXIT/`gotol` still need the table.
+- **Still on the table**: the remaining ~1 ns tax is the call itself plus
+  `Machine::step`'s re-decode of the instruction (it re-reads the opcode,
+  re-checks `insn_count`, the profile hook, bounds). A specialized entry point
+  that skips the re-decode could shave more. Compiling loads natively would be
+  faster still but forfeits the memory-safety story (see above) — don't.
 
 The frontend (`jit/mod.rs`, `classify.rs`) is architecture-independent; the
 backends (`x64.rs`, `aarch64.rs`) are pure encoders implementing `JitBackend`.

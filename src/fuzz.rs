@@ -316,6 +316,123 @@ fn gen_mixed(rng: &mut Prng, p: &mut Vec<Insn>) {
     }
 }
 
+/// Helpers whose return value is *identical* in the interpreter and the JIT,
+/// so a differential test can call them. `get_prandom_u32` is a fixed-seed
+/// xorshift (each `Vm` starts from the same seed) and `get_smp_processor_id`
+/// is a constant. `ktime_get_ns` is deliberately absent: it reads the wall
+/// clock, and the two engines would disagree.
+const DETERMINISTIC_HELPERS: &[i32] = &[
+    7, // get_prandom_u32
+    8, // get_smp_processor_id
+];
+
+/// Generate a **memory-heavy** program: stack loads/stores at every width,
+/// atomics (including `cmpxchg`, which reads and writes r0 implicitly),
+/// helper calls, deferred ALU (div/mod/byte-swap/sign-extend/register shifts)
+/// and native reads of r10 — interleaved with native ALU.
+///
+/// This exists to exercise the JIT's *deferred* path, which [`gen_program`]
+/// never touches: it is memory-free by construction, so it cannot catch a
+/// wrong spill/reload mask (see `DeferredRegs`). Every access is an aligned,
+/// in-bounds stack slot so both engines run clean to `exit` — a program that
+/// faults would prove nothing about codegen.
+pub fn gen_mem_program(rng: &mut Prng) -> Vec<Insn> {
+    let mut p: Vec<Insn> = Vec::new();
+    for r in 0..10u8 {
+        p.push(ins(0xb7 /* mov64 imm */, r, 0, 0, rng.next_u32() as i32));
+    }
+
+    // Aligned, in-bounds stack slot: r10-8 .. r10-512.
+    let slot = |rng: &mut Prng| -(8 + 8 * (rng.below(63) as i16));
+    const SIZES: &[u8] = &[size::B, size::H, size::W, size::DW];
+    const ATOMIC_OPS: &[i32] = &[
+        atomic::ADD,
+        atomic::OR,
+        atomic::AND,
+        atomic::XOR,
+        atomic::ADD | atomic::FETCH,
+        atomic::OR | atomic::FETCH,
+        atomic::XCHG,
+        atomic::CMPXCHG,
+    ];
+
+    let body = 8 + rng.below(20) as usize;
+    for _ in 0..body {
+        // Registers 1..=9: leave r0 free to be clobbered by helpers/cmpxchg.
+        let d = 1 + rng.below(9) as u8;
+        let s = 1 + rng.below(9) as u8;
+        let k = slot(rng);
+        match rng.below(9) {
+            // store a register, then read it back at the same width
+            0 => {
+                let sz = *rng.pick(SIZES);
+                p.push(ins(stx(sz), 10, s, k, 0));
+                p.push(ins(ldx(sz), d, 10, k, 0));
+            }
+            // store an immediate, load it back
+            1 => {
+                let sz = *rng.pick(SIZES);
+                p.push(ins(class::ST | mode::MEM | sz, 10, 0, k, rng.next_u32() as i32));
+                p.push(ins(ldx(sz), d, 10, k, 0));
+            }
+            // sign-extending load (deferred; reads src, writes dst)
+            2 => {
+                let sz = *rng.pick(&[size::B, size::H, size::W]);
+                p.push(ins(stx(size::DW), 10, s, k, 0));
+                p.push(ins(class::LDX | mode::MEMSX | sz, d, 10, k, 0));
+            }
+            // atomic RMW on an 8-byte slot (cmpxchg touches r0 implicitly)
+            3 => {
+                let op = *rng.pick(ATOMIC_OPS);
+                let sz = if rng.below(2) == 0 { size::DW } else { size::W };
+                p.push(ins(stx(size::DW), 10, s, k, 0));
+                p.push(ins(class::STX | mode::ATOMIC | sz, 10, s, k, op));
+            }
+            // copy the frame pointer and store through it: the one native
+            // instruction that *reads* r10, which aarch64 keeps in memory
+            4 => {
+                p.push(ins(0xbf /* mov64 reg */, d, 10, 0, 0)); // rd = r10
+                p.push(ins(alu64(alu::ADD), d, 0, 0, k as i32)); // rd += k
+                p.push(ins(stx(size::DW), d, s, 0, 0)); // *(u64*)(rd) = rs
+                p.push(ins(ldx(size::DW), d, d, 0, 0)); // rd = *(u64*)(rd)
+            }
+            // helper call: scrubs r1-r5, writes r0
+            5 => {
+                // NOT `SAFE_HELPERS`: that list includes ktime_get_ns, which
+                // returns the wall clock. A differential test may only call
+                // helpers whose result is identical in both engines.
+                let h = *rng.pick(DETERMINISTIC_HELPERS);
+                p.push(ins(class::JMP | jmp::CALL, 0, 0, 0, h));
+            }
+            // deferred ALU: div/mod (by a possibly-zero register), byte swap,
+            // register-count shifts
+            6 => {
+                let op = *rng.pick(&[alu::DIV, alu::MOD]);
+                let is32 = rng.below(2) == 1;
+                let opc = if is32 { alu32(op) } else { alu64(op) };
+                p.push(ins(opc | src::X, d, s, 0, 0));
+            }
+            7 => {
+                let imm = *rng.pick(&[16i32, 32, 64]);
+                p.push(ins(alu64(alu::END), d, 0, 0, imm));
+            }
+            _ => {
+                let sop = *rng.pick(SHIFT_OPS);
+                let is32 = rng.below(2) == 1;
+                let opc = if is32 { alu32(sop) } else { alu64(sop) };
+                p.push(ins(opc | src::X, d, s, 0, 0));
+            }
+        }
+        // Keep some native ALU in the mix so the JIT is not purely trampolines.
+        let aop = *rng.pick(ALU_OPS);
+        p.push(ins(alu64(aop), rng.below(10) as u8, 0, 0, rng.next_u32() as i32));
+    }
+
+    p.push(ins(0xb7, 0, 0, 0, rng.next_u32() as i32)); // r0 = imm
+    p.push(ins(class::JMP | jmp::EXIT, 0, 0, 0, 0));
+    p
+}
+
 /// Run `insns` (no maps) under the interpreter and the JIT with a fresh 16-byte
 /// zero context, returning `(interp_r0, jit_r0)`. Errors from either engine are
 /// surfaced as `Err`.
@@ -442,6 +559,33 @@ mod tests {
                     crate::disasm::disasm_program(&prog)
                 ),
                 Err(e) => panic!("seed {seed}: engine error: {e}\n{}", crate::disasm::disasm_program(&prog)),
+            }
+        }
+    }
+
+    /// The same invariant over *memory-heavy* programs. [`gen_program`] is
+    /// memory-free, so it exercises none of the JIT's deferred path: it cannot
+    /// catch a wrong spill/reload mask, a clobbered scratch register, or a
+    /// mis-encoded trampoline. This generator does.
+    #[cfg(feature = "jit")]
+    #[test]
+    fn interp_and_jit_agree_on_memory() {
+        if crate::jit::compile(&[Insn { opcode: 0x95, dst: 0, src: 0, off: 0, imm: 0 }]).is_err() {
+            return;
+        }
+        for seed in 0..2000u64 {
+            let mut rng = Prng::new(seed ^ 0xA5A5_0000_0000);
+            let prog = gen_mem_program(&mut rng);
+            match interp_vs_jit(&prog) {
+                Ok((i, j)) => assert_eq!(
+                    i, j,
+                    "interp/JIT mismatch on memory seed {seed}:\n{}",
+                    crate::disasm::disasm_program(&prog)
+                ),
+                Err(e) => panic!(
+                    "memory seed {seed}: engine error: {e}\n{}",
+                    crate::disasm::disasm_program(&prog)
+                ),
             }
         }
     }

@@ -8,45 +8,70 @@
 //!
 //! ## Register mapping (eBPF → aarch64)
 //!
-//! eBPF r0..r10 map **identically** to `x0..x10`. All of those are
-//! caller-saved, which is fine: native code makes exactly one kind of call
-//! (the deferred-instruction trampoline), and that glue spills all 11 eBPF
-//! registers to the register file before the call and reloads them after,
-//! so nothing live crosses a call boundary in a scratch register.
+//! eBPF r0..r9 live in `x19..x28`, which are **callee-saved**. That is the
+//! whole point: the trampoline call preserves them, so a deferred instruction
+//! only has to spill the registers the interpreter *reads* and reload the ones
+//! it *writes* (see [`DeferredRegs`]). Mapping them to caller-saved registers
+//! instead would force all 11 to be spilled and reloaded on every deferred
+//! instruction, which is exactly the trampoline tax this mapping avoids.
 //!
-//! | purpose            | register | notes                                |
-//! |--------------------|----------|--------------------------------------|
-//! | eBPF r0..r10       | x0..x10  | identity map, caller-saved           |
-//! | `regs_ptr`         | x19      | callee-saved, survives trampoline    |
-//! | `machine_ptr`      | x20      | callee-saved, survives trampoline    |
-//! | trampoline return  | x11      | next pc / STOP                       |
-//! | table base/target  | x12      |                                      |
-//! | immediates         | x15      | materialized rhs operands            |
-//! | call target        | x16      | IP0, conventional intra-call scratch |
+//! AAPCS64 offers ten callee-saved registers (`x19..x28`) and eBPF has eleven
+//! registers, so one has to live somewhere else. That one is **r10**, the
+//! frame pointer: it is read-only in eBPF (the verifier rejects writes, and
+//! `classify::lower` defers any that slip through), and the interpreter
+//! already rewrites `regs[10]` on every call/exit. So r10 is simply left in
+//! the in-memory register file, which is always authoritative for it, and
+//! loaded on demand in the rare native instruction that reads it.
+//!
+//! | purpose            | register  | notes                                 |
+//! |--------------------|-----------|---------------------------------------|
+//! | eBPF r0..r9        | x19..x28  | callee-saved: survive the trampoline  |
+//! | eBPF r10           | `regs[10]`| memory-backed, read-only              |
+//! | `regs_ptr`         | `[sp,#96]`| stack slot (frees a callee-saved reg) |
+//! | `machine_ptr`      | `[sp,#104]`|                                      |
+//! | regs_ptr scratch   | x9        | reloaded after each call (caller-saved)|
+//! | trampoline return  | x11       | next pc / STOP                        |
+//! | table base/target  | x12       |                                       |
+//! | r10 materialization| x14       | left operand of a compare             |
+//! | immediates / rhs   | x15       |                                       |
+//! | call target        | x16       | IP0, conventional intra-call scratch  |
 //!
 //! `W`-register forms give eBPF's 32-bit zero-extension semantics for free.
 //! Absolute pointers (trampoline, pc→address table) live in an 8-byte-aligned
-//! literal pool after the epilogue, loaded with `LDR (literal)` and written
-//! by `patch_absolutes` once the code has its final address.
+//! literal pool after the epilogue, loaded with `LDR (literal)` and written by
+//! `patch_absolutes` once the code has its final address.
 
-use super::{AluOp, Cc, JitBackend, RegOrImm, ShiftOp, Target, Width};
+use super::{AluOp, Cc, DeferredRegs, JitBackend, RegMask, RegOrImm, ShiftOp, Target, Width};
+use crate::insn::REG_FP;
 
-/// eBPF register index → physical register number (identity, see above).
+/// eBPF register index → physical register. Only valid for r0..r9; r10 is
+/// memory-backed (see [`Aarch64Backend::read_reg`]).
 #[inline]
 fn hreg(ebpf: u8) -> u32 {
-    ebpf as u32
+    debug_assert!(ebpf < REG_FP, "r10 has no physical register");
+    19 + ebpf as u32
 }
 
-const REGS_PTR: u32 = 19; // x19
-const MACHINE_PTR: u32 = 20; // x20
-const RET_SAVE: u32 = 11; // x11: trampoline return (next pc / STOP)
-const TBL: u32 = 12; // x12: table base, then jump target
-const IMM: u32 = 15; // x15: materialized immediates
-const CALL_TGT: u32 = 16; // x16 (IP0): trampoline address
+/// eBPF registers that have a physical register (r0..r9).
+const IN_REGS: RegMask = 0x3FF;
+
+const TMP: u32 = 9; // regs_ptr scratch (caller-saved: reloaded after calls)
+const RET_SAVE: u32 = 11; // trampoline return (next pc / STOP)
+const TBL: u32 = 12; // table base, then jump target
+const DSTV: u32 = 14; // r10 materialized as a compare's left operand
+const IMM: u32 = 15; // immediates / materialized rhs
+const CALL_TGT: u32 = 16; // x16 (IP0)
 const FP: u32 = 29;
 const LR: u32 = 30;
 const SP: u32 = 31; // also XZR in register-operand positions
 const ZR: u32 = 31;
+
+/// Frame layout: 16-byte frame record, x19..x28 (5 pairs), then the two
+/// incoming pointers. 112 bytes keeps sp 16-byte aligned for the call.
+const FRAME: u32 = 112;
+/// Stack slots, in 8-byte units from sp.
+const REGS_SLOT: u32 = 12; // [sp, #96]  — regs_ptr
+const MACH_SLOT: u32 = 13; // [sp, #104] — machine_ptr
 
 const NOP: u32 = 0xD503_201F;
 
@@ -126,9 +151,8 @@ impl Aarch64Backend {
         }
     }
 
-    /// Add/sub (shifted register): `rd = rn op rm`. `base` is the 32-bit
-    /// opcode (`ADD` 0x0B.., `SUB` 0x4B.., `SUBS` 0x6B..); logical ops use
-    /// [`logic_rrr`].
+    /// Add/sub (shifted register): `rd = rn op rm`. `base` selects ADD
+    /// (0x0B..), SUB (0x4B..) or SUBS (0x6B..).
     fn addsub_rrr(&mut self, base: u32, w: Width, rd: u32, rn: u32, rm: u32) {
         self.w(base | Self::sf(w) | (rm << 16) | (rn << 5) | rd);
     }
@@ -142,6 +166,20 @@ impl Aarch64Backend {
     /// `MOV rd, rm` as `ORR rd, zr, rm` (W-form zero-extends).
     fn mov_rr(&mut self, w: Width, rd: u32, rm: u32) {
         self.logic_rrr(0x2A00_0000, w, rd, ZR, rm);
+    }
+
+    /// `STR xt, [xn, #8*slot]` / `LDR xt, [xn, #8*slot]` (unsigned offset).
+    fn str_off(&mut self, xt: u32, xn: u32, slot: u32) {
+        self.w(0xF900_0000 | (slot << 10) | (xn << 5) | xt);
+    }
+    fn ldr_off(&mut self, xt: u32, xn: u32, slot: u32) {
+        self.w(0xF940_0000 | (slot << 10) | (xn << 5) | xt);
+    }
+
+    /// Load `regs_ptr` from its stack slot into [`TMP`]. Needed again after
+    /// every call: x9 is caller-saved.
+    fn load_regs_ptr(&mut self) {
+        self.ldr_off(TMP, SP, REGS_SLOT);
     }
 
     /// Materialize an arbitrary 64-bit constant with MOVZ/MOVN + MOVK.
@@ -169,9 +207,20 @@ impl Aarch64Backend {
         }
     }
 
-    /// Materialize a sign-extended i32 rhs into the scratch register and
-    /// return it. W-form consumers read only the low 32 bits, which equal
-    /// the raw imm bits, so one materialization serves both widths.
+    /// The physical register holding eBPF register `ebpf`, materializing r10
+    /// from the register file into `scratch` when needed.
+    fn read_reg(&mut self, ebpf: u8, scratch: u32) -> u32 {
+        if ebpf < REG_FP {
+            return hreg(ebpf);
+        }
+        self.load_regs_ptr();
+        self.ldr_off(scratch, TMP, REG_FP as u32);
+        scratch
+    }
+
+    /// Materialize a sign-extended i32 rhs into [`IMM`]. W-form consumers read
+    /// only the low 32 bits, which equal the raw immediate bits, so one
+    /// materialization serves both widths.
     fn imm_to_scratch(&mut self, imm: i32) -> u32 {
         self.mov_u64(IMM, imm as i64 as u64);
         IMM
@@ -179,34 +228,17 @@ impl Aarch64Backend {
 
     fn rhs_reg(&mut self, rhs: RegOrImm) -> u32 {
         match rhs {
-            RegOrImm::Reg(s) => hreg(s),
+            RegOrImm::Reg(s) => self.read_reg(s, IMM),
             RegOrImm::Imm(v) => self.imm_to_scratch(v),
         }
     }
 
-    /// `STR xt, [x19, #8*slot]` / `LDR xt, [x19, #8*slot]`.
-    fn str_slot(&mut self, xt: u32, slot: u32) {
-        self.w(0xF900_0000 | (slot << 10) | (REGS_PTR << 5) | xt);
-    }
-    fn ldr_slot(&mut self, xt: u32, slot: u32) {
-        self.w(0xF940_0000 | (slot << 10) | (REGS_PTR << 5) | xt);
-    }
-
-    fn spill_all(&mut self) {
-        for i in 0..super::abi::NUM_REGS as u32 {
-            self.str_slot(i, i);
-        }
-    }
-    fn reload_all(&mut self) {
-        for i in 0..super::abi::NUM_REGS as u32 {
-            self.ldr_slot(i, i);
-        }
-    }
-
-    /// `CMP dst, rhs` (`SUBS zr, dst, rhs`) for a following B.cond.
+    /// `CMP dst, rhs` (`SUBS zr, dst, rhs`) for a following B.cond. `dst` is
+    /// read-only here, so it may legitimately be r10.
     fn emit_cmp(&mut self, w: Width, dst: u8, rhs: RegOrImm) {
+        let a = self.read_reg(dst, DSTV);
         let rm = self.rhs_reg(rhs);
-        self.addsub_rrr(0x6B00_0000, w, ZR, hreg(dst), rm);
+        self.addsub_rrr(0x6B00_0000, w, ZR, a, rm);
     }
 
     /// `B.cond` with a fixup.
@@ -251,25 +283,34 @@ impl JitBackend for Aarch64Backend {
     fn mark_label(&mut self, _pc: usize) {}
 
     fn prologue(&mut self) {
-        // stp x29, x30, [sp, #-32]!  (frame record + room for x19/x20)
-        self.w(0xA980_0000 | (0x7C << 15) | (LR << 10) | (SP << 5) | FP);
-        // stp x19, x20, [sp, #16]
-        self.w(0xA900_0000 | (2 << 15) | (MACHINE_PTR << 10) | (SP << 5) | REGS_PTR);
+        // stp x29, x30, [sp, #-112]!   (imm7 = -112/8 = -14)
+        self.w(0xA980_0000 | ((-14i32 as u32 & 0x7F) << 15) | (LR << 10) | (SP << 5) | FP);
+        // stp x19..x28, [sp, #16..#80]
+        for (i, pair) in [(19, 20), (21, 22), (23, 24), (25, 26), (27, 28)].iter().enumerate() {
+            let off = 2 + 2 * i as u32; // in 8-byte units
+            self.w(0xA900_0000 | (off << 15) | (pair.1 << 10) | (SP << 5) | pair.0);
+        }
         // mov x29, sp   (ADD x29, sp, #0)
         self.w(0x9100_0000 | (SP << 5) | FP);
-        // x19 = regs_ptr (arg0), x20 = machine_ptr (arg1)
-        self.mov_rr(Width::W64, REGS_PTR, 0);
-        self.mov_rr(Width::W64, MACHINE_PTR, 1);
-        // load the eBPF register file, then fall through into pc 0
-        self.reload_all();
+        // stash the incoming pointers: regs_ptr (x0), machine_ptr (x1)
+        self.str_off(0, SP, REGS_SLOT);
+        self.str_off(1, SP, MACH_SLOT);
+        // load eBPF r0..r9 from the register file (r10 stays in memory)
+        for i in 0..10u32 {
+            self.ldr_off(19 + i, 0, i);
+        }
+        // fall through into pc 0
     }
 
     fn epilogue(&mut self) {
         self.epilogue = self.buf.len();
-        // ldp x19, x20, [sp, #16]
-        self.w(0xA940_0000 | (2 << 15) | (MACHINE_PTR << 10) | (SP << 5) | REGS_PTR);
-        // ldp x29, x30, [sp], #32
-        self.w(0xA8C0_0000 | (4 << 15) | (LR << 10) | (SP << 5) | FP);
+        // ldp x19..x28
+        for (i, pair) in [(19, 20), (21, 22), (23, 24), (25, 26), (27, 28)].iter().enumerate() {
+            let off = 2 + 2 * i as u32;
+            self.w(0xA940_0000 | (off << 15) | (pair.1 << 10) | (SP << 5) | pair.0);
+        }
+        // ldp x29, x30, [sp], #112   (post-index, imm7 = 14)
+        self.w(0xA8C0_0000 | (14 << 15) | (LR << 10) | (SP << 5) | FP);
         self.w(0xD65F_03C0); // ret
         // 8-byte-aligned literal pool: [trampoline u64][table u64]
         if !self.buf.len().is_multiple_of(8) {
@@ -280,7 +321,8 @@ impl JitBackend for Aarch64Backend {
     }
 
     fn alu_reg(&mut self, op: AluOp, w: Width, dst: u8, src: u8) {
-        let (d, s) = (hreg(dst), hreg(src));
+        let s = self.read_reg(src, IMM);
+        let d = hreg(dst);
         match op {
             AluOp::Add => self.addsub_rrr(0x0B00_0000, w, d, d, s),
             AluOp::Sub => self.addsub_rrr(0x4B00_0000, w, d, d, s),
@@ -303,12 +345,13 @@ impl JitBackend for Aarch64Backend {
             AluOp::Or => self.logic_rrr(0x2A00_0000, w, d, d, s),
             AluOp::And => self.logic_rrr(0x0A00_0000, w, d, d, s),
             AluOp::Xor => self.logic_rrr(0x4A00_0000, w, d, d, s),
-            AluOp::Mul => self.w(0x1B00_7C00 | Self::sf(w) | (s << 16) | (hreg(dst) << 5) | hreg(dst)),
+            AluOp::Mul => self.w(0x1B00_7C00 | Self::sf(w) | (s << 16) | (d << 5) | d),
         }
     }
 
     fn mov_reg(&mut self, w: Width, dst: u8, src: u8) {
-        let (d, s) = (hreg(dst), hreg(src));
+        let s = self.read_reg(src, IMM);
+        let d = hreg(dst);
         if d == s && w == Width::W64 {
             return; // no-op (W32 must still zero-extend)
         }
@@ -361,27 +404,52 @@ impl JitBackend for Aarch64Backend {
 
     fn jset_branch(&mut self, w: Width, dst: u8, rhs: RegOrImm, target: Target) {
         // TST dst, rhs (ANDS zr, dst, rhs); taken when (dst & rhs) != 0.
+        let a = self.read_reg(dst, DSTV);
         let rm = self.rhs_reg(rhs);
-        self.logic_rrr(0x6A00_0000, w, ZR, hreg(dst), rm);
+        self.logic_rrr(0x6A00_0000, w, ZR, a, rm);
         self.bcond(cond::NE, target);
     }
 
-    fn deferred(&mut self, pc: usize) {
-        // Spill the eBPF register file.
-        self.spill_all();
+    fn deferred(&mut self, pc: usize, regs: DeferredRegs) {
+        // r0..r9 are callee-saved, so only what the interpreter actually reads
+        // has to reach the register file. r10 needs nothing: it has no
+        // physical copy, and `regs[10]` is always authoritative.
+        let spill = regs.spill & IN_REGS;
+        let reload = regs.reload & IN_REGS;
+
+        if spill != 0 {
+            self.load_regs_ptr();
+            for i in 0..10u32 {
+                if spill & (1 << i) != 0 {
+                    self.str_off(19 + i, TMP, i);
+                }
+            }
+        }
         // arg0 = machine_ptr, arg1 = pc
-        self.mov_rr(Width::W64, 0, MACHINE_PTR);
+        self.ldr_off(0, SP, MACH_SLOT);
         self.mov_u64(1, pc as u64);
         // Call the trampoline through the literal pool.
         self.ldr_lit(CALL_TGT, FixTarget::PoolTrampoline);
         self.w(0xD63F_0000 | (CALL_TGT << 5)); // blr x16
-        // Save next-pc/STOP, reload the eBPF registers (loads leave flags
-        // alone, but TST comes after the reload anyway).
+        // Save next-pc/STOP before touching x0.
         self.mov_rr(Width::W64, RET_SAVE, 0);
-        self.reload_all();
+        if reload != 0 {
+            self.load_regs_ptr(); // x9 was caller-saved: reload it
+            for i in 0..10u32 {
+                if reload & (1 << i) != 0 {
+                    self.ldr_off(19 + i, TMP, i);
+                }
+            }
+        }
         // STOP has bit 63 set: TST sets N, B.MI exits via the epilogue.
         self.logic_rrr(0x6A00_0000, Width::W64, ZR, RET_SAVE, RET_SAVE);
         self.bcond(cond::MI, Target::Epilogue);
+        if regs.falls_through {
+            // The interpreter can only have landed on the next instruction,
+            // whose code the frontend emits right here — no table lookup and
+            // no indirect branch.
+            return;
+        }
         // Resume: br table[next_pc]
         self.ldr_lit(TBL, FixTarget::PoolTable);
         // ldr x12, [x12, x11, lsl #3]
@@ -436,3 +504,7 @@ impl JitBackend for Aarch64Backend {
         code[self.pool + 8..self.pool + 16].copy_from_slice(&table.to_le_bytes());
     }
 }
+
+// The frame size is baked into the prologue/epilogue immediates above; keep
+// the constant honest if anyone changes the layout.
+const _: () = assert!(FRAME == 112 && REGS_SLOT * 8 == 96 && MACH_SLOT * 8 == 104);

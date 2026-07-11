@@ -96,7 +96,7 @@ pub fn conftest(o: &Opts, prog: Program) -> Result<ExitCode, String> {
 }
 
 pub fn fuzz(o: &Opts) -> Result<ExitCode, String> {
-    use febpf::fuzz::{gen_program, interp_vs_jit, random_seed, Prng};
+    use febpf::fuzz::{gen_mem_program, gen_program, interp_vs_jit, random_seed, Prng};
 
     let base_seed = o.seed.unwrap_or_else(random_seed);
     let iters = o.iters;
@@ -129,7 +129,16 @@ pub fn fuzz(o: &Opts) -> Result<ExitCode, String> {
         // iteration i is reproducible with `--seed <printed>`.
         let seed = base_seed.wrapping_add(i);
         let mut rng = Prng::new(seed);
-        let prog = gen_program(&mut rng);
+        // Alternate generators: `gen_program` is memory-free and so exercises
+        // only the JIT's natively-compiled core, while `gen_mem_program` drives
+        // the deferred path (loads/stores/atomics/helpers/r10). Without the
+        // latter, a bad spill/reload mask would sail straight through.
+        let memory = i % 2 == 1;
+        let prog = if memory {
+            gen_mem_program(&mut rng)
+        } else {
+            gen_program(&mut rng)
+        };
 
         let (r_interp, r_jit) = match interp_vs_jit(&prog) {
             Ok(v) => v,
@@ -143,7 +152,10 @@ pub fn fuzz(o: &Opts) -> Result<ExitCode, String> {
             ));
         }
 
-        if use_kernel {
+        // Kernel diff only for the memory-free generator: the memory one calls
+        // `get_prandom_u32`, which is a fixed seed in febpf (for replayability)
+        // but genuinely random in the kernel — the retvals could not match.
+        if use_kernel && !memory {
             let mut log = String::new();
             match kbpf::run_program(&prog, &[], &[0u8; 16], Some(&mut log)) {
                 Ok(retval) => {
