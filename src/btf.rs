@@ -1203,4 +1203,133 @@ pub(crate) mod tests {
         assert_eq!(essential_name("___weird"), "___weird");
         assert_eq!(essential_name(""), "");
     }
+
+    /// A small task_struct-like graph shared by the read_kind /
+    /// resolve_ctx_args tests:
+    ///   [1] int
+    ///   [2] struct task { int pid; int flags:3; struct task *parent;
+    ///                     struct task *peers[2]; struct wrap w; }   (size 56)
+    ///   [3] ptr -> task
+    ///   [4] array of 2 ptr->task
+    ///   [5] struct wrap { int depth; struct task *leader; }         (size 16)
+    ///   [6] typedef btf_trace_evt -> [7] ptr -> [8] proto(void*, int, task*)
+    ///   [9] ptr -> void   (the tp_btf __data arg)
+    ///   [10] func probe_target -> [11] proto(int, task*) ret task*
+    fn ctx_test_btf() -> Btf {
+        let strings = [
+            "int", "pid", "flags", "parent", "peers", "w", "task", "depth",
+            "leader", "wrap", "btf_trace_evt", "probe_target",
+        ];
+        let s = |n| stroff(&strings, n);
+        let blob = build_btf(
+            &strings,
+            &[
+                // [1] int
+                (s("int"), info(kind::INT, 0, false), 4, vec![(1u32 << 24) | 32]),
+                // [2] struct task (kflag: member offsets carry bitfield size)
+                (
+                    s("task"),
+                    info(kind::STRUCT, 5, true),
+                    56,
+                    vec![
+                        s("pid"), 1, 0,                    // int pid @0
+                        s("flags"), 1, (3u32 << 24) | 32,  // int flags:3 @4
+                        s("parent"), 3, 64,                // task *parent @8
+                        s("peers"), 4, 128,                // task *peers[2] @16
+                        s("w"), 5, 256,                    // struct wrap w @32
+                    ],
+                ),
+                // [3] ptr -> task
+                (0, info(kind::PTR, 0, false), 2, vec![]),
+                // [4] array: 2 x ptr->task (elem [3], index type [1])
+                (0, info(kind::ARRAY, 0, false), 0, vec![3, 1, 2]),
+                // [5] struct wrap { int depth; task *leader; }
+                (
+                    s("wrap"),
+                    info(kind::STRUCT, 2, false),
+                    16,
+                    vec![s("depth"), 1, 0, s("leader"), 3, 64],
+                ),
+                // [6] typedef btf_trace_evt -> [7]
+                (s("btf_trace_evt"), info(kind::TYPEDEF, 0, false), 7, vec![]),
+                // [7] ptr -> [8]
+                (0, info(kind::PTR, 0, false), 8, vec![]),
+                // [8] proto (void *__data, int, task*) -> void
+                (
+                    0,
+                    info(kind::FUNC_PROTO, 3, false),
+                    0,
+                    vec![0, 9, 0, 1, 0, 3],
+                ),
+                // [9] ptr -> void
+                (0, info(kind::PTR, 0, false), 0, vec![]),
+                // [10] func probe_target -> proto [11]
+                (s("probe_target"), info(kind::FUNC, 0, false), 11, vec![]),
+                // [11] proto (int, task*) -> task*
+                (0, info(kind::FUNC_PROTO, 2, false), 3, vec![0, 1, 0, 3]),
+            ],
+        );
+        Btf::parse(true, &blob).unwrap()
+    }
+
+    #[test]
+    fn read_kind_walks_like_btf_struct_walk() {
+        let btf = ctx_test_btf();
+        let task = 2u32;
+        // Whole-pointer member reads chase to the pointee type.
+        assert_eq!(btf.read_kind(task, 8, 8).unwrap(), Some(task)); // parent
+        assert_eq!(btf.read_kind(task, 16, 8).unwrap(), Some(task)); // peers[0]
+        assert_eq!(btf.read_kind(task, 24, 8).unwrap(), Some(task)); // peers[1]
+        // Nested struct member: w.leader @ 32+8.
+        assert_eq!(btf.read_kind(task, 40, 8).unwrap(), Some(task));
+        // Scalars, partial pointer reads, and element-straddling reads are data.
+        assert_eq!(btf.read_kind(task, 0, 4).unwrap(), None); // pid
+        assert_eq!(btf.read_kind(task, 8, 4).unwrap(), None); // half of parent
+        assert_eq!(btf.read_kind(task, 20, 8).unwrap(), None); // straddles peers
+        assert_eq!(btf.read_kind(task, 32, 4).unwrap(), None); // w.depth
+        // Bitfield members never produce pointers (and don't confuse the walk).
+        assert_eq!(btf.read_kind(task, 4, 4).unwrap(), None);
+        // Reading through the pointer TYPE itself (deref of ptr-to-task at
+        // offset 0 size 8 of type ptr) — resolves the pointee.
+        assert_eq!(btf.read_kind(3, 0, 8).unwrap(), Some(task));
+    }
+
+    #[test]
+    fn resolve_ctx_args_matches_btf_ctx_access() {
+        let btf = ctx_test_btf();
+        let task = 2u32;
+        // tp_btf: typedef btf_trace_<name> -> ptr -> proto, __data skipped.
+        let args = resolve_ctx_args(&btf, "tp_btf/evt").unwrap().unwrap();
+        assert_eq!(args, vec![CtxSlot::Scalar, CtxSlot::Ptr { btf_id: task }]);
+        // fentry/fmod_ret: the function's own proto.
+        let args = resolve_ctx_args(&btf, "fentry/probe_target").unwrap().unwrap();
+        assert_eq!(args, vec![CtxSlot::Scalar, CtxSlot::Ptr { btf_id: task }]);
+        // fexit: one extra slot typed by the return value (here task*).
+        let args = resolve_ctx_args(&btf, "fexit/probe_target").unwrap().unwrap();
+        assert_eq!(
+            args,
+            vec![
+                CtxSlot::Scalar,
+                CtxSlot::Ptr { btf_id: task },
+                CtxSlot::Ptr { btf_id: task }
+            ]
+        );
+        // Non-BTF-typed program types resolve to None…
+        assert!(resolve_ctx_args(&btf, "kprobe/probe_target").unwrap().is_none());
+        assert!(resolve_ctx_args(&btf, "tracepoint/sched/x").unwrap().is_none());
+        // …but a BTF-typed section with a missing target is an error.
+        assert!(resolve_ctx_args(&btf, "tp_btf/nope").is_err());
+        assert!(resolve_ctx_args(&btf, "fentry/nope").is_err());
+    }
+
+    #[test]
+    fn btf_ctx_section_names() {
+        assert!(is_btf_ctx_section("tp_btf/sched_switch"));
+        assert!(is_btf_ctx_section("fentry/vfs_read"));
+        assert!(is_btf_ctx_section("fexit/vfs_read"));
+        assert!(is_btf_ctx_section("fmod_ret/x"));
+        assert!(!is_btf_ctx_section("raw_tp/sched_switch"));
+        assert!(!is_btf_ctx_section("kprobe/vfs_read"));
+        assert!(!is_btf_ctx_section(".text"));
+    }
 }

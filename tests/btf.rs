@@ -206,3 +206,44 @@ fn core_relos_resolve_against_own_btf() {
         assert!(res.validate);
     }
 }
+
+#[test]
+fn ctx_args_resolve_against_real_vmlinux() {
+    // BTF-typed ctx resolution at vmlinux scale: the real sched_switch
+    // tracepoint and vfs_read kernel function, checked against their known
+    // kernel signatures.
+    let Ok(data) = std::fs::read(VMLINUX) else {
+        eprintln!("skipping: no {VMLINUX}");
+        return;
+    };
+    let btf = Btf::parse(true, &data).expect("parse vmlinux BTF");
+    use febpf::btf::{resolve_ctx_args, CtxSlot};
+
+    // trace_sched_switch(preempt, prev, next[, prev_state]): bool + 2x
+    // task_struct* (+ a scalar prev_state on kernels >= 5.16).
+    let args = resolve_ctx_args(&btf, "tp_btf/sched_switch")
+        .unwrap()
+        .expect("BTF-typed section");
+    assert!(args.len() == 3 || args.len() == 4, "{args:?}");
+    assert_eq!(args[0], CtxSlot::Scalar);
+    for a in &args[1..3] {
+        let CtxSlot::Ptr { btf_id } = a else {
+            panic!("expected task_struct pointers: {args:?}")
+        };
+        assert_eq!(btf.type_name(*btf_id), "task_struct");
+    }
+
+    // vfs_read(file*, buf, count, pos): fexit gets one extra slot for the
+    // ssize_t return value (a scalar).
+    let fentry = resolve_ctx_args(&btf, "fentry/vfs_read").unwrap().unwrap();
+    let fexit = resolve_ctx_args(&btf, "fexit/vfs_read").unwrap().unwrap();
+    assert_eq!(fentry.len(), 4, "{fentry:?}");
+    assert_eq!(fexit.len(), 5, "{fexit:?}");
+    assert!(matches!(fentry[0], CtxSlot::Ptr { btf_id }
+        if btf.type_name(btf_id) == "file"));
+    assert_eq!(fexit[4], CtxSlot::Scalar);
+    assert_eq!(&fexit[..4], &fentry[..]);
+
+    // Not present in any kernel: an error, not a panic.
+    assert!(resolve_ctx_args(&btf, "fentry/definitely_not_a_kernel_fn").is_err());
+}

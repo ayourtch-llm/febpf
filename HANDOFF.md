@@ -14,44 +14,42 @@ load-bearing constraint. Don't add any without a very good reason and the
 user's OK (raw Linux syscalls via `asm!` are used instead of libc — see the
 JIT's `sys` module).
 
-Everything works today: `cargo test` is 197 green (188 with
+Everything works today: `cargo test` is 250 green (240 with
 `--no-default-features`, i.e. no JIT), `cargo clippy --all-targets` is 0
 warnings in both configs, release builds clean. **Keep BOTH configs green** —
 the JIT is now behind `default = ["jit"]`, so always run `cargo test` AND
 `cargo test --no-default-features` (and clippy in both) before calling
 anything done.
 
-**⚠ IN-FLIGHT AT LAST CONTEXT CHECKPOINT (2026-07-11, session 3):** a
-background agent is implementing **BTF-typed ctx pointers** (kernel
-PTR_TO_BTF_ID for `tp_btf`/`fentry` ctx args — the last fixable corpus class)
-in a worktree; its branch will be `worktree-agent-*`. FIRST THING ON REFRESH:
-`git worktree list` + `git branch -a`. If the branch exists with commits,
-REVIEW BEFORE MERGING — this is the largest verifier surface change since
-conformance hardening. Review checklist: (1) new PtrKind must join/subsume
-correctly in pruning (a typed pointer must never widen to scalar); (2) runtime
-must stay inside the virtual-address model — expect a synthetic
-"kernel-memory-reads-as-zero" region, writes must fault; (3) every acceptance
-should cite the kernel rule (`btf_ctx_access`/`btf_struct_access`); (4) run
-BOTH test configs + clippy, `cargo build --release`, `./scripts/scan-corpus.sh`
-— expect **55/56** (ksnoop stays rejected BY DESIGN, see "DO NOT 'FIX'" note).
-If the worktree has uncommitted work, check `git -C <worktree> status` — a
-previous agent once left a finished-but-uncommitted test (fix: `.map` before
-first use).
+**DONE (2026-07-11, session 4): BTF-typed ctx pointers** (kernel
+PTR_TO_BTF_ID for `tp_btf`/`fentry`/`fexit`/`fmod_ret` ctx args) — the last
+fixable corpus class. `docs/specs/btf-ctx-pointers.md` is the contract; every
+rule cites the kernel function it mirrors (`btf_ctx_access`,
+`btf_struct_walk`, `check_ptr_to_btf_access`, `convert_ctx_accesses`'
+BPF_PROBE_MEM rewrite → `VerifyOk::probe_mem` arms the VM). Runtime adds
+`Region::KernelMem` (reads-as-zero, writes fault — virtual-address model
+intact), ctx pointer slots prefilled with distinct deterministic addresses.
+`Program` gained a `btf_ctx` field (literal constructions everywhere gained
+`btf_ctx: None`). Corpus: **100% loads / 98.2% verified (55/56)** — and the
+four unblocked tp_btf tools also EXECUTE under interp+JIT. The in-flight
+agent from the last checkpoint had died leaving only the btf.rs foundation
+uncommitted; it was salvaged, finished, reviewed and committed on main.
+Known deliberate divergences + replay-file limitation are in the spec §1/§3.
 
-**QUEUED NEXT (user-approved, do after the BTF merge to avoid verifier.rs
-conflicts):** an agent batch for exhaustive small-bit-width soundness checks
-of the verifier's abstract operators (tnum + ranges) — see "Formal methods"
-in `docs/ideas.md` item 1. After that, pick from the user-endorsed roadmap in
-`docs/ideas.md` (extension-mechanism packaging ≥ XDP/packet-access >
-CI/LSP packaging; `febpf snapshot-kernel` as migration phase 1; GPUs parked).
+**QUEUED NEXT (user-approved):** an agent batch for exhaustive
+small-bit-width soundness checks of the verifier's abstract operators
+(tnum + ranges) — see "Formal methods" in `docs/ideas.md` item 1; verifier.rs
+is now conflict-free for it. After that, pick from the user-endorsed roadmap
+in `docs/ideas.md` (extension-mechanism packaging ≥ XDP/packet-access >
+CI/LSP packaging; `febpf snapshot-kernel` as migration phase 1 — note it can
+now also back `Region::KernelMem` with real struct contents; GPUs parked).
 
-Merged earlier this session (all on main): map-types-2 (perf/cgroup/stack
+Merged earlier (sessions 1–3, all on main): map-types-2 (perf/cgroup/stack
 maps, tracing helpers #14–16/#35, get_stackid #27), probe_read family
 (#4/#45/#112–115) + task_under_cgroup #37, get_stack #67, kconfig externs,
 max_entries default, subprog pointer returns (kernel-exact:
 `prepare_func_exit`), rodata DCE (`src/dce.rs`), get_socket_cookie #46 +
-get_func_ip #173, scan-corpus helper-name fix. Corpus: **100% loads / 91.1%
-verified (51/56)**, from 30%/5.4% at session start.
+get_func_ip #173, scan-corpus helper-name fix.
 
 ## The big picture (data flow)
 
@@ -105,7 +103,7 @@ Line counts are approximate (they drift); the point is the shape. Specs live
 in `docs/specs/` — one per subsystem (jit-backend, elf-loading, core-relocations,
 time-travel-debug, verifier-explainer, source-debug, conftest, verifier-diff,
 wasm-playground, dataflow-queries, replay-files, equiv-optimizer, race-explorer,
-map-types, corpus-tooling). **Read the relevant spec before extending a
+map-types, corpus-tooling, btf-ctx-pointers). **Read the relevant spec before extending a
 subsystem** — they encode the contracts and gotchas.
 
 ## Load-bearing design decisions (the non-obvious stuff)
@@ -388,11 +386,14 @@ PERF_EVENT_ARRAY for this corpus). Coverage progression (loads / verifies):
   100% / 89.3% (50/56). The two parallel batches' fixes compounded
   (each measured 78.6% alone).
 - + get_socket_cookie (#46) + get_func_ip (#173) + ksnoop verdict-parity
-  investigation (appended to `tracing-helpers.md`): **100% / 91.1%** (51/56).
+  investigation (appended to `tracing-helpers.md`): 100% / 91.1% (51/56).
   Also tightened subprog stack-pointer returns back to the exact kernel rule
   (reject ANY stack pointer, `prepare_func_exit()` conservatism) — the
   caller-frame allowance from the load-failure batch was laxer than the
   kernel and would have shown up as FEBPF-LAX in `vfuzz --kernel`.
+- + BTF-typed ctx pointers (`btf-ctx-pointers.md`): **100% / 98.2%** (55/56).
+  bitesize/offcputime/runqlat/runqslower unblocked AND running. The one
+  remaining rejection is ksnoop — correct by design, see below.
 **Workflow: merge a coverage batch → `./scripts/scan-corpus.sh` → the histogram
 names the next batch.** febpf is an analysis/test/CI/debug engine, NOT a datapath
 runtime — "production useful" means verify/explain/differential-test/debug real
@@ -404,15 +405,9 @@ measure the previous build; and helper names in the histogram come from the
 uapi header now — the old hardcoded table had wrong ids (#113 was labelled
 ringbuf_output; it is probe_read_kernel).
 
-What blocks the remaining 5 objects (2026-07-11 scan, after the #46/#173
-batch):
-1. **4 × BTF-typed ctx scalar-derefs** — `r1 = *(u32*)(r6+2804)` where r6
-   came from a `tp_btf` ctx load: real kernels type that as PTR_TO_BTF_ID and
-   allow direct kernel-memory reads (`bitesize`, `offcputime`, `runqlat`,
-   `runqslower`). Fix = model BTF-typed ctx pointers (bigger; verifier + a
-   deterministic "kernel memory reads as zero" story). The ONLY remaining
-   fixable class.
-2. **1 × `ksnoop` — DO NOT "FIX"; the rejection is correct.** Investigated
+What blocks the remaining 1 object (2026-07-11 scan, after the BTF-ctx
+batch — item 1 of the previous list is DONE, `btf-ctx-pointers.md`):
+1. **1 × `ksnoop` — DO NOT "FIX"; the rejection is correct.** Investigated
    2026-07-11 (full write-up in `tracing-helpers.md`): the real kernel
    verifier rejects this exact object with the identical error — upstream bcc
    commit `0ae562c` (2025-07-13, after our v0.31.0 corpus pin) changed
