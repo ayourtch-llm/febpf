@@ -2,7 +2,13 @@
 
 `febpf race <prog> [--procs N] [--schedules M] [--seed S] [--schedule CSV] [--ctx ...] [--stats]`
 
-STATUS: in progress.
+STATUS: complete (2026-07-11). `febpf race` ships with systematic + seeded
+exploration, outcome-divergence and lost-update detection, `--schedule` replay,
+`--stats`, and `examples/race_{rmw,atomic}.s`. Behavioral tests in
+`tests/race.rs` cover the whole testing bar. Both build configs green, clippy
+clean. Follow-ups if extended: model `BPF_EXIST`/`BPF_NOEXIST` update flags
+explicitly, per-CPU maps, and full `.febpf` replay-file integration (the
+`--schedule` choice-vector is the current reproduction path).
 
 ## What it is
 
