@@ -253,8 +253,28 @@ what makes them feasible here when they aren't elsewhere:
    **FEBPF-LAX** cell (febpf accepts / kernel rejects = a soundness gap) is
    dumped loud + first with disasm + kernel log. FEBPF-STRICT (kernel stricter)
    is expected in bulk, reported separately. New bpf(2) surface `kbpf::verdict`
-   keeps the `&mut` attr provenance. Root run is the payoff (see cmds.txt);
-   0 disagreements found unprivileged.
+   keeps the `&mut` attr provenance. Root run against a live kernel
+   (2026-07-11) initially found 2407/20000 FEBPF-LAX in two classes, both now
+   FIXED (see below) — a re-run is 0 FEBPF-LAX / 0 FEBPF-STRICT, i.e. febpf's
+   verifier verdict matches the kernel's on every one of 20k frontier
+   programs. `vfuzz --kernel` is the regression check; keep it at 0 LAX.
+
+### Verifier hardened to kernel conformance (2026-07-11, via #9)
+`fix/verifier-conformance` closed the two gaps vfuzz found — both were febpf
+being *more permissive* than the kernel (conformance gaps, not memory-unsafety,
+since febpf's virtual-address model is safe regardless):
+- **Modified ctx-ptr deref**: the kernel requires a `PTR_TO_CTX`'s own
+  accumulated offset to be 0 at dereference — the access offset must come from
+  the load/store instruction immediate, never from pointer arithmetic baked
+  into the register. `check_mem_access` now rejects a ctx deref when the
+  pointer's `p.off != 0` or `p.var` is non-zero/non-const (keying on the
+  POINTER's offset, NOT the total access offset — that distinction is what
+  keeps `*(u32*)(r1+8)` legal while rejecting `r2=r1; r2+=8; *(u32*)(r2+0)`).
+- **Stack alignment**: the kernel *always* enforces natural alignment on
+  `PTR_TO_STACK` accesses (size-N access must be N-aligned), independent of the
+  `--strict-align` policy that governs ctx/map/packet. febpf now enforces stack
+  alignment unconditionally; the helper-buffer path is exempted (helper args
+  pass a byte length as `size` with no alignment constraint).
 
 ## Known limitations / where to go next (roughly prioritized)
 
