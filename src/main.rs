@@ -39,7 +39,7 @@ options:
   --ctx-size <n>       context size in bytes (default 4096, or data length)
   --no-verify          run without verifying first (still memory-safe)
   --no-explain         don't print the counterexample trace when rejected
-  --jit                compile to native code (run/bench; x86-64 Linux)
+  --jit                compile to native code (run/bench; x86-64 Linux, arm64 macOS)
   --strict-align       verifier: require aligned memory accesses
   --readonly-ctx       verifier: forbid stores to the context
   --iters <n>          bench/fuzz: iterations (default 1000)
