@@ -2,3 +2,5 @@
 Cargo.lock
 *.bin
 out.bin
+.claude/
+web/dist/
