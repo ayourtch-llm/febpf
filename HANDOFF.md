@@ -14,8 +14,9 @@ load-bearing constraint. Don't add any without a very good reason and the
 user's OK (raw Linux syscalls via `asm!` are used instead of libc — see the
 JIT's `sys` module).
 
-Everything works today: `cargo test` is 106 green, `cargo clippy --all-targets`
-is 0 warnings, release builds clean.
+Everything works today: `cargo test` is 130 green (123 with
+`--no-default-features`, i.e. no JIT), `cargo clippy --all-targets` is 0
+warnings in both configs, release builds clean.
 
 ## The big picture (data flow)
 
@@ -194,20 +195,26 @@ what makes them feasible here when they aren't elsewhere:
    like "r0 may be NULL: returned by map_lookup_elem at insn 6"). On by
    default, `--no-explain` to suppress. Path arena during DFS + replay on
    rejection; pruning machinery untouched.
-3. **Source-level debugging** — parse `.BTF.ext` line info (we already parse
-   BTF) and show C source lines in the debugger/disasm/heatmap. `febpf debug
-   prog.o` stepping through *C, not bytecode*, with globals readable by name
-   (BTF has the types). bpftool shows line info statically; nobody steps it.
-4. **Kernel conformance mode** — `febpf conftest prog.o`: run the same
-   program+inputs under febpf and under the real kernel via
-   `BPF_PROG_TEST_RUN` (raw syscall, zero deps — we already do raw syscalls
-   in the JIT), diff results. Turns "toy reimplementation" into "validated
-   against Linux". Also a differential fuzzer: random ALU/branch programs,
-   interp vs JIT vs kernel must agree — this is how you find real bugs.
-5. **WASM playground** — the interpreter+verifier+asm are zero-dependency
-   pure-std Rust; a `wasm32` build (JIT feature-gated off) plus a small HTML
-   page = eBPF playground in the browser: paste asm or a hex .o, verify,
-   step, see the heatmap. Nothing like it exists; huge demo value.
+3. **Source-level debugging** — **DONE 2026-07-11** (`docs/specs/source-debug.md`):
+   `.BTF.ext` line/func info surfaced via `src/debuginfo.rs` (clang embeds the
+   source text — no .c needed): debugger shows the C line, `list`,
+   `steps`/`nexts`/`rsteps` (source-line stepping, incl. reverse), `bt`
+   backtraces with function names, `print <global>` typed via the BTF graph;
+   source interleaved into disasm/heatmap/analyze. Watch the `.text`-stitching
+   offset (`text_base`) — same trap as CO-RE relocs.
+4. **Kernel conformance mode** — **DONE 2026-07-11** (`docs/specs/conftest.md`):
+   `febpf conftest` (interp+JIT+kernel via raw bpf(2), exit codes 0/1/2/3 =
+   agree/mismatch/no-priv/kernel-reject) and `febpf fuzz [--seed N] [--kernel]`
+   (seeded differential fuzzer; already caught a real generator bug).
+   `src/kbpf.rs` attr offsets verified against kernel headers; the real
+   kernel round-trip needs root (`sudo cargo test --test conftest` once on a
+   privileged box — this host has unprivileged_bpf_disabled=2).
+5. **WASM playground** — **DONE 2026-07-11** (`docs/specs/wasm-playground.md`):
+   JIT now behind `default = ["jit"]` feature (keep BOTH configs green:
+   `cargo test` and `cargo test --no-default-features`). `src/playground.rs`
+   (pure-std API) + `src/wasm.rs` (hand-written ABI, no wasm-bindgen) +
+   `web/`: `cd web && make` → self-contained `web/dist/` for any static
+   server. Verified without a browser via wasmi harness (`web/test/`).
 6. **CO-RE relocations** — **DONE 2026-07-11** (`docs/specs/core-relocations.md`):
    full BTF type graph in `src/btf.rs` (all 19 kinds, validated byte-exact
    against `bpftool btf dump` on vmlinux, 168k types ~56ms), `.BTF.ext`
