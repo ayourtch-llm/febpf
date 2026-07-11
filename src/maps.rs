@@ -24,7 +24,7 @@ impl std::fmt::Display for MapKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapDef {
     pub name: String,
     pub kind: MapKind,
