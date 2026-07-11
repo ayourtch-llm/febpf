@@ -92,6 +92,45 @@ single-entry array map (`key_size=4`, `value_size=` section size,
 This is what makes ordinary clang-compiled C — string literals, lookup
 tables, persistent counters in globals — load and run unmodified.
 
+## Kconfig externs (`.kconfig`)
+
+libbpf models `extern ... __kconfig` variables (`LINUX_KERNEL_VERSION`,
+`CONFIG_*`) as a virtual read-only `.kconfig` internal map. In the object the
+extern is an **UNDefined** ELF symbol (value 0, section UND) whose type lives
+in a BTF `.kconfig` DATASEC — so `R_BPF_64_64` relocations against it cannot
+be resolved by section index like data-section symbols. febpf mirrors libbpf
+(`elf.rs::load_kconfig_map`):
+
+- The `.kconfig` DATASEC's extern VARs are laid out sequentially with natural
+  alignment (the object's DATASEC offsets are all 0 — libbpf assigns them at
+  load time, and so do we) into a synthetic frozen single-entry array map
+  named `.kconfig`.
+- Relocations against UND symbols resolve **by name** to
+  `BPF_PSEUDO_MAP_VALUE` pointers at the extern's assigned offset
+  (`MapRef::Data { idx, base }` — `base` is 0 for ordinary data-section
+  symbols).
+- Values: `LINUX_KERNEL_VERSION` is filled with `KERNEL_VERSION(a,b,c)` of
+  the running kernel (patch clamped to 255, like libbpf), read from
+  `/proc/sys/kernel/osrelease` — host-dependent in exactly the way the
+  default `--target-btf /sys/kernel/btf/vmlinux` already is; a fixed 6.1.0
+  fallback applies when /proc is unavailable (non-Linux, wasm). Other
+  `CONFIG_*` externs are zero-filled — febpf does not parse kernel configs,
+  and 0 is what libbpf gives an unset *weak* kconfig extern. (A strong unset
+  extern would fail libbpf's load; febpf's zero-fill is deliberately more
+  tolerant, since it is an analysis engine.)
+
+This was the root cause of the `LOAD-FAIL:relocation` corpus failures
+(bcc `biosnoop`/`bitesize`/`capable`): "map relocation for unknown symbol
+'LINUX_KERNEL_VERSION'". Fixture: `examples/c/kconfig.c` / `tests/kconfig.o`.
+
+## Tolerated omissions in BTF map defs
+
+A BTF map def may omit `max_entries` entirely (libbpf leaves it 0 and the
+loader app sets it via `bpf_map__set_max_entries` before load — bcc's
+`cpudist` does this). febpf defaults it to `DEFAULT_MAX_ENTRIES` (10240,
+bcc's usual value) instead of rejecting the object. This was the
+`LOAD-FAIL:other` corpus failure ("map 'start': missing max_entries").
+
 ## CO-RE relocations
 
 `elf::load_with_target_btf` applies `.BTF.ext` CO-RE relocations against a

@@ -89,6 +89,29 @@ fn cross_text_bpf_to_bpf_call() {
 }
 
 #[test]
+fn kconfig_extern_object() {
+    maybe_compile("kconfig.c", "kconfig.o");
+    let obj = load("tests/kconfig.o");
+
+    // The extern lands in a synthetic frozen `.kconfig` map, filled with the
+    // running kernel's KERNEL_VERSION (or the documented fallback) — always
+    // a plausible nonzero version.
+    let kc = obj
+        .maps
+        .iter()
+        .find(|m| m.name == ".kconfig")
+        .expect("no .kconfig map");
+    assert!(kc.readonly);
+    assert_eq!(kc.value_size, 4);
+    let kver = u32::from_le_bytes(kc.init[0..4].try_into().unwrap());
+    assert!(kver >= (3 << 16), "implausible kernel version {kver:#x}");
+
+    // The program compares LINUX_KERNEL_VERSION against 3.0.0: the UND
+    // extern symbol relocated into the .kconfig value, read at runtime.
+    assert_eq!(run_prog(&obj, "socket", &mut [0u8; 8]), 1);
+}
+
+#[test]
 fn global_data_object() {
     maybe_compile("global_data.c", "global_data.o");
     let obj = load("tests/global_data.o");

@@ -819,6 +819,69 @@ fn get_stack_is_deterministic_across_calls() {
     assert_eq!(run_src(src), 1);
 }
 
+// ------------------------------------------- subprogram pointer returns
+
+/// A static subprogram may return a pointer (kernel semantics: the caller's
+/// r0 inherits the register state) — here a map-value-or-null from a lookup
+/// wrapper, null-checked by the caller. Real programs (bcc cpudist) do this.
+#[test]
+fn subprog_may_return_map_value_pointer() {
+    let src = "
+        .map a array 4 8 1
+        call get_val
+        if r0 == 0 goto miss
+        r1 = *(u64 *)(r0 + 0)
+        r0 = 1
+        exit
+    miss:
+        r0 = 0
+        exit
+    get_val:
+        r1 = 0
+        *(u32 *)(r10 - 4) = r1
+        r1 = map[a]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        exit";
+    // Array element 0 always exists, so the lookup hits.
+    assert_eq!(run_src(src), 1);
+}
+
+/// Returning a caller-frame stack pointer back to the caller is fine (the
+/// frame is still live); returning the subprogram's OWN stack pointer is not.
+#[test]
+fn subprog_may_return_caller_stack_pointer() {
+    let src = "
+        r1 = 42
+        *(u64 *)(r10 - 8) = r1
+        r1 = r10
+        r1 += -8
+        call ident
+        r0 = *(u64 *)(r0 + 0)
+        exit
+    ident:
+        r0 = r1
+        exit";
+    assert_eq!(run_src(src), 42);
+}
+
+/// A pointer into the exiting frame's own stack dies with the frame and must
+/// be rejected at verification.
+#[test]
+fn subprog_may_not_return_own_stack_pointer() {
+    let src = "
+        call f
+        r0 = 0
+        exit
+    f:
+        r0 = r10
+        r0 += -8
+        exit";
+    let err = verify_err(src);
+    assert!(err.contains("own stack frame"), "{err}");
+}
+
 /// get_stackid rejects (at verification) a map that is not a stack_trace map.
 #[test]
 fn get_stackid_requires_stack_trace_map() {

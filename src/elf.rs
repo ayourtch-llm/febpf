@@ -48,6 +48,10 @@ const BPF_MAP_TYPE_CGROUP_ARRAY: u32 = 8;
 const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
 const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 
+/// Default for a BTF map def that omits `max_entries` entirely (libbpf leaves
+/// it 0 for the loader app to fill in; bcc tools use 10240).
+const DEFAULT_MAX_ENTRIES: u32 = 10240;
+
 /// One program (executable section) from an object.
 pub struct LoadedProgram {
     pub name: String,
@@ -232,6 +236,11 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
     // Global data sections become single-entry array maps; `ld_imm64`
     // relocations against their symbols resolve to value pointers.
     load_data_maps(bytes, &sections, &mut maps, &mut map_by_symval)?;
+
+    // Kconfig externs (`LINUX_KERNEL_VERSION`, `CONFIG_*`) become a synthetic
+    // frozen `.kconfig` map, mirroring libbpf; relocations against the UND
+    // extern symbols resolve by name to value pointers into it.
+    load_kconfig_map(r.le, bytes, &sections, &mut maps, &mut map_by_symval)?;
 
     // The `.text` section holds subprograms that entry sections call into via
     // `R_BPF_64_32` relocations. We stitch all of `.text` onto the end of any
@@ -728,10 +737,13 @@ fn apply_relocations(
                         insns[insn_idx].imm = map_idx as i32;
                         insns[insn_idx + 1].imm = 0;
                     }
-                    Some(MapRef::Data(map_idx)) => {
-                        // Pointer into the section's value: symbol offset plus
-                        // the addend clang stored in the instruction's imm.
-                        let off = (sym.value as u32).wrapping_add(insns[insn_idx].imm as u32);
+                    Some(MapRef::Data { idx: map_idx, base }) => {
+                        // Pointer into the map's value: base (kconfig extern
+                        // offset, else 0) plus the symbol offset plus the
+                        // addend clang stored in the instruction's imm.
+                        let off = base
+                            .wrapping_add(sym.value as u32)
+                            .wrapping_add(insns[insn_idx].imm as u32);
                         insns[insn_idx].src = insn::pseudo::MAP_VALUE;
                         insns[insn_idx].imm = map_idx as i32;
                         insns[insn_idx + 1].imm = off as i32;
@@ -773,9 +785,11 @@ fn apply_relocations(
 enum MapRef {
     /// A map object (declared in `maps`/`.maps`): lddw a map pointer.
     Obj(usize),
-    /// A global-data section mapped as a single-entry array map: lddw a
-    /// pointer into its value (the symbol offset is added by the caller).
-    Data(usize),
+    /// A pointer into an internal map's value. `base` is an extra offset
+    /// within the value (0 for `.data`/`.rodata`/`.bss` section symbols,
+    /// where the symbol value carries the offset; the assigned extern
+    /// offset for `.kconfig` externs, whose symbols are UND with value 0).
+    Data { idx: usize, base: u32 },
 }
 
 /// Maps a relocation symbol to a map reference.
@@ -784,10 +798,24 @@ struct MapIndex {
     by_offset: Vec<(u64, u16, usize)>,
     /// data section index → map index, for symbols in `.data`/`.rodata`/`.bss`.
     data_secs: Vec<(u16, usize)>,
+    /// kconfig extern name → (map index, offset in the `.kconfig` value).
+    /// These symbols are UNDefined in the ELF, so they resolve by name.
+    kconfig: Vec<(String, usize, u32)>,
 }
 
 impl MapIndex {
     fn resolve(&self, sym: &Symbol) -> Option<MapRef> {
+        if sym.shndx == 0 {
+            // UND symbol: a kconfig extern (LINUX_KERNEL_VERSION et al).
+            return self
+                .kconfig
+                .iter()
+                .find(|(name, _, _)| *name == sym.name)
+                .map(|(_, idx, base)| MapRef::Data {
+                    idx: *idx,
+                    base: *base,
+                });
+        }
         if let Some((_, _, idx)) = self
             .by_offset
             .iter()
@@ -798,7 +826,7 @@ impl MapIndex {
         self.data_secs
             .iter()
             .find(|(shndx, _)| *shndx == sym.shndx)
-            .map(|(_, idx)| MapRef::Data(*idx))
+            .map(|(_, idx)| MapRef::Data { idx: *idx, base: 0 })
     }
 }
 
@@ -824,6 +852,7 @@ fn load_maps(
         MapIndex {
             by_offset: Vec::new(),
             data_secs: Vec::new(),
+            kconfig: Vec::new(),
         },
     ))
 }
@@ -873,6 +902,82 @@ fn load_data_maps(
     Ok(())
 }
 
+/// Expose the object's kconfig externs as a synthetic frozen `.kconfig`
+/// single-entry array map, mirroring libbpf's virtual extern model. Extern
+/// variables live in the BTF `.kconfig` DATASEC with UNDefined ELF symbols;
+/// libbpf assigns their offsets at load time (the object's DATASEC offsets
+/// are all 0), so we lay them out sequentially with natural alignment.
+///
+/// Values: `LINUX_KERNEL_VERSION` gets `KERNEL_VERSION(a,b,c)` of the running
+/// kernel (patch clamped to 255, like libbpf), read from
+/// `/proc/sys/kernel/osrelease` — host-dependent in exactly the way the
+/// default `--target-btf /sys/kernel/btf/vmlinux` already is. Other externs
+/// (`CONFIG_*`) are zero-filled: febpf does not parse kernel configs, and 0 is
+/// what libbpf gives an unset weak kconfig extern.
+fn load_kconfig_map(
+    le: bool,
+    bytes: &[u8],
+    sections: &[Section],
+    maps: &mut Vec<MapDef>,
+    index: &mut MapIndex,
+) -> Result<(), String> {
+    let Some(btf_idx) = sections.iter().position(|s| s.name == ".BTF" && s.size > 0) else {
+        return Ok(());
+    };
+    let btf = Btf::parse(le, section_bytes(bytes, sections, btf_idx)?)?;
+    let Some(entries) = btf.datasec(".kconfig") else {
+        return Ok(());
+    };
+    let mut init: Vec<u8> = Vec::new();
+    let mut externs = Vec::new();
+    for si in entries {
+        let Ok(var) = btf.ty(si.type_id) else { continue };
+        let Kind::Var { type_id, .. } = var.kind else {
+            continue;
+        };
+        let name = btf.str_at(var.name_off).to_string();
+        let size = btf.type_size(type_id)? as usize;
+        let align = size.clamp(1, 8);
+        let off = init.len().next_multiple_of(align);
+        init.resize(off + size, 0);
+        if name == "LINUX_KERNEL_VERSION" && size >= 4 {
+            init[off..off + 4].copy_from_slice(&host_kernel_version().to_le_bytes());
+        }
+        externs.push((name, off as u32));
+    }
+    if externs.is_empty() {
+        return Ok(());
+    }
+    let map_idx = maps.len();
+    maps.push(MapDef {
+        name: ".kconfig".into(),
+        kind: MapKind::Array,
+        key_size: 4,
+        value_size: init.len() as u32,
+        max_entries: 1,
+        readonly: true,
+        init,
+    });
+    for (name, off) in externs {
+        index.kconfig.push((name, map_idx, off));
+    }
+    Ok(())
+}
+
+/// `KERNEL_VERSION(a, b, c)` of the running kernel (c clamped to 255, like
+/// libbpf), parsed from `/proc/sys/kernel/osrelease`. Falls back to a fixed
+/// 6.1.0 when /proc is unavailable (non-Linux hosts, wasm).
+fn host_kernel_version() -> u32 {
+    let s = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let mut parts = s.trim().split(|c: char| !c.is_ascii_digit());
+    let mut next = || parts.next().and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+    let (a, b, c) = (next(), next(), next());
+    if a == 0 {
+        return (6 << 16) | (1 << 8); // deterministic fallback: 6.1.0
+    }
+    (a << 16) | (b << 8) | c.min(255)
+}
+
 fn load_legacy_maps(
     r: &Reader,
     _bytes: &[u8],
@@ -913,6 +1018,7 @@ fn load_legacy_maps(
         MapIndex {
             by_offset: index,
             data_secs: Vec::new(),
+            kconfig: Vec::new(),
         },
     ))
 }
@@ -1005,7 +1111,7 @@ fn cstr(strtab: &[u8], off: usize) -> String {
 // ---------------------------------------------------------------------------
 
 mod btf_maps {
-    use super::{map_kind, MapIndex, Section, Symbol};
+    use super::{map_kind, MapIndex, Section, Symbol, DEFAULT_MAX_ENTRIES};
     use crate::btf::{Btf, Kind};
     use crate::maps::MapDef;
 
@@ -1093,9 +1199,13 @@ mod btf_maps {
                 value_size: value_size
                     .or(no_kv.then_some(0))
                     .ok_or_else(|| format!("map '{map_name}': missing value size"))?,
+                // A missing max_entries is legal in a BTF map def: libbpf
+                // leaves it 0 and the loader app sets it before load (e.g.
+                // bcc's cpudist calls bpf_map__set_max_entries). Default it
+                // rather than reject the object.
                 max_entries: max_entries
                     .or(no_kv.then_some(0))
-                    .ok_or_else(|| format!("map '{map_name}': missing max_entries"))?,
+                    .unwrap_or(DEFAULT_MAX_ENTRIES),
                 readonly: false,
                 init: Vec::new(),
             });
@@ -1118,6 +1228,7 @@ mod btf_maps {
             MapIndex {
                 by_offset: index,
                 data_secs: Vec::new(),
+            kconfig: Vec::new(),
             },
         ))
     }

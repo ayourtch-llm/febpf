@@ -56,7 +56,50 @@ per-helper map-kind check, same mechanism as `perf_event_output` /
 answer is the fixed constant **0** ("not under"), per the determinism note in
 `map-types-2.md`. An index `>= max_entries` returns -EINVAL like the kernel.
 
+## get_stack (#67)
+
+`(ctx, buf, size, flags)` → number of bytes written on success, negative on
+error. The buffer-writing sibling of `get_stackid` (#27,
+`docs/specs/map-types-2.md`), and the last helper blocker for
+`bcc__biostacks.o` (whose 5 programs all verify now).
+
+Same deterministic stack model as get_stackid: febpf's stand-in for a kernel
+stack is `Machine::backtrace_pcs()` — the call stack's instruction indices,
+innermost first — written into `buf` as little-endian u64s. The buffer is
+zeroed first so the result is deterministic in every outcome; only whole
+8-byte frames are written (min(stack bytes, size), so the return value is
+always a multiple of 8 — a size of 4 writes nothing and returns 0, matching
+the kernel's whole-`u64`-slots behaviour). Verifier signature: `buf` is
+`MemWrite { size_arg: 2 }`, `size` is `Size`; `ctx`/`flags` are accepted
+loosely (`Any`/`Scalar`) like get_stackid's. No map is involved — there is no
+map-kind check.
+
+## Corpus load-failure batch (same session)
+
+The 4 remaining `LOAD-FAIL` corpus objects were diagnosed and fixed:
+
+- **`biosnoop`/`bitesize`/`capable` (LOAD-FAIL:relocation)** — relocations
+  against the UNDefined `LINUX_KERNEL_VERSION` kconfig extern. Fixed by
+  modelling libbpf's virtual `.kconfig` map; full write-up in
+  `docs/specs/elf-loading.md` ("Kconfig externs").
+- **`cpudist` (LOAD-FAIL:other)** — BTF map def omitting `max_entries`
+  (libbpf lets the app fill it before load). Fixed by defaulting; see
+  `docs/specs/elf-loading.md` ("Tolerated omissions").
+- **`cpudist` (follow-on VERIFY-REJECT)** — its `lookup-or-init` static
+  subprogram returns a map-value pointer, which febpf's verifier rejected
+  ("subprogram may not return a pointer"). The kernel *allows* a static
+  subprogram to return a pointer (the caller's r0 inherits the register
+  state); febpf now does too, still rejecting the one unsound case — a
+  pointer into the exiting frame's own stack, which dies with the frame
+  (returning a *caller*-frame stack pointer remains legal). Tests in
+  `tests/integration.rs` ("subprogram pointer returns").
+
+After this batch: **loads 100%, verifies 78.6%** (44/56). The 12 remaining
+rejects are all `VERIFY-REJECT:other` in the two known classes (rodata-driven
+dead-code elimination; BTF-typed `tp_btf` ctx pointers) — see HANDOFF.
+
 ## STATUS
 
-All implemented, tested (`tests/integration.rs` probe_read/cgroup sections),
-both feature configs green.
+All implemented, tested (`tests/integration.rs` probe_read/cgroup/get_stack/
+subprog-pointer sections, `tests/elf.rs::kconfig_extern_object`), both
+feature configs green.
