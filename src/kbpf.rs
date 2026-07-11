@@ -86,8 +86,9 @@ mod imp {
     use std::arch::asm;
 
     /// Raw `bpf(2)`: `syscall(321, cmd, attr, size)`. Returns the kernel's
-    /// signed result (fd/return value >= 0, or `-errno`).
-    unsafe fn sys_bpf(cmd: i32, attr: *const u8, size: usize) -> isize {
+    /// signed result (fd/return value >= 0, or `-errno`). The pointer must be
+    /// `*mut`: some commands (TEST_RUN) write results back into the attr.
+    unsafe fn sys_bpf(cmd: i32, attr: *mut u8, size: usize) -> isize {
         let ret: isize;
         asm!(
             "syscall",
@@ -101,10 +102,15 @@ mod imp {
         ret
     }
 
-    fn call(cmd: i32, attr: &[u8; ATTR_SIZE], what: &str) -> KResult<i32> {
+    fn call(cmd: i32, attr: &mut [u8; ATTR_SIZE], what: &str) -> KResult<i32> {
         // Safety: `attr` is a valid, fully-initialized 128-byte buffer; the
-        // kernel reads `size` bytes and never retains the pointer.
-        let ret = unsafe { sys_bpf(cmd, attr.as_ptr(), ATTR_SIZE) };
+        // kernel reads `size` bytes and never retains the pointer. It must be
+        // a mutable borrow: TEST_RUN writes `retval` (offset 4) back into it,
+        // and through a shared reference the compiler is free to assume the
+        // buffer unchanged and fold the read-back to its old value (this
+        // exact miscompile shipped: kernel retval always read as 0 in
+        // release builds).
+        let ret = unsafe { sys_bpf(cmd, attr.as_mut_ptr(), ATTR_SIZE) };
         if (-4095..0).contains(&ret) {
             Err(KError {
                 errno: (-ret) as i32,
@@ -179,7 +185,7 @@ mod imp {
             put_u64(&mut a, 32, ptr(&logbuf));
         }
 
-        let r = call(BPF_PROG_LOAD, &a, "BPF_PROG_LOAD");
+        let r = call(BPF_PROG_LOAD, &mut a, "BPF_PROG_LOAD");
         if let Some(dst) = log {
             let end = logbuf.iter().position(|&b| b == 0).unwrap_or(logbuf.len());
             *dst = String::from_utf8_lossy(&logbuf[..end]).into_owned();
@@ -202,7 +208,7 @@ mod imp {
         let name = def.name.as_bytes();
         let n = name.len().min(15);
         a[28..28 + n].copy_from_slice(&name[..n]);
-        call(BPF_MAP_CREATE, &a, "BPF_MAP_CREATE").map(Fd)
+        call(BPF_MAP_CREATE, &mut a, "BPF_MAP_CREATE").map(Fd)
     }
 
     /// `BPF_MAP_UPDATE_ELEM` with `BPF_ANY`.
@@ -212,7 +218,7 @@ mod imp {
         put_u64(&mut a, 8, ptr(key));
         put_u64(&mut a, 16, ptr(value));
         put_u64(&mut a, 24, 0); // BPF_ANY
-        call(BPF_MAP_UPDATE_ELEM, &a, "BPF_MAP_UPDATE_ELEM").map(|_| ())
+        call(BPF_MAP_UPDATE_ELEM, &mut a, "BPF_MAP_UPDATE_ELEM").map(|_| ())
     }
 
     /// `BPF_PROG_TEST_RUN`. Returns the program's `retval` (its `r0` as u32).
@@ -230,7 +236,7 @@ mod imp {
         put_u64(&mut a, 16, ptr(&input)); // data_in
         put_u64(&mut a, 24, ptr(&out)); // data_out
         put_u32(&mut a, 32, 1); // repeat
-        call(BPF_PROG_TEST_RUN, &a, "BPF_PROG_TEST_RUN")?;
+        call(BPF_PROG_TEST_RUN, &mut a, "BPF_PROG_TEST_RUN")?;
         // retval is written back into the attr buffer at offset 4.
         Ok(u32::from_le_bytes([a[4], a[5], a[6], a[7]]))
     }
