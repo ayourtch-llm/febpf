@@ -14,9 +14,22 @@ load-bearing constraint. Don't add any without a very good reason and the
 user's OK (raw Linux syscalls via `asm!` are used instead of libc — see the
 JIT's `sys` module).
 
-Everything works today: `cargo test` is 154 green (147 with
+Everything works today: `cargo test` is 197 green (188 with
 `--no-default-features`, i.e. no JIT), `cargo clippy --all-targets` is 0
-warnings in both configs, release builds clean.
+warnings in both configs, release builds clean. **Keep BOTH configs green** —
+the JIT is now behind `default = ["jit"]`, so always run `cargo test` AND
+`cargo test --no-default-features` (and clippy in both) before calling
+anything done.
+
+**⚠ IN-FLIGHT AT LAST SESSION END (2026-07-11):** a background agent was
+implementing `feat/map-types-2` — PERF_EVENT_ARRAY (+ bpf_perf_event_output),
+CGROUP_ARRAY, STACK_TRACE (+ bpf_get_stackid), and core tracing helpers
+(get_current_pid_tgid #14 / uid_gid #15 / comm #16 / task #35). FIRST THING
+NEXT SESSION: check `git branch` for `feat/map-types-2`; if present, review it,
+merge into main (expect a small `src/elf.rs` `map_kind`/`map_type_name` conflict
+— union both sides like the map-types merge did), run both test configs +
+clippy, then re-run `./scripts/scan-corpus.sh` to measure the coverage jump.
+See the corpus workflow under "Production coverage" below.
 
 ## The big picture (data flow)
 
@@ -41,26 +54,37 @@ warnings in both configs, release builds clean.
 
 | file | lines | what |
 |------|-------|------|
-| `insn.rs` | 224 | ISA v4 opcode constants, `Insn`, decode/encode, `wide_imm` |
-| `asm.rs` | 952 | assembler for kernel "pseudo-C" syntax (tokenizer + recursive-descent) |
-| `disasm.rs` | 228 | disassembler (round-trips with asm) |
-| `tnum.rs` | 281 | tracked-numbers (known-bits) abstract domain, mirrors kernel `tnum.c` |
-| `verifier.rs` | 2164 | the big one: path-sensitive abstract interpreter |
-| `maps.rs` | 208 | array + hash maps with stable value storage (see safety note) |
-| `helpers.rs` | 174 | helper id/name/signature registry + user-helper API |
-| `interp.rs` | 907 | the VM: `Vm`, `Machine`, virtual-address memory model, JIT glue |
-| `jit/mod.rs` | 347 | arch-independent JIT frontend + `JitBackend` trait + exec-mem |
-| `jit/classify.rs` | 176 | native-vs-deferred lowering (pure eBPF logic) |
-| `jit/x64.rs` | 440 | the only arch-specific file: x86-64 encoder |
-| `jit/abi.rs` | 32 | the trampoline ABI constants/contract |
-| `elf.rs` | 818 | ELF64 loader for `clang -target bpf` objects + BTF `.maps` |
-| `analysis.rs` | 302 | CFG, DOT export, stats, annotated listing, heatmap |
-| `debug.rs` | 248 | interactive debugger REPL |
-| `main.rs` | 399 | CLI |
+| `insn.rs` | ISA v4 opcode constants, `Insn`, decode/encode, `wide_imm` |
+| `asm.rs` | assembler for kernel "pseudo-C" syntax; `.map name kind key val entries` (kinds: hash/array/percpu_hash/percpu_array/lru_hash/ringbuf) |
+| `disasm.rs` | disassembler (round-trips with asm) |
+| `tnum.rs` | tracked-numbers (known-bits) abstract domain, mirrors kernel `tnum.c` |
+| `verifier.rs` (2806) | the big one: path-sensitive abstract interpreter; rejection explainer; per-PC joined abstract state (`pc_regs`/`regs_at`) used by the optimizer |
+| `maps.rs` (516) | hash/array + per-CPU array/hash + LRU hash + ringbuf; stable value storage (safety note #5); record capture for ringbuf |
+| `helpers.rs` | helper id/name/signature registry + user-helper API |
+| `interp.rs` (1455) | the VM: `Vm`, `Machine`, virtual-address memory model, snapshot/restore (time travel), multi-instance activate/deactivate (race), JIT glue |
+| `jit/*` | arch-independent frontend + `JitBackend` trait + x86-64 encoder (aarch64 backend TODO) |
+| `elf.rs` (1126) | ELF64 loader + BTF `.maps` + CO-RE relocation application; `map_kind`/`map_type_name` |
+| `btf.rs` (1002) | full BTF type graph (all 19 kinds), scales to vmlinux; `.BTF.ext` |
+| `relo.rs` (1401) | CO-RE relocation algorithm (libbpf candidate matching) |
+| `debuginfo.rs` (356) | `.BTF.ext` line/func info → source-level debugging |
+| `kbpf.rs` (382) | raw `bpf(2)` syscall layer (conftest/vfuzz); **attr MUST be `&mut`** |
+| `fuzz.rs` (526) | seeded PRNG + program generators (conservative + verification-frontier) |
+| `conftest.rs` (310) | `conftest`/`fuzz`/`vfuzz` CLI orchestration |
+| `race.rs` (688) | deterministic concurrency race explorer (`febpf race`) |
+| `equiv.rs` (463) | observable-equivalence checker (`febpf equiv`) |
+| `optimize.rs` (648) | verifier-guided, equivalence-checked optimizer (`febpf optimize`) |
+| `replay.rs` (534) | `.febpf` shareable replay-file container (record/replay) |
+| `analysis.rs` | CFG, DOT export, stats, annotated listing, heatmap (source-aware) |
+| `debug.rs` (1301) | debugger REPL: breakpoints, time travel (rstep/rcontinue/goto), watchpoints, dataflow queries (origin/when/who), source stepping |
+| `playground.rs` (517) / `wasm.rs` (193) | pure-std playground API + hand-written WASM ABI (no wasm-bindgen) for `web/` |
+| `main.rs` (850) | CLI |
 
-Specs for the two subsystems most likely to be extended:
-`docs/specs/jit-backend.md` and `docs/specs/elf-loading.md`. **Read those**
-before touching the JIT or ELF code — they encode the contracts.
+Line counts are approximate (they drift); the point is the shape. Specs live
+in `docs/specs/` — one per subsystem (jit-backend, elf-loading, core-relocations,
+time-travel-debug, verifier-explainer, source-debug, conftest, verifier-diff,
+wasm-playground, dataflow-queries, replay-files, equiv-optimizer, race-explorer,
+map-types, corpus-tooling). **Read the relevant spec before extending a
+subsystem** — they encode the contracts and gotchas.
 
 ## Load-bearing design decisions (the non-obvious stuff)
 
@@ -276,22 +300,60 @@ since febpf's virtual-address model is safe regardless):
   alignment unconditionally; the helper-buffer path is exempted (helper args
   pass a byte length as `size` with no alignment constraint).
 
+### Third wow tier (2026-07-11) — built on deterministic replay + the verifier
+
+10. **Omniscient debugging (dataflow queries)** — `docs/specs/dataflow-queries.md`.
+    Debugger `origin <reg>` (def-use trail to where a value was born), `when`,
+    `whenwrite`/`ww`, `who <addr>`. Rebuilds a bounded write-log on demand from
+    the nearest checkpoint (no eager recording). Limited to one replay interval.
+11. **Shareable replay files** — `docs/specs/replay-files.md`. `febpf record ->
+    bug.febpf`, `febpf replay` (opens the time-travel debugger at the cursor, or
+    `--run`). See `src/replay.rs` DoS note above.
+12. **Verifier differential fuzzing (vfuzz)** — see #9 / verifier-conformance.
+13. **Deterministic race explorer** — `docs/specs/race-explorer.md`. `febpf race
+    <prog> --procs N` runs N instances sharing one map set, enumerates
+    interleavings at map-op granularity, flags lost-update / stale-RMW /
+    outcome-divergence, and emits the losing interleaving as a replayable
+    `--schedule` vector. Also in the web playground (`febpf_race`, its own panel).
+14. **Verified performance optimizer** — `docs/specs/equiv-optimizer.md`. `febpf
+    equiv <a> <b>` decides *observable* equivalence (r0 + final map state +
+    ordered helper effects — NOT just r0), via the verifier's joined per-PC
+    abstract state plus differential falsification. `febpf optimize` applies
+    verifier-gated sound rewrites (const-fold, dead-branch, strength-reduction,
+    algebraic identity, redundant-mask), then runs `equiv` on its own output and
+    REFUSES to emit if it can't prove behavior was preserved.
+
+### Production coverage — the corpus-driven loop (START HERE for "is it useful?")
+`scripts/fetch-corpus.sh` (gentle, pinned, cached) builds ~56 real `.bpf.o`
+from bcc libbpf-tools + libbpf-bootstrap using local clang + bpftool + kernel
+BTF. `scripts/scan-corpus.sh` runs febpf over them and prints a ranked
+histogram of the exact map types / helpers blocking the most real programs.
+`corpus/` is gitignored. This is how we pick what to build next — MEASURE, don't
+guess (it already corrected a wrong guess: ringbuf mattered less than
+PERF_EVENT_ARRAY for this corpus). Coverage progression (loads / verifies):
+- baseline (hash+array only): 23% / 3.6%
+- + ringbuf/per-CPU/LRU (`docs/specs/map-types.md`): 30% / 5.4%
+- next (in-flight `feat/map-types-2`): PERF_EVENT_ARRAY (19 progs), CGROUP_ARRAY
+  (13), STACK_TRACE (6), get_current_pid_tgid (7) — should move loads a lot.
+**Workflow: merge a coverage batch → `./scripts/scan-corpus.sh` → the histogram
+names the next batch.** febpf is an analysis/test/CI/debug engine, NOT a datapath
+runtime — "production useful" means verify/explain/differential-test/debug real
+programs, not attach-and-run in the kernel.
+
 ## Known limitations / where to go next (roughly prioritized)
 
-1. **aarch64 JIT backend** — the trait is ready, spec is written. Highest-value
-   next step and the user explicitly wants it. Then riscv64.
-2. **Richer map types** — per-CPU, LRU, ringbuf, maps-of-maps. `maps.rs` is
-   where they go; `helpers.rs` for any new helpers; verifier needs to know
-   their semantics.
-3. **Fuller BTF** — CO-RE relocations, `.BTF.ext` (func/line info). Current
-   BTF is the minimal `.maps` subset only.
-4. **ELF gaps** — `R_BPF_64_ABS*` relocations, static linking of multiple
-   objects. (Global data sections — `.bss`/`.data`/`.rodata*` as single-entry
-   array maps with init data and frozen `.rodata` — are DONE, 2026-07-10.)
-5. **Verifier depth** — it's solid but not exhaustive; e.g. more precise
-   handling of variable-offset pointer arithmetic, dynptr, spin locks. Compare
-   against kernel `verifier.c` behavior if extending.
-6. **kfuncs**, legacy packet-access (`ld_abs`/`ld_ind`) — deliberately
+1. **Real-world map/helper coverage** — the corpus loop above is the active
+   thrust. After `feat/map-types-2`, the next histogram picks the batch. Still
+   missing: PROG_ARRAY/tail-calls, maps-of-maps, SK/TASK/INODE_STORAGE, LPM_TRIE,
+   sock/dev/xsk maps; the `probe_read` family and most of the ~200 helpers;
+   program-type-specific ctx (esp. XDP/TC **direct packet access** with
+   data/data_end — the biggest verifier-side gap).
+2. **aarch64 JIT backend** — the trait is ready, spec is written. The user wants
+   it; needs the macOS/arm64 exec-mem layer (see toolchain notes). Then riscv64.
+3. **Verifier depth** — dynptr, spin locks, bpf_loop/iterators, packet bounds.
+   `vfuzz --kernel` (keep at 0 FEBPF-LAX) is the conformance regression check.
+4. **ELF gaps** — `R_BPF_64_ABS*`, static linking of multiple objects.
+5. **kfuncs**, legacy packet-access (`ld_abs`/`ld_ind`) — deliberately
    unsupported; add only if a real program needs them.
 
 ## Working style the user likes
