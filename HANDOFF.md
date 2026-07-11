@@ -206,9 +206,11 @@ what makes them feasible here when they aren't elsewhere:
    `febpf conftest` (interp+JIT+kernel via raw bpf(2), exit codes 0/1/2/3 =
    agree/mismatch/no-priv/kernel-reject) and `febpf fuzz [--seed N] [--kernel]`
    (seeded differential fuzzer; already caught a real generator bug).
-   `src/kbpf.rs` attr offsets verified against kernel headers; the real
-   kernel round-trip needs root (`sudo cargo test --test conftest` once on a
-   privileged box — this host has unprivileged_bpf_disabled=2).
+   `src/kbpf.rs` attr offsets verified against kernel headers, and the full
+   kernel differential validated as root on this host 2026-07-11 (10k fuzz
+   programs + gated tests all agree — after fixing a real harness miscompile:
+   the TEST_RUN retval write-back needs the attr passed as `&mut`, see
+   `kbpf::call`).
 5. **WASM playground** — **DONE 2026-07-11** (`docs/specs/wasm-playground.md`):
    JIT now behind `default = ["jit"]` feature (keep BOTH configs green:
    `cargo test` and `cargo test --no-default-features`). `src/playground.rs`
