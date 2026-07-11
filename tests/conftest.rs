@@ -5,7 +5,10 @@
 //! unprivileged. The interp-vs-JIT differential fuzzing needs no privilege and
 //! is always exercised.
 
-use febpf::fuzz::{gen_program, interp_vs_jit, Prng};
+use febpf::fuzz::{
+    check_self_consistency, febpf_verdict, gen_frontier_program, gen_program, interp_vs_jit, Prng,
+    SelfConsistency,
+};
 use febpf::insn::Insn;
 use febpf::kbpf;
 
@@ -96,4 +99,95 @@ fn fuzz_kernel_differential_if_privileged() {
         }
     }
     eprintln!("kernel differential: {checked} programs agreed");
+}
+
+// ---------------------------------------------------------------------------
+// Verifier differential fuzzing (vfuzz) — see docs/specs/verifier-diff.md
+// ---------------------------------------------------------------------------
+
+/// The frontier generator must produce *both* accepted and rejected programs;
+/// a generator that only ever hits one side cannot expose verdict disagreement.
+#[test]
+fn frontier_generator_exercises_both_verdicts() {
+    let (mut acc, mut rej) = (0u32, 0u32);
+    for seed in 0..1500u64 {
+        let mut rng = Prng::new(seed);
+        let prog = gen_frontier_program(&mut rng);
+        if febpf_verdict(&prog, &[]).is_ok() {
+            acc += 1;
+        } else {
+            rej += 1;
+        }
+    }
+    assert!(acc > 50 && rej > 50, "unbalanced verdicts: {acc} accepted, {rej} rejected");
+}
+
+/// febpf verify+run self-consistency over many seeds and both generators: a
+/// verify-accepted program must never raise a verifier-caught safety fault at
+/// run time. This is the kernel-free soundness check and needs no privilege.
+#[test]
+fn febpf_verifier_is_self_consistent() {
+    for seed in 0..2000u64 {
+        let mut rc = Prng::new(seed);
+        let mut rf = Prng::new(seed);
+        for prog in [gen_program(&mut rc), gen_frontier_program(&mut rf)] {
+            if let SelfConsistency::AcceptedSafetyFault(m) = check_self_consistency(&prog, &[]) {
+                panic!(
+                    "seed {seed}: febpf accepted but interpreter faulted: {m}\n{}",
+                    febpf::disasm::disasm_program(&prog)
+                );
+            }
+        }
+    }
+}
+
+/// Classification is stable per seed: the same seed yields the same program and
+/// the same febpf verdict every time (reproducible `--seed` triage).
+#[test]
+fn classification_is_stable_per_seed() {
+    for seed in 0..500u64 {
+        let mut a = Prng::new(seed);
+        let mut b = Prng::new(seed);
+        let pa = gen_frontier_program(&mut a);
+        let pb = gen_frontier_program(&mut b);
+        assert_eq!(pa, pb, "frontier generator not deterministic at seed {seed}");
+        assert_eq!(
+            febpf_verdict(&pa, &[]).is_ok(),
+            febpf_verdict(&pb, &[]).is_ok(),
+            "verdict not stable at seed {seed}"
+        );
+    }
+}
+
+/// Kernel-side verifier verdict differential: when privileged, classify frontier
+/// programs into the four cells and assert febpf never accepts a program the
+/// kernel rejects (FEBPF-LAX would be a soundness gap). Skipped unprivileged.
+#[test]
+fn vfuzz_kernel_verdict_differential_if_privileged() {
+    if !matches!(kbpf::has_privilege(), Ok(true)) {
+        eprintln!("skipped: no bpf privilege");
+        return;
+    }
+    let (mut lax, mut strict, mut agree) = (0u32, 0u32, 0u32);
+    for seed in 0..1000u64 {
+        let mut rng = Prng::new(seed);
+        let prog = gen_frontier_program(&mut rng);
+        let febpf_ok = febpf_verdict(&prog, &[]).is_ok();
+        let mut log = String::new();
+        let kernel_ok = kbpf::verdict(&prog, Some(&mut log)).is_ok();
+        match (febpf_ok, kernel_ok) {
+            (true, false) => {
+                lax += 1;
+                eprintln!(
+                    "FEBPF-LAX at seed {seed} (febpf accepts, kernel rejects):\n{}\nkernel log:\n{}",
+                    febpf::disasm::disasm_program(&prog),
+                    log.trim_end()
+                );
+            }
+            (false, true) => strict += 1,
+            _ => agree += 1,
+        }
+    }
+    eprintln!("vfuzz kernel differential: {agree} agree, {strict} FEBPF-STRICT, {lax} FEBPF-LAX");
+    assert_eq!(lax, 0, "{lax} FEBPF-LAX case(s) — febpf verifier unsound vs kernel");
 }

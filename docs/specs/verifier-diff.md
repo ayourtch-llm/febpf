@@ -186,8 +186,49 @@ Exit codes (scriptable, consistent with `conftest.rs`):
 
 ## STATUS
 
-Planned. Implementation proceeds stage by stage; each stage keeps
-`cargo test` green and `cargo clippy --all-targets` at zero warnings in **both**
-the default and `--no-default-features` configurations.
+**Done (harness).** All four stages (a–d) are implemented, tested and green in
+**both** the default and `--no-default-features` configurations, with
+`cargo clippy --all-targets` at zero warnings in each.
+
+- `src/fuzz.rs` — `febpf_verdict`, `is_safety_error`, `SelfConsistency` +
+  `check_self_consistency` (ctx sized to the verifier's assumed `ctx_size` so
+  in-bounds ctx accesses don't read as spurious faults), and
+  `gen_frontier_program` (flavors: ctx pointer arithmetic + load, stack access
+  at various offsets, uninitialized reads, bounded/unbounded loops, helper
+  calls, mixed body).
+- `src/kbpf.rs` — `verdict(insns, Option<&mut String>)` returns the kernel
+  verifier's accept/reject and captures the log on rejection; it reuses
+  `prog_load`, so the `bpf(2)` attr keeps **mutable provenance to the syscall**
+  (no new command, no new miscompile surface).
+- `src/conftest.rs` — `vfuzz()`: four-cell classification, always-on kernel-free
+  self-consistency, FEBPF-LAX + self-consistency failures dumped in full,
+  FEBPF-STRICT summarised. Exit 1 (soundness problem) / 2 (kernel requested but
+  unprivileged) / 0 (clean).
+- `src/main.rs` — `vfuzz` subcommand, `--frontier` (default) / `--conservative`.
+- `tests/conftest.rs` — unprivileged: frontier generator exercises both
+  verdicts; febpf verify+run self-consistency over 2000 seeds × both
+  generators; classification stable per seed. Privileged: kernel verdict
+  differential asserts zero FEBPF-LAX (probe/skip unprivileged).
+
+**Validated unprivileged:** self-consistency holds over thousands of seeds
+(no febpf soundness bug against its own runtime); the frontier generator splits
+roughly half accept / half reject; `vfuzz --kernel` unprivileged degrades
+gracefully (probe + skip, exit 2).
+
+**Kernel side — the user's to run (needs root/`CAP_BPF`).** This environment
+could not `sudo` non-interactively, so the real kernel differential was not
+executed here. Run it on the privileged reference host with:
+
+```
+cargo build --release
+sudo ./target/release/febpf vfuzz --kernel --iters 20000
+# reproduce any dumped disagreement with:  --seed <printed> --iters 1
+sudo cargo test --test conftest    # runs the privileged vfuzz differential too
+```
+
+Expect **many FEBPF-STRICT** (kernel far stricter — normal, not bugs) and,
+ideally, **zero FEBPF-LAX**. Any FEBPF-LAX line is a real soundness gap in
+febpf's verifier and is triage material (disasm + kernel log are printed, seed
+reproduces it); it is not a blocker for landing the harness.
 </content>
 </invoke>
