@@ -14,7 +14,7 @@ load-bearing constraint. Don't add any without a very good reason and the
 user's OK (raw Linux syscalls via `asm!` are used instead of libc — see the
 JIT's `sys` module).
 
-Everything works today: `cargo test` is 62 green, `cargo clippy --all-targets`
+Everything works today: `cargo test` is 106 green, `cargo clippy --all-targets`
 is 0 warnings, release builds clean.
 
 ## The big picture (data flow)
@@ -183,17 +183,17 @@ these catch encoding bugs. Add more programs to the `programs()` list in
 Ranked by wow-per-effort. Each builds on something we already have, which is
 what makes them feasible here when they aren't elsewhere:
 
-1. **Time-travel debugging** — `rstep`/`rcontinue` in the debugger, plus data
-   watchpoints ("break when this map byte changes", then step *back* to the
-   write). Execution is already fully deterministic (fixed-seed prandom,
-   stable map storage), so this is snapshot + replay-to-N, no state recording
-   needed. Kernel eBPF devs literally cannot have this; we get it almost free.
-2. **Verifier rejection explainer** — on reject, print the exact branch path
-   (as source-annotated disasm) from entry to the failing instruction with
-   the abstract register state at each step: a counterexample trace, "your
-   pointer can be NULL here because the branch at insn 12 was taken". The #1
-   real-world eBPF pain is inscrutable verifier errors. The DFS already has
-   the path; we just have to keep it and pretty-print it.
+1. **Time-travel debugging** — **DONE 2026-07-11** (`docs/specs/time-travel-debug.md`):
+   `rstep`/`rcontinue`/`goto` + data watchpoints (raw addr and logical map+key),
+   10k-step checkpoints, snapshot must include region table + per-map region
+   handles (lazy allocation order matters on replay). Warns once if
+   non-deterministic helpers were called.
+2. **Verifier rejection explainer** — **DONE 2026-07-11**
+   (`docs/specs/verifier-explainer.md`): counterexample trace on rejection
+   (annotated disasm of the failing path, per-step abstract state, cause notes
+   like "r0 may be NULL: returned by map_lookup_elem at insn 6"). On by
+   default, `--no-explain` to suppress. Path arena during DFS + replay on
+   rejection; pruning machinery untouched.
 3. **Source-level debugging** — parse `.BTF.ext` line info (we already parse
    BTF) and show C source lines in the debugger/disasm/heatmap. `febpf debug
    prog.o` stepping through *C, not bytecode*, with globals readable by name
@@ -208,9 +208,15 @@ what makes them feasible here when they aren't elsewhere:
    pure-std Rust; a `wasm32` build (JIT feature-gated off) plus a small HTML
    page = eBPF playground in the browser: paste asm or a hex .o, verify,
    step, see the heatmap. Nothing like it exists; huge demo value.
-6. **CO-RE relocations** — `.BTF.ext` relocs against a target BTF (take
-   /sys/kernel/btf/vmlinux or a file). Makes real-world portable programs
-   load unmodified; pairs with #3 since both need `.BTF.ext`.
+6. **CO-RE relocations** — **DONE 2026-07-11** (`docs/specs/core-relocations.md`):
+   full BTF type graph in `src/btf.rs` (all 19 kinds, validated byte-exact
+   against `bpftool btf dump` on vmlinux, 168k types ~56ms), `.BTF.ext`
+   parsing (core_relo semantic; func/line_info stored for future #3), the
+   libbpf matching algorithm in `src/relo.rs` (13 relo kinds, flavors,
+   ambiguity rules), load-time patching with libbpf-style `0xbad2310`
+   poisoning of unresolved relos. CLI: `--target-btf <path>`, defaults to
+   /sys/kernel/btf/vmlinux. Differentially validated against bpftool and the
+   running kernel.
 
 ## Known limitations / where to go next (roughly prioritized)
 
