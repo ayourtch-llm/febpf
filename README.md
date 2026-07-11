@@ -7,6 +7,8 @@ A **zero-dependency** eBPF virtual machine in Rust with its own kernel-style
 an **interactive debugger**. Made for developing, debugging and understanding
 eBPF programs entirely in userland.
 
+> **Try it in your browser:** [febpf WebAssembly playground](https://stdio.be/febpf/)
+
 ```
 $ febpf run examples/fib.s --ctx 0b
 r0 = 89 (0x59)   [interp, 1.9µs]
