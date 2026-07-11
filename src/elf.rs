@@ -312,6 +312,22 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
         prog.debug = build_debug_info(r.le, bytes, &sections, sec_name, *text_base, &maps)?;
     }
 
+    // libbpf-style load-time dead-code elimination driven by frozen `.rodata`
+    // values (docs/specs/rodata-dce.md): resolve branches on read-only config
+    // constants and remove the code they prove dead — including subprograms
+    // stitched in from `.text` that this entry point never calls. Real libbpf
+    // does the equivalent before handing a program to the kernel, so objects
+    // compiled with the `const volatile` config idiom rely on it to pass the
+    // verifier's unreachable-instruction check.
+    for (prog, _, _) in programs.iter_mut() {
+        if let Some(res) = crate::dce::eliminate_rodata_dead_code(&prog.insns, &maps) {
+            if let Some(d) = prog.debug.as_mut() {
+                d.remap_insns(&res.pc_map);
+            }
+            prog.insns = res.insns;
+        }
+    }
+
     Ok(Object {
         programs: programs.into_iter().map(|(p, _, _)| p).collect(),
         maps,

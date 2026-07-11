@@ -51,11 +51,89 @@ pub struct Optimized {
 }
 
 /// What to do with one instruction slot during a rewrite round.
-enum Action {
+/// Shared with the load-time rodata DCE pass (`crate::dce`).
+pub(crate) enum Action {
     /// Keep this slot, possibly with a rewritten instruction.
     Keep(Insn),
     /// Remove this slot (it was a proven no-op / dead branch).
     Drop,
+}
+
+/// The result of applying a slot-action vector: the surviving instructions
+/// with every pc-relative target relocated, plus the old→new index mapping
+/// (needed by callers that must remap side tables such as line info).
+pub(crate) struct Relocated {
+    pub insns: Vec<Insn>,
+    /// `pc_map[old]` = new index of the first kept slot at or after `old`.
+    /// Length is `old_len + 1`; `pc_map[old_len]` = the new length.
+    pub pc_map: Vec<usize>,
+}
+
+/// Build the kept instruction vector from per-slot actions and relocate all
+/// pc-relative targets (JMP/JMP32 offsets, `gotol` imm, local-call imm)
+/// through the old→new index map. Errors if a relocated offset no longer fits
+/// its field or a kept jump targets out of range.
+pub(crate) fn apply_actions(insns: &[Insn], actions: Vec<Action>) -> Result<Relocated, String> {
+    let n = insns.len();
+    debug_assert_eq!(actions.len(), n);
+    let mut out: Vec<Insn> = Vec::new();
+    let mut kept_new: Vec<Option<usize>> = vec![None; n];
+    let mut old_of_new: Vec<usize> = Vec::new();
+    for (pc, act) in actions.into_iter().enumerate() {
+        if let Action::Keep(ins) = act {
+            kept_new[pc] = Some(out.len());
+            old_of_new.push(pc);
+            out.push(ins);
+        }
+    }
+    let new_len = out.len();
+    // pc_map[pc] = new index of the first kept slot at or after pc.
+    let mut pc_map = vec![new_len; n + 1];
+    for pc in (0..n).rev() {
+        pc_map[pc] = kept_new[pc].unwrap_or(pc_map[pc + 1]);
+    }
+
+    // Relocate pc-relative targets.
+    for (new_pc, ins) in out.iter_mut().enumerate() {
+        let old_pc = old_of_new[new_pc];
+        let cls = ins.class();
+        if cls != class::JMP && cls != class::JMP32 {
+            continue;
+        }
+        let op = ins.op();
+        if op == jmp::EXIT {
+            continue;
+        }
+        if op == jmp::CALL {
+            if ins.src == crate::insn::call_kind::LOCAL {
+                let target = (old_pc as i64 + 1 + ins.imm as i64) as usize;
+                let new_rel = pc_map[target] as i64 - (new_pc as i64 + 1);
+                ins.imm = new_rel as i32;
+            }
+            continue;
+        }
+        // JA (both classes) or a conditional. gotol (JMP32|JA) uses imm.
+        let uses_imm = cls == class::JMP32 && op == jmp::JA;
+        let rel = if uses_imm {
+            ins.imm as i64
+        } else {
+            ins.off as i64
+        };
+        let target = (old_pc as i64 + 1 + rel) as usize;
+        if target > n {
+            return Err(format!("relocated jump target {target} out of range"));
+        }
+        let new_rel = pc_map[target] as i64 - (new_pc as i64 + 1);
+        if uses_imm {
+            ins.imm = new_rel as i32;
+        } else {
+            if new_rel < i16::MIN as i64 || new_rel > i16::MAX as i64 {
+                return Err(format!("relocated branch offset {new_rel} overflows i16"));
+            }
+            ins.off = new_rel as i16;
+        }
+    }
+    Ok(Relocated { insns: out, pc_map })
 }
 
 /// The scalar an abstract register holds, if it is a scalar (else `None`).
@@ -67,8 +145,8 @@ fn as_scalar(r: &RegState) -> Option<Scalar> {
 }
 
 /// Exact evaluation of a 64/32-bit conditional-jump predicate on two constants,
-/// mirroring the interpreter (`interp.rs` `step`).
-fn eval_pred_const(op: u8, is32: bool, a: u64, b: u64) -> Option<bool> {
+/// mirroring the interpreter (`interp.rs` `step`). Shared with `crate::dce`.
+pub(crate) fn eval_pred_const(op: u8, is32: bool, a: u64, b: u64) -> Option<bool> {
     let r = if is32 {
         let (a, b) = (a as u32, b as u32);
         let (sa, sb) = (a as i32, b as i32);
@@ -185,7 +263,8 @@ fn range_eq(a: (u64, u64), b: (u64, u64)) -> Option<bool> {
 
 /// Exact ALU result of `a op b` for two constants, matching the interpreter.
 /// `None` for ops we do not fold (e.g. byte-swap, or shifts out of range).
-fn eval_alu_const(op: u8, is32: bool, off: i16, a: u64, b: u64) -> Option<u64> {
+/// Shared with `crate::dce`.
+pub(crate) fn eval_alu_const(op: u8, is32: bool, off: i16, a: u64, b: u64) -> Option<u64> {
     if is32 {
         let a = a as u32;
         let b = b as u32;
@@ -416,67 +495,9 @@ fn rewrite_round(insns: &[Insn], vres: &VerifyOk) -> Result<(Vec<Insn>, bool, St
         pc += 1;
     }
 
-    // Build the kept vector and the old->new index map.
-    let mut out: Vec<Insn> = Vec::new();
-    let mut kept_new: Vec<Option<usize>> = vec![None; n];
-    let mut old_of_new: Vec<usize> = Vec::new();
-    for (pc, act) in actions.into_iter().enumerate() {
-        if let Action::Keep(ins) = act {
-            kept_new[pc] = Some(out.len());
-            old_of_new.push(pc);
-            out.push(ins);
-        }
-    }
-    let new_len = out.len();
-    // map[pc] = new index of the first kept slot at or after pc.
-    let mut map = vec![new_len; n + 1];
-    for pc in (0..n).rev() {
-        map[pc] = kept_new[pc].unwrap_or(map[pc + 1]);
-    }
-
-    // Relocate pc-relative targets.
-    for (new_pc, ins) in out.iter_mut().enumerate() {
-        let old_pc = old_of_new[new_pc];
-        let cls = ins.class();
-        if cls != class::JMP && cls != class::JMP32 {
-            continue;
-        }
-        let op = ins.op();
-        if op == jmp::EXIT {
-            continue;
-        }
-        if op == jmp::CALL {
-            if ins.src == crate::insn::call_kind::LOCAL {
-                let target = (old_pc as i64 + 1 + ins.imm as i64) as usize;
-                let new_rel = map[target] as i64 - (new_pc as i64 + 1);
-                ins.imm = new_rel as i32;
-            }
-            continue;
-        }
-        // JA (both classes) or a conditional. gotol (JMP32|JA) uses imm.
-        let uses_imm = cls == class::JMP32 && op == jmp::JA;
-        let rel = if uses_imm {
-            ins.imm as i64
-        } else {
-            ins.off as i64
-        };
-        let target = (old_pc as i64 + 1 + rel) as usize;
-        if target > n {
-            return Err(format!("relocated jump target {target} out of range"));
-        }
-        let new_rel = map[target] as i64 - (new_pc as i64 + 1);
-        if uses_imm {
-            ins.imm = new_rel as i32;
-        } else {
-            if new_rel < i16::MIN as i64 || new_rel > i16::MAX as i64 {
-                return Err(format!("relocated branch offset {new_rel} overflows i16"));
-            }
-            ins.off = new_rel as i16;
-        }
-    }
-
-    let changed = new_len != n || stats.total_rewrites() > 0;
-    Ok((out, changed, stats))
+    let relocated = apply_actions(insns, actions)?;
+    let changed = relocated.insns.len() != n || stats.total_rewrites() > 0;
+    Ok((relocated.insns, changed, stats))
 }
 
 /// Optimize a program: apply sound, verifier-gated rewrites to a fixpoint, then
