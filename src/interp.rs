@@ -16,7 +16,33 @@
 use crate::helpers::{self, MemBus, UserHelpers};
 use crate::insn::*;
 use crate::maps::{Map, MapDef, ValueRef};
-use std::time::Instant;
+
+/// Monotonic clock for the `ktime_get_ns` helper. `std::time::Instant` panics
+/// on `wasm32-unknown-unknown` (no time source), so that target gets a stub
+/// that reports 0 — deterministic, and fine for the browser playground.
+struct Clock {
+    #[cfg(not(target_arch = "wasm32"))]
+    start: std::time::Instant,
+}
+
+impl Clock {
+    fn start() -> Clock {
+        Clock {
+            #[cfg(not(target_arch = "wasm32"))]
+            start: std::time::Instant::now(),
+        }
+    }
+    fn elapsed_nanos(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.start.elapsed().as_nanos() as u64
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct EbpfError {
@@ -67,7 +93,7 @@ pub struct Vm {
     pub user_helpers: UserHelpers,
     regions: Vec<Region>,
     stack: Vec<u8>,
-    start: Instant,
+    start: Clock,
     prandom: u64,
     /// Lines emitted by trace_printk.
     pub printk: Vec<String>,
@@ -110,7 +136,7 @@ impl Vm {
             user_helpers: UserHelpers::new(),
             regions,
             stack: vec![0u8; MAX_CALL_FRAMES * STACK_SIZE],
-            start: Instant::now(),
+            start: Clock::start(),
             prandom: 0x853c49e6748fea9b,
             printk: Vec::new(),
             echo_printk: false,
@@ -801,7 +827,7 @@ impl<'a> Machine<'a> {
                     Err(e) => e as u64,
                 }
             }
-            helpers::id::KTIME_GET_NS => self.vm.start.elapsed().as_nanos() as u64,
+            helpers::id::KTIME_GET_NS => self.vm.start.elapsed_nanos(),
             helpers::id::TRACE_PRINTK => {
                 let fmt = self.read_bytes(args[0], args[1] as usize)?;
                 let line = self.format_printk(&fmt, [args[2], args[3], args[4]])?;

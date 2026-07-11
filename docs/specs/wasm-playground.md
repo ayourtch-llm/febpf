@@ -180,7 +180,10 @@ host. Serving needs a real server for the `application/wasm` MIME type
 - [x] Spec written
 - [x] Stage 1 — JIT feature gate (tests green with & without `jit`, clippy
       clean both ways, `bench --jit` = 9.5 GIPS)
-- [ ] Stage 2 — playground + wasm ABI
+- [x] Stage 2 — playground + wasm ABI (native `tests/playground.rs` green both
+      feature ways; wasm cdylib builds; `wasmtime --invoke febpf_selftest`
+      returns 15 — the engine runs end-to-end in wasm. Note: `Instant` panics on
+      `wasm32-unknown-unknown`, so `ktime_get_ns` uses a cfg'd zero clock.)
 - [ ] Stage 3 — web page
 - [ ] Stage 4 — Makefile, docs, smoke test
 </content>
