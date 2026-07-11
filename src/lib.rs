@@ -23,6 +23,7 @@ pub mod analysis;
 pub mod asm;
 pub mod btf;
 pub mod debug;
+pub mod debuginfo;
 pub mod disasm;
 pub mod elf;
 pub mod helpers;

@@ -13,6 +13,8 @@
 //! members encoded as pointer-to-array and pointer-to-type).
 //! See `docs/specs/elf-loading.md`.
 
+use crate::btf::{Btf, BtfExt, Kind};
+use crate::debuginfo::{DebugInfo, FuncBound, GlobalVar, SourceLine};
 use crate::insn::{self, Insn};
 use crate::maps::{MapDef, MapKind};
 
@@ -43,6 +45,8 @@ const BPF_MAP_TYPE_ARRAY: u32 = 2;
 pub struct LoadedProgram {
     pub name: String,
     pub insns: Vec<Insn>,
+    /// Source-level debug info from `.BTF`/`.BTF.ext`, if the object had any.
+    pub debug: Option<DebugInfo>,
 }
 
 /// The result of loading an object file.
@@ -264,6 +268,7 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
             LoadedProgram {
                 name: sec.name.clone(),
                 insns,
+                debug: None,
             },
             sec.name.clone(),
             text_base,
@@ -280,6 +285,7 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
                 LoadedProgram {
                     name: "text".into(),
                     insns,
+                    debug: None,
                 },
                 ".text".into(),
                 text_base,
@@ -292,6 +298,11 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
 
     if let Some(target) = target_btf {
         apply_core_relocations(r.le, bytes, &sections, &mut programs, target)?;
+    }
+
+    // Surface source-level debug info (line/func/globals) for each program.
+    for (prog, sec_name, text_base) in programs.iter_mut() {
+        prog.debug = build_debug_info(r.le, bytes, &sections, sec_name, *text_base, &maps)?;
     }
 
     Ok(Object {
@@ -326,8 +337,6 @@ fn apply_core_relocations(
     programs: &mut [(LoadedProgram, String, Option<usize>)],
     target_btf: &[u8],
 ) -> Result<(), String> {
-    use crate::btf::{Btf, BtfExt};
-
     let Some(btf_idx) = sections.iter().position(|s| s.name == ".BTF" && s.size > 0) else {
         return Ok(()); // no local BTF, nothing to relocate
     };
@@ -382,6 +391,105 @@ fn apply_core_relocations(
         }
     }
     Ok(())
+}
+
+/// Build source-level [`DebugInfo`] for one program from the object's `.BTF`
+/// and `.BTF.ext`. `sec_name`/`text_base` describe where this program's code
+/// came from (see [`build_program`]); `.BTF.ext` records are grouped per ELF
+/// section and translated to flat instruction indices exactly as CO-RE
+/// relocations are (see `docs/specs/source-debug.md`). Returns `None` when the
+/// object carries no usable debug info.
+fn build_debug_info(
+    le: bool,
+    bytes: &[u8],
+    sections: &[Section],
+    sec_name: &str,
+    text_base: Option<usize>,
+    maps: &[MapDef],
+) -> Result<Option<DebugInfo>, String> {
+    let Some(btf_idx) = sections.iter().position(|s| s.name == ".BTF" && s.size > 0) else {
+        return Ok(None);
+    };
+    let btf = Btf::parse(le, section_bytes(bytes, sections, btf_idx)?)?;
+
+    // Flat instruction index of a per-section byte offset, or None if the
+    // record belongs to a section not part of this program.
+    let flat_idx = |rec_sec: &str, insn_off: u32| -> Option<usize> {
+        let base = if rec_sec == sec_name {
+            0
+        } else if rec_sec == ".text" {
+            text_base?
+        } else {
+            return None;
+        };
+        Some(base + insn_off as usize / insn::INSN_SIZE)
+    };
+
+    let mut lines = Vec::new();
+    let mut funcs = Vec::new();
+    if let Some(ext_idx) = sections
+        .iter()
+        .position(|s| s.name == ".BTF.ext" && s.size > 0)
+    {
+        let ext = BtfExt::parse(le, section_bytes(bytes, sections, ext_idx)?)?;
+        for es in &ext.line_info {
+            let rec_sec = btf.str_at(es.sec_name_off).to_string();
+            for r in &es.recs {
+                if let Some(idx) = flat_idx(&rec_sec, r.insn_off) {
+                    lines.push(SourceLine {
+                        insn: idx,
+                        file: btf.str_at(r.file_name_off).to_string(),
+                        line: r.line(),
+                        col: r.col(),
+                        text: btf.str_at(r.line_off).trim_end().to_string(),
+                    });
+                }
+            }
+        }
+        for es in &ext.func_info {
+            let rec_sec = btf.str_at(es.sec_name_off).to_string();
+            for r in &es.recs {
+                if let Some(idx) = flat_idx(&rec_sec, r.insn_off) {
+                    funcs.push(FuncBound {
+                        insn: idx,
+                        name: btf.type_name(r.type_id).to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Globals: every DATASEC var that maps to a data-section map.
+    let mut globals = Vec::new();
+    for (id, t) in btf.iter() {
+        let Kind::Datasec { entries, .. } = &t.kind else {
+            continue;
+        };
+        let sec = btf.type_name(id);
+        let map = maps.iter().position(|m| m.name == sec).or_else(|| {
+            // clang merges `.rodata.*` into one `.rodata` DATASEC; best-effort.
+            sec.starts_with(".rodata")
+                .then(|| maps.iter().position(|m| m.name.starts_with(".rodata")))
+                .flatten()
+        });
+        let Some(map) = map else { continue };
+        for e in entries {
+            let Ok(var) = btf.ty(e.type_id) else { continue };
+            let Kind::Var { type_id, .. } = var.kind else {
+                continue;
+            };
+            globals.push(GlobalVar {
+                name: btf.str_at(var.name_off).to_string(),
+                map,
+                map_name: maps[map].name.clone(),
+                offset: e.offset,
+                type_id,
+            });
+        }
+    }
+
+    let di = DebugInfo::new(btf, lines, funcs, globals);
+    Ok((!di.is_empty()).then_some(di))
 }
 
 /// Patch one relocated instruction with the computed target value, mirroring

@@ -81,6 +81,9 @@ pub struct Vm {
     /// Compiled native code, if this VM was JIT-compiled. Taken out during
     /// execution (like `user_helpers`) to satisfy the borrow checker.
     pub jit: Option<crate::jit::JitProgram>,
+    /// Source-level debug info (from `.BTF.ext`/`.BTF`), when the program was
+    /// loaded from a `-g` ELF object. Static across a run, so not snapshotted.
+    debug: Option<crate::debuginfo::DebugInfo>,
 }
 
 impl Vm {
@@ -116,6 +119,7 @@ impl Vm {
             insn_limit: u64::MAX,
             profile: None,
             jit: None,
+            debug: None,
         };
 
         // Patch map-reference lddw instructions into plain 64-bit immediates.
@@ -187,6 +191,16 @@ impl Vm {
 
     pub fn insns(&self) -> &[Insn] {
         &self.insns
+    }
+
+    /// Attach source-level debug info (set by the ELF loader path).
+    pub fn set_debug(&mut self, debug: crate::debuginfo::DebugInfo) {
+        self.debug = Some(debug);
+    }
+
+    /// Source-level debug info, if this program carried any.
+    pub fn debug(&self) -> Option<&crate::debuginfo::DebugInfo> {
+        self.debug.as_ref()
     }
 
     /// Start counting executions per instruction (see [`Vm::profile`]).
@@ -464,6 +478,17 @@ impl<'a> Machine<'a> {
 
     pub fn current_frame(&self) -> usize {
         self.frames.len()
+    }
+
+    /// Instruction indices of the current call stack, innermost first: the
+    /// current pc followed by each caller's call site (`ret_pc - 1`). Used to
+    /// build a source-level backtrace.
+    pub fn backtrace_pcs(&self) -> Vec<usize> {
+        let mut pcs = vec![self.pc];
+        for f in self.frames.iter().rev() {
+            pcs.push(f.ret_pc.saturating_sub(1));
+        }
+        pcs
     }
 
     /// Shared access to the underlying VM (for inspection tools).
