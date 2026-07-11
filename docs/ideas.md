@@ -92,3 +92,31 @@ Known-hard corners (documentable limitations, not fatal): prog_array /
 tail-call contents are FDs (re-link by name), stack_trace ids are hashes of
 kernel addresses (stale across kernels; translatable only with both hosts'
 kallsyms), ringbuf in-flight records at quiesce time.
+
+## Formal methods (2026-07-11 pondering)
+
+TLA+ verdict: wrong tool for the ISA (big 64-bit state, no temporal structure
+— TLC explodes; Sail/K/Lean/SMT are the right shapes there, and the ISA is
+already RFC 9669 + CertrBPF academically). Right tool for exactly one slice:
+**the race explorer's map-op interleaving semantics** — N instances, shared
+maps, lost-update/stale-RMW properties. A TLA+ model in docs/formal/ +
+TLC-vs-`febpf race` verdict cross-validation on small configs is a genuine,
+modest project (differential testing applied to formal methods).
+
+The high-value target is **verifier abstract-operator soundness** (where Agni
+found real kernel bugs; the tnum paper proved the kernel's ops sound). The
+bugs live in abstract arithmetic — our `tnum.rs` + range logic — and
+soundness is a ∀-property fuzzing can't establish. Feasible in-repo,
+zero-dep, ranked:
+1. **Exhaustive small-width soundness checks** (do first; single-agent batch):
+   parameterize tnum/interval ops over bit width, brute-force the soundness
+   obligation (∀x∈γ(a),y∈γ(b): x⊕y ∈ γ(a⊕'b)) at w=8 over ALL abstract pairs
+   in a test module. Seconds to run, lives in CI, catches the Agni bug class.
+2. **SMT-LIB emission**: hand-written emitter (SMT-LIB2 is text) dumping each
+   operator's 64-bit soundness obligation to .smt2, discharged by z3 IF
+   installed — same optional-oracle pattern as clang/bpftool/root-kernel.
+3. The TLA+ race-model cross-check above.
+
+A fully verified verifier (Lean/Coq) is a different project; febpf would be a
+good substrate (deterministic, no libc, interpreter = executable semantics)
+but CertrBPF/Agni occupy that research ground.
