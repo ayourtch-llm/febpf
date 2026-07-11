@@ -21,15 +21,12 @@ the JIT is now behind `default = ["jit"]`, so always run `cargo test` AND
 `cargo test --no-default-features` (and clippy in both) before calling
 anything done.
 
-**⚠ IN-FLIGHT AT LAST SESSION END (2026-07-11):** a background agent was
-implementing `feat/map-types-2` — PERF_EVENT_ARRAY (+ bpf_perf_event_output),
-CGROUP_ARRAY, STACK_TRACE (+ bpf_get_stackid), and core tracing helpers
-(get_current_pid_tgid #14 / uid_gid #15 / comm #16 / task #35). FIRST THING
-NEXT SESSION: check `git branch` for `feat/map-types-2`; if present, review it,
-merge into main (expect a small `src/elf.rs` `map_kind`/`map_type_name` conflict
-— union both sides like the map-types merge did), run both test configs +
-clippy, then re-run `./scripts/scan-corpus.sh` to measure the coverage jump.
-See the corpus workflow under "Production coverage" below.
+**Nothing in flight.** `feat/map-types-2` (perf/cgroup/stack maps + core
+tracing helpers) and `feat/probe-read-helpers` (probe_read family #4/#45/#112–115
++ current_task_under_cgroup #37, spec `docs/specs/tracing-helpers.md`) are both
+finished and merged (2026-07-11). Corpus coverage after the two batches:
+**loads 92.9%, verifies 67.9%** (38/56) — up from 30% / 5.4%. Zero map-type
+blockers remain; the next work is named under "Known limitations" below.
 
 ## The big picture (data flow)
 
@@ -333,12 +330,34 @@ guess (it already corrected a wrong guess: ringbuf mattered less than
 PERF_EVENT_ARRAY for this corpus). Coverage progression (loads / verifies):
 - baseline (hash+array only): 23% / 3.6%
 - + ringbuf/per-CPU/LRU (`docs/specs/map-types.md`): 30% / 5.4%
-- next (in-flight `feat/map-types-2`): PERF_EVENT_ARRAY (19 progs), CGROUP_ARRAY
-  (13), STACK_TRACE (6), get_current_pid_tgid (7) — should move loads a lot.
+- + perf/cgroup/stack maps + tracing helpers (`map-types-2.md`): 92.9% / 30.4%
+- + probe_read family + task_under_cgroup (`tracing-helpers.md`): 92.9% / **67.9%**
 **Workflow: merge a coverage batch → `./scripts/scan-corpus.sh` → the histogram
 names the next batch.** febpf is an analysis/test/CI/debug engine, NOT a datapath
 runtime — "production useful" means verify/explain/differential-test/debug real
 programs, not attach-and-run in the kernel.
+
+Two gotchas learned running this loop (2026-07-11): the scan uses
+`target/release/febpf`, so `cargo build --release` BEFORE scanning or you
+measure the previous build; and helper names in the histogram come from the
+uapi header now — the old hardcoded table had wrong ids (#113 was labelled
+ringbuf_output; it is probe_read_kernel).
+
+What blocks the remaining 18 objects (ranked by count, from the per-object
+detail in `corpus/coverage-report.txt`):
+1. **13 × VERIFY-REJECT:other, two root causes.** (a) "unreachable
+   instruction": libbpf performs dead-code elimination using frozen `.rodata`
+   config values before the kernel ever sees the program; febpf verifies the
+   object as-is, so `if (cfg_flag)` branches over unloaded code trip the
+   unreachable check. Fix = a load-time rodata-driven branch-elimination pass
+   (mirror libbpf's). (b) scalar-deref like `r1 = *(u32*)(r6+2804)` where r6
+   came from a `tp_btf` ctx load: real kernels type that as PTR_TO_BTF_ID and
+   allow direct kernel-memory reads. Fix = model BTF-typed ctx pointers
+   (bigger; verifier + a deterministic "kernel memory reads as zero" story).
+2. **3 × LOAD-FAIL:relocation + 1 LOAD-FAIL:other** — CO-RE edge cases worth a
+   look (`biosnoop`, `bitesize`, `capable`, `cpudist`).
+3. **1 × helper #67 get_stack** (biostacks) — easy: same model as get_stackid
+   but writes the stack into a caller buffer.
 
 ## Known limitations / where to go next (roughly prioritized)
 
