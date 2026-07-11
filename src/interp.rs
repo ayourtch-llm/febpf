@@ -1369,6 +1369,77 @@ impl<'a> Machine<'a> {
                 let _ = self.vm.maps[m].update(&id.to_le_bytes(), &val);
                 id as u64
             }
+            helpers::id::PROBE_READ
+            | helpers::id::PROBE_READ_KERNEL
+            | helpers::id::PROBE_READ_USER => {
+                // (dst, size, unsafe_ptr). The source is an arbitrary address;
+                // resolve it through the virtual-address model. Success copies;
+                // anything unresolvable zero-fills dst and returns -EFAULT,
+                // exactly the kernel's fault behaviour (and deterministic).
+                let size = args[1] as usize;
+                let src = self.read_bytes(args[2], size);
+                let dst = self.mem(args[0], size, true)?;
+                match src {
+                    Ok(bytes) => {
+                        dst.copy_from_slice(&bytes);
+                        0
+                    }
+                    Err(_) => {
+                        dst.fill(0);
+                        (-14i64) as u64 // -EFAULT
+                    }
+                }
+            }
+            helpers::id::PROBE_READ_STR
+            | helpers::id::PROBE_READ_KERNEL_STR
+            | helpers::id::PROBE_READ_USER_STR => {
+                // (dst, size, unsafe_ptr): copy a NUL-terminated string of at
+                // most `size` bytes (truncating with a forced NUL, like the
+                // kernel) and return the copied length including the NUL. The
+                // dst is zeroed first so the result is deterministic; a fault
+                // on any source byte zero-fills and returns -EFAULT.
+                let size = args[1] as usize;
+                let mut copied = Vec::with_capacity(size);
+                let mut fault = false;
+                for i in 0..size {
+                    match self.read_bytes(args[2] + i as u64, 1) {
+                        Ok(b) => {
+                            copied.push(b[0]);
+                            if b[0] == 0 {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            fault = true;
+                            break;
+                        }
+                    }
+                }
+                let dst = self.mem(args[0], size, true)?;
+                dst.fill(0);
+                if fault {
+                    (-14i64) as u64 // -EFAULT
+                } else if size == 0 {
+                    0
+                } else {
+                    if *copied.last().unwrap() != 0 {
+                        *copied.last_mut().unwrap() = 0; // truncated: force NUL
+                    }
+                    dst[..copied.len()].copy_from_slice(&copied);
+                    copied.len() as u64
+                }
+            }
+            helpers::id::CURRENT_TASK_UNDER_CGROUP => {
+                // febpf's single synthetic task belongs to no cgroup: always
+                // 0 ("not under"), deterministically. Validate the index like
+                // the kernel (-EINVAL beyond the array) for fidelity.
+                let m = self.map_from_ptr(args[0])?;
+                if args[1] >= self.vm.maps[m].def.max_entries as u64 {
+                    (-22i64) as u64 // -EINVAL
+                } else {
+                    0
+                }
+            }
             helpers::id::RINGBUF_RESERVE => {
                 let m = self.map_from_ptr(args[0])?;
                 self.ringbuf_reserve(m, args[1] as u32)

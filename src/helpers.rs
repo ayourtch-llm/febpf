@@ -6,6 +6,7 @@ pub mod id {
     pub const MAP_LOOKUP_ELEM: u32 = 1;
     pub const MAP_UPDATE_ELEM: u32 = 2;
     pub const MAP_DELETE_ELEM: u32 = 3;
+    pub const PROBE_READ: u32 = 4;
     pub const KTIME_GET_NS: u32 = 5;
     pub const TRACE_PRINTK: u32 = 6;
     pub const GET_PRANDOM_U32: u32 = 7;
@@ -16,6 +17,12 @@ pub mod id {
     pub const PERF_EVENT_OUTPUT: u32 = 25;
     pub const GET_STACKID: u32 = 27;
     pub const GET_CURRENT_TASK: u32 = 35;
+    pub const CURRENT_TASK_UNDER_CGROUP: u32 = 37;
+    pub const PROBE_READ_STR: u32 = 45;
+    pub const PROBE_READ_USER: u32 = 112;
+    pub const PROBE_READ_KERNEL: u32 = 113;
+    pub const PROBE_READ_USER_STR: u32 = 114;
+    pub const PROBE_READ_KERNEL_STR: u32 = 115;
     pub const RINGBUF_OUTPUT: u32 = 130;
     pub const RINGBUF_RESERVE: u32 = 131;
     pub const RINGBUF_SUBMIT: u32 = 132;
@@ -135,6 +142,45 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [Any, ConstMapPtr, Scalar, None, None],
             ret: RetKind::Scalar,
         },
+        // probe_read family: (dst, size, unsafe_ptr). The source is
+        // ARG_ANYTHING in the kernel (any scalar/pointer); febpf resolves it
+        // through the virtual-address model at runtime and faults cleanly.
+        id::PROBE_READ => HelperSig {
+            name: "probe_read",
+            args: [MemWrite { size_arg: 1 }, Size, Any, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::PROBE_READ_KERNEL => HelperSig {
+            name: "probe_read_kernel",
+            args: [MemWrite { size_arg: 1 }, Size, Any, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::PROBE_READ_USER => HelperSig {
+            name: "probe_read_user",
+            args: [MemWrite { size_arg: 1 }, Size, Any, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::PROBE_READ_STR => HelperSig {
+            name: "probe_read_str",
+            args: [MemWrite { size_arg: 1 }, Size, Any, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::PROBE_READ_KERNEL_STR => HelperSig {
+            name: "probe_read_kernel_str",
+            args: [MemWrite { size_arg: 1 }, Size, Any, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::PROBE_READ_USER_STR => HelperSig {
+            name: "probe_read_user_str",
+            args: [MemWrite { size_arg: 1 }, Size, Any, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::CURRENT_TASK_UNDER_CGROUP => HelperSig {
+            name: "current_task_under_cgroup",
+            // (map, index); map must be a cgroup_array.
+            args: [ConstMapPtr, Scalar, None, None, None],
+            ret: RetKind::Scalar,
+        },
         id::PERF_EVENT_OUTPUT => HelperSig {
             name: "perf_event_output",
             // (ctx, map, flags, data, size); data is a readable region of `size`
@@ -190,6 +236,13 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::GET_CURRENT_COMM,
         id::GET_CURRENT_TASK,
         id::GET_STACKID,
+        id::PROBE_READ,
+        id::PROBE_READ_STR,
+        id::PROBE_READ_KERNEL,
+        id::PROBE_READ_USER,
+        id::PROBE_READ_KERNEL_STR,
+        id::PROBE_READ_USER_STR,
+        id::CURRENT_TASK_UNDER_CGROUP,
         id::PERF_EVENT_OUTPUT,
         id::RINGBUF_OUTPUT,
         id::RINGBUF_RESERVE,

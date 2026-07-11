@@ -2166,6 +2166,9 @@ impl<'a> Verifier<'a> {
             let required = match hid {
                 crate::helpers::id::PERF_EVENT_OUTPUT => Some(crate::maps::MapKind::PerfEventArray),
                 crate::helpers::id::GET_STACKID => Some(crate::maps::MapKind::StackTrace),
+                crate::helpers::id::CURRENT_TASK_UNDER_CGROUP => {
+                    Some(crate::maps::MapKind::CgroupArray)
+                }
                 _ => None,
             };
             if let Some(k) = required {

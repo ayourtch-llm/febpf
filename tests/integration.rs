@@ -790,6 +790,143 @@ fn get_current_comm_writes_fixed_name() {
     assert_eq!(run_src(src), 0x66_7062_6566); // \"febpf\\0\\0\\0\" little-endian
 }
 
+// ------------------------------------------------------ probe_read family
+
+/// probe_read_kernel from a resolvable pointer (here: a map value) copies the
+/// bytes and returns 0.
+#[test]
+fn probe_read_kernel_copies_from_valid_pointer() {
+    let src = "
+        .map a array 4 8 1
+        ; store 777 into element 0
+        w1 = 0
+        *(u32 *)(r10 - 4) = r1
+        r1 = 777
+        *(u64 *)(r10 - 16) = r1
+        r1 = map[a]
+        r2 = r10
+        r2 += -4
+        r3 = r10
+        r3 += -16
+        r4 = 0
+        call map_update_elem
+        ; probe_read_kernel(fp-24, 8, &elem0)
+        r7 = map[a][0]
+        r1 = r10
+        r1 += -24
+        r2 = 8
+        r3 = r7
+        call probe_read_kernel
+        if r0 != 0 goto fault
+        r0 = *(u64 *)(r10 - 24)
+        exit
+    fault:
+        r0 = 0
+        exit";
+    assert_eq!(run_src(src), 777);
+}
+
+/// probe_read_kernel from an unresolvable address (the opaque
+/// get_current_task token) zero-fills dst and returns -EFAULT.
+#[test]
+fn probe_read_kernel_faults_cleanly_on_wild_pointer() {
+    let src = "
+        ; poison the buffer so the zero-fill is observable
+        r1 = 0xdead
+        *(u64 *)(r10 - 8) = r1
+        call get_current_task
+        r3 = r0
+        r1 = r10
+        r1 += -8
+        r2 = 8
+        call probe_read_kernel
+        if r0 == -14 goto efault
+        r0 = 0
+        exit
+    efault:
+        r0 = *(u64 *)(r10 - 8)
+        r0 += 1        ; zero-filled buffer + 1
+        exit";
+    assert_eq!(run_src(src), 1);
+}
+
+/// probe_read_kernel_str stops at the NUL and returns length including it;
+/// the rest of the buffer is zeroed.
+#[test]
+fn probe_read_kernel_str_copies_nul_terminated() {
+    let src = "
+        ; build \"hi\\0\" + junk at fp-8
+        r1 = 0x4141410000006968 ll ; bytes: 68 69 00 00 00 41 41 41
+        *(u64 *)(r10 - 8) = r1
+        r3 = r10
+        r3 += -8
+        r1 = r10
+        r1 += -16
+        r2 = 8
+        call probe_read_kernel_str
+        if r0 != 3 goto bad       ; 'h','i',NUL
+        r0 = *(u64 *)(r10 - 16)   ; \"hi\\0\" then zeros, junk not copied
+        exit
+    bad:
+        r0 = 0
+        exit";
+    assert_eq!(run_src(src), 0x6968);
+}
+
+/// An unterminated source is truncated to size with a forced NUL and the
+/// returned length equals size.
+#[test]
+fn probe_read_kernel_str_truncates_with_nul() {
+    let src = "
+        r1 = 0x4242424242424242 ll
+        *(u64 *)(r10 - 8) = r1
+        r3 = r10
+        r3 += -8
+        r1 = r10
+        r1 += -16
+        r2 = 4
+        call probe_read_kernel_str
+        if r0 != 4 goto bad
+        r0 = *(u32 *)(r10 - 16)   ; 42 42 42 00
+        exit
+    bad:
+        r0 = 0
+        exit";
+    assert_eq!(run_src(src), 0x0042_4242);
+}
+
+/// current_task_under_cgroup: febpf's task is under no cgroup (fixed 0);
+/// an out-of-range index is -EINVAL; a non-cgroup map fails verification.
+#[test]
+fn current_task_under_cgroup_deterministic() {
+    let src = "
+        .map cg cgroup_array 4 4 2
+        r1 = map[cg]
+        r2 = 1
+        call current_task_under_cgroup
+        if r0 != 0 goto bad
+        r1 = map[cg]
+        r2 = 5                    ; >= max_entries
+        call current_task_under_cgroup
+        if r0 != -22 goto bad
+        r0 = 7
+        exit
+    bad:
+        r0 = 0
+        exit";
+    assert_eq!(run_src(src), 7);
+
+    let err = verify_err(
+        "
+        .map h hash 4 4 2
+        r1 = map[h]
+        r2 = 0
+        call current_task_under_cgroup
+        exit",
+    );
+    assert!(err.contains("cgroup_array"), "{err}");
+}
+
 // ------------------------------------------------------------------ calls
 
 #[test]
