@@ -914,7 +914,53 @@ fn map_kind(ty: u32) -> Result<MapKind, String> {
     match ty {
         BPF_MAP_TYPE_HASH => Ok(MapKind::Hash),
         BPF_MAP_TYPE_ARRAY => Ok(MapKind::Array),
-        other => Err(format!("unsupported map type {other} (only hash/array)")),
+        other => Err(format!(
+            "unsupported map type {other} ({}); only hash/array are implemented",
+            map_type_name(other)
+        )),
+    }
+}
+
+/// Symbolic name for a kernel `enum bpf_map_type` value, so an unsupported-map
+/// error names the type (e.g. `RINGBUF`) and not just its number. Keeps the
+/// corpus coverage histogram crisp (see `docs/specs/corpus-tooling.md`).
+fn map_type_name(ty: u32) -> &'static str {
+    match ty {
+        0 => "UNSPEC",
+        1 => "HASH",
+        2 => "ARRAY",
+        3 => "PROG_ARRAY",
+        4 => "PERF_EVENT_ARRAY",
+        5 => "PERCPU_HASH",
+        6 => "PERCPU_ARRAY",
+        7 => "STACK_TRACE",
+        8 => "CGROUP_ARRAY",
+        9 => "LRU_HASH",
+        10 => "LRU_PERCPU_HASH",
+        11 => "LPM_TRIE",
+        12 => "ARRAY_OF_MAPS",
+        13 => "HASH_OF_MAPS",
+        14 => "DEVMAP",
+        15 => "SOCKMAP",
+        16 => "CPUMAP",
+        17 => "XSKMAP",
+        18 => "SOCKHASH",
+        19 => "CGROUP_STORAGE",
+        20 => "REUSEPORT_SOCKARRAY",
+        21 => "PERCPU_CGROUP_STORAGE",
+        22 => "QUEUE",
+        23 => "STACK",
+        24 => "SK_STORAGE",
+        25 => "DEVMAP_HASH",
+        26 => "STRUCT_OPS",
+        27 => "RINGBUF",
+        28 => "INODE_STORAGE",
+        29 => "TASK_STORAGE",
+        30 => "BLOOM_FILTER",
+        31 => "USER_RINGBUF",
+        32 => "CGRP_STORAGE",
+        33 => "ARENA",
+        _ => "unknown",
     }
 }
 
@@ -1043,5 +1089,23 @@ mod btf_maps {
                 data_secs: Vec::new(),
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{map_kind, map_type_name};
+
+    #[test]
+    fn map_kind_names_unsupported_type() {
+        // Supported types resolve; unsupported ones name the type crisply so
+        // the corpus coverage histogram can bucket by name (RINGBUF, etc.).
+        assert!(map_kind(1).is_ok());
+        assert!(map_kind(2).is_ok());
+        let e = map_kind(27).unwrap_err();
+        assert!(e.contains("unsupported map type 27"), "{e}");
+        assert!(e.contains("RINGBUF"), "{e}");
+        assert_eq!(map_type_name(5), "PERCPU_HASH");
+        assert_eq!(map_type_name(999), "unknown");
     }
 }

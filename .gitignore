@@ -4,3 +4,6 @@ Cargo.lock
 out.bin
 .claude/
 web/dist/
+
+# corpus tooling working area (scripts/fetch-corpus.sh, scripts/scan-corpus.sh)
+/corpus/
