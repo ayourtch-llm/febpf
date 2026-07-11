@@ -2643,20 +2643,21 @@ impl<'a> Verifier<'a> {
                         RegState::Uninit => {
                             return Err(self.err(pc, "subprogram exits without setting r0"));
                         }
-                        // The kernel lets a static subprogram return a pointer
-                        // (the caller's r0 simply inherits the register state)
-                        // and real programs rely on it — e.g. bcc's cpudist
-                        // returns a map-value pointer from a lookup-or-init
-                        // helper function. The one case that must stay
-                        // rejected is a pointer into the exiting frame's own
-                        // stack, which dies with the frame.
+                        // The kernel lets a static subprogram return a pointer:
+                        // prepare_func_exit() copies the callee's r0 to the
+                        // caller verbatim (real programs rely on it — e.g.
+                        // bcc's cpudist returns a map-value pointer from a
+                        // lookup-or-init helper function). The one exception is
+                        // PTR_TO_STACK: the kernel rejects returning ANY stack
+                        // pointer — even a still-live caller-frame one —
+                        // "technically it's ok [...] but let's be conservative"
+                        // ("cannot return stack pointer to the caller"). Mirror
+                        // that exactly so vfuzz verdict parity holds.
                         RegState::Ptr(p) => {
-                            if matches!(p.kind, PtrKind::Stack { frame }
-                                if frame == state.frames.len() - 1)
-                            {
+                            if matches!(p.kind, PtrKind::Stack { .. }) {
                                 return Err(self.err(
                                     pc,
-                                    "subprogram may not return a pointer into its own stack frame",
+                                    "cannot return stack pointer to the caller",
                                 ));
                             }
                         }
