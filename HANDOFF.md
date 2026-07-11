@@ -14,7 +14,7 @@ load-bearing constraint. Don't add any without a very good reason and the
 user's OK (raw Linux syscalls via `asm!` are used instead of libc — see the
 JIT's `sys` module).
 
-Everything works today: `cargo test` is 130 green (123 with
+Everything works today: `cargo test` is 154 green (147 with
 `--no-default-features`, i.e. no JIT), `cargo clippy --all-targets` is 0
 warnings in both configs, release builds clean.
 
@@ -226,6 +226,35 @@ what makes them feasible here when they aren't elsewhere:
    poisoning of unresolved relos. CLI: `--target-btf <path>`, defaults to
    /sys/kernel/btf/vmlinux. Differentially validated against bpftool and the
    running kernel.
+
+### Second wow tier (all DONE 2026-07-11) — built on the deterministic replay + kbpf
+
+7. **Omniscient debugging (dataflow queries)** — `docs/specs/dataflow-queries.md`.
+   Debugger commands `origin <reg>` (recursive def-use trail to where a value
+   was born: constant/ctx/map-load/helper-return), `when <reg>`, `whenwrite
+   <addr|reg>` (alias `ww`), `who <addr|reg>`. No eager recording: rebuilds a
+   lightweight write-log on demand by restoring the nearest checkpoint and
+   replaying to the cursor (`DebugSession::build_write_log` +
+   `Machine::describe_addr`). Bounded to one replay interval — defs older than
+   the nearest checkpoint report "not written in this interval" (next step:
+   cross-interval `origin`). Atomic-STX destinations not yet followed.
+8. **Shareable replay files** — `docs/specs/replay-files.md`. `febpf record
+   <prog> [--stop-at N] -o bug.febpf` + `febpf replay bug.febpf` (opens the
+   time-travel debugger at the cursor, or `--run` reproduces r0). Versioned
+   hand-written container (`src/replay.rs`, magic `FEBPFRPL`, no serde);
+   determinism guard records expected r0 and warns on divergence. `from_bytes`
+   grows vecs per bounds-checked element — do NOT reintroduce
+   `Vec::with_capacity(untrusted_count)` (that was a real multi-GB-alloc DoS
+   the corruption fuzz test caught). Playground/WASM entry `febpf_dbg_replay`
+   opens a `.febpf` in the browser.
+9. **Verifier differential fuzzing** — `docs/specs/verifier-diff.md`. `febpf
+   vfuzz [--frontier|--conservative] [--kernel]` diffs febpf-verifier vs
+   kernel-verifier *verdicts* (not just execution). Four cells; the
+   **FEBPF-LAX** cell (febpf accepts / kernel rejects = a soundness gap) is
+   dumped loud + first with disasm + kernel log. FEBPF-STRICT (kernel stricter)
+   is expected in bulk, reported separately. New bpf(2) surface `kbpf::verdict`
+   keeps the `&mut` attr provenance. Root run is the payoff (see cmds.txt);
+   0 disagreements found unprivileged.
 
 ## Known limitations / where to go next (roughly prioritized)
 
