@@ -175,4 +175,37 @@ The join and the public accessor live in `verifier.rs`; recording is always on
 
 ## STATUS
 
-Spec written. NEXT: implement the verifier per-PC abstract-state hook (stage 2).
+**DONE.** All stages complete and green in both feature configs
+(`cargo test`: 180 / `--no-default-features`: 173; `cargo clippy --all-targets`
+0 warnings in both).
+
+Implemented:
+- Stage 2 — verifier per-PC join-over-all-visits abstract state
+  (`Scalar::join`, `RegState::join`, `VerifyOk::pc_regs` + `regs_at`).
+- Stage 3 — `src/equiv.rs`: observation capture (r0/fault + printk + final ctx
+  bytes + writable-map contents), abstract layer (identical program;
+  side-effect-free proven-constant r0), differential layer (fixed/boundary/
+  seeded-random), `Verdict` + exit codes, `febpf equiv` CLI, unit +
+  integration tests (incl. a printk-only and a map-only difference).
+- Stage 4 — `src/optimize.rs`: strength reduction, algebraic identities,
+  constant folding, dead-branch elimination (const + range/tnum), redundant-
+  mask elimination; PC relocation with i16-overflow detection; fixpoint loop;
+  re-verify; **equiv self-check gate** (refuses to emit otherwise); `febpf
+  optimize` CLI with `--stats`. `examples/optimizable.s` exercises all classes
+  (11 → 7 insns).
+
+Design choices worth noting for a future extender:
+- Fault outcomes compare the PC-stripped message; both sides are verified so
+  faults are rare. Error strings that embed absolute targets could in principle
+  differ spuriously — not observed in practice.
+- Constant folding only emits when the value round-trips through i32 (single
+  `mov` slot); wider constants are left alone rather than synthesized as
+  `lddw`.
+- Redundant-reload elimination from the spec was intentionally **not**
+  implemented: proving a reload redundant needs alias/memory analysis beyond
+  the current per-PC register domain. The self-check gate means adding it later
+  cannot ship an unsound result — worst case it fails to emit.
+
+Exact next step if extending: add redundant-reload elimination behind a simple
+"no intervening write to the pointer's region or the register" check, or teach
+the abstract layer a CFG-isomorphism proof for the empirical cases.
