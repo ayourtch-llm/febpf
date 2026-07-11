@@ -333,6 +333,106 @@ impl Snapshot {
     }
 }
 
+/// Per-instance execution state for the race explorer (`src/race.rs`):
+/// everything that is private to one logical invocation of a program —
+/// registers, program counter, call frames, counters, and its own stack and
+/// context images. The shared map state, region table and prandom stream live
+/// in the [`Vm`] and are deliberately *not* part of this. Only one instance is
+/// active in a [`Machine`] at a time; the scheduler swaps these in and out with
+/// [`Machine::activate`]/[`Machine::deactivate`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstanceState {
+    regs: [u64; NUM_REGS],
+    pc: usize,
+    frames: Vec<SavedFrame>,
+    insn_count: u64,
+    nondet_calls: u64,
+    stack: Vec<u8>,
+    ctx: Vec<u8>,
+}
+
+impl InstanceState {
+    /// A fresh instance positioned at pc 0, with `ctx` as its private context
+    /// image and a zeroed stack — mirrors the register setup in
+    /// [`Machine::new`].
+    pub fn new(ctx: &[u8]) -> InstanceState {
+        let mut regs = [0u64; NUM_REGS];
+        regs[1] = mkaddr(CTX_HANDLE, 0);
+        regs[2] = ctx.len() as u64;
+        regs[REG_FP as usize] = mkaddr(STACK0_HANDLE, STACK_SIZE as u32);
+        InstanceState {
+            regs,
+            pc: 0,
+            frames: Vec::new(),
+            insn_count: 0,
+            nondet_calls: 0,
+            stack: vec![0u8; MAX_CALL_FRAMES * STACK_SIZE],
+            ctx: ctx.to_vec(),
+        }
+    }
+
+    /// Number of instructions this instance has retired so far.
+    pub fn insn_count(&self) -> u64 {
+        self.insn_count
+    }
+
+    /// The instance's current `r0`.
+    pub fn r0(&self) -> u64 {
+        self.regs[0]
+    }
+}
+
+/// What kind of map-visible operation an instance is poised to perform. Used
+/// by the race scheduler as its preemption points (see the spec).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapOpKind {
+    Lookup,
+    Update,
+    Delete,
+    /// Plain load through a pointer into a map value.
+    ValueLoad,
+    /// Plain store through a pointer into a map value.
+    ValueStore,
+    /// Atomic RMW (`lock += `, `atomic_fetch_*`, `xchg`, `cmpxchg`) on a value.
+    Atomic,
+}
+
+impl MapOpKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MapOpKind::Lookup => "lookup",
+            MapOpKind::Update => "update",
+            MapOpKind::Delete => "delete",
+            MapOpKind::ValueLoad => "load",
+            MapOpKind::ValueStore => "store",
+            MapOpKind::Atomic => "atomic",
+        }
+    }
+}
+
+/// A pending (not-yet-executed) map-visible operation, as classified at the
+/// instance's current pc.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MapOp {
+    pub kind: MapOpKind,
+    pub pc: usize,
+    /// Map index, when statically known (helper calls, resolvable pointers).
+    pub map: Option<usize>,
+    /// Key bytes, for helper calls (`lookup`/`update`/`delete`).
+    pub key: Option<Vec<u8>>,
+    /// Region handle of the map value touched by a value load/store/atomic.
+    pub region: Option<u32>,
+}
+
+/// Result of running an instance forward to its next scheduling point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MapStep {
+    /// The instance is now poised on a map-visible op (not yet executed).
+    Pending(MapOp),
+    /// The instance's program exited with this `r0`.
+    Exited(u64),
+}
+
 /// One in-flight execution of a [`Vm`] program. Use [`Machine::step`] to
 /// single-step (the debugger does), or [`Vm::run`] to run to completion.
 pub struct Machine<'a> {
@@ -482,6 +582,146 @@ impl<'a> Machine<'a> {
             }
         }
         Ok(None)
+    }
+
+    // -- race explorer hooks (src/race.rs) ----------------------------------
+
+    /// Load per-instance state into this machine, making `st`'s
+    /// registers/pc/frames/stack/ctx the live execution context. Shared map
+    /// state and the region table are left untouched. Assumes `st` was created
+    /// for this machine's program and context length.
+    pub fn activate(&mut self, st: &InstanceState) {
+        self.regs = st.regs;
+        self.pc = st.pc;
+        self.frames.clone_from(&st.frames);
+        self.insn_count = st.insn_count;
+        self.nondet_calls = st.nondet_calls;
+        self.vm.stack.copy_from_slice(&st.stack);
+        self.ctx.copy_from_slice(&st.ctx);
+    }
+
+    /// Save the live per-instance state back into `st` (inverse of
+    /// [`Machine::activate`]).
+    pub fn deactivate(&self, st: &mut InstanceState) {
+        st.regs = self.regs;
+        st.pc = self.pc;
+        st.frames.clone_from(&self.frames);
+        st.insn_count = self.insn_count;
+        st.nondet_calls = self.nondet_calls;
+        st.stack.copy_from_slice(&self.vm.stack);
+        st.ctx.copy_from_slice(self.ctx);
+    }
+
+    /// Classify the instruction at the current pc as a map-visible operation,
+    /// if it is one. Pure inspection — does not execute. Returns `None` for
+    /// instance-local instructions (ALU, branches, stack/ctx memory, non-map
+    /// helpers, exit).
+    pub fn classify_mapop(&self) -> Option<MapOp> {
+        let ins = *self.vm.exec.get(self.pc)?;
+        match ins.class() {
+            class::JMP | class::JMP32
+                if ins.op() == jmp::CALL && ins.src == call_kind::HELPER =>
+            {
+                let kind = match ins.imm as u32 {
+                    helpers::id::MAP_LOOKUP_ELEM => MapOpKind::Lookup,
+                    helpers::id::MAP_UPDATE_ELEM => MapOpKind::Update,
+                    helpers::id::MAP_DELETE_ELEM => MapOpKind::Delete,
+                    _ => return None,
+                };
+                let map = self.map_from_ptr(self.regs[1]).ok();
+                let key = map.and_then(|m| {
+                    let ks = self.vm.maps[m].def.key_size as usize;
+                    self.peek_bytes(self.regs[2], ks)
+                });
+                Some(MapOp { kind, pc: self.pc, map, key, region: None })
+            }
+            class::LDX => {
+                if ins.src as usize >= NUM_REGS {
+                    return None;
+                }
+                let addr = self.regs[ins.src as usize].wrapping_add(ins.off as i64 as u64);
+                self.map_value_region(addr).map(|region| MapOp {
+                    kind: MapOpKind::ValueLoad,
+                    pc: self.pc,
+                    map: None,
+                    key: None,
+                    region: Some(region),
+                })
+            }
+            class::ST | class::STX => {
+                if ins.dst as usize >= NUM_REGS {
+                    return None;
+                }
+                let addr = self.regs[ins.dst as usize].wrapping_add(ins.off as i64 as u64);
+                let region = self.map_value_region(addr)?;
+                let kind = if ins.mem_mode() == mode::ATOMIC {
+                    MapOpKind::Atomic
+                } else {
+                    MapOpKind::ValueStore
+                };
+                Some(MapOp {
+                    kind,
+                    pc: self.pc,
+                    map: None,
+                    key: None,
+                    region: Some(region),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Run instance-local instructions from the current pc until the next
+    /// instruction is a map-visible op (returned `Pending`, not executed) or
+    /// the program exits (`Exited`).
+    pub fn run_to_mapop(&mut self) -> Result<MapStep, EbpfError> {
+        loop {
+            if let Some(op) = self.classify_mapop() {
+                return Ok(MapStep::Pending(op));
+            }
+            if let Some(r0) = self.step()? {
+                return Ok(MapStep::Exited(r0));
+            }
+        }
+    }
+
+    /// Region handle if `addr` points into a map value, else `None`.
+    fn map_value_region(&self, addr: u64) -> Option<u32> {
+        let handle = (addr >> 32) as usize;
+        match self.vm.regions.get(handle) {
+            Some(Region::MapValue { .. }) => Some(handle as u32),
+            _ => None,
+        }
+    }
+
+    /// Immutable bounded read of guest memory (for classification/reporting).
+    fn peek_bytes(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
+        let handle = (addr >> 32) as usize;
+        let off = addr as u32 as usize;
+        let buf: &[u8] = match self.vm.regions.get(handle).copied()? {
+            Region::Ctx => self.ctx,
+            Region::Stack(f) => {
+                &self.vm.stack[f as usize * STACK_SIZE..(f as usize + 1) * STACK_SIZE]
+            }
+            Region::MapValue { map, vref } => self.vm.maps[map as usize].value(vref),
+            _ => return None,
+        };
+        buf.get(off..off + len).map(|s| s.to_vec())
+    }
+
+    /// The `(map index, key bytes)` cell a map-value region handle refers to
+    /// (for hazard attribution). `None` if the handle isn't a live map value.
+    pub fn cell_of_region(&self, handle: u32) -> Option<(usize, Vec<u8>)> {
+        match self.vm.regions.get(handle as usize).copied()? {
+            Region::MapValue { map, vref } => {
+                let key = match vref {
+                    ValueRef::ArrayElem(i) => i.to_ne_bytes().to_vec(),
+                    ValueRef::Slab(i) => self.vm.maps[map as usize].key_for_slab(i)?,
+                };
+                Some((map as usize, key))
+            }
+            _ => None,
+        }
     }
 
     /// Toggle printk echoing (the debugger suppresses it during replay so

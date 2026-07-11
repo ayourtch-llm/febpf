@@ -29,6 +29,8 @@ commands:
   record <file> -o <out>      write a self-contained .febpf replay file
   replay <file.febpf>         load a replay file into the time-travel debugger
                               (or --run to just reproduce r0)
+  race <file>                 explore interleavings of N instances sharing maps
+                              and report concurrency races (lost updates, etc.)
 
 options:
   --ctx <hex|@file>    context memory contents (hex string or file)
@@ -45,6 +47,10 @@ options:
   --conservative       vfuzz: use the conservative (fuzz) generator instead
   --stop-at <n>        record: store a debugger cursor at instruction count n
   --run                replay: reproduce r0 instead of opening the debugger
+  --procs <n>          race: number of concurrent instances (default 2)
+  --schedules <m>      race: cap on schedules explored (default 2000)
+  --schedule <csv>     race: replay one interleaving (choice vector) verbatim
+  --stats              race: print exploration statistics
   --prog <name>        select a program from a multi-program ELF object
   --target-btf <path>  CO-RE: relocate against this BTF (raw blob or ELF with
                        a .BTF section); defaults to /sys/kernel/btf/vmlinux
@@ -75,6 +81,10 @@ struct Opts {
     conservative: bool,
     stop_at: Option<u64>,
     run: bool,
+    procs: usize,
+    schedules: usize,
+    schedule: Option<String>,
+    stats: bool,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -99,6 +109,10 @@ fn parse_args() -> Result<Opts, String> {
         conservative: false,
         stop_at: None,
         run: false,
+        procs: 2,
+        schedules: 2000,
+        schedule: None,
+        stats: false,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -139,6 +153,22 @@ fn parse_args() -> Result<Opts, String> {
                 )
             }
             "--run" => o.run = true,
+            "--procs" => {
+                o.procs = args
+                    .next()
+                    .ok_or("--procs needs a value")?
+                    .parse()
+                    .map_err(|e| format!("bad --procs: {e}"))?
+            }
+            "--schedules" => {
+                o.schedules = args
+                    .next()
+                    .ok_or("--schedules needs a value")?
+                    .parse()
+                    .map_err(|e| format!("bad --schedules: {e}"))?
+            }
+            "--schedule" => o.schedule = Some(args.next().ok_or("--schedule needs a value")?),
+            "--stats" => o.stats = true,
             "--no-verify" => o.no_verify = true,
             "--no-explain" => o.no_explain = true,
             "--jit" => o.jit = true,
@@ -402,6 +432,52 @@ fn check_determinism(recorded: Option<&febpf::replay::Outcome>, reproduced: &feb
     }
 }
 
+/// `febpf race <prog> [--procs N] [--schedules M] [--seed S] [--schedule CSV]
+/// [--ctx ...] [--stats]`. Explore interleavings of N instances sharing one map
+/// set and report concurrency races. Exit code 1 when a race is found.
+fn cmd_race(o: &Opts, prog: Program) -> Result<ExitCode, String> {
+    use febpf::race;
+    let ctx = make_ctx(o)?;
+
+    // Verify once (a race is not a verifier error); require pass unless
+    // --no-verify, mirroring `run`.
+    if !o.no_verify {
+        let vm = Vm::new(prog.clone())?;
+        vm.verify(verifier_config(o, ctx.len())).map_err(|e| {
+            format!(
+                "verification failed: {e}\n{}(use --no-verify to race anyway)",
+                explain(vm.insns(), &e, o)
+            )
+        })?;
+    }
+
+    // `--schedule CSV`: replay exactly one interleaving.
+    if let Some(csv) = &o.schedule {
+        let path = csv
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim().parse::<usize>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("bad --schedule choice vector: {e}"))?;
+        let run = race::replay_schedule(&prog, &ctx, o.procs, path)?;
+        print!("{}", race::render_single(&run, &o.file, o.procs.max(1)));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let cfg = race::ExploreConfig {
+        procs: o.procs,
+        schedules: o.schedules,
+        seed: o.seed,
+    };
+    let rep = race::explore(&prog, &ctx, &cfg)?;
+    print!("{}", race::render_report(&rep, &o.file, o.stats));
+    Ok(if rep.is_race() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
 fn run() -> Result<ExitCode, String> {
     let o = parse_args().map_err(|e| format!("{e}\n\n{USAGE}"))?;
     if o.cmd == "help" {
@@ -423,6 +499,9 @@ fn run() -> Result<ExitCode, String> {
     }
     if o.cmd == "conftest" {
         return conftest::conftest(&o, prog);
+    }
+    if o.cmd == "race" {
+        return cmd_race(&o, prog);
     }
 
     match o.cmd.as_str() {

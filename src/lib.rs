@@ -35,6 +35,7 @@ pub mod jit;
 pub mod kbpf;
 pub mod maps;
 pub mod playground;
+pub mod race;
 pub mod relo;
 pub mod replay;
 pub mod tnum;

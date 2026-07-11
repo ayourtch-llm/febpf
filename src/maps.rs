@@ -234,6 +234,18 @@ impl Map {
         self.region_handles = s.region_handles.clone();
     }
 
+    /// The key currently mapped to hash slab index `i` (hash maps only),
+    /// found by reverse scan. O(n); used by the race explorer to attribute a
+    /// value-pointer access back to its `(map, key)` cell.
+    pub fn key_for_slab(&self, i: u32) -> Option<Vec<u8>> {
+        match &self.storage {
+            Storage::Hash { index, .. } => {
+                index.iter().find(|(_, &v)| v == i).map(|(k, _)| k.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// Live entries, for dumping from the CLI/debugger.
     pub fn iter_entries(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         match &self.storage {
