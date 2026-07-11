@@ -1,6 +1,6 @@
 # Shareable replay files (`.febpf`)
 
-STATUS: in progress
+STATUS: complete (2026-07-11)
 
 A **replay file** is a small, self-contained, versioned binary blob that captures
 everything needed to *deterministically* reproduce one run of an eBPF program and
@@ -70,7 +70,9 @@ Round-trip is exact: `from_bytes(to_bytes(r)) == r` for every field.
 - a missing required section (INSNS/MAPS/CTX/SEED).
 
 Unknown section tags are skipped (forward compatibility). A `.o`/random file is
-rejected cleanly by the magic check.
+rejected cleanly by the magic check. Element counts (maps, preload entries) are
+**never** used to pre-allocate — vectors grow as each bounds-checked element is
+read — so a corrupted count fails fast instead of attempting a huge allocation.
 
 ## Determinism contract
 
@@ -124,11 +126,12 @@ same `bug.febpf` opens in the browser build. The WASM ABI stub and a note in
 
 ## Staged plan
 
-1. Spec (this file) + `interp` seed accessors. **← commit**
+1. Spec (this file) + `interp` seed accessors. **done**
 2. `src/replay.rs`: format + `to_bytes`/`from_bytes` round-trip + `record`. Unit
-   tests for round-trip, corruption/short-file rejection, version mismatch. **commit**
-3. CLI `record`/`replay` wired into `main.rs`; `DebuggerOpts::start_at`. **commit**
-4. Playground `replay_session` + WASM/web stub. **commit**
-5. Integration test: record→file→replay reproduces identical r0 + final
-   register/map state vs a direct run. Spec STATUS: complete. **commit**
+   tests for round-trip, corruption/short-file rejection, version mismatch. **done**
+3. CLI `record`/`replay` wired into `main.rs`; `DebuggerOpts::start_at`. **done**
+4. Playground `replay_session` + WASM/web `dbgReplay` stub. **done**
+5. Integration test (`tests/replay.rs`): record→file→replay reproduces identical
+   r0 + final register/map state vs a direct run; preload reproduction; corrupt/
+   short/flipped-byte fuzz rejects with no panic. Spec STATUS: complete. **done**
 ```

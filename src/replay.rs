@@ -254,7 +254,10 @@ impl Replay {
                 TAG_MAPS => {
                     let mut r = Reader::new(payload);
                     let n = r.u32()? as usize;
-                    let mut v = Vec::with_capacity(n);
+                    // Do not pre-allocate from an untrusted count; grow as each
+                    // element is read (bounds-checked), so a corrupt count fails
+                    // fast instead of attempting a huge allocation.
+                    let mut v = Vec::new();
                     for _ in 0..n {
                         let name = r.str()?;
                         let kind = match r.u8()? {
@@ -292,7 +295,8 @@ impl Replay {
                     let mut r = Reader::new(payload);
                     let n = r.u32()? as usize;
                     // Group consecutive entries by map_index into MapPreload.
-                    let mut flat: Vec<(u32, Vec<u8>, Vec<u8>)> = Vec::with_capacity(n);
+                    // Grow lazily (untrusted count — see MAPS above).
+                    let mut flat: Vec<(u32, Vec<u8>, Vec<u8>)> = Vec::new();
                     for _ in 0..n {
                         let mi = r.u32()?;
                         let k = r.bytes()?;
