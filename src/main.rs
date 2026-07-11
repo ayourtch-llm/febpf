@@ -25,6 +25,9 @@ commands:
   bench <file>                measure interpreter throughput
   conftest <file>             run under interp, JIT and the real kernel; diff r0
   fuzz                        differential fuzzer: interp vs JIT (vs --kernel)
+  record <file> -o <out>      write a self-contained .febpf replay file
+  replay <file.febpf>         load a replay file into the time-travel debugger
+                              (or --run to just reproduce r0)
 
 options:
   --ctx <hex|@file>    context memory contents (hex string or file)
@@ -37,6 +40,8 @@ options:
   --iters <n>          bench/fuzz: iterations (default 1000)
   --seed <n>           fuzz: PRNG seed (random if omitted; printed on failure)
   --kernel             conftest/fuzz: also diff against the real kernel (root)
+  --stop-at <n>        record: store a debugger cursor at instruction count n
+  --run                replay: reproduce r0 instead of opening the debugger
   --prog <name>        select a program from a multi-program ELF object
   --target-btf <path>  CO-RE: relocate against this BTF (raw blob or ELF with
                        a .BTF section); defaults to /sys/kernel/btf/vmlinux
@@ -64,6 +69,8 @@ struct Opts {
     target_btf: Option<String>,
     seed: Option<u64>,
     kernel: bool,
+    stop_at: Option<u64>,
+    run: bool,
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -85,6 +92,8 @@ fn parse_args() -> Result<Opts, String> {
         target_btf: None,
         seed: None,
         kernel: false,
+        stop_at: None,
+        run: false,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -114,6 +123,15 @@ fn parse_args() -> Result<Opts, String> {
                 )
             }
             "--kernel" => o.kernel = true,
+            "--stop-at" => {
+                o.stop_at = Some(
+                    args.next()
+                        .ok_or("--stop-at needs a value")?
+                        .parse()
+                        .map_err(|e| format!("bad --stop-at: {e}"))?,
+                )
+            }
+            "--run" => o.run = true,
             "--no-verify" => o.no_verify = true,
             "--no-explain" => o.no_explain = true,
             "--jit" => o.jit = true,
@@ -283,6 +301,100 @@ fn verifier_config(o: &Opts, ctx_len: usize) -> verifier::Config {
     }
 }
 
+/// `febpf record <prog> [--ctx ...] [--stop-at N] -o out.febpf`
+fn cmd_record(o: &Opts, prog: Program) -> Result<ExitCode, String> {
+    let out = o
+        .out
+        .as_deref()
+        .ok_or("record needs an output file: -o <out.febpf>")?;
+    let ctx = make_ctx(o)?;
+    let seed = febpf::interp::DEFAULT_PRANDOM_SEED;
+    let replay = febpf::replay::Replay::record(&prog, ctx, seed, o.stop_at, Vec::new())?;
+    let bytes = replay.to_bytes();
+    std::fs::write(out, &bytes).map_err(|e| format!("cannot write {out}: {e}"))?;
+    let outcome = match &replay.outcome {
+        Some(febpf::replay::Outcome::Exit(r0)) => format!("r0 = {r0} ({r0:#x})"),
+        Some(febpf::replay::Outcome::Error(msg)) => format!("error: {msg}"),
+        None => "not captured".to_string(),
+    };
+    println!(
+        "wrote {} bytes to {out} ({} insns, {} map(s), ctx {}B, {}) [{outcome}]",
+        bytes.len(),
+        replay.insns.len(),
+        replay.maps.len(),
+        replay.ctx.len(),
+        match replay.stop_at {
+            Some(n) => format!("cursor @ {n}"),
+            None => "no cursor".to_string(),
+        }
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `febpf replay <file.febpf> [--run]`. Loads the replay, re-executes with the
+/// recorded inputs, checks the determinism guard, and either prints r0
+/// (`--run`) or drops into the time-travel debugger at the recorded cursor.
+fn cmd_replay(o: &Opts) -> Result<ExitCode, String> {
+    let bytes = std::fs::read(&o.file).map_err(|e| format!("cannot read {}: {e}", o.file))?;
+    let replay = febpf::replay::Replay::from_bytes(&bytes)?;
+    if replay.febpf_version != febpf::replay::febpf_version() {
+        eprintln!(
+            "note: replay recorded by febpf {} (this build is {})",
+            replay.febpf_version,
+            febpf::replay::febpf_version()
+        );
+    }
+    let (mut vm, mut ctx) = replay.build_vm()?;
+
+    if o.run {
+        // Reproduce r0 and apply the determinism guard.
+        vm.insn_limit = 100_000_000;
+        let reproduced = vm.run(&mut ctx);
+        let repro = match &reproduced {
+            Ok(r0) => febpf::replay::Outcome::Exit(*r0),
+            Err(e) => febpf::replay::Outcome::Error(e.to_string()),
+        };
+        match &reproduced {
+            Ok(r0) => println!("r0 = {r0} ({r0:#x})   [replay]"),
+            Err(e) => println!("runtime error: {e}   [replay]"),
+        }
+        check_determinism(replay.outcome.as_ref(), &repro);
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Drop into the debugger, positioned at the recorded cursor.
+    let opts = debug::DebuggerOpts {
+        start_at: replay.stop_at,
+        ..Default::default()
+    };
+    debug::repl(&mut vm, &mut ctx, opts).map_err(|e| e.to_string())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Warn loudly if a reproduced run disagrees with what the file recorded — a
+/// determinism regression.
+fn check_determinism(recorded: Option<&febpf::replay::Outcome>, reproduced: &febpf::replay::Outcome) {
+    use febpf::replay::Outcome;
+    let Some(recorded) = recorded else {
+        return; // no guard stored
+    };
+    if recorded != reproduced {
+        let fmt = |o: &Outcome| match o {
+            Outcome::Exit(r0) => format!("r0 = {r0} ({r0:#x})"),
+            Outcome::Error(m) => format!("error: {m}"),
+        };
+        eprintln!(
+            "WARNING: determinism mismatch — recorded {}, reproduced {}",
+            fmt(recorded),
+            fmt(reproduced)
+        );
+        eprintln!(
+            "         this replay is no longer reproducible on this build; a \
+             determinism regression worth investigating."
+        );
+    }
+}
+
 fn run() -> Result<ExitCode, String> {
     let o = parse_args().map_err(|e| format!("{e}\n\n{USAGE}"))?;
     if o.cmd == "help" {
@@ -292,7 +404,13 @@ fn run() -> Result<ExitCode, String> {
     if o.cmd == "fuzz" {
         return conftest::fuzz(&o);
     }
+    if o.cmd == "replay" {
+        return cmd_replay(&o);
+    }
     let (prog, debug) = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
+    if o.cmd == "record" {
+        return cmd_record(&o, prog);
+    }
     if o.cmd == "conftest" {
         return conftest::conftest(&o, prog);
     }

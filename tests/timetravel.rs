@@ -149,6 +149,7 @@ fn opts() -> DebuggerOpts {
     DebuggerOpts {
         echo_printk: false,
         snapshot_interval: 3,
+        ..Default::default()
     }
 }
 
