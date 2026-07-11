@@ -21,6 +21,7 @@ struct Wasm {
     f_dbg_cmd: TypedFunc<(i32, i32, i32), i64>,
     disasm: TypedFunc<(i32, i32), i64>,
     verify: TypedFunc<(i32, i32), i64>,
+    f_race: TypedFunc<(i32, i32, i32, i32), i64>, // src,procs,schedules -> packed
 }
 
 impl Wasm {
@@ -51,7 +52,8 @@ impl Wasm {
         let f_analyze = tf!("febpf_analyze", (i32, i32, i32), i64);
         let f_dbg_new = tf!("febpf_dbg_new", (i32, i32, i32, i32, i32), i64);
         let f_dbg_cmd = tf!("febpf_dbg_cmd", (i32, i32, i32), i64);
-        Wasm { store, mem, alloc, free, f_run, f_analyze, f_dbg_new, f_dbg_cmd, disasm, verify }
+        let f_race = tf!("febpf_race", (i32, i32, i32, i32), i64);
+        Wasm { store, mem, alloc, free, f_run, f_analyze, f_dbg_new, f_dbg_cmd, disasm, verify, f_race }
     }
 
     /// Write bytes into a fresh wasm buffer; return (ptr, len).
@@ -126,7 +128,24 @@ impl Wasm {
         self.free.call(&mut self.store, (cp, cl)).unwrap();
         out
     }
+    fn race(&mut self, src: &[u8], procs: i32, schedules: i32) -> String {
+        let (p, l) = self.write(src);
+        let packed = self.f_race.call(&mut self.store, (p, l, procs, schedules)).expect("race");
+        let out = self.read(packed);
+        self.free.call(&mut self.store, (p, l)).unwrap();
+        out
+    }
 }
+
+const RACE_RMW: &[u8] = b".map counter array 4 8 1\n\
+r0 = 0\n*(u32 *)(r10 - 4) = r0\nr1 = map[counter]\nr2 = r10\nr2 += -4\n\
+call map_lookup_elem\nif r0 == 0 goto out\nr6 = *(u64 *)(r0 + 0)\nr6 += 1\n\
+*(u64 *)(r10 - 16) = r6\nr1 = map[counter]\nr2 = r10\nr2 += -4\nr3 = r10\n\
+r3 += -16\nr4 = 0\ncall map_update_elem\nout:\nr0 = 0\nexit\n";
+const RACE_ATOMIC: &[u8] = b".map counter array 4 8 1\n\
+r0 = 0\n*(u32 *)(r10 - 4) = r0\nr1 = map[counter]\nr2 = r10\nr2 += -4\n\
+call map_lookup_elem\nif r0 == 0 goto out\nr1 = 1\n\
+lock *(u64 *)(r0 + 0) += r1\nout:\nr0 = 0\nexit\n";
 
 const GOOD: &[u8] =
     b"r0 = 0\nr1 = 10\nloop:\nr0 += r1\nr1 -= 1\nif r1 != 0 goto loop\nexit\n";
@@ -184,6 +203,13 @@ fn main() {
     );
     let cont = w.dbg_cmd(1, "continue");
     ok &= check("continue exits with r0 = 55", cont.contains("r0 = 55"), &cont);
+
+    // Race explorer via the wasm ABI: the RMW program must race, the atomic one must not.
+    let racy = w.race(RACE_RMW, 2, 0);
+    ok &= check("race(rmw) reports RACE", racy.contains("RESULT: RACE"), &racy);
+    ok &= check("race(rmw) witnesses a lost update", racy.contains("lost-update witnessed: true"), &racy);
+    let safe = w.race(RACE_ATOMIC, 3, 0);
+    ok &= check("race(atomic) reports RACE-FREE", safe.contains("RACE-FREE"), &safe);
 
     println!("\n{}", if ok { "ALL ABI CHECKS PASSED" } else { "SOME CHECKS FAILED" });
     std::process::exit(if ok { 0 } else { 1 });
