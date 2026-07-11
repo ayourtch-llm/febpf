@@ -336,8 +336,8 @@ PERF_EVENT_ARRAY for this corpus). Coverage progression (loads / verifies):
   pointer returns (batch appended to `tracing-helpers.md` / `elf-loading.md`):
   100% / 78.6%. Zero load failures remain.
 - + load-time rodata DCE (`rodata-dce.md`), merged on top of the above:
-  **100% / TBD-after-merge-scan** (the two batches were developed in parallel;
-  each measured 78.6% alone and their fixes are disjoint).
+  **100% / 89.3%** (50/56). The two parallel batches' fixes compounded
+  (each measured 78.6% alone).
 **Workflow: merge a coverage batch → `./scripts/scan-corpus.sh` → the histogram
 names the next batch.** febpf is an analysis/test/CI/debug engine, NOT a datapath
 runtime — "production useful" means verify/explain/differential-test/debug real
@@ -349,21 +349,21 @@ measure the previous build; and helper names in the histogram come from the
 uapi header now — the old hardcoded table had wrong ids (#113 was labelled
 ringbuf_output; it is probe_read_kernel).
 
-What blocks the remaining objects (post-merge of BOTH parallel batches —
-get_stack/kconfig/subprog-returns AND rodata DCE; re-run the scan for the
-authoritative per-object list):
-1. **BTF-typed ctx scalar-derefs** — `r1 = *(u32*)(r6+2804)` where r6 came
-   from a `tp_btf` ctx load: real kernels type that as PTR_TO_BTF_ID and
-   allow direct kernel-memory reads (`offcputime`, `runqlat`, `runqslower`,
-   `bitesize`). Fix = model BTF-typed ctx pointers (bigger; verifier + a
-   deterministic "kernel memory reads as zero" story). This is now the main
-   remaining class.
-2. **helper #46 bpf_get_socket_cookie** (`tcppktlat`) — small, deterministic
-   constant model would do.
-3. Note: the DCE branch's "subprogram may not return a pointer" list
-   (`filetop`, `ksnoop`, `tcpsynbl`) was fixed in parallel by the
-   subprog-pointer-return change in `tracing-helpers.md`'s batch; the two
-   batches' fixes compound.
+What blocks the remaining 6 objects (2026-07-11 scan, post-merge of both
+parallel batches — get_stack/kconfig/subprog-returns AND rodata DCE, whose
+fixes compounded):
+1. **4 × BTF-typed ctx scalar-derefs** — `r1 = *(u32*)(r6+2804)` where r6
+   came from a `tp_btf` ctx load: real kernels type that as PTR_TO_BTF_ID and
+   allow direct kernel-memory reads (`bitesize`, `offcputime`, `runqlat`,
+   `runqslower`). Fix = model BTF-typed ctx pointers (bigger; verifier + a
+   deterministic "kernel memory reads as zero" story). The main remaining class.
+2. **1 × verifier bounds depth** (`ksnoop`): variable-size
+   `perf_event_output` where the size reg is bounded [0,65535] but the data
+   map value is 16296 bytes — the real program clamps; febpf's range
+   refinement loses it. Needs a look at how the kernel bounds
+   ARG_CONST_SIZE against the region here.
+3. **1 × helper #46 bpf_get_socket_cookie** (`tcppktlat`) — small,
+   deterministic per-socket-token model would do.
 
 ## Known limitations / where to go next (roughly prioritized)
 
