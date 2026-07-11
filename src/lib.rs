@@ -25,6 +25,7 @@ pub mod btf;
 pub mod debug;
 pub mod disasm;
 pub mod elf;
+pub mod fuzz;
 pub mod helpers;
 pub mod insn;
 pub mod interp;
