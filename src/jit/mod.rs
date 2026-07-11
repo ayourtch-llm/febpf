@@ -40,7 +40,7 @@ pub mod x64;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub mod aarch64;
 
-pub use classify::{AluOp, Cc, Lowering, RegOrImm, ShiftOp, Width};
+pub use classify::{AluOp, Cc, DeferredRegs, Lowering, RegMask, RegOrImm, ShiftOp, Width, ALL_REGS};
 
 /// Symbolic branch target used while emitting, resolved during finalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,9 +105,15 @@ pub trait JitBackend {
 
     // ---- deferred instructions ----
     /// Emit the trampoline glue for the instruction at `pc`: spill the eBPF
-    /// registers, call the trampoline, and either jump to the epilogue (stop
-    /// bit set) or reload and indirect-jump through the pc→address table.
-    fn deferred(&mut self, pc: usize);
+    /// registers the interpreter reads, call the trampoline, and either jump
+    /// to the epilogue (stop bit set) or reload the registers it writes and
+    /// indirect-jump through the pc→address table.
+    ///
+    /// `regs` says which registers actually need moving (see [`DeferredRegs`]).
+    /// A backend that maps some eBPF register to a *caller-saved* physical
+    /// register must spill and reload it regardless of the mask — the call
+    /// destroys it either way.
+    fn deferred(&mut self, pc: usize, regs: DeferredRegs);
 
     // ---- finalization ----
     /// Patch relative branch fixups now that every label offset is known.
@@ -201,7 +207,7 @@ pub fn compile_with<B: JitBackend>(insns: &[Insn]) -> Result<JitProgram, String>
         label_off[pc] = b.code().len();
         let width = if insns[pc].is_wide() { 2 } else { 1 };
         match classify::lower(insns[pc]) {
-            Lowering::Deferred => b.deferred(pc),
+            Lowering::Deferred => b.deferred(pc, classify::deferred_regs(insns[pc])),
             Lowering::AluReg { op, w, dst, src } => b.alu_reg(op, w, dst, src),
             Lowering::AluImm { op, w, dst, imm } => b.alu_imm(op, w, dst, imm),
             Lowering::MovReg { w, dst, src } => b.mov_reg(w, dst, src),
@@ -232,11 +238,18 @@ pub fn compile_with<B: JitBackend>(insns: &[Insn]) -> Result<JitProgram, String>
     }
 
     // Build the pc→address table now that we know the base address.
+    //
+    // It has `n + 1` entries, not `n`: a program whose last instruction is a
+    // store or a helper call (legal to *run* without verifying) leaves the
+    // interpreter at pc == n, and the glue would otherwise index one past the
+    // table and branch to whatever it read. The extra slot lands on the
+    // epilogue, which is also what the interpreter does next (it reports
+    // "program counter out of bounds" on the following step).
     let base = mem.ptr as u64;
     let epilogue_addr = base + b.epilogue_off() as u64;
-    let table: Vec<u64> = (0..n)
+    let table: Vec<u64> = (0..=n)
         .map(|pc| {
-            if label_off[pc] == usize::MAX {
+            if label_off.get(pc).copied().unwrap_or(usize::MAX) == usize::MAX {
                 epilogue_addr
             } else {
                 base + label_off[pc] as u64
