@@ -19,6 +19,7 @@ pub mod id {
     pub const GET_CURRENT_TASK: u32 = 35;
     pub const CURRENT_TASK_UNDER_CGROUP: u32 = 37;
     pub const PROBE_READ_STR: u32 = 45;
+    pub const GET_SOCKET_COOKIE: u32 = 46;
     pub const GET_STACK: u32 = 67;
     pub const PROBE_READ_USER: u32 = 112;
     pub const PROBE_READ_KERNEL: u32 = 113;
@@ -28,6 +29,7 @@ pub mod id {
     pub const RINGBUF_RESERVE: u32 = 131;
     pub const RINGBUF_SUBMIT: u32 = 132;
     pub const RINGBUF_DISCARD: u32 = 133;
+    pub const GET_FUNC_IP: u32 = 173;
     /// First id available for user-registered helpers.
     pub const FIRST_USER: u32 = 0x1_0000;
 }
@@ -183,6 +185,13 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [MemWrite { size_arg: 1 }, Size, Any, None, None],
             ret: RetKind::Scalar,
         },
+        id::GET_SOCKET_COOKIE => HelperSig {
+            // (ctx) -> u64 cookie; the kernel also has (sk) flavors, so the
+            // argument is accepted loosely like perf_event_output's ctx.
+            name: "get_socket_cookie",
+            args: [Any, None, None, None, None],
+            ret: RetKind::Scalar,
+        },
         id::CURRENT_TASK_UNDER_CGROUP => HelperSig {
             name: "current_task_under_cgroup",
             // (map, index); map must be a cgroup_array.
@@ -194,6 +203,12 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             // (ctx, map, flags, data, size); data is a readable region of `size`
             // bytes. ctx/flags accepted loosely to keep corpus objects loading.
             args: [Any, ConstMapPtr, Scalar, MemRead { size_arg: 4 }, Size],
+            ret: RetKind::Scalar,
+        },
+        id::GET_FUNC_IP => HelperSig {
+            // (ctx) -> u64 address of the traced function.
+            name: "get_func_ip",
+            args: [Any, None, None, None, None],
             ret: RetKind::Scalar,
         },
         id::RINGBUF_OUTPUT => HelperSig {
@@ -247,12 +262,14 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::GET_STACK,
         id::PROBE_READ,
         id::PROBE_READ_STR,
+        id::GET_SOCKET_COOKIE,
         id::PROBE_READ_KERNEL,
         id::PROBE_READ_USER,
         id::PROBE_READ_KERNEL_STR,
         id::PROBE_READ_USER_STR,
         id::CURRENT_TASK_UNDER_CGROUP,
         id::PERF_EVENT_OUTPUT,
+        id::GET_FUNC_IP,
         id::RINGBUF_OUTPUT,
         id::RINGBUF_RESERVE,
         id::RINGBUF_SUBMIT,

@@ -1331,6 +1331,12 @@ impl<'a> Machine<'a> {
             helpers::id::GET_CURRENT_PID_TGID => 0x0000_0001_0000_0001, // tgid=1, pid=1
             helpers::id::GET_CURRENT_UID_GID => 0,                      // uid=gid=0
             helpers::id::GET_CURRENT_TASK => 0xffff_0000_0000_0001, // opaque, non-deref token
+            // febpf has no sockets: a fixed, nonzero, documented token in the
+            // same spirit as get_current_task (docs/specs/tracing-helpers.md).
+            helpers::id::GET_SOCKET_COOKIE => 0x0000_0000_c00c_1e01,
+            // febpf has no attach point: the "traced function address" is an
+            // opaque, nonzero, non-dereferenceable token like get_current_task.
+            helpers::id::GET_FUNC_IP => 0xffff_0000_0000_0002,
             helpers::id::GET_CURRENT_COMM => {
                 let size = args[1] as usize;
                 let buf = self.mem(args[0], size, true)?;
