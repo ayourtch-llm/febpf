@@ -90,6 +90,14 @@ pub struct Object {
     pub warnings: Vec<String>,
 }
 
+impl Object {
+    /// Override one map's capacity by exact name before its definitions are
+    /// cloned into a [`crate::Program`] and instantiated by [`crate::Vm`].
+    pub fn set_map_max_entries(&mut self, name: &str, max_entries: u32) -> Result<(), String> {
+        crate::maps::set_max_entries(&mut self.maps, name, max_entries)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgArrayInit {
     pub map_index: usize,

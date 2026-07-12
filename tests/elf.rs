@@ -55,6 +55,37 @@ fn legacy_maps_object() {
 }
 
 #[test]
+fn explicit_zero_max_entries_requires_an_exact_loader_override() {
+    maybe_compile("legacy_maps.c", "legacy_maps.o");
+    let mut obj = load("tests/legacy_maps.o");
+    obj.maps[0].max_entries = 0;
+
+    let unconfigured = Program {
+        insns: obj.programs[0].insns.clone(),
+        maps: obj.maps.clone(),
+        btf_ctx: None,
+    };
+    let error = match Vm::new(unconfigured) {
+        Ok(_) => panic!("explicit-zero map instantiated without configuration"),
+        Err(error) => error,
+    };
+    assert!(error.contains("zero max_entries"), "{error}");
+
+    let unknown = obj.set_map_max_entries("not-counts", 8).unwrap_err();
+    assert!(unknown.contains("unknown map 'not-counts'"), "{unknown}");
+    assert!(unknown.contains("counts"), "{unknown}");
+    assert!(
+        obj.set_map_max_entries("counts", 0)
+            .unwrap_err()
+            .contains("nonzero")
+    );
+
+    obj.set_map_max_entries("counts", 8).unwrap();
+    assert_eq!(obj.maps[0].max_entries, 8);
+    assert_eq!(run_prog(&obj, "socket", &mut [0u8; 64]), 100);
+}
+
+#[test]
 fn btf_maps_object() {
     maybe_compile("btf_maps.c", "btf_maps.o");
     let obj = load("tests/btf_maps.o");

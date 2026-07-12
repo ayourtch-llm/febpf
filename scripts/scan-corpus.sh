@@ -105,6 +105,25 @@ EMPTY_PACKET="$TMP/empty-packet"
 : > "$OBJECT_DETAIL"; : > "$OBJECT_BUCKETS"; : > "$GRAPHS"; : > "$LINKS"
 : > "$EMPTY_PACKET"
 
+# Application-side loader configuration for the pinned Gadget lane. These
+# exact objects include user_stack_map.h's explicit max_entries=0 map and the
+# Gadget loader resizes it to the adjacent 1024 parameter before creation.
+# Keep this list exact: a new explicit-zero object must be audited rather than
+# inheriting a global default silently.
+map_args_for_object() {
+    MAP_ARGS=()
+    case "$1" in
+        inspektor-gadget__audit_seccomp.o|\
+        inspektor-gadget__profile_cpu.o|\
+        inspektor-gadget__profile_cuda.o|\
+        inspektor-gadget__trace_capabilities.o|\
+        inspektor-gadget__trace_malloc.o|\
+        inspektor-gadget__trace_open.o)
+            MAP_ARGS=(--map-max-entries ig_build_id=1024)
+            ;;
+    esac
+}
+
 classify() {
     classified_output="$1"
     if printf '%s' "$classified_output" | grep -q "verification PASSED"; then
@@ -138,9 +157,10 @@ for obj in "${OBJS[@]}"; do
     [ -f "$obj" ] || continue
     total=$((total + 1))
     name=$(basename "$obj")
+    map_args_for_object "$name"
     listing="$TMP/programs.$total"
     listing_err="$TMP/programs.$total.err"
-    if ! "$FEBPF" programs "$obj" "${BTF_ARGS[@]}" >"$listing" 2>"$listing_err"; then
+    if ! "$FEBPF" programs "$obj" "${BTF_ARGS[@]}" "${MAP_ARGS[@]}" >"$listing" 2>"$listing_err"; then
         out="$(<"$listing_err")"
         classify "$out"
         echo "$bucket" >> "$OBJECT_BUCKETS"
@@ -161,11 +181,13 @@ for obj in "${OBJS[@]}"; do
                 entry_total=$((entry_total + 1))
                 kind="$field3"
                 program_name="$field4"
-                out=$("$FEBPF" verify "$obj" --prog "$program_name" "${BTF_ARGS[@]}" 2>&1)
+                out=$("$FEBPF" verify "$obj" --prog "$program_name" \
+                    "${BTF_ARGS[@]}" "${MAP_ARGS[@]}" 2>&1)
                 if [ "$kind" = socket ] \
                     && printf '%s' "$out" | grep -q "legacy packet access"; then
                     out=$("$FEBPF" verify "$obj" --prog "$program_name" \
-                        "${BTF_ARGS[@]}" --legacy-packet linux --packet "$EMPTY_PACKET" 2>&1)
+                        "${BTF_ARGS[@]}" "${MAP_ARGS[@]}" \
+                        --legacy-packet linux --packet "$EMPTY_PACKET" 2>&1)
                 fi
                 classify "$out"
                 echo "$bucket" >> "$BUCKETS"

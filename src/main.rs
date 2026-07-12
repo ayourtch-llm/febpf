@@ -63,6 +63,9 @@ options:
   --target-btf <path>  CO-RE: relocate against this BTF (raw blob or ELF with
                        a .BTF section); defaults to /sys/kernel/btf/vmlinux
                        when present and the object has CO-RE relocations
+  --map-max-entries <name>=<n>
+                       override one ELF map capacity before instantiation;
+                       repeatable, exact map names, n must be nonzero
   -o <file>            output file (asm)
 
 input files ending in .s/.asm/.bpf are assembled; ELF objects from
@@ -91,6 +94,7 @@ struct Opts {
     jit: bool,
     prog: Option<String>,
     target_btf: Option<String>,
+    map_max_entries: Vec<(String, u32)>,
     seed: Option<u64>,
     kernel: bool,
     conservative: bool,
@@ -127,6 +131,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Opts, Strin
         jit: false,
         prog: None,
         target_btf: None,
+        map_max_entries: Vec::new(),
         seed: None,
         kernel: false,
         conservative: false,
@@ -163,6 +168,21 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Opts, Strin
                     }
                     None => return Err("--legacy-packet needs a value: linux or rbpf-0.4.1".into()),
                 }
+            }
+            "--map-max-entries" => {
+                let value = args
+                    .next()
+                    .ok_or("--map-max-entries needs a value: <name>=<nonzero-u32>")?;
+                let (name, max_entries) = parse_map_max_entries(&value)?;
+                if o.map_max_entries
+                    .iter()
+                    .any(|(existing, _)| existing == name)
+                {
+                    return Err(format!(
+                        "duplicate --map-max-entries override for map '{name}'"
+                    ));
+                }
+                o.map_max_entries.push((name.to_string(), max_entries));
             }
             "--ctx-size" => {
                 o.ctx_size = Some(
@@ -233,6 +253,28 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Opts, Strin
         return Err("missing input file".into());
     }
     Ok(o)
+}
+
+fn parse_map_max_entries(value: &str) -> Result<(&str, u32), String> {
+    let Some((name, count)) = value.split_once('=') else {
+        return Err(format!(
+            "bad --map-max-entries '{value}': expected <name>=<nonzero-u32>"
+        ));
+    };
+    if name.is_empty() || count.is_empty() || count.contains('=') {
+        return Err(format!(
+            "bad --map-max-entries '{value}': expected <name>=<nonzero-u32>"
+        ));
+    }
+    let max_entries = count.parse::<u32>().map_err(|error| {
+        format!("bad --map-max-entries '{value}': invalid u32 capacity: {error}")
+    })?;
+    if max_entries == 0 {
+        return Err(format!(
+            "bad --map-max-entries '{value}': capacity must be nonzero"
+        ));
+    }
+    Ok((name, max_entries))
 }
 
 /// Compile the VM to native code, or report that this build has no JIT.
@@ -324,7 +366,8 @@ fn cmd_programs(o: &Opts) -> Result<ExitCode, String> {
     if o.prog.is_some() {
         return Err("programs lists every entry; --prog is not applicable".into());
     }
-    let obj = load_elf_object(&o.file, o.target_btf.as_deref())?;
+    let mut obj = load_elf_object(&o.file, o.target_btf.as_deref())?;
+    apply_map_max_entries(&mut obj, &o.map_max_entries)?;
     for warning in &obj.warnings {
         eprintln!("warning: {warning}");
     }
@@ -358,11 +401,15 @@ fn load_program(
     path: &str,
     prog: Option<&str>,
     target_btf: Option<&str>,
+    map_max_entries: &[(String, u32)],
 ) -> Result<(Program, Option<DebugInfo>, bool, Vec<TailLink>), String> {
     let is_source = [".s", ".asm", ".bpf"]
         .iter()
         .any(|ext| path.ends_with(ext));
     if is_source {
+        if !map_max_entries.is_empty() {
+            return Err("--map-max-entries requires an ELF object".into());
+        }
         let src =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
         let a = asm::assemble(&src).map_err(|e| format!("{path}: {e}"))?;
@@ -393,8 +440,9 @@ fn load_program(
             }
             None => None,
         };
-        let obj = febpf::elf::load_with_target_btf(&bytes, target.as_deref())
+        let mut obj = febpf::elf::load_with_target_btf(&bytes, target.as_deref())
             .map_err(|e| format!("{path}: {e}"))?;
+        apply_map_max_entries(&mut obj, map_max_entries)?;
         for w in &obj.warnings {
             eprintln!("warning: {w}");
         }
@@ -449,6 +497,9 @@ fn load_program(
             links,
         ))
     } else {
+        if !map_max_entries.is_empty() {
+            return Err("--map-max-entries requires an ELF object".into());
+        }
         let insns = insn::decode_program(&bytes)?;
         Ok((
             Program {
@@ -461,6 +512,16 @@ fn load_program(
             Vec::new(),
         ))
     }
+}
+
+fn apply_map_max_entries(
+    object: &mut febpf::elf::Object,
+    overrides: &[(String, u32)],
+) -> Result<(), String> {
+    for (name, max_entries) in overrides {
+        object.set_map_max_entries(name, *max_entries)?;
+    }
+    Ok(())
 }
 
 fn make_ctx(o: &Opts) -> Result<Vec<u8>, String> {
@@ -853,8 +914,18 @@ fn cmd_equiv(o: &Opts) -> Result<ExitCode, String> {
         .file2
         .as_deref()
         .ok_or("equiv needs two programs: febpf equiv <a> <b>")?;
-    let (pa, _, _, ta) = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
-    let (pb, _, _, tb) = load_program(file_b, o.prog.as_deref(), o.target_btf.as_deref())?;
+    let (pa, _, _, ta) = load_program(
+        &o.file,
+        o.prog.as_deref(),
+        o.target_btf.as_deref(),
+        &o.map_max_entries,
+    )?;
+    let (pb, _, _, tb) = load_program(
+        file_b,
+        o.prog.as_deref(),
+        o.target_btf.as_deref(),
+        &o.map_max_entries,
+    )?;
     if !ta.is_empty() || !tb.is_empty() {
         return Err("equiv does not yet model tail-call program graphs".into());
     }
@@ -941,6 +1012,14 @@ fn cmd_optimize(o: &Opts, prog: Program) -> Result<ExitCode, String> {
 
 fn run() -> Result<ExitCode, String> {
     let o = parse_args().map_err(|e| format!("{e}\n\n{USAGE}"))?;
+    if !o.map_max_entries.is_empty()
+        && matches!(o.cmd.as_str(), "replay" | "fuzz" | "vfuzz")
+    {
+        return Err(format!(
+            "--map-max-entries is not applicable to {}; it configures maps loaded from an ELF object",
+            o.cmd
+        ));
+    }
     if o.cmd == "help" {
         print!("{USAGE}");
         return Ok(ExitCode::SUCCESS);
@@ -960,8 +1039,12 @@ fn run() -> Result<ExitCode, String> {
     if o.cmd == "programs" {
         return cmd_programs(&o);
     }
-    let (prog, debug, elf_xdp, tail_links) =
-        load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
+    let (prog, debug, elf_xdp, tail_links) = load_program(
+        &o.file,
+        o.prog.as_deref(),
+        o.target_btf.as_deref(),
+        &o.map_max_entries,
+    )?;
     if o.packet.is_some() && o.pcap.is_some() {
         return Err("--packet and --pcap are mutually exclusive".into());
     }
@@ -1346,6 +1429,51 @@ mod cli_tests {
             Err(error) => error,
         };
         assert!(error.contains("needs a value"), "{error}");
+    }
+
+    #[test]
+    fn parses_map_max_entries_and_rejects_bad_or_duplicate_values() {
+        let parsed = parse(&[
+            "verify",
+            "--map-max-entries",
+            "first=16",
+            "program.o",
+            "--map-max-entries",
+            "second=32",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.map_max_entries,
+            [("first".to_string(), 16), ("second".to_string(), 32)]
+        );
+
+        for bad in [
+            "missing-equals",
+            "=1",
+            "map=",
+            "map=0",
+            "map=nope",
+            "a=1=2",
+        ] {
+            let error = match parse(&["verify", "--map-max-entries", bad, "program.o"]) {
+                Ok(_) => panic!("bad override parsed: {bad}"),
+                Err(error) => error,
+            };
+            assert!(error.contains("--map-max-entries"), "{error}");
+        }
+
+        let duplicate = match parse(&[
+            "run",
+            "--map-max-entries",
+            "map=1",
+            "program.o",
+            "--map-max-entries",
+            "map=2",
+        ]) {
+            Ok(_) => panic!("duplicate override parsed"),
+            Err(error) => error,
+        };
+        assert!(duplicate.contains("duplicate"), "{duplicate}");
     }
 
     #[test]

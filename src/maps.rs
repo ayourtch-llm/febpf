@@ -124,6 +124,37 @@ pub struct MapDef {
     pub map_in_map_values: Vec<(u32, u32)>,
 }
 
+/// Override a map capacity by exact name before map instantiation.
+#[cfg(feature = "std")]
+pub(crate) fn set_max_entries(
+    maps: &mut [MapDef],
+    name: &str,
+    max_entries: u32,
+) -> Result<(), String> {
+    if max_entries == 0 {
+        return Err(format!(
+            "map max_entries override for '{name}' must be nonzero"
+        ));
+    }
+    let Some(map) = maps.iter_mut().find(|map| map.name == name) else {
+        let available = maps
+            .iter()
+            .map(|map| map.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "map max_entries override names unknown map '{name}'; available: {}",
+            if available.is_empty() {
+                "<none>"
+            } else {
+                &available
+            }
+        ));
+    };
+    map.max_entries = max_entries;
+    Ok(())
+}
+
 /// Location of a map value inside its map's storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueRef {

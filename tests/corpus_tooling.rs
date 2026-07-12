@@ -62,7 +62,7 @@ fn programs_lists_each_global_entry_in_a_shared_section() {
 fn scanner_counts_a_non_default_rejection_and_preserves_section_names() {
     let temp = temp_dir("corpus-scan");
     let mock = temp.join("febpf-mock");
-    let object = temp.join("multi.o");
+    let object = temp.join("inspektor-gadget__audit_seccomp.o");
     let report = temp.join("report.txt");
     fs::write(&object, b"mock object").unwrap();
     fs::write(
@@ -70,6 +70,10 @@ fn scanner_counts_a_non_default_rejection_and_preserves_section_names() {
         r#"#!/usr/bin/env bash
 set -u
 if [ "$1" = programs ]; then
+    case " $* " in
+        *" --map-max-entries ig_build_id=1024 "*) ;;
+        *) printf 'error: missing Gadget map override\n' >&2; exit 1 ;;
+    esac
     printf 'program\t0\tother\tfirst/name\n'
     printf 'program\t1\tother\tsecond:name\n'
     printf 'program\t2\tsocket\tsocket/legacy\n'
@@ -77,13 +81,19 @@ if [ "$1" = programs ]; then
 fi
 prog=
 legacy=0
+map_override=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --prog) prog="$2"; shift 2 ;;
         --legacy-packet) legacy=1; shift 2 ;;
+        --map-max-entries)
+            [ "$2" = ig_build_id=1024 ] && map_override=1
+            shift 2
+            ;;
         *) shift ;;
     esac
 done
+[ "$map_override" -eq 1 ] || { printf 'error: missing Gadget map override\n' >&2; exit 1; }
 case "$prog" in
     first/name) printf 'verification PASSED\n' ;;
     second:name) printf 'verification FAILED: at insn 0: call to unknown helper #999\n' ;;

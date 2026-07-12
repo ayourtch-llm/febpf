@@ -140,11 +140,26 @@ This was the root cause of the `LOAD-FAIL:relocation` corpus failures
 
 ## Tolerated omissions in BTF map defs
 
-A BTF map def may omit `max_entries` entirely (libbpf leaves it 0 and the
-loader app sets it via `bpf_map__set_max_entries` before load — bcc's
-`cpudist` does this). febpf defaults it to `DEFAULT_MAX_ENTRIES` (10240,
-bcc's usual value) instead of rejecting the object. This was the
-`LOAD-FAIL:other` corpus failure ("map 'start': missing max_entries").
+A BTF map def may **omit** the `max_entries` member entirely. febpf defaults
+that omission to `DEFAULT_MAX_ENTRIES` (10240, bcc's usual value), preserving
+the tolerant behavior that fixed bcc `cpudist`'s historical
+`"map 'start': missing max_entries"` failure.
+
+An explicitly encoded `__uint(max_entries, 0)` is different: it is a loader
+contract saying the application must choose the capacity before map creation.
+febpf keeps rejecting explicit zero at `Vm` construction unless the embedding
+application first calls
+`elf::Object::set_map_max_entries(exact_name, nonzero_u32)`. The method rejects
+zero and unknown names; applying it to the `Object` before selecting an entry
+means every entry and static tail-call target cloned from that object receives
+the same map definitions.
+
+The CLI exposes the same operation as repeatable
+`--map-max-entries <name>=<nonzero-u32>`. It rejects malformed values,
+duplicates, unknown map names, and non-ELF inputs rather than silently sizing
+unrelated maps. This mirrors the configuration phase provided by libbpf's
+`bpf_map__set_max_entries` without importing application-specific policy into
+the ELF parser.
 
 ## Load-time dead-code elimination (rodata DCE)
 

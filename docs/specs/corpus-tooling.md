@@ -51,6 +51,16 @@ before recording the baseline below:
    object, for example, has several functions in `SEC("xdp")`, so the program
    count is a known undercount.
 
+The Gadget lane also carries six objects whose shared `ig_build_id` map
+explicitly declares `max_entries=0` and is resized by the Gadget userspace
+loader. The scanner models that application configuration explicitly: only
+`audit_seccomp`, `profile_cpu`, `profile_cuda`, `trace_capabilities`,
+`trace_malloc`, and `trace_open` receive
+`--map-max-entries ig_build_id=1024`. No other Inspektor Gadget object and no
+other corpus lane receives a silent default. An omitted `max_entries` member
+continues to use febpf's documented tolerant loader default; an explicit zero
+without a named override remains a crisp load failure.
+
 After those fixes, the authoritative combined scan observed 114 object
 families and 785 entry programs. 113 families enumerate, 71 are fully
 compatible, and 486/785 entries verify (61.9%); 42 entries fail during loading
@@ -256,6 +266,11 @@ For each entry returned from a successfully enumerated
 febpf verify <obj> --prog <exact-section-name> \
     --target-btf /sys/kernel/btf/vmlinux
 ```
+
+Lane-specific loader arguments are appended to both `programs` and `verify`.
+At present the only such configuration is the six-object Gadget
+`ig_build_id=1024` list above; keeping it as an exact basename list makes a
+new explicit-zero object fail visibly until its real loader policy is audited.
 
 and captures **combined stdout+stderr**. Classification keys off the output
 text, which febpf makes unambiguous (see below), not exit codes:
