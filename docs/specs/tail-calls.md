@@ -1,11 +1,12 @@
 # Program arrays and tail calls
 
-Status: userspace-populated and static ELF program bundles are implemented
-across verifier, interpreter, JIT, snapshots/debugger, replay, CLI, and kernel
-conformance APIs. The pinned corpus now includes Cilium's sparse static
-program-array loader fixture; loading that complete object is currently
-blocked by its separate `ARRAY_OF_MAPS` declaration. Privileged execution of
-the static ELF graph remains before this item is fully closed.
+Status: **complete.** Userspace-populated and static ELF program bundles are
+implemented across verifier, interpreter, JIT, snapshots/debugger, replay,
+CLI, and kernel conformance APIs. A privileged kernel differential loaded and
+executed the static ELF graph successfully on 2026-07-12. The pinned corpus
+includes Cilium's sparse static program-array loader fixture; loading that
+complete object is blocked only by its separate `ARRAY_OF_MAPS` declaration,
+which is the next independent coverage item rather than a tail-call gap.
 
 ## Goal
 

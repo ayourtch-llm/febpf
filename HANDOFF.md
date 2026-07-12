@@ -25,7 +25,7 @@ anything done.
 
 ## LATEST (2026-07-11): verifier soundness + the XDP packet workbench foundation
 
-**IN PROGRESS (2026-07-12): real-world program graphs / tail calls.**
+**DONE (2026-07-12): real-world program graphs / tail calls.**
 `docs/specs/tail-calls.md` is the contract. The userspace-populated path is
 implemented: `MapKind::ProgArray`, helper #12 verifier rules, independently
 verified targets sharing maps, interpreter hit/miss/cycle/33-chain semantics,
@@ -35,10 +35,11 @@ program-fd population plus a privilege-gated differential. Static BTF `.maps`
 `values[]` relocations now produce automatic multi-program ELF/CLI bundles;
 interpreter, JIT, analyze, record/replay, and conftest consume them. The pinned
 corpus includes Cilium v0.21.0's sparse program-array loader fixture and the
-scanner reports program graphs separately. That complete upstream object also
-contains `ARRAY_OF_MAPS`, now the next measured loader blocker. Remaining
-before this item is DONE: run the static-ELF privileged differential as root
-and load the upstream fixture after map-of-maps support lands.
+scanner reports program graphs separately. The static ELF regression passed
+against the real kernel as root: the entry and target loaded, the program fd
+populated the real program array, and `BPF_PROG_TEST_RUN` returned 42. The
+complete upstream Cilium object also contains `ARRAY_OF_MAPS`; that is now the
+next independent measured loader blocker, not remaining tail-call work.
 
 This is the current tip and the context a fresh agent is most likely to need.
 The work is committed linearly on `main`:
