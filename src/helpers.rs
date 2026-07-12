@@ -48,6 +48,7 @@ pub mod id {
     pub const SKC_TO_TCP_REQUEST_SOCK: u32 = 139;
     pub const GET_TASK_STACK: u32 = 141;
     pub const GET_FUNC_IP: u32 = 173;
+    pub const TRACE_VPRINTK: u32 = 177;
     pub const XDP_LOAD_BYTES: u32 = 189;
     pub const XDP_STORE_BYTES: u32 = 190;
     /// First id available for user-registered helpers.
@@ -76,6 +77,9 @@ pub enum ArgKind {
     /// Readable memory whose length is given by the argument at `size_arg`
     /// (0-based index into args).
     MemRead { size_arg: u8 },
+    /// Readable memory sized by another argument, or scalar NULL when that
+    /// size is exactly zero (`ARG_PTR_TO_MEM | PTR_MAYBE_NULL`).
+    MemReadOrNull { size_arg: u8 },
     /// Writable memory whose length is given by the argument at `size_arg`.
     MemWrite { size_arg: u8 },
     /// A scalar used as a memory size; the paired memory argument constrains
@@ -290,6 +294,17 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [Any, None, None, None, None],
             ret: RetKind::Scalar,
         },
+        id::TRACE_VPRINTK => HelperSig {
+            name: "trace_vprintk",
+            args: [
+                MemRead { size_arg: 1 },
+                Size,
+                MemReadOrNull { size_arg: 3 },
+                Size,
+                None,
+            ],
+            ret: RetKind::Scalar,
+        },
         id::XDP_LOAD_BYTES => HelperSig {
             name: "xdp_load_bytes",
             args: [XdpCtxPtr, Scalar, MemWrite { size_arg: 3 }, Size, None],
@@ -392,6 +407,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::SKB_PULL_DATA,
         id::PERF_EVENT_OUTPUT,
         id::GET_FUNC_IP,
+        id::TRACE_VPRINTK,
         id::XDP_LOAD_BYTES,
         id::XDP_STORE_BYTES,
         id::RINGBUF_OUTPUT,

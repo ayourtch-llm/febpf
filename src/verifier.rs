@@ -2889,6 +2889,49 @@ impl<'a> Verifier<'a> {
                     };
                     self.check_helper_mem(state, pc, &p, len, false)?;
                 }
+                ArgKind::MemReadOrNull { size_arg } => {
+                    let sz = match args[*size_arg as usize] {
+                        RegState::Scalar(s) => s,
+                        _ => {
+                            return Err(self.err(
+                                pc,
+                                format!(
+                                    "helper {}: size argument r{} must be a scalar",
+                                    sig.name,
+                                    size_arg + 1
+                                ),
+                            ));
+                        }
+                    };
+                    if matches!(val, RegState::Scalar(s) if s.is_const() && s.umin == 0)
+                        && sz.is_const()
+                        && sz.umin == 0
+                    {
+                        continue;
+                    }
+                    if sz.umax > 1 << 20 {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {}: size in r{} unbounded (umax={})",
+                                sig.name,
+                                size_arg + 1,
+                                sz.umax
+                            ),
+                        ));
+                    }
+                    let RegState::Ptr(p) = val else {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {} arg{}: expected memory pointer or NULL with zero size in r{reg}",
+                                sig.name,
+                                i + 1
+                            ),
+                        ));
+                    };
+                    self.check_helper_mem(state, pc, &p, sz.umax, false)?;
+                }
                 ArgKind::MemRead { size_arg } | ArgKind::MemWrite { size_arg } => {
                     let write = matches!(kind, ArgKind::MemWrite { .. });
                     let sz = match args[*size_arg as usize] {

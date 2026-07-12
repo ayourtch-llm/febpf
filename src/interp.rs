@@ -2244,7 +2244,7 @@ impl<'a> Machine<'a> {
             }
             helpers::id::TRACE_PRINTK => {
                 let fmt = self.read_bytes(args[0], args[1] as usize)?;
-                let line = self.format_printk(&fmt, [args[2], args[3], args[4]])?;
+                let line = self.format_printk(&fmt, &[args[2], args[3], args[4]])?;
                 #[cfg(feature = "std")]
                 if self.vm.echo_printk {
                     eprintln!("printk: {line}");
@@ -2252,6 +2252,31 @@ impl<'a> Machine<'a> {
                 let len = line.len() as u64;
                 self.vm.printk.push(line);
                 len
+            }
+            helpers::id::TRACE_VPRINTK => {
+                let data_len = args[3] as u32 as usize;
+                if !data_len.is_multiple_of(8) || data_len > 12 * 8 {
+                    (-22i64) as u64 // -EINVAL
+                } else {
+                    let fmt = self.read_bytes(args[0], args[1] as usize)?;
+                    let data = if data_len == 0 {
+                        Vec::new()
+                    } else {
+                        self.read_bytes(args[2], data_len)?
+                    };
+                    let values = data
+                        .chunks_exact(8)
+                        .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    let line = self.format_printk(&fmt, &values)?;
+                    #[cfg(feature = "std")]
+                    if self.vm.echo_printk {
+                        eprintln!("printk: {line}");
+                    }
+                    let len = line.len() as u64;
+                    self.vm.printk.push(line);
+                    len
+                }
             }
             helpers::id::GET_PRANDOM_U32 => {
                 // xorshift64*: deterministic across runs for debuggability
@@ -2598,7 +2623,7 @@ impl<'a> Machine<'a> {
     }
 
     /// Minimal printk-style formatter: %d %u %x %s and l/ll length modifiers.
-    fn format_printk(&mut self, fmt: &[u8], args: [u64; 3]) -> Result<String, EbpfError> {
+    fn format_printk(&mut self, fmt: &[u8], args: &[u64]) -> Result<String, EbpfError> {
         let mut out = String::new();
         let mut argi = 0;
         let mut i = 0;
@@ -2631,7 +2656,7 @@ impl<'a> Machine<'a> {
             }
             let conv = fmt[i];
             i += 1;
-            let arg = if argi < 3 { args[argi] } else { 0 };
+            let arg = args.get(argi).copied().unwrap_or(0);
             match conv {
                 b's' => {
                     // bounded C-string read

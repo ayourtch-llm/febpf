@@ -120,6 +120,20 @@ blocker was helper #46; #173 fell out of the ksnoop investigation below.
   cleanly through the virtual-address model, and probe_read of it
   zero-fills + returns -EFAULT like any wild pointer).
 
+## trace_vprintk (#177)
+
+`(fmt, fmt_size, data, data_len)` extends `trace_printk` with an array of up to
+12 little-endian u64 arguments. The format and nonempty argument array must be
+initialized readable memory; `data` may be NULL exactly when `data_len` is
+zero. A data length not divisible by eight or above 96 returns `-EINVAL`
+without appending output.
+
+The deterministic runtime reuses the bounded `%d`/`%u`/`%x`/`%s`/`%p`/`%c`
+formatter and appends the rendered line to `Vm::printk`, so snapshots,
+equivalence observations, interpreter, and JIT retain the same behavior as
+ordinary `trace_printk`. This closes both libbpf-bootstrap ksyscall entries,
+whose four- and five-argument `bpf_printk` expansions select vprintk.
+
 ## ktime_get_boot_ns (#125)
 
 The all-entry Inspektor Gadget scan made `bpf_ktime_get_boot_ns` the largest

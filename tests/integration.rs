@@ -1931,6 +1931,74 @@ fn helper_trace_printk() {
     assert_eq!(vm.printk, vec!["n=42".to_string()]);
 }
 
+#[test]
+fn helper_trace_vprintk_formats_argument_array_and_accepts_null_for_zero() {
+    assert_eq!(febpf::helpers::helper_id("trace_vprintk"), Some(177));
+    let src = "r0 = 0x253d622064253d61 ll\n\
+        *(u64 *)(r10 - 64) = r0\n\
+        r0 = 0x642064253d632064 ll\n\
+        *(u64 *)(r10 - 56) = r0\n\
+        r0 = 0x64253d ll\n\
+        *(u64 *)(r10 - 48) = r0\n\
+        *(u64 *)(r10 - 32) = 1\n\
+        *(u64 *)(r10 - 24) = 2\n\
+        *(u64 *)(r10 - 16) = 3\n\
+        *(u64 *)(r10 - 8) = 4\n\
+        r1 = r10\n\
+        r1 += -64\n\
+        r2 = 24\n\
+        r3 = r10\n\
+        r3 += -32\n\
+        r4 = 32\n\
+        call trace_vprintk\n\
+        exit";
+    let mut vm = Vm::new(program(src)).unwrap();
+    vm.verify(Config::default()).unwrap();
+    assert_eq!(vm.run_no_data().unwrap(), 15);
+    assert_eq!(vm.printk, ["a=1 b=2 c=3 d=4"]);
+    #[cfg(feature = "jit")]
+    {
+        vm.printk.clear();
+        assert_eq!(vm.run_jit(&mut []).unwrap(), 15);
+        assert_eq!(vm.printk, ["a=1 b=2 c=3 d=4"]);
+    }
+
+    let mut no_args = Vm::new(program(
+        "*(u32 *)(r10 - 4) = 0x000a6b6f\n\
+         r1 = r10\n\
+         r1 += -4\n\
+         r2 = 4\n\
+         r3 = 0\n\
+         r4 = 0\n\
+         call trace_vprintk\n\
+         exit",
+    ))
+    .unwrap();
+    no_args.verify(Config::default()).unwrap();
+    assert_eq!(no_args.run_no_data().unwrap(), 3);
+    assert_eq!(no_args.printk, ["ok\n"]);
+}
+
+#[test]
+fn helper_trace_vprintk_rejects_malformed_data_length_atomically() {
+    let mut vm = Vm::new(program(
+        "*(u32 *)(r10 - 16) = 0x000a6b6f\n\
+         *(u64 *)(r10 - 8) = 1\n\
+         r1 = r10\n\
+         r1 += -16\n\
+         r2 = 4\n\
+         r3 = r10\n\
+         r3 += -8\n\
+         r4 = 7\n\
+         call trace_vprintk\n\
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config::default()).unwrap();
+    assert_eq!(vm.run_no_data().unwrap(), (-22i64) as u64);
+    assert!(vm.printk.is_empty());
+}
+
 // ------------------------------------------------------------------ verifier rejections
 
 #[test]
