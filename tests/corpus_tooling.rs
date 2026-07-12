@@ -140,3 +140,71 @@ esac
 
     fs::remove_dir_all(temp).unwrap();
 }
+
+#[test]
+fn scanner_applies_attach_targets_to_listing_and_verification() {
+    let temp = temp_dir("corpus-attach-target");
+    let mock = temp.join("febpf-mock");
+    let object = temp.join("bcc__cachestat.o");
+    let target = temp.join("target.btf");
+    let report = temp.join("report.txt");
+    fs::write(&object, b"mock object").unwrap();
+    fs::write(&target, b"mock BTF").unwrap();
+    fs::write(
+        &mock,
+        r#"#!/usr/bin/env bash
+set -u
+attach=0
+target=0
+for arg in "$@"; do
+    [ "$arg" = section:fentry/account_page_dirtied=folio_account_dirtied ] && attach=1
+    [ "$arg" = "$TARGET_BTF" ] && target=1
+done
+[ "$attach" -eq 1 ] || { printf 'error: missing attach override\n' >&2; exit 1; }
+[ "$target" -eq 1 ] || { printf 'error: missing target BTF\n' >&2; exit 1; }
+if [ "$1" = programs ]; then
+    if [ "${MOCK_MISSING_FUNCTION:-0}" -eq 1 ]; then
+        printf "error: attach-target: no function 'folio_account_dirtied' in target BTF\n" >&2
+        exit 1
+    fi
+    printf 'program\t0\tother\tfentry/account_page_dirtied\n'
+else
+    printf 'verification PASSED\n'
+fi
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&mock).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&mock, permissions).unwrap();
+
+    let scan = |missing_function: bool| {
+        let mut command = Command::new("bash");
+        command
+            .arg("scripts/scan-corpus.sh")
+            .arg(&object)
+            .env("NO_BUILD", "1")
+            .env("FEBPF", &mock)
+            .env("TARGET_BTF", &target)
+            .env("CORPUS_REPORT", &report);
+        if missing_function {
+            command.env("MOCK_MISSING_FUNCTION", "1");
+        }
+        command.output().expect("run corpus scanner")
+    };
+
+    let output = scan(false);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let successful = fs::read_to_string(&report).unwrap();
+    assert!(successful.contains("objects fully compatible  : 1  (100.0%)"), "{successful}");
+    assert!(successful.contains("entries verified OK       : 1  (100.0%)"), "{successful}");
+
+    let output = scan(true);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let missing = fs::read_to_string(&report).unwrap();
+    assert!(missing.contains("objects fully compatible  : 0  (0.0%)"), "{missing}");
+    assert!(missing.contains("LOAD-FAIL:other"), "{missing}");
+    assert!(!missing.contains("entries verified OK       : 1"), "{missing}");
+
+    fs::remove_dir_all(temp).unwrap();
+}

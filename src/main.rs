@@ -67,6 +67,9 @@ options:
   --map-max-entries <name>=<n>
                        override one ELF map capacity before instantiation;
                        repeatable, exact map names, n must be nonzero
+  --attach-target <selector>=<function>
+                       retarget BTF ctx typing to a real target-BTF function;
+                       selector is program:<name> or section:<section>, repeatable
   -o <file>            output file (asm)
 
 input files ending in .s/.asm/.bpf are assembled; ELF objects from
@@ -97,6 +100,7 @@ struct Opts {
     prog: Option<String>,
     target_btf: Option<String>,
     map_max_entries: Vec<(String, u32)>,
+    attach_targets: Vec<febpf::elf::AttachTarget>,
     seed: Option<u64>,
     kernel: bool,
     conservative: bool,
@@ -135,6 +139,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Opts, Strin
         prog: None,
         target_btf: None,
         map_max_entries: Vec::new(),
+        attach_targets: Vec::new(),
         seed: None,
         kernel: false,
         conservative: false,
@@ -186,6 +191,22 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Opts, Strin
                     ));
                 }
                 o.map_max_entries.push((name.to_string(), max_entries));
+            }
+            "--attach-target" => {
+                let value = args.next().ok_or(
+                    "--attach-target needs a value: (program:<name>|section:<section>)=<function>",
+                )?;
+                let override_ = parse_attach_target(&value)?;
+                if o.attach_targets
+                    .iter()
+                    .any(|existing| existing.selector == override_.selector)
+                {
+                    return Err(format!(
+                        "duplicate --attach-target selector {:?}",
+                        override_.selector
+                    ));
+                }
+                o.attach_targets.push(override_);
             }
             "--ctx-size" => {
                 o.ctx_size = Some(
@@ -281,6 +302,32 @@ fn parse_map_max_entries(value: &str) -> Result<(&str, u32), String> {
     Ok((name, max_entries))
 }
 
+fn parse_attach_target(value: &str) -> Result<febpf::elf::AttachTarget, String> {
+    use febpf::elf::{AttachTarget, AttachTargetSelector};
+
+    let expected = "expected (program:<name>|section:<section>)=<function>";
+    let Some((selector, function)) = value.split_once('=') else {
+        return Err(format!("bad --attach-target '{value}': {expected}"));
+    };
+    if function.is_empty() || function.contains('=') {
+        return Err(format!("bad --attach-target '{value}': {expected}"));
+    }
+    let selector = if let Some(name) = selector.strip_prefix("program:") {
+        if name.is_empty() {
+            return Err(format!("bad --attach-target '{value}': {expected}"));
+        }
+        AttachTargetSelector::Program(name.to_string())
+    } else if let Some(section) = selector.strip_prefix("section:") {
+        if section.is_empty() {
+            return Err(format!("bad --attach-target '{value}': {expected}"));
+        }
+        AttachTargetSelector::Section(section.to_string())
+    } else {
+        return Err(format!("bad --attach-target '{value}': {expected}"));
+    };
+    Ok(AttachTarget { selector, function: function.to_string() })
+}
+
 /// Compile the VM to native code, or report that this build has no JIT.
 #[cfg(feature = "jit")]
 fn jit_compile(vm: &mut Vm) -> Result<(), String> {
@@ -321,7 +368,11 @@ fn read_target_btf(path: &str) -> Result<Vec<u8>, String> {
 
 const VMLINUX_BTF: &str = "/sys/kernel/btf/vmlinux";
 
-fn load_elf_object(path: &str, target_btf: Option<&str>) -> Result<febpf::elf::Object, String> {
+fn load_elf_object(
+    path: &str,
+    target_btf: Option<&str>,
+    attach_targets: &[febpf::elf::AttachTarget],
+) -> Result<febpf::elf::Object, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     if bytes.len() < 4 || &bytes[..4] != b"\x7fELF" {
         return Err(format!("{path}: programs requires an ELF object"));
@@ -335,7 +386,11 @@ fn load_elf_object(path: &str, target_btf: Option<&str>) -> Result<febpf::elf::O
         }
         None => None,
     };
-    febpf::elf::load_with_target_btf(&bytes, target.as_deref())
+    febpf::elf::load_with_target_btf_and_attach_targets(
+        &bytes,
+        target.as_deref(),
+        attach_targets,
+    )
         .map_err(|e| format!("{path}: {e}"))
 }
 
@@ -355,7 +410,7 @@ fn cmd_programs(o: &Opts) -> Result<ExitCode, String> {
     if o.prog.is_some() {
         return Err("programs lists every entry; --prog is not applicable".into());
     }
-    let mut obj = load_elf_object(&o.file, o.target_btf.as_deref())?;
+    let mut obj = load_elf_object(&o.file, o.target_btf.as_deref(), &o.attach_targets)?;
     apply_map_max_entries(&mut obj, &o.map_max_entries)?;
     for warning in &obj.warnings {
         eprintln!("warning: {warning}");
@@ -391,13 +446,14 @@ fn load_program(
     prog: Option<&str>,
     target_btf: Option<&str>,
     map_max_entries: &[(String, u32)],
+    attach_targets: &[febpf::elf::AttachTarget],
 ) -> Result<(Program, Option<DebugInfo>, febpf::elf::ProgramKind, Vec<TailLink>), String> {
     let is_source = [".s", ".asm", ".bpf"]
         .iter()
         .any(|ext| path.ends_with(ext));
     if is_source {
-        if !map_max_entries.is_empty() {
-            return Err("--map-max-entries requires an ELF object".into());
+        if !map_max_entries.is_empty() || !attach_targets.is_empty() {
+            return Err("--map-max-entries and --attach-target require an ELF object".into());
         }
         let src =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
@@ -429,8 +485,12 @@ fn load_program(
             }
             None => None,
         };
-        let mut obj = febpf::elf::load_with_target_btf(&bytes, target.as_deref())
-            .map_err(|e| format!("{path}: {e}"))?;
+        let mut obj = febpf::elf::load_with_target_btf_and_attach_targets(
+            &bytes,
+            target.as_deref(),
+            attach_targets,
+        )
+        .map_err(|e| format!("{path}: {e}"))?;
         apply_map_max_entries(&mut obj, map_max_entries)?;
         for w in &obj.warnings {
             eprintln!("warning: {w}");
@@ -486,8 +546,8 @@ fn load_program(
             links,
         ))
     } else {
-        if !map_max_entries.is_empty() {
-            return Err("--map-max-entries requires an ELF object".into());
+        if !map_max_entries.is_empty() || !attach_targets.is_empty() {
+            return Err("--map-max-entries and --attach-target require an ELF object".into());
         }
         let insns = insn::decode_program(&bytes)?;
         Ok((
@@ -923,12 +983,14 @@ fn cmd_equiv(o: &Opts) -> Result<ExitCode, String> {
         o.prog.as_deref(),
         o.target_btf.as_deref(),
         &o.map_max_entries,
+        &o.attach_targets,
     )?;
     let (pb, _, _, tb) = load_program(
         file_b,
         o.prog.as_deref(),
         o.target_btf.as_deref(),
         &o.map_max_entries,
+        &o.attach_targets,
     )?;
     if !ta.is_empty() || !tb.is_empty() {
         return Err("equiv does not yet model tail-call program graphs".into());
@@ -1024,6 +1086,14 @@ fn run() -> Result<ExitCode, String> {
             o.cmd
         ));
     }
+    if !o.attach_targets.is_empty()
+        && matches!(o.cmd.as_str(), "replay" | "fuzz" | "vfuzz")
+    {
+        return Err(format!(
+            "--attach-target is not applicable to {}; it configures programs loaded from an ELF object",
+            o.cmd
+        ));
+    }
     if o.cmd == "help" {
         print!("{USAGE}");
         return Ok(ExitCode::SUCCESS);
@@ -1048,6 +1118,7 @@ fn run() -> Result<ExitCode, String> {
         o.prog.as_deref(),
         o.target_btf.as_deref(),
         &o.map_max_entries,
+        &o.attach_targets,
     )?;
     if o.packet.is_some() && o.pcap.is_some() {
         return Err("--packet and --pcap are mutually exclusive".into());
@@ -1520,6 +1591,62 @@ mod cli_tests {
             "program.o",
             "--map-max-entries",
             "map=2",
+        ]) {
+            Ok(_) => panic!("duplicate override parsed"),
+            Err(error) => error,
+        };
+        assert!(duplicate.contains("duplicate"), "{duplicate}");
+    }
+
+    #[test]
+    fn parses_attach_targets_and_rejects_bad_or_duplicate_selectors() {
+        use febpf::elf::{AttachTarget, AttachTargetSelector};
+
+        let parsed = parse(&[
+            "verify",
+            "--attach-target",
+            "program:first=real_one",
+            "program.o",
+            "--attach-target",
+            "section:fentry/dummy=real_two",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.attach_targets,
+            [
+                AttachTarget {
+                    selector: AttachTargetSelector::Program("first".into()),
+                    function: "real_one".into(),
+                },
+                AttachTarget {
+                    selector: AttachTargetSelector::Section("fentry/dummy".into()),
+                    function: "real_two".into(),
+                },
+            ]
+        );
+
+        for bad in [
+            "missing-equals",
+            "program:=fn",
+            "section:=fn",
+            "program:name=",
+            "name=fn",
+            "program:name=fn=extra",
+        ] {
+            let error = match parse(&["verify", "--attach-target", bad, "program.o"]) {
+                Ok(_) => panic!("bad override parsed: {bad}"),
+                Err(error) => error,
+            };
+            assert!(error.contains("--attach-target"), "{error}");
+        }
+
+        let duplicate = match parse(&[
+            "verify",
+            "--attach-target",
+            "program:same=one",
+            "program.o",
+            "--attach-target",
+            "program:same=two",
         ]) {
             Ok(_) => panic!("duplicate override parsed"),
             Err(error) => error,

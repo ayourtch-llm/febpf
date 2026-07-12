@@ -532,3 +532,72 @@ fn core_alu_relocation_against_running_kernel() {
     let obj = elf::load_with_target_btf(&probe, Some(&target)).unwrap();
     assert_eq!(run_prog(&obj, "text", &mut [0u8; 8]), expected);
 }
+
+#[test]
+fn application_attach_target_resolves_a_real_target_btf_prototype() {
+    use elf::{AttachTarget, AttachTargetSelector};
+
+    maybe_compile("attach_target.c", "attach_target.o");
+    let bytes = std::fs::read("tests/attach_target.o").unwrap();
+    let target = elf::read_section(&bytes, ".BTF").unwrap().unwrap().0;
+    let override_ = AttachTarget {
+        selector: AttachTargetSelector::Section("fentry/dummy_target".into()),
+        function: "actual_target".into(),
+    };
+    let obj = elf::load_with_target_btf_and_attach_targets(&bytes, Some(&target), &[override_])
+        .unwrap();
+    assert!(obj.warnings.is_empty(), "{:?}", obj.warnings);
+    let program = obj
+        .programs
+        .iter()
+        .find(|program| program.section == "fentry/dummy_target")
+        .unwrap();
+    assert!(program.btf_ctx.is_some());
+}
+
+#[test]
+fn application_attach_target_validation_is_strict() {
+    use elf::{AttachTarget, AttachTargetSelector};
+
+    maybe_compile("attach_target.c", "attach_target.o");
+    let bytes = std::fs::read("tests/attach_target.o").unwrap();
+    let target = elf::read_section(&bytes, ".BTF").unwrap().unwrap().0;
+    let section = |name: &str, function: &str| AttachTarget {
+        selector: AttachTargetSelector::Section(name.into()),
+        function: function.into(),
+    };
+    let program = |name: &str, function: &str| AttachTarget {
+        selector: AttachTargetSelector::Program(name.into()),
+        function: function.into(),
+    };
+    let error = |target_btf: Option<&[u8]>, overrides: &[AttachTarget]| {
+        elf::load_with_target_btf_and_attach_targets(&bytes, target_btf, overrides)
+            .err()
+            .expect("override must fail")
+    };
+
+    assert!(error(None, &[section("fentry/dummy_target", "actual_target")])
+        .contains("require target BTF"));
+    assert!(error(Some(&target), &[section("fentry/missing", "actual_target")])
+        .contains("matched no ELF program"));
+    assert!(error(Some(&target), &[section("xdp", "actual_target")])
+        .contains("non-BTF section"));
+    assert!(error(Some(&target), &[section("fentry/dummy_target", "missing")])
+        .contains("no function 'missing'"));
+    assert!(error(
+        Some(&target),
+        &[
+            section("fentry/dummy_target", "actual_target"),
+            section("fentry/dummy_target", "actual_target"),
+        ],
+    )
+    .contains("duplicate"));
+    assert!(error(
+        Some(&target),
+        &[
+            section("fentry/dummy_target", "actual_target"),
+            program("fentry/dummy_target", "actual_target"),
+        ],
+    )
+    .contains("overlapping"));
+}

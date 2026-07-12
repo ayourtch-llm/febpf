@@ -198,6 +198,24 @@ pub struct Object {
     pub warnings: Vec<String>,
 }
 
+/// Selects which loaded ELF entry receives an application-supplied attach
+/// target. Program names are the names printed by `febpf programs`; section
+/// selectors apply to every entry in that exact executable section.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum AttachTargetSelector {
+    Program(String),
+    Section(String),
+}
+
+/// A libbpf-style attach-target override supplied by the loading application.
+/// The function must exist in the target BTF; febpf never fabricates a
+/// prototype for an override.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachTarget {
+    pub selector: AttachTargetSelector,
+    pub function: String,
+}
+
 impl Object {
     /// Override one map's capacity by exact name before its definitions are
     /// cloned into a [`crate::Program`] and instantiated by [`crate::Vm`].
@@ -373,6 +391,17 @@ pub fn load(bytes: &[u8]) -> Result<Object, String> {
 /// `.BTF.ext` against `target_btf` (a raw BTF blob: a `.BTF` section payload
 /// or a kernel BTF file such as `/sys/kernel/btf/vmlinux`) when given.
 pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<Object, String> {
+    load_with_target_btf_and_attach_targets(bytes, target_btf, &[])
+}
+
+/// Parse and relocate a BPF object while applying explicit application-side
+/// attach targets. Overrides affect BTF ctx typing only; CO-RE relocations are
+/// still resolved against the same `target_btf`.
+pub fn load_with_target_btf_and_attach_targets(
+    bytes: &[u8],
+    target_btf: Option<&[u8]>,
+    attach_targets: &[AttachTarget],
+) -> Result<Object, String> {
     let (r, sections) = parse_elf(bytes)?;
     let bytes = r.buf;
 
@@ -529,6 +558,7 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
         return Err("no executable program sections found".into());
     }
 
+    let resolved_attach_targets = resolve_attach_targets(&programs, target_btf, attach_targets)?;
     if let Some(target) = target_btf {
         // A raw BTF blob declares its own byte order via the magic.
         let target_le = match target.first_chunk::<2>() {
@@ -546,8 +576,12 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
         // some kernel versions) — such a program keeps the untyped flat-ctx
         // model, with a warning, and would only fail on a real kernel when
         // actually loaded against that target.
-        for (prog, sec_name, _, _, _) in programs.iter_mut() {
-            match crate::btf::resolve_ctx_args(&target, sec_name) {
+        for (index, (prog, sec_name, _, _, _)) in programs.iter_mut().enumerate() {
+            let effective_section = match resolved_attach_targets[index].as_deref() {
+                Some(function) => retargeted_btf_section(sec_name, function)?,
+                None => sec_name.clone(),
+            };
+            match crate::btf::resolve_ctx_args(&target, &effective_section) {
                 Ok(Some(args)) => {
                     prog.btf_ctx = Some(crate::btf::BtfCtx {
                         args,
@@ -555,6 +589,12 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
                     });
                 }
                 Ok(None) => {}
+                Err(e) if resolved_attach_targets[index].is_some() => {
+                    return Err(format!(
+                        "attach-target for program '{}' in section '{sec_name}': {e}",
+                        prog.name
+                    ));
+                }
                 Err(e) => warnings.push(format!(
                     "{sec_name}: {e}; verifying with an untyped ctx \
                      (the kernel would reject loading against this target)"
@@ -592,6 +632,75 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
         prog_array_inits,
         warnings,
     })
+}
+
+fn resolve_attach_targets(
+    programs: &[(LoadedProgram, String, usize, usize, Option<usize>)],
+    target_btf: Option<&[u8]>,
+    overrides: &[AttachTarget],
+) -> Result<Vec<Option<String>>, String> {
+    if overrides.is_empty() {
+        return Ok(vec![None; programs.len()]);
+    }
+    if target_btf.is_none() {
+        return Err("attach-target overrides require target BTF".into());
+    }
+
+    let mut resolved = vec![None; programs.len()];
+    let mut seen = std::collections::HashSet::new();
+    for override_ in overrides {
+        if override_.function.is_empty() {
+            return Err("attach-target function name must not be empty".into());
+        }
+        if !seen.insert(override_.selector.clone()) {
+            return Err(format!("duplicate attach-target selector {:?}", override_.selector));
+        }
+        let mut matched = false;
+        for (index, (program, section, _, _, _)) in programs.iter().enumerate() {
+            let selected = match &override_.selector {
+                AttachTargetSelector::Program(name) => program.name == *name,
+                AttachTargetSelector::Section(name) => section == name,
+            };
+            if !selected {
+                continue;
+            }
+            matched = true;
+            if !crate::btf::is_btf_ctx_section(section) {
+                return Err(format!(
+                    "attach-target selector {:?} matched non-BTF section '{section}'",
+                    override_.selector
+                ));
+            }
+            if resolved[index].is_some() {
+                return Err(format!(
+                    "overlapping attach-target selectors for program '{}' in section '{section}'",
+                    program.name
+                ));
+            }
+            // Reject iterator/tp_btf targets explicitly: these do not attach
+            // to ordinary target-BTF functions and cannot use set_attach_target.
+            retargeted_btf_section(section, &override_.function)?;
+            resolved[index] = Some(override_.function.clone());
+        }
+        if !matched {
+            return Err(format!(
+                "attach-target selector {:?} matched no ELF program",
+                override_.selector
+            ));
+        }
+    }
+    Ok(resolved)
+}
+
+fn retargeted_btf_section(section: &str, function: &str) -> Result<String, String> {
+    for prefix in ["fentry/", "fexit/", "fmod_ret/"] {
+        if section.starts_with(prefix) {
+            return Ok(format!("{prefix}{function}"));
+        }
+    }
+    Err(format!(
+        "section '{section}' is BTF-typed but does not support a function attach-target override"
+    ))
 }
 
 /// Does this object carry CO-RE relocations (a `.BTF.ext` with a non-empty

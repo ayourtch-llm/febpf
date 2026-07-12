@@ -115,13 +115,12 @@ EMPTY_PACKET="$TMP/empty-packet"
 : > "$OBJECT_DETAIL"; : > "$OBJECT_BUCKETS"; : > "$GRAPHS"; : > "$LINKS"
 : > "$EMPTY_PACKET"
 
-# Application-side loader configuration for the pinned Gadget lane. These
-# exact objects include user_stack_map.h's explicit max_entries=0 map and the
-# Gadget loader resizes it to the adjacent 1024 parameter before creation.
-# Keep this list exact: a new explicit-zero object must be audited rather than
-# inheriting a global default silently.
+# Application-side loader configuration for exact pinned objects. This mirrors
+# choices made by their userspace loaders; it is not generic ELF policy. Keep
+# every entry exact so new objects are audited rather than inheriting a choice.
 map_args_for_object() {
     MAP_MAX_ENTRIES=""
+    ATTACH_TARGETS=""
     ALLOW_UNINIT_STACK=0
     case "$1" in
         inspektor-gadget__audit_seccomp.o|\
@@ -131,6 +130,39 @@ map_args_for_object() {
         inspektor-gadget__trace_malloc.o|\
         inspektor-gadget__trace_open.o)
             MAP_MAX_ENTRIES="ig_build_id=1024"
+            ;;
+    esac
+    case "$1" in
+        bcc__cachestat.o)
+            ATTACH_TARGETS="section:fentry/account_page_dirtied=folio_account_dirtied"
+            ;;
+        bcc__fsdist.o)
+            ATTACH_TARGETS="section:fentry/dummy_file_read=ext4_file_read_iter
+section:fexit/dummy_file_read=ext4_file_read_iter
+section:fentry/dummy_file_write=ext4_file_write_iter
+section:fexit/dummy_file_write=ext4_file_write_iter
+section:fentry/dummy_file_open=ext4_file_open
+section:fexit/dummy_file_open=ext4_file_open
+section:fentry/dummy_file_sync=ext4_sync_file
+section:fexit/dummy_file_sync=ext4_sync_file
+section:fentry/dummy_getattr=ext4_file_getattr
+section:fexit/dummy_getattr=ext4_file_getattr"
+            ;;
+        bcc__fsslower.o)
+            ATTACH_TARGETS="section:fentry/dummy_file_read=ext4_file_read_iter
+section:fexit/dummy_file_read=ext4_file_read_iter
+section:fentry/dummy_file_write=ext4_file_write_iter
+section:fexit/dummy_file_write=ext4_file_write_iter
+section:fentry/dummy_file_open=ext4_file_open
+section:fexit/dummy_file_open=ext4_file_open
+section:fentry/dummy_file_sync=ext4_sync_file
+section:fexit/dummy_file_sync=ext4_sync_file"
+            ;;
+        bcc__funclatency.o)
+            # Match the tool's documented vfs_read example. The real loader
+            # uses the function selected by its positional CLI argument.
+            ATTACH_TARGETS="section:fentry/dummy_fentry=vfs_read
+section:fexit/dummy_fexit=vfs_read"
             ;;
     esac
     case "$1" in
@@ -152,6 +184,9 @@ run_febpf() {
     if [ -n "$MAP_MAX_ENTRIES" ]; then
         set -- "$@" --map-max-entries "$MAP_MAX_ENTRIES"
     fi
+    for attach_target in $ATTACH_TARGETS; do
+        set -- "$@" --attach-target "$attach_target"
+    done
     "$FEBPF" "$@"
 }
 
