@@ -3,32 +3,29 @@
 _A note from past-me to future-me (or whoever picks this up). Read this before
 diving in; it's the context that isn't obvious from the code._
 
-## ACTIVE RESUME CHECKPOINT (2026-07-12 20:22 UTC, read this first)
+## ACTIVE RESUME CHECKPOINT (2026-07-12 21:18 UTC, read this first)
 
-The production-corpus moonshot is active. The portable CI closure is fully
-green at `932060e`; the iterator helper batch is `f1f8ff0` on top of the
-user's `39366b8` refresh checkpoint.
-Do not resume from the older 62/62 object-level claim: measurement is now per
-ELF entry function and preserves static graph grouping.
+The production-corpus moonshot is active. The portable CI closure remains
+fully green at `932060e`; local development has advanced through `188e641`.
+Do not resume from older 62/62 object-level or 600/785 entry-level claims:
+measurement is per ELF entry function and preserves static graph grouping.
 
-No subagent is active. Helpers #127/#141 are complete; do not redo them from
-the older resume note below. Continue with one evidence-selected batch at a
-time and commit before widening scope.
+The worktree is clean. No Codex subagent is active. A Claude peer is available
+through the user's `tttt` tmux session for an independent JMP32 refinement
+review. Continue with one evidence-selected batch at a time and commit before
+widening scope.
 
-Completed and committed in this wave:
+Completed and committed since the prior refresh:
 
 ```
-932060e docs: record portable CI closure
-26ec5bc corpus: support macOS system bash
-2fcc237 ci: isolate fixtures and preserve arm registers
-f1f8ff0 helpers: complete iterator output layer
-e811bb8 verifier: type kernel iterator contexts
-dae2029 loader: fix corpus-driven relocation and DCE cases
-f2fae21 xdp: preserve program kind and metadata fields
-8207531 elf: support explicit map capacity overrides
-3203f79 helpers: add deterministic boot time
-40a98a2 corpus: add Gadget lane and preserve ELF entries
-4f953c0 corpus: measure every ELF entry program
+188e641 tracing: add deterministic pid namespace helper
+58bdecf tracing: implement variadic printk helper
+3b47d42 skb: implement pull data invalidation
+079456f network: implement direct redirect helper
+593a726 xdp: add packet byte copy helpers
+eb9aac3 xdp: implement redirect map helper
+01e59f1 skb: add safe packet load adapter
+f60e2f6 helpers: type iterator socket conversions
 ```
 
 Current measured corpus:
@@ -36,52 +33,54 @@ Current measured corpus:
 - 114 pinned object families and 785 entry programs: BCC/libbpf-tools,
   libbpf-bootstrap, xdp-tools, Cilium fixture, and 39/39 production Inspektor
   Gadget v0.54.0 sources.
-- Latest stable full scan: **91/114 fully compatible families** and **600/785
-  verified entries (76.4%)**, with all 785 entries loading. `snapshot_process`
-  and `task_iter` became fully compatible; Gadget UDP also verifies while its
-  object family remains blocked by the TCP entry's helper #137.
-- The Gadget lane is reproducible: two offline rebuilds produced identical
-  39-source/39-object manifest digest
+- Latest stable full scan: **101/114 fully compatible families** and **624/785
+  verified entries (79.5%)**. All 785 entries load; one `HASH_OF_MAPS` family
+  still fails object-level map construction, so 113/114 families instantiate.
+- The unknown-helper histogram is now empty. Remaining buckets are seven
+  `VERIFY-REJECT:other` families / 154 entries, five poisoned-CO-RE families /
+  seven entries, and one `HASH_OF_MAPS` load failure.
+- The Gadget lane remains reproducible at manifest digest
   `cc4b5fdff7392995183181692f328dbb063356d8004bd88b5fdb96b9847bb62d`.
-- Default tests: **406 passed + 4 ignored**. Std interpreter-only: **388 passed
-  + 4 ignored**. Both strict Clippy profiles are green; true thumb no-std
-  check/Clippy, wasm/std, Windows/std, and shell syntax gates were green in
-  the completed batches.
+- Default tests: **419 passed + 4 ignored**. Std interpreter-only: **401 passed
+  + 4 ignored**. Both strict Clippy profiles and true thumb no-std check/Clippy
+  are green. The last full GitHub portable matrix remains run `29207495214`;
+  no new remote CI run has been claimed for the post-checkpoint commits.
 
-Important correctness fixes already landed:
+Important correctness and breadth now landed:
 
-- `R_BPF_64_32` REL call addends are preserved; seven previously false-OK BCC
-  entries had silently called the wrong first `.text` subprogram.
-- Multiple global `STT_FUNC` entries sharing one executable section are sliced
-  and enumerated individually while retaining their section-derived
-  `ProgramKind`.
-- Exact application map sizing (`--map-max-entries`) makes six Gadget families
-  and 42 entries compatible without a global silent default.
-- Helper #125 `ktime_get_boot_ns` uses a snapshotted logical boot clock and
-  removed 210 first-visible blockers, raising fully compatible families by 10.
-- XDP `xdp_md` scalar fields at offsets 12/16/20 are modeled; CO-RE flavored
-  enum enumerators match correctly; the narrow rodata-DCE call removal was
-  hardened so it cannot erase observable r1-r5 call clobbers.
-- Typed `iter/task`, `iter/task_file`, `iter/tcp`, and `iter/udp` contexts use
-  exact target-BTF layouts, nullable element pointers, and safe terminal
-  runtime records. Helper #127 `seq_write` requires the exact `seq_file` BTF
-  id and writes snapshotted VM-owned output; #141 `get_task_stack` requires the
-  exact `task_struct` BTF id and returns deterministic VM call-stack bytes.
-  The remaining iterator helper blocker is #137 `skc_to_tcp_sock` (TCP).
+- Iterator conversions #137-#139 require exact `sock_common` target-BTF input
+  and return nullable exact TCP target types; standalone execution returns
+  null rather than fabricating host or synthetic sockets.
+- Explicit `__sk_buff` mode supplies a VM-owned packet and exact scalar/data
+  context fields. #26 copies packet bytes safely; #39 invalidates every stale
+  packet/data-end register alias and spill even though the VM packet is already
+  linear. Reload plus a fresh bounds check is required.
+- Redirect helpers #23/#51 distinguish XDP versus TC verdicts and enforce
+  redirect map kinds without inventing device transmission.
+- XDP #189/#190 use original-context typing, initialized buffer rules, atomic
+  kernel-style errors, VM-owned packet mutation, and preserve range proofs
+  because store does not change packet extent.
+- #177 supports up to 12 u64 format arguments, nullable zero-length data, and
+  deterministic snapshotted output. #120 zeroes output and returns `-EINVAL`
+  because febpf imports no host PID namespace identity.
+- The earlier relocation, ELF-entry slicing, map-capacity, deterministic boot
+  clock, XDP metadata, DCE hardening, typed iterator contexts, #127 sequence
+  output, and #141 task-stack fixes remain authoritative below.
 
 Immediate resume order:
 
-1. Finish iterator socket conversions #137-#139 as a separate typed-pointer
-   batch. The measured first blocker is #137 on one `iter/tcp` entry; preserve
-   exact target-BTF ids and do not fabricate host socket pointers.
-2. Close SKB/networking breadth. `ProgramKind` is ready. Implement an explicit
-   safe SKB packet/context adapter and helper #26 `skb_load_bytes` (now four
-   families), then #51 `redirect_map` (three families/13 entries), #189+#190
-   XDP load/store bytes, #23 redirect, and #39 pull-data with packet-pointer
-   invalidation. See the prior agent plan in conversation context if present.
-3. Implement sound 32-bit conditional range refinement (advise_seccomp and
-   ttysnoop), then generalized `HASH_OF_MAPS`/anonymous inner templates.
-4. Treat missing fentry targets and Gadget application-supplied socket BTF as
+1. Implement **sound 32-bit conditional range refinement** for
+   `advise_seccomp` and `ttysnoop`. Audit both taken/fallthrough branches,
+   signed/unsigned JMP32 projection, tnum reconciliation, equality-linked
+   copies/spills, and joins. Use exhaustive small-domain soundness tests and
+   ask the Claude peer for an adversarial review before committing.
+2. Add generalized `HASH_OF_MAPS` plus anonymous inner-map templates for
+   Gadget `traceloop`; do not silently coerce it to `ARRAY_OF_MAPS`.
+3. Design the explicit privileged uninitialized-stack verification policy for
+   `snapshot_file`, `top_blockio`, and generated `trace_lsm` hooks. Strict must
+   remain the default; differential-test bytes before changing corpus policy.
+4. Keep application-supplied/missing CO-RE targets (Gadget DNS/SNI/tcpdump,
+   tcpdrop/tcpretrans, missing fentry targets/socket BTF) classified as
    environment/configuration artifacts, not reasons to loosen verification.
 
 CI failures were identified from the `27a3404` logs and fixed at `2fcc237`.
