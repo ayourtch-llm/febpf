@@ -149,6 +149,15 @@ classify() {
     fi
 }
 
+# The first verification pass intentionally keeps legacy packet loads disabled.
+# Retry socket programs only for the verifier's explicit profile-disabled
+# diagnostic; broad text such as "legacy packet" would also match genuine
+# verifier/runtime faults that a profile retry must not hide.
+needs_linux_legacy_packet() {
+    printf '%s\n' "$1" | grep -Eq \
+        '^verification FAILED: at insn [0-9]+: legacy packet profile disabled for opcode 0x[0-9a-fA-F]{2}$'
+}
+
 total=0
 objects_loaded=0
 objects_ok=0
@@ -183,8 +192,7 @@ for obj in "${OBJS[@]}"; do
                 program_name="$field4"
                 out=$("$FEBPF" verify "$obj" --prog "$program_name" \
                     "${BTF_ARGS[@]}" "${MAP_ARGS[@]}" 2>&1)
-                if [ "$kind" = socket ] \
-                    && printf '%s' "$out" | grep -q "legacy packet access"; then
+                if [ "$kind" = socket ] && needs_linux_legacy_packet "$out"; then
                     out=$("$FEBPF" verify "$obj" --prog "$program_name" \
                         "${BTF_ARGS[@]}" "${MAP_ARGS[@]}" \
                         --legacy-packet linux --packet "$EMPTY_PACKET" 2>&1)

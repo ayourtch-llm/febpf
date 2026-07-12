@@ -65,6 +65,17 @@ at pc 0 with all-`Unknown` and propagates along **feasible** edges only:
   callee (r0 clobbered — r1–r5 are the arguments) and clobber r0–r5 on the
   fall-through; r6–r9 survive because the runtime saves/restores them around
   bpf-to-bpf calls (`SavedFrame` in `interp.rs`).
+- A frozen decision can leave a called clang subprogram with only private
+  register/stack bookkeeping and `EXIT`. When a top-level caller immediately
+  overwrites r0 and then immediately exits, the call is observationally empty
+  and is removed together with the now-unreachable body. Requiring the exit
+  also makes the call's r1-r5 clobbers unobservable; a caller that performs
+  any intervening instruction keeps the call. This handles clang's optimization
+  of a source-level `return 0`: it may omit the r0 write when every caller
+  discards that return. The purity check rejects helpers, atomics, non-stack
+  stores, nested calls, backward control flow, and control flow escaping the
+  subprogram; the verifier's rule that a surviving subprogram must initialize
+  r0 is not relaxed.
 - Conditional jumps with both operands `Const` propagate along the single
   decided edge (`eval_pred_const`, shared with the optimizer); otherwise both.
 - Atomics conservatively clobber r0 and the src register (FETCH/XCHG

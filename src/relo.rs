@@ -468,10 +468,15 @@ fn types_match(local: &Btf, l_id: u32, target: &Btf, t_id: u32, depth: u32) -> R
             true
         }
         (Kind::Enum { vals: lv, .. }, Kind::Enum { vals: tv, .. }) => {
-            // every local enumerator name must exist in the target
+            // Every local enumerator name must exist in the target. Enum
+            // values use the same `___flavor` convention as type names (for
+            // example `FSNOTIFY_PRIO_NORMAL___new`), so compare their
+            // essential names too. libbpf's TYPE_MATCHES does not make the
+            // flavor suffix part of type compatibility.
             lv.iter().all(|v| {
-                let name = local.str_at(v.name_off);
-                tv.iter().any(|t_v| target.str_at(t_v.name_off) == name)
+                let name = essential_name(local.str_at(v.name_off));
+                tv.iter()
+                    .any(|t_v| essential_name(target.str_at(t_v.name_off)) == name)
             })
         }
         (
@@ -1091,6 +1096,104 @@ mod tests {
         )
         .unwrap();
         assert_eq!((r.orig_val, r.new_val), (4, 12));
+    }
+
+    #[test]
+    fn type_matches_strips_flavors_from_enum_values() {
+        // Inspektor Gadget uses this exact shape to distinguish the pre-6.10
+        // integer fsnotify priority from the newer enum. Both the wrapper
+        // struct and its enum/enumerators carry CO-RE flavor suffixes.
+        let ls = [
+            "fsnotify_group_prio___new",
+            "FSNOTIFY_PRIO_NORMAL___new",
+            "FSNOTIFY_PRIO_CONTENT___new",
+            "FSNOTIFY_PRIO_PRE_CONTENT___new",
+            "__FSNOTIFY_PRIO_NUM___new",
+            "fsnotify_group___with_prio_enum",
+            "priority",
+            "0",
+        ];
+        let l = |n| stroff(&ls, n);
+        let local = Btf::parse(
+            true,
+            &build_btf(
+                &ls,
+                &[
+                    (
+                        l("fsnotify_group_prio___new"),
+                        info(kind::ENUM, 4, false),
+                        4,
+                        vec![
+                            l("FSNOTIFY_PRIO_NORMAL___new"),
+                            0,
+                            l("FSNOTIFY_PRIO_CONTENT___new"),
+                            1,
+                            l("FSNOTIFY_PRIO_PRE_CONTENT___new"),
+                            2,
+                            l("__FSNOTIFY_PRIO_NUM___new"),
+                            3,
+                        ],
+                    ),
+                    (
+                        l("fsnotify_group___with_prio_enum"),
+                        info(kind::STRUCT, 1, false),
+                        4,
+                        vec![l("priority"), 1, 0],
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let ts = [
+            "fsnotify_group_prio",
+            "FSNOTIFY_PRIO_NORMAL",
+            "FSNOTIFY_PRIO_CONTENT",
+            "FSNOTIFY_PRIO_PRE_CONTENT",
+            "__FSNOTIFY_PRIO_NUM",
+            "fsnotify_group",
+            "priority",
+        ];
+        let t = |n| stroff(&ts, n);
+        let target = Btf::parse(
+            true,
+            &build_btf(
+                &ts,
+                &[
+                    (
+                        t("fsnotify_group_prio"),
+                        info(kind::ENUM, 4, false),
+                        4,
+                        vec![
+                            t("FSNOTIFY_PRIO_NORMAL"),
+                            0,
+                            t("FSNOTIFY_PRIO_CONTENT"),
+                            1,
+                            t("FSNOTIFY_PRIO_PRE_CONTENT"),
+                            2,
+                            t("__FSNOTIFY_PRIO_NUM"),
+                            3,
+                        ],
+                    ),
+                    (
+                        t("fsnotify_group"),
+                        info(kind::STRUCT, 1, false),
+                        4,
+                        vec![t("priority"), 1, 0],
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let result = calc_relo(
+            &local,
+            &relo(&local, 2, "0", relo_kind::TYPE_MATCHES),
+            &target,
+            &CandidateIndex::new(&target),
+        )
+        .unwrap();
+        assert_eq!((result.new_val, result.matched, result.poison), (1, 1, false));
     }
 
     #[test]

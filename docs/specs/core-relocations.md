@@ -165,7 +165,10 @@ For each `bpf_core_relo`:
    member of that name in the target struct (recursing into anonymous
    struct/union members, as libbpf does). Accumulate the target byte offset /
    size / signedness. For enumval relos, match the enumerator by name and read
-   its value. A candidate that cannot be matched is dropped.
+   its value. `TYPE_MATCHES` applies essential-name comparison recursively,
+   including enum enumerators: `FSNOTIFY_PRIO_NORMAL___new` matches
+   `FSNOTIFY_PRIO_NORMAL` just as its flavored enum and wrapper-struct names
+   match their target names. A candidate that cannot be matched is dropped.
 
 5. **Compute the value** (`new_val`) from the target spec by relo kind:
    - FIELD_BYTE_OFFSET → target field byte offset
@@ -257,7 +260,8 @@ in `src/elf.rs`, before `Vm::new` — same lifecycle stage as the existing map
   by essential name, target replay by member NAME with recursive descent into
   anonymous members + `fields_compat` checks, `types_compat` (TYPE_EXISTS) and
   `types_match` (TYPE_MATCHES), bitfield byte-offset/LSHIFT/RSHIFT (LE
-  formulas), ambiguity rule (all candidates must agree on `new_val`),
+  formulas), recursive `___flavor` stripping for TYPE_MATCHES type and enum
+  enumerator names, ambiguity rule (all candidates must agree on `new_val`),
   EXISTS-family → 0 on no match, others hard-error. Deviations from libbpf:
   none intended; candidate root name is the type's own name (typedef roots
   match target typedefs), anonymous roots error. 11 unit tests in `src/relo.rs`

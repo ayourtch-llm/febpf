@@ -75,6 +75,13 @@ helpers #39 `skb_pull_data` and #177 `trace_vprintk` (two entries each), and one
 separate signals; no single large generated hook family is treated as hundreds
 of independent production workloads.
 
+Program-kind records are derived from each executable ELF section and retained
+independently of the exposed FUNC-symbol name. Multiple named functions sharing
+one `xdp` section all report `xdp`, while Gadget's
+`classifier/ingress/main` and `classifier/egress/main` entries report `tc`
+instead of the old catch-all `other`. The scanner consumes these stable records
+without guessing a program family from its display name.
+
 The old `libbpf-bootstrap v1.4` clone ref did not exist upstream and therefore
 never populated a fresh cache. This revision pins the repository directly at
 `fac4e8ddf011aead8e14962bf8db74542331264b`; 13 of its current example objects
@@ -242,8 +249,13 @@ only. A load failure is a non-zero exit and produces no partial records.
 The scanner invokes `verify --prog <exact-name>` once for every `program`
 record, using a tab-aware `read` loop rather than shell word splitting. A
 socket entry rejected specifically because legacy packet loads are disabled is
-retried with the Linux legacy profile and an empty, armed packet input. No
-other entry or rejection is retried with a compatibility profile.
+retried with the Linux legacy profile and an empty, armed packet input. The
+retry predicate is the verifier's complete structured diagnostic —
+`verification FAILED: at insn N: legacy packet profile disabled for opcode
+0xNN` — rather than a broad `legacy packet` substring that could hide a real
+fault. No other entry or rejection is retried with a compatibility profile.
+For the pinned Gadget `trace_dns::socket1` entry this retry advances to its
+actual first blocker, helper #26 (`skb_load_bytes`).
 
 Reports retain two levels of aggregation:
 

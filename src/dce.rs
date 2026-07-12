@@ -221,6 +221,127 @@ fn decide_branch(ins: Insn, st: &State) -> Option<bool> {
     eval_pred_const(ins.op(), ins.class() == class::JMP32, a, b)
 }
 
+/// Does this instruction replace r0 without observing its previous value?
+/// Used to recognize clang's `call pure_subprog; w0 = 0` shape.
+fn overwrites_r0(ins: Insn) -> bool {
+    match ins.class() {
+        class::LD | class::LDX => ins.dst == 0,
+        class::ALU | class::ALU64 => {
+            ins.dst == 0
+                && ins.op() == alu::MOV
+                && ins.off == 0
+                && (!ins.is_src_reg() || ins.src != 0)
+        }
+        _ => false,
+    }
+}
+
+/// A frozen-rodata decision can reduce a called subprogram to register/stack
+/// bookkeeping followed by EXIT. If its caller immediately overwrites r0,
+/// invoking that pure body has no observable effect and the call may be
+/// removed. This matters for clang bodies whose source says `return 0` but
+/// which omit the r0 write because every caller discards the return value.
+fn pure_feasible_subprogram(
+    target: usize,
+    end: usize,
+    insns: &[Insn],
+    maps: &[MapDef],
+    states: &[Option<State>],
+) -> bool {
+    let mut seen = vec![false; insns.len()];
+    let mut work = vec![target];
+    let mut saw_exit = false;
+    while let Some(pc) = work.pop() {
+        if pc < target || pc >= end || seen[pc] {
+            if pc < target || pc >= end {
+                return false;
+            }
+            continue;
+        }
+        seen[pc] = true;
+        let Some(st) = states[pc] else {
+            continue;
+        };
+        let ins = insns[pc];
+        let width = if ins.is_wide() { 2 } else { 1 };
+        let fallthrough = pc + width;
+        match ins.class() {
+            class::ST
+                if ins.dst == 10
+                    && ins.off < 0
+                    && ins.off as i32 >= -512
+                    && ins.off as i32 + ins.mem_size() as i32 <= 0
+                    && i32::from(ins.off).rem_euclid(ins.mem_size() as i32) == 0 =>
+            {
+                work.push(fallthrough)
+            }
+            class::STX
+                if ins.dst == 10
+                    && ins.opcode & 0xe0 != mode::ATOMIC
+                    && ins.off < 0
+                    && ins.off as i32 >= -512
+                    && ins.off as i32 + ins.mem_size() as i32 <= 0
+                    && i32::from(ins.off).rem_euclid(ins.mem_size() as i32) == 0 =>
+            {
+                work.push(fallthrough)
+            }
+            class::ST | class::STX => return false,
+            class::LDX => {
+                let Val::Rodata { map, off } = st[ins.src as usize] else {
+                    return false;
+                };
+                if ins.dst == 10
+                    || read_rodata(
+                        maps,
+                        map,
+                        off + i64::from(ins.off),
+                        ins.mem_size(),
+                        ins.opcode & 0xe0 == mode::MEMSX,
+                    )
+                    .is_none()
+                {
+                    return false;
+                }
+                work.push(fallthrough);
+            }
+            class::JMP | class::JMP32 => match ins.op() {
+                jmp::EXIT => saw_exit = true,
+                jmp::CALL => return false,
+                jmp::JA => {
+                    let rel = if ins.class() == class::JMP32 {
+                        ins.imm as i64
+                    } else {
+                        ins.off as i64
+                    };
+                    let next = pc as i64 + 1 + rel;
+                    if next <= pc as i64 {
+                        return false;
+                    }
+                    work.push(next as usize);
+                }
+                _ => {
+                    let branch = pc as i64 + 1 + ins.off as i64;
+                    if branch <= pc as i64 {
+                        return false;
+                    }
+                    match decide_branch(ins, &st) {
+                        Some(true) => work.push(branch as usize),
+                        Some(false) => work.push(fallthrough),
+                        None => {
+                            work.push(branch as usize);
+                            work.push(fallthrough);
+                        }
+                    }
+                }
+            },
+            class::LD if !ins.is_wide() || ins.dst == 10 => return false,
+            class::ALU | class::ALU64 if ins.dst == 10 => return false,
+            _ => work.push(fallthrough),
+        }
+    }
+    saw_exit
+}
+
 /// Run the pass. Returns `None` when nothing changes (the program is fully
 /// reachable and no branch is decided by frozen rodata) or when the stream is
 /// malformed — the caller then keeps the original instructions and the
@@ -323,6 +444,61 @@ pub fn eliminate_rodata_dead_code(insns: &[Insn], maps: &[MapDef]) -> Option<Dce
                 }
             }
         }
+    }
+
+    // Clang may omit a subprogram's source-level `return 0` write when every
+    // caller immediately overwrites r0. Once frozen-rodata folding proves the
+    // remaining callee path pure, keeping only its bare EXIT would manufacture
+    // an unverifiable subprogram. Remove the observationally empty call first,
+    // then rerun reachability so the now-uncalled body disappears as a unit.
+    let mut call_targets: Vec<usize> = insns
+        .iter()
+        .enumerate()
+        .filter(|(_, ins)| {
+            (ins.class() == class::JMP || ins.class() == class::JMP32)
+                && ins.op() == jmp::CALL
+                && ins.src == call_kind::LOCAL
+        })
+        .filter_map(|(pc, ins)| usize::try_from(pc as i64 + 1 + ins.imm as i64).ok())
+        .collect();
+    call_targets.sort_unstable();
+    call_targets.dedup();
+    let entry_end = call_targets.first().copied().unwrap_or(n);
+    let mut without_empty_calls = insns.to_vec();
+    let mut removed_call = false;
+    for (pc, ins) in insns.iter().copied().enumerate() {
+        if (ins.class() != class::JMP && ins.class() != class::JMP32)
+            || ins.op() != jmp::CALL
+            || ins.src != call_kind::LOCAL
+            || pc >= entry_end
+            || pc + 2 >= n
+            || !overwrites_r0(insns[pc + 1])
+            || insns[pc + 2].class() != class::JMP
+            || insns[pc + 2].op() != jmp::EXIT
+        {
+            continue;
+        }
+        let Ok(target) = usize::try_from(pc as i64 + 1 + ins.imm as i64) else {
+            continue;
+        };
+        let end = call_targets
+            .iter()
+            .copied()
+            .find(|&candidate| candidate > target)
+            .unwrap_or(n);
+        if pure_feasible_subprogram(target, end, insns, maps, &states) {
+            without_empty_calls[pc] = Insn {
+                opcode: class::JMP | jmp::JA,
+                dst: 0,
+                src: 0,
+                off: 0,
+                imm: 0,
+            };
+            removed_call = true;
+        }
+    }
+    if removed_call {
+        return eliminate_rodata_dead_code(&without_empty_calls, maps);
     }
 
     // ---- rewrite from the fixpoint ---------------------------------------
@@ -556,6 +732,32 @@ mod tests {
         );
         let res = eliminate_rodata_dead_code(&insns, &maps).expect("should fire");
         assert_eq!(res.branches_resolved, 1);
+    }
+
+    #[test]
+    fn pure_discarded_return_call_is_removed() {
+        let (insns, maps) = prog(
+            ".map cfg array 4 1 1 ro\n\
+             r1 = 123\n\
+             call sub\n\
+             r0 = 42\n\
+             exit\n\
+             sub:\n\
+             r1 = 0\n\
+             *(u64 *)(r10 - 8) = r1\n\
+             r1 = map[cfg][0] + 0\n\
+             r1 = *(u8 *)(r1 + 0)\n\
+             if r1 != 0 goto enabled\n\
+             exit\n\
+             enabled:\n\
+             r0 = 7\n\
+             exit\n",
+        );
+        let res = eliminate_rodata_dead_code(&insns, &maps).expect("should fire");
+        assert!(res.insns.iter().all(|ins| {
+            ins.op() != jmp::CALL || ins.src != call_kind::LOCAL
+        }));
+        assert_eq!(res.insns.len(), 3);
     }
 
     #[test]

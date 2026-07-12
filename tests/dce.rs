@@ -156,3 +156,69 @@ helper_fn:
     assert_eq!(opt.insns.len(), 5);
     assert_eq!(run(&opt, &mut []), 42);
 }
+
+#[test]
+fn dce_removes_pure_called_subprog_when_caller_discards_return() {
+    // trace_signal shape: clang omits the source-level `return 0` write on
+    // the frozen-false path because this caller immediately overwrites r0.
+    // Folding the callee to a bare EXIT would violate febpf's subprogram
+    // return contract, so the observationally empty call and body must go.
+    let src = "\
+.map cfg array 4 1 1 ro
+    r1 = 123
+    call probe_entry
+    r0 = 42
+    exit
+probe_entry:
+    r6 = r1
+    r1 = 0
+    *(u64 *)(r10 - 8) = r1
+    r1 = map[cfg][0] + 0
+    r1 = *(u8 *)(r1 + 0)
+    if r1 != 0 goto enabled
+    exit
+enabled:
+    r0 = 7
+    exit
+";
+    let orig = program(src);
+    let opt = dced(&orig);
+    assert!(
+        opt.insns.iter().all(|ins| {
+            ins.src != febpf::insn::call_kind::LOCAL || ins.op() != febpf::insn::jmp::CALL
+        }),
+        "pure discarded-return call survived DCE"
+    );
+    assert_eq!(run(&opt, &mut []), 42);
+}
+
+#[test]
+fn dce_keeps_call_when_caller_saved_register_is_observed() {
+    // A local call clobbers r1-r5. Even though r0 is immediately replaced,
+    // deleting this call would make the later r1 read appear initialized and
+    // could turn a verifier rejection into acceptance.
+    let src = "\
+.map cfg array 4 1 1 ro
+    r1 = 123
+    call probe_entry
+    r0 = 42
+    r0 += r1
+    exit
+probe_entry:
+    r1 = map[cfg][0] + 0
+    r1 = *(u8 *)(r1 + 0)
+    if r1 != 0 goto enabled
+    exit
+enabled:
+    r0 = 7
+    exit
+";
+    let orig = program(src);
+    let opt = dced(&orig);
+    assert!(
+        opt.insns.iter().any(|ins| {
+            ins.src == febpf::insn::call_kind::LOCAL && ins.op() == febpf::insn::jmp::CALL
+        }),
+        "call whose caller-saved clobber is observable was removed"
+    );
+}

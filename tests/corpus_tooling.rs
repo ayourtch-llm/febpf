@@ -99,9 +99,9 @@ case "$prog" in
     second:name) printf 'verification FAILED: at insn 0: call to unknown helper #999\n' ;;
     socket/legacy)
         if [ "$legacy" -eq 1 ]; then
-            printf 'verification PASSED\n'
+            printf 'verification FAILED: at insn 7: call to unknown helper #26\n'
         else
-            printf 'verification FAILED: at insn 0: legacy packet access (opcode 0x20) is not supported\n'
+            printf 'verification FAILED: at insn 0: legacy packet profile disabled for opcode 0x20\n'
         fi
         ;;
     *) printf 'error: unexpected program %s\n' "$prog" >&2; exit 1 ;;
@@ -132,9 +132,10 @@ esac
     assert!(report.contains("objects/families scanned  : 1"), "{report}");
     assert!(report.contains("objects fully compatible  : 0  (0.0%)"), "{report}");
     assert!(report.contains("entry programs scanned    : 3"), "{report}");
-    assert!(report.contains("entries verified OK       : 2  (66.7%)"), "{report}");
+    assert!(report.contains("entries verified OK       : 1  (33.3%)"), "{report}");
     assert!(report.contains("second:name"), "{report}");
     assert!(report.contains("VERIFY-REJECT:unsupported-helper:#999"), "{report}");
+    assert!(report.contains("VERIFY-REJECT:unsupported-helper:#26"), "{report}");
     assert!(report.contains("socket/legacy"), "{report}");
 
     fs::remove_dir_all(temp).unwrap();
