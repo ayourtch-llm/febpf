@@ -30,7 +30,80 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 xdp-tools expansion complete; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 AF_XDP corpus frontier; authoritative)
+
+The real-world coverage moonshot remains active. Two complete, measured
+xdp-tools batches landed after the prior checkpoint: `d19da69` (`xdp: cover
+dump and filter production programs`) and `f33f92d` (`xdp: support AF_XDP
+socket maps`). At checkpoint writing HEAD is `f33f92d` and the worktree is
+clean except for this intentional HANDOFF update. No test/build/scanner
+process, Codex subagent, or external terminal collaborator is active.
+
+Completed:
+
+- The pinned xdp-tools v1.6.3 lane now includes xdp-dump's two BPF translation
+  units, all ten xdp-filter variants, three lib/util BPF probes, and both
+  libxdp default AF_XDP programs. The offline build produces 136 total object
+  families. Explicit globs cover upstream's generated-style `.c` filenames;
+  libbpf feature declarations match the pinned headers.
+- ALU32 `data_end - data` is accepted only for XDP packet-end minus packet
+  pointers and yields an unknown zero-extended u32 scalar. All other ALU32
+  pointer arithmetic remains rejected. Interpreter and JIT execute the
+  ordinary subtraction and a 37-byte focused test agrees exactly.
+- `BPF_MAP_TYPE_XSKMAP` is supported across ELF, maps, verifier, interpreter/
+  JIT redirect behavior, assembler, replay v1 (additive kind 15), and kernel
+  map translation. It has exact four-byte key/value shape, sparse slots, and
+  bounded queue indices; absent slots return the redirect fallback. Standalone
+  execution never fabricates an AF_XDP socket or transmission.
+- xdp-dump's placeholder fentry/fexit target remains an honest
+  `ENVIRONMENT:missing-attach-target`. The two flowtable objects remain
+  `ENVIRONMENT:missing-kfunc` on this host. Application CO-RE poison remains
+  explicit rather than being weakened or reclassified.
+
+Exact final validation and measurement:
+
+- Default all-target tests: **453 passed + 4 ignored**.
+- Std interpreter-only all-target tests: **435 passed + 4 ignored**.
+- Strict Clippy passes in default and `--no-default-features --features std`.
+- True `thumbv7em-none-eabihf` no-std check and strict Clippy pass.
+- `cargo build --release`, focused XSKMAP/ALU32 tests, offline corpus rebuild,
+  and `git diff --check` pass.
+- Full `NO_BUILD=1 ./scripts/scan-corpus.sh`: **136 families**, 134 instantiate
+  on this host, and **829 enumerable entries all load**. **125/136 families**
+  are compatible and **816/829 entries verify (98.4%)**: 667 strict plus 149
+  explicitly privileged uninitialized-stack entries.
+- Remaining entry outcomes are exactly six missing-attach-target environment
+  gaps and seven poisoned application-supplied CO-RE entries. The two
+  object-level missing-kfunc families do not add enumerable entry outcomes.
+  Unsupported-map, unknown-helper, and ordinary verifier histograms are empty.
+
+Decisions and invariants:
+
+- Continue maximizing honest real-world coverage before new ideas. Rank by
+  distinct production family first, entry count second; never improve the
+  percentage by inventing prototypes, sockets, routes, disabled lanes, or
+  denominators.
+- XSKMAP is deliberately sparse even though queue keys are bounded like an
+  array. A missing socket is not a present zero value. AF_XDP socket ownership
+  belongs to the future packet-provider backend, not the helper/map model.
+- The agreed post-saturation architecture remains a generic packet-provider/
+  batch boundary, AF_XDP as the zero-dependency first backend, and DPDK only as
+  a separate optional workspace adapter/sidecar. Preserve mlx5 kernel
+  ownership; direct PCI/VFIO mlx5 ownership is a separate driver project.
+
+Immediate resume order:
+
+1. Commit this HANDOFF update if it remains the only modification after the
+   tttt refresh.
+2. Add the next small immutable production upstream (or another clearly
+   production pinned source lane), rebuild offline/reproducibly, and rank the
+   newly exposed blockers by distinct family. The ordinary xdp-tools source
+   frontier is now exhausted except generated dispatcher templates and tests.
+3. Continue one full-matrix, measured, documented, clean commit at a time. At
+   genuine real-world saturation, record and implement the generic packet
+   provider/AF_XDP design before any DPDK-specific adapter.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-13 xdp-tools expansion complete; superseded by checkpoint above)
 
 The production-corpus moonshot remains active. The xdp-tools production
 expansion and its general functionality are committed at `814ced9` (`xdp:
