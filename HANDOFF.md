@@ -3,22 +3,21 @@
 _A note from past-me to future-me (or whoever picks this up). Read this before
 diving in; it's the context that isn't obvious from the code._
 
-## ACTIVE RESUME CHECKPOINT (2026-07-12 16:00 UTC, read this first)
+## ACTIVE RESUME CHECKPOINT (2026-07-12 20:05 UTC, read this first)
 
-The production-corpus moonshot is active. The tree is clean at `23eef18`.
+The production-corpus moonshot is active. The iterator helper batch is clean
+and committed at `f1f8ff0` on top of the user's `39366b8` refresh checkpoint.
 Do not resume from the older 62/62 object-level claim: measurement is now per
 ELF entry function and preserves static graph grouping.
 
-Refresh/pause note: the user explicitly stopped agent respawning immediately
-before this context refresh. The attempted iterator-helper restart was
-interrupted before it changed files. No subagent is active and the working
-tree is clean. After reading this handoff, wait for the user's direction; do
-not automatically restart #127/#141 implementation merely because it is first
-in the technical resume order below.
+No subagent is active. Helpers #127/#141 are complete; do not redo them from
+the older resume note below. Continue with one evidence-selected batch at a
+time and commit before widening scope.
 
 Completed and committed in this wave:
 
 ```
+f1f8ff0 helpers: complete iterator output layer
 e811bb8 verifier: type kernel iterator contexts
 dae2029 loader: fix corpus-driven relocation and DCE cases
 f2fae21 xdp: preserve program kind and metadata fields
@@ -33,14 +32,14 @@ Current measured corpus:
 - 114 pinned object families and 785 entry programs: BCC/libbpf-tools,
   libbpf-bootstrap, xdp-tools, Cilium fixture, and 39/39 production Inspektor
   Gadget v0.54.0 sources.
-- Latest stable full scan before iterator typing: **89/114 fully compatible
-  families** and **597/785 verified entries (76.1%)**, with all 785 entries
-  loading. Iterator typing advances five rejections to their next helpers but
-  does not yet increase these totals.
+- Latest stable full scan: **91/114 fully compatible families** and **600/785
+  verified entries (76.4%)**, with all 785 entries loading. `snapshot_process`
+  and `task_iter` became fully compatible; Gadget UDP also verifies while its
+  object family remains blocked by the TCP entry's helper #137.
 - The Gadget lane is reproducible: two offline rebuilds produced identical
   39-source/39-object manifest digest
   `cc4b5fdff7392995183181692f328dbb063356d8004bd88b5fdb96b9847bb62d`.
-- Default tests: **402 passed + 4 ignored**. Std interpreter-only: **385 passed
+- Default tests: **405 passed + 4 ignored**. Std interpreter-only: **388 passed
   + 4 ignored**. Both strict Clippy profiles are green; true thumb no-std
   check/Clippy, wasm/std, Windows/std, and shell syntax gates were green in
   the completed batches.
@@ -61,16 +60,16 @@ Important correctness fixes already landed:
   hardened so it cannot erase observable r1-r5 call clobbers.
 - Typed `iter/task`, `iter/task_file`, `iter/tcp`, and `iter/udp` contexts use
   exact target-BTF layouts, nullable element pointers, and safe terminal
-  runtime records. Their next blockers are #127 `seq_write` (three entries),
-  #137 `skc_to_tcp_sock` (TCP), and #141 `get_task_stack` (task_iter).
+  runtime records. Helper #127 `seq_write` requires the exact `seq_file` BTF
+  id and writes snapshotted VM-owned output; #141 `get_task_stack` requires the
+  exact `task_struct` BTF id and returns deterministic VM call-stack bytes.
+  The remaining iterator helper blocker is #137 `skc_to_tcp_sock` (TCP).
 
 Immediate resume order:
 
-1. Finish the iterator helper layer. A partial #127/#141 implementation was
-   intentionally discarded at handoff because it had no completed tests.
-   Re-spec and implement exact BTF pointer signatures, VM-owned seq output,
-   snapshots, and deterministic task-stack behavior; then handle #137-#139
-   typed socket conversions separately.
+1. Finish iterator socket conversions #137-#139 as a separate typed-pointer
+   batch. The measured first blocker is #137 on one `iter/tcp` entry; preserve
+   exact target-BTF ids and do not fabricate host socket pointers.
 2. Close SKB/networking breadth. `ProgramKind` is ready. Implement an explicit
    safe SKB packet/context adapter and helper #26 `skb_load_bytes` (now four
    families), then #51 `redirect_map` (three families/13 entries), #189+#190
@@ -80,6 +79,14 @@ Immediate resume order:
    ttysnoop), then generalized `HASH_OF_MAPS`/anonymous inner templates.
 4. Treat missing fentry targets and Gadget application-supplied socket BTF as
    environment/configuration artifacts, not reasons to loosen verification.
+
+CI watch (not explained yet): GitHub runs at `23eef18` and `39366b8` reproduce
+the same failures. x86-64 Linux passes default JIT and fails interpreter-only;
+aarch64 Linux and macOS fail default JIT. Windows, wasm, and true no-std pass.
+Both exact Linux commands, including fixture regeneration followed by the
+interpreter-only pass and doctests, are green locally. Public annotations show
+only exit 101, so use the next pushed run or authenticated logs to identify the
+test name before changing CI or architecture code.
 
 Privileged-kernel oracle result that changes the earlier audit:
 
