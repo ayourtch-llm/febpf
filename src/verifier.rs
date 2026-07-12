@@ -4013,6 +4013,22 @@ impl<'a> Verifier<'a> {
         let b_ptr = matches!(b, RegState::Ptr(_));
         if a_ptr || b_ptr {
             if is32 {
+                // XDP exposes data/data_end as 32-bit context fields, so clang
+                // computes packet length with an ALU32 subtraction.  This is
+                // a difference, not pointer arithmetic: its result is an
+                // ordinary zero-extended u32.  Keep every other truncated
+                // pointer operation rejected.
+                if op == alu::SUB
+                    && matches!(a, RegState::Ptr(Ptr { kind: PtrKind::PacketEnd, .. }))
+                    && matches!(b, RegState::Ptr(Ptr { kind: PtrKind::Packet { .. }, .. }))
+                {
+                    return self.write_reg(
+                        state,
+                        pc,
+                        ins.dst,
+                        RegState::Scalar(Scalar::from_tnum(Tnum::unknown().cast(4))),
+                    );
+                }
                 return Err(self.err(pc, "32-bit arithmetic on a pointer"));
             }
             match op {

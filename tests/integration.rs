@@ -50,6 +50,37 @@ fn xdp_config() -> Config {
 }
 
 #[test]
+fn xdp_alu32_data_end_minus_data_is_a_u32_scalar() {
+    let mut vm = Vm::new(program(
+        "r2 = *(u32 *)(r1 + 4)\n\
+         r1 = *(u32 *)(r1 + 0)\n\
+         w2 -= w1\n\
+         r0 = r2\n\
+         exit",
+    ))
+    .unwrap();
+    vm.verify(xdp_config()).unwrap();
+
+    let mut packet = [0u8; 37];
+    assert_eq!(vm.run_xdp(&mut packet).unwrap(), 37);
+    #[cfg(feature = "jit")]
+    assert_eq!(vm.run_xdp_jit(&mut packet).unwrap(), 37);
+
+    let mut vm = Vm::new(program(
+        "r2 = *(u32 *)(r1 + 4)\n\
+         w2 += 1\n\
+         r0 = 0\n\
+         exit",
+    ))
+    .unwrap();
+    let error = match vm.verify(xdp_config()) {
+        Ok(_) => panic!("ALU32 pointer addition verified"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("32-bit arithmetic on a pointer"), "{error}");
+}
+
+#[test]
 fn fib_lookup_requires_initialized_writable_input_and_has_no_route_standalone() {
     assert_eq!(febpf::helpers::helper_id("fib_lookup"), Some(69));
     let initialized = "
