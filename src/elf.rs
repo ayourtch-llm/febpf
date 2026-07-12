@@ -33,8 +33,81 @@ const SHT_NOBITS: u32 = 8;
 const SHF_ALLOC: u64 = 0x2;
 const SHF_EXECINSTR: u64 = 0x4;
 
-fn is_xdp_section(name: &str) -> bool {
-    name == "xdp" || name.starts_with("xdp/")
+/// Kernel program family derived from an ELF executable section name.
+///
+/// This is deliberately independent of the source-level function symbol used
+/// as [`LoadedProgram::name`]: several entry functions may share one section.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProgramKind {
+    Xdp,
+    SocketFilter,
+    SchedClassifier,
+    CgroupSkb,
+    SkSkb,
+    FlowDissector,
+    LwtIn,
+    LwtOut,
+    LwtXmit,
+    LwtSeg6Local,
+    SkReuseport,
+    #[default]
+    Other,
+}
+
+impl ProgramKind {
+    pub fn from_section(name: &str) -> Self {
+        if name == "xdp" || name.starts_with("xdp/") {
+            Self::Xdp
+        } else if name == "socket"
+            || name.starts_with("socket/")
+            || name
+                .strip_prefix("socket")
+                .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+        {
+            Self::SocketFilter
+        } else if name == "classifier" || name.starts_with("classifier/") || name == "tc" || name.starts_with("tc/") {
+            Self::SchedClassifier
+        } else if name == "cgroup_skb" || name.starts_with("cgroup_skb/") {
+            Self::CgroupSkb
+        } else if name == "sk_skb" || name.starts_with("sk_skb/") {
+            Self::SkSkb
+        } else if name == "flow_dissector" || name.starts_with("flow_dissector/") {
+            Self::FlowDissector
+        } else if name == "lwt_in" || name.starts_with("lwt_in/") {
+            Self::LwtIn
+        } else if name == "lwt_out" || name.starts_with("lwt_out/") {
+            Self::LwtOut
+        } else if name == "lwt_xmit" || name.starts_with("lwt_xmit/") {
+            Self::LwtXmit
+        } else if name == "lwt_seg6local" || name.starts_with("lwt_seg6local/") {
+            Self::LwtSeg6Local
+        } else if name == "sk_reuseport" || name.starts_with("sk_reuseport/") {
+            Self::SkReuseport
+        } else {
+            Self::Other
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Xdp => "xdp",
+            Self::SocketFilter => "socket",
+            Self::SchedClassifier => "tc",
+            Self::CgroupSkb => "cgroup_skb",
+            Self::SkSkb => "sk_skb",
+            Self::FlowDissector => "flow_dissector",
+            Self::LwtIn => "lwt_in",
+            Self::LwtOut => "lwt_out",
+            Self::LwtXmit => "lwt_xmit",
+            Self::LwtSeg6Local => "lwt_seg6local",
+            Self::SkReuseport => "sk_reuseport",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn is_xdp(self) -> bool {
+        self == Self::Xdp
+    }
 }
 
 // BPF relocation types.
@@ -68,8 +141,11 @@ const DEFAULT_MAX_ENTRIES: u32 = 10240;
 /// One program (executable section) from an object.
 pub struct LoadedProgram {
     pub name: String,
+    /// Original executable section, retained even when `name` is a FUNC symbol.
+    pub section: String,
+    pub kind: ProgramKind,
     pub insns: Vec<Insn>,
-    /// True for `xdp` / `xdp/*` ELF entry sections.
+    /// Compatibility alias for `kind.is_xdp()`.
     pub xdp: bool,
     /// Source-level debug info from `.BTF`/`.BTF.ext`, if the object had any.
     pub debug: Option<DebugInfo>,
@@ -366,11 +442,14 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
                 &symbols,
                 &map_by_symval,
             )?;
+            let kind = ProgramKind::from_section(&sec.name);
             programs.push((
                 LoadedProgram {
                     name: entry_name,
+                    section: sec.name.clone(),
+                    kind,
                     insns,
-                    xdp: is_xdp_section(&sec.name),
+                    xdp: kind.is_xdp(),
                     debug: None,
                     btf_ctx: None,
                 },
@@ -400,6 +479,8 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
             programs.push((
                 LoadedProgram {
                     name: "text".into(),
+                    section: ".text".into(),
+                    kind: ProgramKind::Other,
                     insns,
                     xdp: false,
                     debug: None,
@@ -1719,14 +1800,24 @@ mod btf_maps {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_xdp_section, map_kind, map_type_name};
+    use super::{map_kind, map_type_name, ProgramKind};
 
     #[test]
-    fn xdp_section_classification_is_exact() {
-        assert!(is_xdp_section("xdp"));
-        assert!(is_xdp_section("xdp/firewall"));
-        assert!(!is_xdp_section("xdp_devmap"));
-        assert!(!is_xdp_section("fentry/xdp_do_redirect"));
+    fn program_section_classification_is_exact() {
+        assert_eq!(ProgramKind::from_section("xdp"), ProgramKind::Xdp);
+        assert_eq!(ProgramKind::from_section("xdp/firewall"), ProgramKind::Xdp);
+        assert_eq!(ProgramKind::from_section("socket1"), ProgramKind::SocketFilter);
+        assert_eq!(ProgramKind::from_section("classifier/ingress/main"), ProgramKind::SchedClassifier);
+        assert_eq!(ProgramKind::from_section("cgroup_skb/ingress"), ProgramKind::CgroupSkb);
+        assert_eq!(ProgramKind::from_section("sk_skb/stream_parser"), ProgramKind::SkSkb);
+        assert_eq!(ProgramKind::from_section("flow_dissector"), ProgramKind::FlowDissector);
+        assert_eq!(ProgramKind::from_section("lwt_in"), ProgramKind::LwtIn);
+        assert_eq!(ProgramKind::from_section("lwt_out"), ProgramKind::LwtOut);
+        assert_eq!(ProgramKind::from_section("lwt_xmit"), ProgramKind::LwtXmit);
+        assert_eq!(ProgramKind::from_section("lwt_seg6local"), ProgramKind::LwtSeg6Local);
+        assert_eq!(ProgramKind::from_section("sk_reuseport/select"), ProgramKind::SkReuseport);
+        assert_eq!(ProgramKind::from_section("xdp_devmap"), ProgramKind::Other);
+        assert_eq!(ProgramKind::from_section("fentry/xdp_do_redirect"), ProgramKind::Other);
     }
 
     #[test]

@@ -62,7 +62,7 @@ pub fn conftest(
     let ctx = make_ctx(o)?;
 
     // febpf side (always available, unprivileged).
-    let cfg = crate::verifier_config(o, ctx.len(), false);
+    let cfg = crate::verifier_config(o, ctx.len(), febpf::elf::ProgramKind::Other);
     let (r_interp, r_jit) = run_febpf(&prog, &ctx, links, cfg)?;
     println!("interp : r0 = {r_interp} ({r_interp:#x})");
     if let Some(j) = r_jit {
@@ -131,7 +131,7 @@ fn conftest_xdp(o: &Opts, prog: Program, links: &[crate::TailLink]) -> Result<Ex
     let input = crate::read_packet(o)?;
 
     let mut vm = Vm::new(prog.clone())?;
-    let cfg = crate::verifier_config(o, 24, true);
+    let cfg = crate::verifier_config(o, 24, febpf::elf::ProgramKind::Xdp);
     crate::link_tail_calls(&mut vm, links, &cfg)?;
     let febpf_verify = vm.verify(cfg);
     let febpf_run = match &febpf_verify {

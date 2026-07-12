@@ -357,6 +357,45 @@ fn xdp_packet_access_after_data_end_check() {
 }
 
 #[test]
+fn xdp_scalar_metadata_fields_are_exact_and_zero_backed() {
+    let src = "
+        r0 = *(u32 *)(r1 + 12)
+        r2 = *(u32 *)(r1 + 16)
+        r0 |= r2
+        r2 = *(u32 *)(r1 + 20)
+        r0 |= r2
+        exit";
+    let mut vm = Vm::new(program(src)).unwrap();
+    vm.verify(xdp_config()).expect("scalar xdp_md fields verify");
+    let mut packet = [1u8, 2, 3];
+    assert_eq!(vm.run_xdp(&mut packet).unwrap(), 0);
+    #[cfg(feature = "jit")]
+    assert_eq!(vm.run_xdp_jit(&mut packet).unwrap(), 0);
+}
+
+#[test]
+fn xdp_context_rejects_unmodelled_metadata_and_non_exact_accesses() {
+    for src in [
+        "r0 = *(u32 *)(r1 + 8)\nexit",  // data_meta is a pointer, not a scalar
+        "r0 = *(u16 *)(r1 + 12)\nexit", // partial scalar field
+        "r0 = *(u64 *)(r1 + 12)\nexit", // overlapping scalar fields
+        "*(u32 *)(r1 + 12) = 1\nr0 = 0\nexit", // read-only context
+        "r0 = *(u32 *)(r1 + 24)\nexit", // outside xdp_md
+    ] {
+        let mut vm = Vm::new(program(src)).unwrap();
+        let error = match vm.verify(xdp_config()) {
+            Ok(_) => panic!("invalid XDP context access verified"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("invalid XDP context access")
+                || error.contains("XDP context is read-only"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn xdp_packet_access_requires_sufficient_proof() {
     let unchecked = "
         r2 = *(u32 *)(r1 + 0)

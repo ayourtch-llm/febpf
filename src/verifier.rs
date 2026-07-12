@@ -65,8 +65,9 @@ pub struct Config {
     /// slots yield [`PtrKind::BtfId`] pointers, and writes are rejected.
     pub btf_ctx: Option<crate::btf::BtfCtx>,
     /// Treat the context as `struct xdp_md`: 32-bit loads at offsets 0 and 4
-    /// yield the packet start and end pointers. Packet memory may only be
-    /// accessed after a comparison against `data_end` proves the range safe.
+    /// yield packet start/end pointers; offsets 12, 16, and 20 yield scalar
+    /// interface/queue metadata. Packet memory may only be accessed after a
+    /// comparison against `data_end` proves the range safe.
     pub xdp: bool,
     /// Treat exact 64-bit loads at caller-selected context offsets as packet
     /// start/end virtual pointers.
@@ -2193,7 +2194,7 @@ impl<'a> Verifier<'a> {
                     if write {
                         return Err(self.err(pc, "XDP context is read-only"));
                     }
-                    if !matches!((disp, size), (0 | 4, 4)) {
+                    if !matches!((disp, size), (0 | 4 | 12 | 16 | 20, 4)) {
                         return Err(self.err(
                             pc,
                             format!("invalid XDP context access at offset {disp} size {size}"),
@@ -2432,6 +2433,7 @@ impl<'a> Verifier<'a> {
                     return match disp {
                         0 => Ok(RegState::Ptr(Ptr::new(PtrKind::Packet { range: 0 }))),
                         4 => Ok(RegState::Ptr(Ptr::new(PtrKind::PacketEnd))),
+                        12 | 16 | 20 => Ok(RegState::Scalar(Scalar::unknown())),
                         _ => unreachable!("validated XDP ctx offset"),
                     };
                 }

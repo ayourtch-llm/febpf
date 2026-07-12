@@ -23,8 +23,12 @@ Multiple `SEC()` programs in one object are all exposed; the CLI selects with
 places multiple global entry `STT_FUNC` symbols in one executable section,
 each function is sliced at its symbol value/size and exposed by its symbol
 name, in byte-offset then symbol-table order. The slice retains the containing
-section's program type, CO-RE/BTF context classification, relocations and
-debug records. Calls into `.text` still stitch that section after the slice.
+section name and its section-derived `ProgramKind`, CO-RE/BTF context
+classification, relocations and debug records. Program kind is never guessed
+from the exposed function/display name. `febpf programs` reports this retained
+kind, so two differently named global functions sharing `SEC("xdp")` both
+remain XDP entries. Calls into `.text` still stitch that section after the
+slice.
 
 ## `.text` stitching (cross-section bpf-to-bpf calls)
 

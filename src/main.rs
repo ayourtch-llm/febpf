@@ -343,23 +343,8 @@ fn machine_field(value: &str) -> Result<&str, String> {
     }
 }
 
-fn program_kind_name(name: &str, xdp: bool) -> &'static str {
-    if xdp {
-        "xdp"
-    } else if name == "socket"
-        || name.starts_with("socket/")
-        || name
-            .strip_prefix("socket")
-            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
-    {
-        "socket"
-    } else {
-        "other"
-    }
-}
-
 fn program_kind(program: &febpf::elf::LoadedProgram) -> &'static str {
-    program_kind_name(&program.name, program.xdp)
+    program.kind.name()
 }
 
 fn cmd_programs(o: &Opts) -> Result<ExitCode, String> {
@@ -402,7 +387,7 @@ fn load_program(
     prog: Option<&str>,
     target_btf: Option<&str>,
     map_max_entries: &[(String, u32)],
-) -> Result<(Program, Option<DebugInfo>, bool, Vec<TailLink>), String> {
+) -> Result<(Program, Option<DebugInfo>, febpf::elf::ProgramKind, Vec<TailLink>), String> {
     let is_source = [".s", ".asm", ".bpf"]
         .iter()
         .any(|ext| path.ends_with(ext));
@@ -420,7 +405,7 @@ fn load_program(
                 btf_ctx: None,
             },
             None,
-            false,
+            febpf::elf::ProgramKind::Other,
             Vec::new(),
         ));
     }
@@ -485,7 +470,7 @@ fn load_program(
             .collect::<Result<_, String>>()?;
         let mut programs = obj.programs;
         let chosen = programs.swap_remove(idx);
-        let xdp = chosen.xdp;
+        let kind = chosen.kind;
         Ok((
             Program {
                 insns: chosen.insns,
@@ -493,7 +478,7 @@ fn load_program(
                 btf_ctx: chosen.btf_ctx,
             },
             chosen.debug,
-            xdp,
+            kind,
             links,
         ))
     } else {
@@ -508,7 +493,7 @@ fn load_program(
                 btf_ctx: None,
             },
             None,
-            false,
+            febpf::elf::ProgramKind::Other,
             Vec::new(),
         ))
     }
@@ -603,12 +588,16 @@ fn run_pcap(vm: &mut Vm, path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn verifier_config(o: &Opts, ctx_len: usize, xdp: bool) -> verifier::Config {
+fn verifier_config(
+    o: &Opts,
+    ctx_len: usize,
+    kind: febpf::elf::ProgramKind,
+) -> verifier::Config {
     verifier::Config {
         ctx_size: ctx_len,
         ctx_writable: !o.readonly_ctx,
         strict_alignment: o.strict_align,
-        xdp,
+        xdp: kind.is_xdp(),
         legacy_packet: o.legacy_packet,
         ..Default::default()
     }
@@ -850,7 +839,7 @@ fn cmd_race(o: &Opts, prog: Program) -> Result<ExitCode, String> {
     // --no-verify, mirroring `run`.
     if !o.no_verify {
         let mut vm = Vm::new(prog.clone())?;
-        vm.verify(verifier_config(o, ctx.len(), false)).map_err(|e| {
+        vm.verify(verifier_config(o, ctx.len(), febpf::elf::ProgramKind::Other)).map_err(|e| {
             format!(
                 "verification failed: {e}\n{}(use --no-verify to race anyway)",
                 explain(vm.insns(), &e, o)
@@ -955,7 +944,7 @@ fn cmd_equiv(o: &Opts) -> Result<ExitCode, String> {
 fn cmd_optimize(o: &Opts, prog: Program) -> Result<ExitCode, String> {
     use febpf::equiv::Verdict;
     let ctx = make_ctx(o)?;
-    let cfg = verifier_config(o, ctx.len(), false);
+    let cfg = verifier_config(o, ctx.len(), febpf::elf::ProgramKind::Other);
     let equiv_opts = equiv_options(o)?;
     let result = febpf::optimize::optimize(&prog, cfg, &equiv_opts)?;
     let s = &result.stats;
@@ -1039,7 +1028,7 @@ fn run() -> Result<ExitCode, String> {
     if o.cmd == "programs" {
         return cmd_programs(&o);
     }
-    let (prog, debug, elf_xdp, tail_links) = load_program(
+    let (prog, debug, elf_kind, tail_links) = load_program(
         &o.file,
         o.prog.as_deref(),
         o.target_btf.as_deref(),
@@ -1051,7 +1040,12 @@ fn run() -> Result<ExitCode, String> {
     if o.pcap.is_some() && !matches!(o.cmd.as_str(), "run" | "record") {
         return Err("--pcap is currently supported by run and record".into());
     }
-    let xdp = elf_xdp || o.packet.is_some() || o.pcap.is_some();
+    let kind = if o.packet.is_some() || o.pcap.is_some() {
+        febpf::elf::ProgramKind::Xdp
+    } else {
+        elf_kind
+    };
+    let xdp = kind.is_xdp();
     validate_legacy_options(&o)?;
     if !tail_links.is_empty()
         && o.no_verify
@@ -1115,7 +1109,7 @@ fn run() -> Result<ExitCode, String> {
         "verify" => {
             let ctx = make_ctx(&o)?;
             let mut vm = Vm::new(prog.clone())?;
-            let vcfg = verifier_config(&o, ctx.len(), xdp);
+            let vcfg = verifier_config(&o, ctx.len(), kind);
             link_tail_calls(&mut vm, &tail_links, &vcfg)?;
             for link in &tail_links {
                 println!(
@@ -1171,7 +1165,7 @@ fn run() -> Result<ExitCode, String> {
                 );
             }
             let mut vm = Vm::new(prog.clone())?;
-            let vcfg = verifier_config(&o, ctx.len(), xdp);
+            let vcfg = verifier_config(&o, ctx.len(), kind);
             link_tail_calls(&mut vm, &tail_links, &vcfg)?;
             match vm.verify(vcfg) {
                 Ok(ok) => {
@@ -1208,7 +1202,7 @@ fn run() -> Result<ExitCode, String> {
             if o.no_verify {
                 vm.insn_limit = 100_000_000;
             } else {
-                let vcfg = verifier_config(&o, ctx.len(), xdp);
+                let vcfg = verifier_config(&o, ctx.len(), kind);
                 link_tail_calls(&mut vm, &tail_links, &vcfg)?;
                 vm.verify(vcfg).map_err(|e| {
                     format!(
@@ -1245,7 +1239,7 @@ fn run() -> Result<ExitCode, String> {
             let mut vm = Vm::new(prog.clone())?;
             vm.echo_printk = true;
             if !o.no_verify {
-                let vcfg = verifier_config(&o, ctx.len(), xdp);
+                let vcfg = verifier_config(&o, ctx.len(), kind);
                 link_tail_calls(&mut vm, &tail_links, &vcfg)?;
                 vm.verify(vcfg).map_err(|e| {
                     format!("verification failed: {e}\n{}", explain(vm.insns(), &e, &o))
@@ -1277,7 +1271,7 @@ fn run() -> Result<ExitCode, String> {
                 vm.set_debug(di);
             }
             if !o.no_verify {
-                let vcfg = verifier_config(&o, ctx.len(), xdp);
+                let vcfg = verifier_config(&o, ctx.len(), kind);
                 link_tail_calls(&mut vm, &tail_links, &vcfg)?;
                 match vm.verify(vcfg) {
                     Ok(_) => println!("verifier: PASSED"),
@@ -1307,7 +1301,7 @@ fn run() -> Result<ExitCode, String> {
             let mut ctx = make_ctx(&o)?;
             let mut vm = Vm::new(prog)?;
             if !o.no_verify {
-                let vcfg = verifier_config(&o, ctx.len(), xdp);
+                let vcfg = verifier_config(&o, ctx.len(), kind);
                 link_tail_calls(&mut vm, &tail_links, &vcfg)?;
                 vm.verify(vcfg).map_err(|e| {
                     format!("verification failed: {e}\n{}", explain(vm.insns(), &e, &o))
@@ -1500,12 +1494,14 @@ mod cli_tests {
     }
 
     #[test]
-    fn machine_program_records_classify_socket_sections_without_splitting_names() {
-        assert_eq!(program_kind_name("socket", false), "socket");
-        assert_eq!(program_kind_name("socket/entry:name", false), "socket");
-        assert_eq!(program_kind_name("socket1", false), "socket");
-        assert_eq!(program_kind_name("tracepoint/socket", false), "other");
-        assert_eq!(program_kind_name("anything", true), "xdp");
+    fn machine_program_records_use_section_kinds_without_splitting_names() {
+        use febpf::elf::ProgramKind;
+        assert_eq!(ProgramKind::from_section("socket").name(), "socket");
+        assert_eq!(ProgramKind::from_section("socket/entry:name").name(), "socket");
+        assert_eq!(ProgramKind::from_section("socket1").name(), "socket");
+        assert_eq!(ProgramKind::from_section("classifier/ingress/main").name(), "tc");
+        assert_eq!(ProgramKind::from_section("tracepoint/socket").name(), "other");
+        assert_eq!(ProgramKind::from_section("xdp").name(), "xdp");
         assert_eq!(machine_field("uprobe/lib:name").unwrap(), "uprobe/lib:name");
         assert!(machine_field("bad\tname").is_err());
         assert!(machine_field("bad\nname").is_err());

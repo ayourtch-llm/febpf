@@ -109,6 +109,11 @@ fn shared_section_entries_and_section_symbol_call_addends() {
             .collect::<Vec<_>>(),
         ["first_entry", "second_entry"]
     );
+    assert!(obj.programs.iter().all(|program| {
+        program.section == "xdp"
+            && program.kind == febpf::elf::ProgramKind::Xdp
+            && program.xdp
+    }));
 
     // The second relocation is against the .text SECTION symbol with encoded
     // addend 2 and must select add_seven rather than silently selecting
