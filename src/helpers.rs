@@ -37,6 +37,7 @@ pub mod id {
     pub const PROBE_READ_KERNEL: u32 = 113;
     pub const PROBE_READ_USER_STR: u32 = 114;
     pub const PROBE_READ_KERNEL_STR: u32 = 115;
+    pub const GET_NS_CURRENT_PID_TGID: u32 = 120;
     pub const KTIME_GET_BOOT_NS: u32 = 125;
     pub const SEQ_WRITE: u32 = 127;
     pub const RINGBUF_OUTPUT: u32 = 130;
@@ -242,6 +243,11 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [MemWrite { size_arg: 1 }, Size, Any, None, None],
             ret: RetKind::Scalar,
         },
+        id::GET_NS_CURRENT_PID_TGID => HelperSig {
+            name: "get_ns_current_pid_tgid",
+            args: [Scalar, Scalar, MemWrite { size_arg: 3 }, Size, None],
+            ret: RetKind::Scalar,
+        },
         id::KTIME_GET_BOOT_NS => HelperSig {
             name: "ktime_get_boot_ns",
             args: [None, None, None, None, None],
@@ -401,6 +407,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::PROBE_READ_USER,
         id::PROBE_READ_KERNEL_STR,
         id::PROBE_READ_USER_STR,
+        id::GET_NS_CURRENT_PID_TGID,
         id::KTIME_GET_BOOT_NS,
         id::SEQ_WRITE,
         id::CURRENT_TASK_UNDER_CGROUP,

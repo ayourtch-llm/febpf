@@ -1614,6 +1614,39 @@ fn tracing_identity_helpers_are_deterministic_constants() {
     assert_eq!(run_src(src), 0x0000_0001_0000_0001);
 }
 
+#[test]
+fn get_ns_current_pid_tgid_zeroes_uninitialized_output_without_host_namespace() {
+    assert_eq!(febpf::helpers::helper_id("get_ns_current_pid_tgid"), Some(120));
+    let mut vm = Vm::new(program(
+        "r1 = 0\n\
+         r2 = 0\n\
+         r3 = r10\n\
+         r3 += -8\n\
+         r4 = 8\n\
+         call get_ns_current_pid_tgid\n\
+         r0 = *(u64 *)(r10 - 8)\n\
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config::default()).unwrap();
+    assert_eq!(vm.run_no_data().unwrap(), 0);
+    #[cfg(feature = "jit")]
+    assert_eq!(vm.run_jit(&mut []).unwrap(), 0);
+
+    let mut errno = Vm::new(program(
+        "r1 = 0\n\
+         r2 = 0\n\
+         r3 = r10\n\
+         r3 += -8\n\
+         r4 = 8\n\
+         call get_ns_current_pid_tgid\n\
+         exit",
+    ))
+    .unwrap();
+    errno.verify(Config::default()).unwrap();
+    assert_eq!(errno.run_no_data().unwrap(), (-22i64) as u64);
+}
+
 /// get_socket_cookie returns the fixed, documented, nonzero token
 /// 0x0000_0000_c00c_1e01 (febpf has no sockets); it is deterministic across
 /// calls and accepts its argument loosely (ctx-like pointer OR scalar), the

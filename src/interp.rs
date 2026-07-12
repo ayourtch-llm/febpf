@@ -2293,6 +2293,13 @@ impl<'a> Machine<'a> {
             helpers::id::GET_CURRENT_PID_TGID => 0x0000_0001_0000_0001, // tgid=1, pid=1
             helpers::id::GET_CURRENT_UID_GID => 0,                      // uid=gid=0
             helpers::id::GET_CURRENT_TASK => 0xffff_0000_0000_0001, // opaque, non-deref token
+            helpers::id::GET_NS_CURRENT_PID_TGID => {
+                // No host PID namespace is imported into the standalone VM,
+                // so dev/inode cannot match. The kernel zeroes the caller's
+                // requested buffer on every failure path.
+                self.mem(args[2], args[3] as u32 as usize, true)?.fill(0);
+                (-22i64) as u64 // -EINVAL
+            }
             // febpf has no sockets: a fixed, nonzero, documented token in the
             // same spirit as get_current_task (docs/specs/tracing-helpers.md).
             helpers::id::GET_SOCKET_COOKIE => 0x0000_0000_c00c_1e01,

@@ -134,6 +134,19 @@ equivalence observations, interpreter, and JIT retain the same behavior as
 ordinary `trace_printk`. This closes both libbpf-bootstrap ksyscall entries,
 whose four- and five-argument `bpf_printk` expansions select vprintk.
 
+## get_ns_current_pid_tgid (#120)
+
+`(dev, ino, nsdata, size)` writes the two-u32 `bpf_pidns_info` record when the
+requested namespace matches the current task. The output is writable
+potentially-uninitialized memory sized by argument four, so successful
+verification marks the destination initialized.
+
+febpf imports no host PID namespace or namespace device/inode identity.
+Standalone execution therefore takes the kernel's mismatch path
+deterministically: it zeroes the complete requested output and returns
+`-EINVAL`. This avoids fabricating a namespace relationship while preserving
+the kernel guarantee that every failure path clears the output.
+
 ## ktime_get_boot_ns (#125)
 
 The all-entry Inspektor Gadget scan made `bpf_ktime_get_boot_ns` the largest
