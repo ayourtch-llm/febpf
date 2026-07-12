@@ -2269,6 +2269,18 @@ impl<'a> Machine<'a> {
             // febpf has no sockets: a fixed, nonzero, documented token in the
             // same spirit as get_current_task (docs/specs/tracing-helpers.md).
             helpers::id::GET_SOCKET_COOKIE => 0x0000_0000_c00c_1e01,
+            helpers::id::REDIRECT_MAP => {
+                let m = self.map_from_ptr(args[0])?;
+                let key = (args[1] as u32).to_ne_bytes();
+                let populated = self.vm.maps[m]
+                    .lookup(&key)
+                    .is_some_and(|value| self.vm.maps[m].value(value).iter().any(|&byte| byte != 0));
+                if populated {
+                    4 // XDP_REDIRECT; standalone execution records only the verdict
+                } else {
+                    args[2] & 3 // kernel fallback action encoded in flag bits 0..1
+                }
+            }
             // febpf has no attach point: the "traced function address" is an
             // opaque, nonzero, non-dereferenceable token like get_current_task.
             helpers::id::GET_FUNC_IP => 0xffff_0000_0000_0002,

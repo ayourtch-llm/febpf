@@ -1072,6 +1072,53 @@ fn xdp_redirect_map_families_load_and_roundtrip() {
     assert_eq!(run_src(src), 0x1122334455667788);
 }
 
+#[test]
+fn redirect_map_requires_redirect_kind_and_returns_deterministic_verdict() {
+    assert_eq!(febpf::helpers::helper_id("redirect_map"), Some(51));
+    for kind in ["devmap", "cpumap", "devmap_hash"] {
+        let src = format!(
+            ".map targets {kind} 4 4 4
+             *(u32 *)(r10 - 4) = 2
+             *(u32 *)(r10 - 8) = 7
+             r1 = map[targets]
+             r2 = r10
+             r2 += -4
+             r3 = r10
+             r3 += -8
+             r4 = 0
+             call map_update_elem
+             r1 = map[targets]
+             r2 = 2
+             r3 = 1
+             call redirect_map
+             exit"
+        );
+        assert_eq!(run_src(&src), 4, "{kind}");
+    }
+
+    assert_eq!(
+        run_src(
+            ".map targets devmap 4 4 4\n\
+             r1 = map[targets]\n\
+             r2 = 9\n\
+             r3 = 2\n\
+             call redirect_map\n\
+             exit"
+        ),
+        2
+    );
+
+    let error = verify_err(
+        ".map wrong array 4 4 4\n\
+         r1 = map[wrong]\n\
+         r2 = 0\n\
+         r3 = 0\n\
+         call redirect_map\n\
+         exit",
+    );
+    assert!(error.contains("requires a devmap"), "{error}");
+}
+
 // --------------------------------------------------------- stack_trace
 
 /// get_stackid returns a deterministic 31-bit id and stores the captured

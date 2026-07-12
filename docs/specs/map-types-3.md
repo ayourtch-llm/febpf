@@ -33,10 +33,12 @@ standalone execution:
   preloads, and JIT/interpreter map-value accesses therefore behave like their
   storage family.
 
-The map kind remains distinct in `MapDef`, so future helper or attachment code
-can enforce the kernel's redirect-specific rules without confusing these maps
-with ordinary arrays or hashes. Device/CPU redirection side effects are not
-invented in the standalone VM; they require an XDP attachment environment.
+The map kind remains distinct in `MapDef`. `redirect_map` (#51) accepts only
+these three kinds and rejects ordinary arrays/hashes. It returns
+`XDP_REDIRECT` when the selected entry exists and contains a nonzero target;
+an absent, out-of-range, or zero entry returns the fallback action encoded in
+the low two flag bits. Device/CPU transmission is not invented in the
+standalone VM; it requires an XDP attachment environment.
 
 Replay format v1 assigns map-kind codes 11–13 to these three kinds. Existing
 v1 files contain only the earlier codes and remain unchanged; readers that
@@ -46,7 +48,8 @@ understand this revision can round-trip all three new kinds.
 
 - `src/elf.rs` unit tests cover all three UAPI type numbers.
 - Integration tests exercise update/lookup round trips through the VM for both
-  array-family maps and the hash-family map.
+  array-family maps and the hash-family map, plus redirect verdict/fallback and
+  wrong-map rejection for helper #51.
 - Replay tests verify that all three map identities survive a v1 round trip.
 - The unchanged xdp-tools objects are rescanned after implementation; the
   corpus histogram, rather than a synthetic object count, is the acceptance

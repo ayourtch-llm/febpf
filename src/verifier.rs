@@ -3019,6 +3019,22 @@ impl<'a> Verifier<'a> {
                     ));
                 }
             }
+            if hid == crate::helpers::id::REDIRECT_MAP
+                && !matches!(
+                    def.kind,
+                    crate::maps::MapKind::DevMap
+                        | crate::maps::MapKind::DevMapHash
+                        | crate::maps::MapKind::CpuMap
+                )
+            {
+                return Err(self.err(
+                    pc,
+                    format!(
+                        "helper {} requires a devmap, devmap_hash, or cpumap, but '{}' is a {} map",
+                        sig.name, def.name, def.kind
+                    ),
+                ));
+            }
         }
 
         // effects: r1-r5 clobbered, r0 = return value

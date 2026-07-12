@@ -29,6 +29,7 @@ pub mod id {
     pub const CURRENT_TASK_UNDER_CGROUP: u32 = 37;
     pub const PROBE_READ_STR: u32 = 45;
     pub const GET_SOCKET_COOKIE: u32 = 46;
+    pub const REDIRECT_MAP: u32 = 51;
     pub const GET_STACK: u32 = 67;
     pub const PROBE_READ_USER: u32 = 112;
     pub const PROBE_READ_KERNEL: u32 = 113;
@@ -249,6 +250,11 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [Any, None, None, None, None],
             ret: RetKind::Scalar,
         },
+        id::REDIRECT_MAP => HelperSig {
+            name: "redirect_map",
+            args: [ConstMapPtr, Scalar, Scalar, None, None],
+            ret: RetKind::Scalar,
+        },
         id::CURRENT_TASK_UNDER_CGROUP => HelperSig {
             name: "current_task_under_cgroup",
             // (map, index); map must be a cgroup_array.
@@ -348,6 +354,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::PROBE_READ,
         id::PROBE_READ_STR,
         id::GET_SOCKET_COOKIE,
+        id::REDIRECT_MAP,
         id::PROBE_READ_KERNEL,
         id::PROBE_READ_USER,
         id::PROBE_READ_KERNEL_STR,
