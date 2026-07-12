@@ -2391,6 +2391,14 @@ impl<'a> Machine<'a> {
                 self.ringbuf_consume(args[0], false)?;
                 0
             }
+            helpers::id::SKC_TO_TCP_SOCK
+            | helpers::id::SKC_TO_TCP_TIMEWAIT_SOCK
+            | helpers::id::SKC_TO_TCP_REQUEST_SOCK => {
+                // febpf does not expose host sockets or fabricate synthetic
+                // socket layouts. A caller-supplied common socket therefore
+                // has no safe standalone conversion target.
+                0
+            }
             helpers::id::RINGBUF_OUTPUT => {
                 let m = self.map_from_ptr(args[0])?;
                 let data = self.read_bytes(args[1], args[2] as usize)?;

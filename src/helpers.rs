@@ -39,6 +39,9 @@ pub mod id {
     pub const RINGBUF_RESERVE: u32 = 131;
     pub const RINGBUF_SUBMIT: u32 = 132;
     pub const RINGBUF_DISCARD: u32 = 133;
+    pub const SKC_TO_TCP_SOCK: u32 = 137;
+    pub const SKC_TO_TCP_TIMEWAIT_SOCK: u32 = 138;
+    pub const SKC_TO_TCP_REQUEST_SOCK: u32 = 139;
     pub const GET_TASK_STACK: u32 = 141;
     pub const GET_FUNC_IP: u32 = 173;
     /// First id available for user-registered helpers.
@@ -87,6 +90,9 @@ pub enum RetKind {
     /// Pointer to a writable ringbuf record of `size_arg` bytes, or NULL —
     /// must be null-checked before use (from `ringbuf_reserve`).
     RingbufMemOrNull { size_arg: u8 },
+    /// Nullable pointer to the exact named struct/union in target BTF. This
+    /// models helpers whose kernel prototype returns `PTR_TO_BTF_ID_OR_NULL`.
+    BtfPtrOrNull { type_name: &'static str },
     /// Non-null pointer to a VM-owned external memory region. The helper
     /// signature declares the byte extent visible to the program and whether
     /// stores are permitted; runtime region resolution independently enforces
@@ -276,6 +282,21 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [RingbufReserved, Any, None, None, None],
             ret: RetKind::Scalar,
         },
+        id::SKC_TO_TCP_SOCK => HelperSig {
+            name: "skc_to_tcp_sock",
+            args: [BtfPtr { type_name: "sock_common" }, None, None, None, None],
+            ret: RetKind::BtfPtrOrNull { type_name: "tcp_sock" },
+        },
+        id::SKC_TO_TCP_TIMEWAIT_SOCK => HelperSig {
+            name: "skc_to_tcp_timewait_sock",
+            args: [BtfPtr { type_name: "sock_common" }, None, None, None, None],
+            ret: RetKind::BtfPtrOrNull { type_name: "tcp_timewait_sock" },
+        },
+        id::SKC_TO_TCP_REQUEST_SOCK => HelperSig {
+            name: "skc_to_tcp_request_sock",
+            args: [BtfPtr { type_name: "sock_common" }, None, None, None, None],
+            ret: RetKind::BtfPtrOrNull { type_name: "tcp_request_sock" },
+        },
         id::GET_TASK_STACK => HelperSig {
             name: "get_task_stack",
             args: [
@@ -331,6 +352,9 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::RINGBUF_RESERVE,
         id::RINGBUF_SUBMIT,
         id::RINGBUF_DISCARD,
+        id::SKC_TO_TCP_SOCK,
+        id::SKC_TO_TCP_TIMEWAIT_SOCK,
+        id::SKC_TO_TCP_REQUEST_SOCK,
         id::GET_TASK_STACK,
     ].into_iter().find(|&hid| builtin_sig(hid).unwrap().name == name)
 }

@@ -3043,6 +3043,29 @@ impl<'a> Verifier<'a> {
                 }
                 RegState::Ptr(Ptr::new(PtrKind::RingbufMemOrNull { id, size }))
             }
+            RetKind::BtfPtrOrNull { type_name } => {
+                let btf_id = self
+                    .cfg
+                    .btf_ctx
+                    .as_ref()
+                    .and_then(|ctx| ctx.btf.as_ref())
+                    .and_then(|btf| btf.composite_id_by_name(type_name))
+                    .ok_or_else(|| {
+                        self.err(
+                            pc,
+                            format!(
+                                "helper {}: target BTF has no struct {type_name}",
+                                sig.name
+                            ),
+                        )
+                    })?;
+                let id = self.next_null_id;
+                self.next_null_id += 1;
+                if let Some(origins) = &mut self.replay_null_origin {
+                    origins.insert(id, (pc, sig.name.to_string()));
+                }
+                RegState::Ptr(Ptr::new(PtrKind::BtfIdOrNull { btf_id, id }))
+            }
             RetKind::ExternalMemory { size, writable } => {
                 RegState::Ptr(Ptr::new(PtrKind::ExternalMemory { size, writable }))
             }

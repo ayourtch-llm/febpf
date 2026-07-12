@@ -83,11 +83,27 @@ zero-fills the rest of the requested buffer, and returns the number of bytes
 written. This uses only VM call-frame state and therefore agrees across the
 interpreter, hybrid JIT, snapshots, and portable builds.
 
+## Socket conversions
+
+`skc_to_tcp_sock` (#137), `skc_to_tcp_timewait_sock` (#138), and
+`skc_to_tcp_request_sock` (#139) require an unmodified, non-null pointer to
+the exact target-BTF `sock_common` type. Their results are nullable pointers
+to the exact target-BTF `tcp_sock`, `tcp_timewait_sock`, and
+`tcp_request_sock` types respectively. A result must be checked against zero
+before it can be dereferenced, and its fields retain the existing bounded,
+fault-tolerant BTF access rules.
+
+febpf does not expose host sockets or manufacture synthetic kernel socket
+layouts. Standalone conversion therefore returns null deterministically. The
+ordinary terminal iterator record does not reach these calls, while an
+explicit future typed socket-record adapter can add meaningful conversion
+semantics without weakening pointer verification.
+
 ## Acceptance
 
 - The five pinned entries in Gadget snapshot-file/process/socket and
-  libbpf-bootstrap task-iter advance through helpers #127 and #141 against
-  the running target BTF.
+  libbpf-bootstrap task-iter advance through helpers #127, #137--#139, and
+  #141 against the running target BTF.
 - Tests cover exact positive member typing, required null checks, malformed
   offsets and widths, read-only enforcement, closed section matching, and
   deterministic interpreter/JIT agreement on the null-element path, sequence

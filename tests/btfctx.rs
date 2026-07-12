@@ -188,6 +188,9 @@ fn iterator_terminal_record_runs_without_host_pointers() {
 #[test]
 fn btf_helper_signatures_are_exact_and_task_stack_is_deterministic() {
     assert_eq!(febpf::helpers::helper_id("seq_write"), Some(127));
+    assert_eq!(febpf::helpers::helper_id("skc_to_tcp_sock"), Some(137));
+    assert_eq!(febpf::helpers::helper_id("skc_to_tcp_timewait_sock"), Some(138));
+    assert_eq!(febpf::helpers::helper_id("skc_to_tcp_request_sock"), Some(139));
     assert_eq!(febpf::helpers::helper_id("get_task_stack"), Some(141));
 
     // sched_switch arg1 is an exact task_struct pointer in the fixture BTF.
@@ -225,6 +228,87 @@ fn btf_helper_signatures_are_exact_and_task_stack_is_deterministic() {
          exit",
     );
     assert!(adjusted.contains("original struct task_struct pointer"), "{adjusted}");
+}
+
+#[test]
+fn iterator_socket_conversions_are_exact_nullable_and_runtime_safe() {
+    let Some(ctx) = live_iterator_ctx(
+        "corpus/obj/inspektor-gadget__snapshot_socket.o",
+        "iter/tcp",
+    ) else {
+        eprintln!("skipping: live target BTF or cached iterator corpus is absent");
+        return;
+    };
+
+    for helper in [
+        "skc_to_tcp_sock",
+        "skc_to_tcp_timewait_sock",
+        "skc_to_tcp_request_sock",
+    ] {
+        let src = format!(
+            "r1 = *(u64 *)(r1 + 8)\n\
+             if r1 == 0 goto null\n\
+             call {helper}\n\
+             if r0 == 0 goto null\n\
+             r0 = 1\n\
+             exit\n\
+             null:\n\
+             r0 = 0\n\
+             exit"
+        );
+        let mut vm = Vm::new(iterator_prog(&src, ctx.clone())).unwrap();
+        vm.verify(Config::default()).unwrap();
+
+        // Even if a caller provides a non-null opaque iterator element, the
+        // standalone runtime never fabricates a converted kernel socket.
+        let mut record = [0u8; 24];
+        record[8..16].copy_from_slice(&1u64.to_le_bytes());
+        assert_eq!(vm.run(&mut record).unwrap(), 0);
+        #[cfg(feature = "jit")]
+        assert_eq!(vm.run_jit(&mut record).unwrap(), 0);
+    }
+
+    let nullable_arg = iterator_prog(
+        "r1 = *(u64 *)(r1 + 8)\ncall skc_to_tcp_sock\nexit",
+        ctx.clone(),
+    );
+    let error = Vm::new(nullable_arg)
+        .unwrap()
+        .verify(Config::default())
+        .err()
+        .expect("nullable socket argument must reject")
+        .to_string();
+    assert!(error.contains("may be NULL; null-check it"), "{error}");
+
+    let wrong_type = iterator_prog(
+        "r1 = *(u64 *)(r1 + 0)\ncall skc_to_tcp_sock\nexit",
+        ctx.clone(),
+    );
+    let error = Vm::new(wrong_type)
+        .unwrap()
+        .verify(Config::default())
+        .err()
+        .expect("wrong socket argument type must reject")
+        .to_string();
+    assert!(error.contains("expected pointer to struct sock_common"), "{error}");
+
+    let nullable_result = iterator_prog(
+        "r0 = 0\n\
+         r1 = *(u64 *)(r1 + 8)\n\
+         if r1 == 0 goto null\n\
+         call skc_to_tcp_sock\n\
+         r0 = *(u32 *)(r0 + 0)\n\
+         null:\n\
+         exit",
+        ctx,
+    );
+    let error = Vm::new(nullable_result)
+        .unwrap()
+        .verify(Config::default())
+        .err()
+        .expect("unchecked socket conversion result must reject")
+        .to_string();
+    assert!(error.contains("may be NULL"), "{error}");
 }
 
 #[test]
@@ -283,7 +367,7 @@ fn iterator_corpus_advances_through_seq_and_task_stack_helpers() {
     let cases = [
         ("corpus/obj/inspektor-gadget__snapshot_file.o", "iter/task_file", Some("uninitialized stack byte")),
         ("corpus/obj/inspektor-gadget__snapshot_process.o", "iter/task", None),
-        ("corpus/obj/inspektor-gadget__snapshot_socket.o", "iter/tcp", Some("unknown helper #137")),
+        ("corpus/obj/inspektor-gadget__snapshot_socket.o", "iter/tcp", None),
         ("corpus/obj/inspektor-gadget__snapshot_socket.o", "iter/udp", None),
         ("corpus/obj/libbpf-bootstrap__task_iter.o", "iter/task", None),
     ];
@@ -307,6 +391,9 @@ fn iterator_corpus_advances_through_seq_and_task_stack_helpers() {
                 let error = result.err().expect("expected rejection").to_string();
                 assert!(error.contains(expected), "{path}::{name}: {error}");
                 assert!(!error.contains("unknown helper #127"), "{path}::{name}: {error}");
+                assert!(!error.contains("unknown helper #137"), "{path}::{name}: {error}");
+                assert!(!error.contains("unknown helper #138"), "{path}::{name}: {error}");
+                assert!(!error.contains("unknown helper #139"), "{path}::{name}: {error}");
                 assert!(!error.contains("unknown helper #141"), "{path}::{name}: {error}");
                 assert!(!error.contains("scalar; loads need a pointer"), "{path}::{name}: {error}");
             }
