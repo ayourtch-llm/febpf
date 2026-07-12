@@ -937,6 +937,7 @@ pub struct Snapshot {
     printk: Vec<String>,
     profile: Option<Vec<u64>>,
     nondet_calls: u64,
+    logical_boot_ns: u64,
     active_program: u32,
     tail_call_count: u32,
 }
@@ -962,6 +963,7 @@ pub struct InstanceState {
     frames: Vec<SavedFrame>,
     insn_count: u64,
     nondet_calls: u64,
+    logical_boot_ns: u64,
     stack: Vec<u8>,
     ctx: Vec<u8>,
     active_program: u32,
@@ -983,6 +985,7 @@ impl InstanceState {
             frames: Vec::new(),
             insn_count: 0,
             nondet_calls: 0,
+            logical_boot_ns: 0,
             stack: vec![0u8; MAX_CALL_FRAMES * STACK_SIZE],
             ctx: ctx.to_vec(),
             active_program: 0,
@@ -1065,6 +1068,8 @@ pub struct Machine<'a> {
     /// (`ktime_get_ns`, user-registered helpers). The debugger warns before
     /// reverse execution when this is nonzero.
     pub nondet_calls: u64,
+    /// Deterministic stand-in for CLOCK_BOOTTIME, advanced by helper #125.
+    logical_boot_ns: u64,
     /// Set by the JIT trampoline when a deferred instruction faults.
     #[cfg(feature = "jit")]
     jit_fault: Option<EbpfError>,
@@ -1236,6 +1241,7 @@ impl<'a> Machine<'a> {
             frames: Vec::new(),
             insn_count: 0,
             nondet_calls: 0,
+            logical_boot_ns: 0,
             #[cfg(feature = "jit")]
             jit_fault: None,
             #[cfg(feature = "jit")]
@@ -1263,6 +1269,7 @@ impl<'a> Machine<'a> {
             printk: self.vm.printk.clone(),
             profile: self.vm.profile.clone(),
             nondet_calls: self.nondet_calls,
+            logical_boot_ns: self.logical_boot_ns,
             active_program: self.active_program,
             tail_call_count: self.tail_call_count,
         }
@@ -1286,6 +1293,7 @@ impl<'a> Machine<'a> {
         self.vm.printk = s.printk.clone();
         self.vm.profile = s.profile.clone();
         self.nondet_calls = s.nondet_calls;
+        self.logical_boot_ns = s.logical_boot_ns;
         self.active_program = s.active_program;
         self.tail_call_count = s.tail_call_count;
         #[cfg(feature = "jit")]
@@ -1318,6 +1326,7 @@ impl<'a> Machine<'a> {
         self.frames.clone_from(&st.frames);
         self.insn_count = st.insn_count;
         self.nondet_calls = st.nondet_calls;
+        self.logical_boot_ns = st.logical_boot_ns;
         self.active_program = st.active_program;
         self.tail_call_count = st.tail_call_count;
         self.vm.stack.copy_from_slice(&st.stack);
@@ -1332,6 +1341,7 @@ impl<'a> Machine<'a> {
         st.frames.clone_from(&self.frames);
         st.insn_count = self.insn_count;
         st.nondet_calls = self.nondet_calls;
+        st.logical_boot_ns = self.logical_boot_ns;
         st.active_program = self.active_program;
         st.tail_call_count = self.tail_call_count;
         st.stack.copy_from_slice(&self.vm.stack);
@@ -2156,6 +2166,13 @@ impl<'a> Machine<'a> {
             helpers::id::KTIME_GET_NS => {
                 self.nondet_calls += 1; // wall clock: replay cannot reproduce it
                 self.vm.start.elapsed_nanos()
+            }
+            // Deterministic stand-in for Linux CLOCK_BOOTTIME: one logical
+            // nanosecond per observation. The counter is part of snapshot and
+            // race-instance state, so interpreter/JIT replay is exact.
+            helpers::id::KTIME_GET_BOOT_NS => {
+                self.logical_boot_ns = self.logical_boot_ns.saturating_add(1);
+                self.logical_boot_ns
             }
             helpers::id::TRACE_PRINTK => {
                 let fmt = self.read_bytes(args[0], args[1] as usize)?;

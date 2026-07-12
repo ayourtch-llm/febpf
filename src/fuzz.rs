@@ -318,12 +318,14 @@ fn gen_mixed(rng: &mut Prng, p: &mut Vec<Insn>) {
 
 /// Helpers whose return value is *identical* in the interpreter and the JIT,
 /// so a differential test can call them. `get_prandom_u32` is a fixed-seed
-/// xorshift (each `Vm` starts from the same seed) and `get_smp_processor_id`
-/// is a constant. `ktime_get_ns` is deliberately absent: it reads the wall
-/// clock, and the two engines would disagree.
+/// xorshift (each `Vm` starts from the same seed), `get_smp_processor_id` is a
+/// constant, and `ktime_get_boot_ns` is a snapshotted logical clock.
+/// `ktime_get_ns` is deliberately absent: it reads the wall clock, and the
+/// two engines would disagree.
 const DETERMINISTIC_HELPERS: &[i32] = &[
     7, // get_prandom_u32
     8, // get_smp_processor_id
+    125, // ktime_get_boot_ns (snapshotted logical clock)
 ];
 
 /// Generate a **memory-heavy** program: stack loads/stores at every width,

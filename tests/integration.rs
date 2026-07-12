@@ -1233,6 +1233,31 @@ fn get_func_ip_is_opaque_nonzero_token() {
     assert_eq!(run_src(src), 0xffff_0000_0000_0002);
 }
 
+/// ktime_get_boot_ns has the kernel's no-argument/scalar signature, but its
+/// standalone value is deterministic logical time: one nanosecond per
+/// observation. Uninitialized r1-r5 prove that no argument is
+/// accidentally required by the verifier.
+#[test]
+fn ktime_get_boot_ns_is_deterministic_logical_time() {
+    assert_eq!(febpf::helpers::helper_id("ktime_get_boot_ns"), Some(125));
+    assert_eq!(febpf::helpers::helper_name(125), "ktime_get_boot_ns");
+
+    let src = "
+        call ktime_get_boot_ns
+        r6 = r0
+        call ktime_get_boot_ns
+        r0 -= r6
+        exit";
+    assert_eq!(run_src(src), 1);
+
+    #[cfg(feature = "jit")]
+    {
+        let mut vm = Vm::new(program(src)).unwrap();
+        vm.verify(Config::default()).unwrap();
+        assert_eq!(vm.run_jit(&mut []).unwrap(), 1);
+    }
+}
+
 /// The caller must null-check a returned map_value_or_null before deref —
 /// the pointer's typing survives the frame pop.
 #[test]

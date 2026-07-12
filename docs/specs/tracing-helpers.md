@@ -120,6 +120,34 @@ blocker was helper #46; #173 fell out of the ksnoop investigation below.
   cleanly through the virtual-address model, and probe_read of it
   zero-fills + returns -EFAULT like any wild pointer).
 
+## ktime_get_boot_ns (#125)
+
+The all-entry Inspektor Gadget scan made `bpf_ktime_get_boot_ns` the largest
+combined-corpus blocker: 210 entries in 14 first-blocked object families. In
+Linux it returns nanoseconds elapsed since boot using the boot-time clock,
+which, unlike the monotonic clock used by `bpf_ktime_get_ns`, includes time
+spent suspended. Its verifier signature is `() -> scalar`: no argument
+register is read and r0 receives an ordinary u64.
+
+febpf deliberately does not consult a host clock for this helper. A Machine's
+deterministic boot-time stand-in is a logical nanosecond counter that advances
+once per `ktime_get_boot_ns` observation; the first call in a run returns 1
+and later calls never go backwards. Each Machine invocation begins at logical
+boot time zero. This preserves the ordering property production programs need
+from timestamps without making a replay depend on scheduler latency, host
+suspend history, browser clock
+availability, or the wall clock of a different machine.
+
+This differs intentionally from the older `ktime_get_ns` model, which uses a
+host `Instant` under native `std` and is consequently counted as
+non-deterministic by the debugger. `ktime_get_boot_ns` does not increment
+`nondet_calls`: snapshots and race-explorer instance state carry the logical
+clock, so restore/replay produces the identical timestamp. JIT helper calls
+use the ordinary deferred-helper path and therefore advance the same clock as
+the interpreter. The model is pure integer arithmetic and is identical under
+`std`, wasm, and true `no_std + alloc`; it adds no platform clock or
+synchronization dependency.
+
 ## The ksnoop rejection is correct: the kernel rejects it too (verdict parity)
 
 `bcc__ksnoop.o` (from the corpus pin, bcc v0.31.0) fails verification at its

@@ -136,6 +136,30 @@ fn nondet_helper_calls_are_counted() {
     assert_eq!(m.nondet_calls, 1);
 }
 
+#[test]
+fn boot_clock_replays_from_snapshot_without_nondeterminism() {
+    let mut v = vm("call ktime_get_boot_ns\n\
+         r6 = r0\n\
+         call ktime_get_boot_ns\n\
+         r0 -= r6\n\
+         exit");
+    let mut ctx = [];
+    let mut m = v.machine(&mut ctx);
+    m.run_to_count(2).unwrap();
+    assert_eq!(m.regs[6], 1);
+    let before_second_call = m.snapshot();
+
+    m.step().unwrap();
+    let after_second_call = m.snapshot();
+    assert_eq!(m.regs[0], 2);
+    assert_eq!(m.nondet_calls, 0);
+
+    m.restore(&before_second_call);
+    m.step().unwrap();
+    assert_eq!(m.snapshot(), after_second_call);
+    assert_eq!(m.regs[0], 2);
+}
+
 // ---------------------------------------------------------------- debugger
 
 /// Run one command through the session, returning its output.
@@ -321,4 +345,16 @@ fn nondet_warning_on_reverse() {
     cmd(&mut s, "step");
     let o = cmd(&mut s, "rstep");
     assert!(!o.contains("warning"), "{o}");
+}
+
+#[test]
+fn boot_clock_reverse_step_needs_no_nondeterminism_warning() {
+    let mut v = vm("call ktime_get_boot_ns\n r6 = r0\n r0 = 0\n exit");
+    let mut c = [];
+    let mut s = DebugSession::new(&mut v, &mut c, &opts());
+    cmd(&mut s, "step 2");
+    let o = cmd(&mut s, "rstep");
+    assert!(!o.contains("warning"), "{o}");
+    cmd(&mut s, "step");
+    assert_eq!(s.machine().regs[6], 1);
 }
