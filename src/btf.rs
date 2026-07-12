@@ -637,9 +637,14 @@ pub enum CtxSlot {
     /// An integer/enum/by-value argument (or a pointer to a non-composite
     /// type): loads read an unknown scalar.
     Scalar,
+    /// A scalar structure member with an exact declared access width.
+    ScalarSized { size: u8 },
     /// A pointer to the (resolved) struct/union type `btf_id` in the target
     /// BTF: an 8-byte load yields a BTF-typed pointer.
     Ptr { btf_id: u32 },
+    /// A nullable pointer to a resolved target-BTF struct/union. Iterator
+    /// element records use this for their end-of-iteration NULL invocation.
+    PtrOrNull { btf_id: u32 },
 }
 
 /// BTF typing of a program's context: one [`CtxSlot`] per 8-byte argument,
@@ -669,6 +674,7 @@ pub fn is_btf_ctx_section(name: &str) -> bool {
     ["tp_btf/", "fentry/", "fexit/", "fmod_ret/"]
         .iter()
         .any(|p| name.starts_with(p))
+        || matches!(name, "iter/task" | "iter/task_file" | "iter/tcp" | "iter/udp")
 }
 
 /// Resolve an ELF section name to the BTF typing of the program's ctx
@@ -686,6 +692,9 @@ pub fn is_btf_ctx_section(name: &str) -> bool {
 /// (`raw_tp/`, `kprobe/`, `tracepoint/`, ...), and `Err` when the section IS
 /// BTF-typed but the target cannot be found in `btf`.
 pub fn resolve_ctx_args(btf: &Btf, section: &str) -> Result<Option<Vec<CtxSlot>>, String> {
+    if let Some(slots) = resolve_iterator_ctx(btf, section)? {
+        return Ok(Some(slots));
+    }
     let (proto_id, skip_data_arg, ret_slot, what) =
         if let Some(name) = section.strip_prefix("tp_btf/") {
             let tname = format!("btf_trace_{name}");
@@ -727,6 +736,67 @@ pub fn resolve_ctx_args(btf: &Btf, section: &str) -> Result<Option<Vec<CtxSlot>>
             CtxSlot::Scalar
         } else {
             slot_of(btf, *ret_type)?
+        });
+    }
+    Ok(Some(slots))
+}
+
+/// Resolve the closed set of iterator context structures. Pointer members are
+/// checked against the target BTF at their exact offsets; scalar widths are
+/// part of the kernel iterator ABI and are verified exactly by the caller.
+fn resolve_iterator_ctx(btf: &Btf, section: &str) -> Result<Option<Vec<CtxSlot>>, String> {
+    let (type_name, layout): (&str, &[(u32, bool, u8)]) = match section {
+        // tuple: (byte offset, nullable pointer, scalar width); scalar width 0
+        // denotes an eight-byte pointer member.
+        "iter/task" => ("bpf_iter__task", &[(0, false, 0), (8, true, 0)]),
+        "iter/task_file" => (
+            "bpf_iter__task_file",
+            &[(0, false, 0), (8, true, 0), (16, false, 4), (24, true, 0)],
+        ),
+        "iter/tcp" => (
+            "bpf_iter__tcp",
+            &[(0, false, 0), (8, true, 0), (16, false, 4)],
+        ),
+        "iter/udp" => (
+            "bpf_iter__udp",
+            &[
+                (0, false, 0),
+                (8, true, 0),
+                (16, false, 4),
+                (24, false, 4),
+            ],
+        ),
+        _ => return Ok(None),
+    };
+    let root = btf
+        .ids_by_name(type_name)
+        .iter()
+        .copied()
+        .find(|&id| matches!(btf.ty(id).map(|t| &t.kind), Ok(Kind::Struct { .. })))
+        .ok_or_else(|| format!("no struct '{type_name}' in target BTF"))?;
+    let expected_size = layout.last().map_or(0, |&(off, _, scalar)| {
+        off + if scalar == 0 { 8 } else { u32::from(scalar) }
+    });
+    if btf.type_size(root)? < expected_size {
+        return Err(format!(
+            "struct '{type_name}' is too small for iterator context: {} < {expected_size}",
+            btf.type_size(root)?
+        ));
+    }
+
+    let mut slots = Vec::with_capacity(layout.len());
+    for &(off, nullable, scalar_size) in layout {
+        if scalar_size != 0 {
+            slots.push(CtxSlot::ScalarSized { size: scalar_size });
+            continue;
+        }
+        let btf_id = btf.read_kind(root, off, 8)?.ok_or_else(|| {
+            format!("struct '{type_name}' member at offset {off} is not a pointer")
+        })?;
+        slots.push(if nullable {
+            CtxSlot::PtrOrNull { btf_id }
+        } else {
+            CtxSlot::Ptr { btf_id }
         });
     }
     Ok(Some(slots))
@@ -1338,6 +1408,11 @@ pub(crate) mod tests {
         assert!(is_btf_ctx_section("fentry/vfs_read"));
         assert!(is_btf_ctx_section("fexit/vfs_read"));
         assert!(is_btf_ctx_section("fmod_ret/x"));
+        assert!(is_btf_ctx_section("iter/task"));
+        assert!(is_btf_ctx_section("iter/task_file"));
+        assert!(is_btf_ctx_section("iter/tcp"));
+        assert!(is_btf_ctx_section("iter/udp"));
+        assert!(!is_btf_ctx_section("iter/task_extra"));
         assert!(!is_btf_ctx_section("raw_tp/sched_switch"));
         assert!(!is_btf_ctx_section("kprobe/vfs_read"));
         assert!(!is_btf_ctx_section(".text"));

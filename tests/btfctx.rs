@@ -65,6 +65,22 @@ fn verify_err(src: &str) -> String {
     }
 }
 
+fn live_iterator_ctx(object: &str, program: &str) -> Option<BtfCtx> {
+    let object = std::fs::read(object).ok()?;
+    let target = std::fs::read("/sys/kernel/btf/vmlinux").ok()?;
+    let loaded = febpf::elf::load_with_target_btf(&object, Some(&target)).ok()?;
+    loaded
+        .programs
+        .into_iter()
+        .find(|p| p.name == program)?
+        .btf_ctx
+}
+
+fn iterator_prog(src: &str, ctx: BtfCtx) -> Program {
+    let a = asm::assemble(src).unwrap();
+    Program { insns: a.insns, maps: a.maps, btf_ctx: Some(ctx) }
+}
+
 // ---------------------------------------------------------------------------
 // ELF loader end to end
 // ---------------------------------------------------------------------------
@@ -104,6 +120,108 @@ fn loader_without_target_btf_leaves_ctx_untyped() {
     assert!(febpf::elf::needs_kernel_btf(&bytes));
     let obj = febpf::elf::load_with_target_btf(&bytes, None).unwrap();
     assert!(obj.programs.iter().all(|p| p.btf_ctx.is_none()));
+}
+
+#[test]
+fn iterator_context_layout_is_exact_and_nullable() {
+    if let Ok(bytes) = std::fs::read("corpus/obj/inspektor-gadget__snapshot_file.o") {
+        assert!(febpf::elf::needs_kernel_btf(&bytes));
+        let without_target = febpf::elf::load_with_target_btf(&bytes, None).unwrap();
+        assert!(without_target.programs.iter().all(|p| p.btf_ctx.is_none()));
+    }
+    let Some(ctx) = live_iterator_ctx(
+        "corpus/obj/inspektor-gadget__snapshot_file.o",
+        "iter/task_file",
+    ) else {
+        eprintln!("skipping: live target BTF or cached iterator corpus is absent");
+        return;
+    };
+    assert!(matches!(ctx.args[0], CtxSlot::Ptr { .. }));
+    assert!(matches!(ctx.args[1], CtxSlot::PtrOrNull { .. }));
+    assert_eq!(ctx.args[2], CtxSlot::ScalarSized { size: 4 });
+    assert!(matches!(ctx.args[3], CtxSlot::PtrOrNull { .. }));
+
+    let reject = |src: &str| {
+        let mut vm = Vm::new(iterator_prog(src, ctx.clone())).unwrap();
+        vm.verify(Config::default()).err().expect("must reject").to_string()
+    };
+    assert!(reject("r0 = *(u32 *)(r1 + 8)\nexit").contains("8-byte"));
+    assert!(reject("r0 = *(u64 *)(r1 + 16)\nexit").contains("4-byte"));
+    assert!(reject("r0 = *(u64 *)(r1 + 4)\nexit").contains("multiple of 8"));
+    assert!(reject("r0 = 0\n*(u64 *)(r1 + 8) = r0\nexit").contains("read-only"));
+    assert!(reject("r2 = *(u64 *)(r1 + 8)\nr0 = *(u32 *)(r2)\nexit").contains("may be NULL"));
+}
+
+#[test]
+fn iterator_terminal_record_runs_without_host_pointers() {
+    let Some(ctx) = live_iterator_ctx(
+        "corpus/obj/inspektor-gadget__snapshot_process.o",
+        "iter/task",
+    ) else {
+        eprintln!("skipping: live target BTF or cached iterator corpus is absent");
+        return;
+    };
+    let src = "
+        r2 = *(u64 *)(r1 + 0)
+        r3 = *(u64 *)(r2 + 0)
+        r4 = *(u64 *)(r1 + 8)
+        if r4 == 0 goto terminal
+        r0 = 1
+        exit
+    terminal:
+        r0 = 0
+        exit";
+    let mut vm = Vm::new(iterator_prog(src, ctx)).unwrap();
+    vm.verify(Config::default()).unwrap();
+    let mut record = [0u8; 16];
+    assert_eq!(vm.run(&mut record).unwrap(), 0);
+    assert_ne!(u64::from_le_bytes(record[0..8].try_into().unwrap()), 0);
+    assert_eq!(u64::from_le_bytes(record[8..16].try_into().unwrap()), 0);
+
+    #[cfg(feature = "jit")]
+    {
+        record.fill(0);
+        assert_eq!(vm.run_jit(&mut record).unwrap(), 0);
+    }
+}
+
+#[test]
+fn iterator_corpus_advances_past_context_typing() {
+    let target = match std::fs::read("/sys/kernel/btf/vmlinux") {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let cases = [
+        ("corpus/obj/inspektor-gadget__snapshot_file.o", "iter/task_file", 127),
+        ("corpus/obj/inspektor-gadget__snapshot_process.o", "iter/task", 127),
+        ("corpus/obj/inspektor-gadget__snapshot_socket.o", "iter/tcp", 137),
+        ("corpus/obj/inspektor-gadget__snapshot_socket.o", "iter/udp", 127),
+        ("corpus/obj/libbpf-bootstrap__task_iter.o", "iter/task", 141),
+    ];
+    for (path, name, helper) in cases {
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skipping: cached iterator corpus is absent");
+            return;
+        };
+        let object = febpf::elf::load_with_target_btf(&bytes, Some(&target)).unwrap();
+        let loaded = object.programs.into_iter().find(|p| p.name == name).unwrap();
+        let mut vm = Vm::new(Program {
+            insns: loaded.insns,
+            maps: object.maps,
+            btf_ctx: loaded.btf_ctx,
+        })
+        .unwrap();
+        let error = vm
+            .verify(Config::default())
+            .err()
+            .expect("next helper must reject")
+            .to_string();
+        assert!(
+            error.contains(&format!("unknown helper #{helper}")),
+            "{path}::{name}: {error}"
+        );
+        assert!(!error.contains("scalar; loads need a pointer"), "{path}::{name}: {error}");
+    }
 }
 
 // ---------------------------------------------------------------------------

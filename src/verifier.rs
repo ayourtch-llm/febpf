@@ -472,6 +472,9 @@ pub enum PtrKind {
     /// members chase to another `BtfId`, everything else is a scalar) and are
     /// executed as fault-tolerant probe reads (kernel `BPF_PROBE_MEM`).
     BtfId { btf_id: u32 },
+    /// Nullable iterator-element BTF pointer. It becomes `BtfId` after an
+    /// equality/inequality comparison against zero.
+    BtfIdOrNull { btf_id: u32, id: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,6 +557,9 @@ impl core::fmt::Display for RegState {
                     PtrKind::RingbufMem { size, .. } => write!(f, "ringbuf_mem[{size}]")?,
                     PtrKind::RingbufMemOrNull { size, .. } => {
                         write!(f, "ringbuf_mem_or_null[{size}]")?
+                    }
+                    PtrKind::BtfIdOrNull { btf_id, .. } => {
+                        write!(f, "kptr_or_null(btf{btf_id})")?
                     }
                     PtrKind::RingbufConsumed { .. } => write!(f, "ringbuf_consumed")?,
                     PtrKind::ExternalMemory { size, writable } => write!(
@@ -2244,19 +2250,31 @@ impl<'a> Verifier<'a> {
                             ),
                         ));
                     }
-                    // A pointer slot must be read whole (the kernel types the
-                    // full 8-byte load as PTR_TO_BTF_ID; a narrower read of a
-                    // pointer is meaningless and rejected).
-                    if size != 8
-                        && matches!(bc.args[arg as usize], crate::btf::CtxSlot::Ptr { .. })
-                    {
-                        return Err(self.err(
-                            pc,
-                            format!(
-                                "BTF ctx pointer argument {arg} must be loaded with an \
-                                 8-byte read (got {size})"
-                            ),
-                        ));
+                    match bc.args[arg as usize] {
+                        crate::btf::CtxSlot::Ptr { .. }
+                        | crate::btf::CtxSlot::PtrOrNull { .. }
+                            if size != 8 =>
+                        {
+                            return Err(self.err(
+                                pc,
+                                format!(
+                                    "BTF ctx pointer argument {arg} must be loaded with an \
+                                     8-byte read (got {size})"
+                                ),
+                            ));
+                        }
+                        crate::btf::CtxSlot::ScalarSized { size: expected }
+                            if size != u64::from(expected) =>
+                        {
+                            return Err(self.err(
+                                pc,
+                                format!(
+                                    "BTF ctx scalar member {arg} must be loaded with a \
+                                     {expected}-byte read (got {size})"
+                                ),
+                            ));
+                        }
+                        _ => {}
                     }
                     // off%8==0 and size in {1,2,4,8} make the access naturally
                     // aligned and slot-contained; nothing left to bounds-check.
@@ -2294,6 +2312,12 @@ impl<'a> Verifier<'a> {
                 return Err(self.err(
                     pc,
                     "ringbuf record pointer may be NULL; compare it against 0 first",
+                ));
+            }
+            PtrKind::BtfIdOrNull { .. } => {
+                return Err(self.err(
+                    pc,
+                    "BTF pointer may be NULL; compare it against 0 first",
                 ));
             }
             PtrKind::RingbufConsumed { .. } => {
@@ -2421,7 +2445,7 @@ impl<'a> Verifier<'a> {
     /// `btf_struct_access()` result typing). Assumes `check_mem_access`
     /// already validated the access.
     fn typed_load(
-        &self,
+        &mut self,
         pc: usize,
         p: &Ptr,
         disp: i64,
@@ -2447,9 +2471,19 @@ impl<'a> Verifier<'a> {
                 }
                 if let Some(bc) = &self.cfg.btf_ctx {
                     if size == 8 {
-                        if let crate::btf::CtxSlot::Ptr { btf_id } = bc.args[(disp / 8) as usize]
-                        {
-                            return Ok(RegState::Ptr(Ptr::new(PtrKind::BtfId { btf_id })));
+                        match bc.args[(disp / 8) as usize] {
+                            crate::btf::CtxSlot::Ptr { btf_id } => {
+                                return Ok(RegState::Ptr(Ptr::new(PtrKind::BtfId { btf_id })));
+                            }
+                            crate::btf::CtxSlot::PtrOrNull { btf_id } => {
+                                let id = self.next_null_id;
+                                self.next_null_id += 1;
+                                return Ok(RegState::Ptr(Ptr::new(PtrKind::BtfIdOrNull {
+                                    btf_id,
+                                    id,
+                                })));
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -3000,6 +3034,13 @@ impl<'a> Verifier<'a> {
                                 p.kind = PtrKind::RingbufMem { id: pid, size };
                             }
                         }
+                        PtrKind::BtfIdOrNull { btf_id, id: pid } if pid == id => {
+                            if becomes_null {
+                                *r = RegState::Scalar(Scalar::constant(0));
+                            } else {
+                                p.kind = PtrKind::BtfId { btf_id };
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -3488,6 +3529,7 @@ impl<'a> Verifier<'a> {
                 | PtrKind::MapValueOrNull { .. }
                 | PtrKind::MapOrNull { .. }
                 | PtrKind::RingbufMemOrNull { .. }
+                | PtrKind::BtfIdOrNull { .. }
                 | PtrKind::RingbufConsumed { .. }
                 | PtrKind::PacketEnd
         ) {
@@ -3618,7 +3660,8 @@ impl<'a> Verifier<'a> {
                         kind:
                             PtrKind::MapValueOrNull { id, .. }
                             | PtrKind::MapOrNull { id, .. }
-                            | PtrKind::RingbufMemOrNull { id, .. },
+                            | PtrKind::RingbufMemOrNull { id, .. }
+                            | PtrKind::BtfIdOrNull { id, .. },
                         ..
                     }) => Some(id),
                     _ => None,

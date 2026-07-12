@@ -50,6 +50,10 @@ pub enum ProgramKind {
     LwtXmit,
     LwtSeg6Local,
     SkReuseport,
+    IterTask,
+    IterTaskFile,
+    IterTcp,
+    IterUdp,
     #[default]
     Other,
 }
@@ -83,6 +87,14 @@ impl ProgramKind {
             Self::LwtSeg6Local
         } else if name == "sk_reuseport" || name.starts_with("sk_reuseport/") {
             Self::SkReuseport
+        } else if name == "iter/task" {
+            Self::IterTask
+        } else if name == "iter/task_file" {
+            Self::IterTaskFile
+        } else if name == "iter/tcp" {
+            Self::IterTcp
+        } else if name == "iter/udp" {
+            Self::IterUdp
         } else {
             Self::Other
         }
@@ -101,6 +113,10 @@ impl ProgramKind {
             Self::LwtXmit => "lwt_xmit",
             Self::LwtSeg6Local => "lwt_seg6local",
             Self::SkReuseport => "sk_reuseport",
+            Self::IterTask => "iter/task",
+            Self::IterTaskFile => "iter/task_file",
+            Self::IterTcp => "iter/tcp",
+            Self::IterUdp => "iter/udp",
             Self::Other => "other",
         }
     }
@@ -1816,6 +1832,11 @@ mod tests {
         assert_eq!(ProgramKind::from_section("lwt_xmit"), ProgramKind::LwtXmit);
         assert_eq!(ProgramKind::from_section("lwt_seg6local"), ProgramKind::LwtSeg6Local);
         assert_eq!(ProgramKind::from_section("sk_reuseport/select"), ProgramKind::SkReuseport);
+        assert_eq!(ProgramKind::from_section("iter/task"), ProgramKind::IterTask);
+        assert_eq!(ProgramKind::from_section("iter/task_file"), ProgramKind::IterTaskFile);
+        assert_eq!(ProgramKind::from_section("iter/tcp"), ProgramKind::IterTcp);
+        assert_eq!(ProgramKind::from_section("iter/udp"), ProgramKind::IterUdp);
+        assert_eq!(ProgramKind::from_section("iter/task_extra"), ProgramKind::Other);
         assert_eq!(ProgramKind::from_section("xdp_devmap"), ProgramKind::Other);
         assert_eq!(ProgramKind::from_section("fentry/xdp_do_redirect"), ProgramKind::Other);
     }

@@ -15,6 +15,11 @@ Tests: `tests/btfctx.rs` (self-contained fixture `examples/c/btfctx.c` —
 carries its *own* target-side types so no kernel is needed), unit tests in
 `src/btf.rs`, vmlinux-gated parity in `tests/btf.rs`.
 
+The closed set of struct-shaped `iter/task`, `iter/task_file`, `iter/tcp`, and
+`iter/udp` contexts builds on the same BTF pointer machinery but has exact
+members and nullable element pointers rather than argument slots. Its contract
+is in `docs/specs/iterator-contexts.md`.
+
 ## 1. Resolving the ctx typing (`btf.rs`)
 
 `resolve_ctx_args(btf, section)` mirrors how the kernel picks the prototype
@@ -43,7 +48,9 @@ needed for verification; the runtime uses the slots alone.
 
 ## 2. Verifier (`verifier.rs`)
 
-New pointer kind: `PtrKind::BtfId { btf_id }`.
+Pointer kinds are `PtrKind::BtfId { btf_id }` and, for iterator elements,
+`BtfIdOrNull { btf_id, id }`; the latter must be null-checked before it refines
+to the former.
 
 **Ctx accesses** (when `Config::btf_ctx` is set) mirror `btf_ctx_access()`:
 - the register's own offset must be 0 (shared `PTR_TO_CTX` rule, kernel

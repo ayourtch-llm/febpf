@@ -579,9 +579,10 @@ impl Vm {
     }
 
     /// Attach BTF typing of the ctx (set by the ELF loader for
-    /// `tp_btf`/`fentry`-style programs). Pointer ctx slots are prefilled
-    /// with kernel-memory addresses on each run, and [`Vm::verify`] verifies
-    /// under the kernel's `btf_ctx_access()` rules.
+    /// `tp_btf`/`fentry`/iterator-style programs). Non-null pointer ctx slots
+    /// are prefilled with kernel-memory addresses on each run; nullable
+    /// iterator elements remain zero for a deterministic terminal record.
+    /// [`Vm::verify`] verifies under the kernel's typed-ctx rules.
     pub fn set_btf_ctx(&mut self, bc: crate::btf::BtfCtx) {
         self.btf_ctx = Some(bc);
     }
@@ -1215,8 +1216,8 @@ impl<'a> Machine<'a> {
     ) -> Machine<'a> {
         vm.stack.iter_mut().for_each(|b| *b = 0);
         // BTF-typed programs: the ctx is an array of 8-byte arguments, and
-        // pointer arguments must hold kernel-memory addresses. Prefill each
-        // pointer slot with a distinct deterministic address in the
+        // non-null pointer arguments must hold kernel-memory addresses.
+        // Prefill each such pointer slot with a distinct deterministic address in the
         // reads-as-zero kernel region (1 MiB apart so distinct arguments
         // compare unequal, like real kernel pointers would).
         if let Some(bc) = &vm.btf_ctx {
