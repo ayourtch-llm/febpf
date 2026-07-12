@@ -9,7 +9,7 @@ eBPF programs entirely in userland.
 
 > **Try it in your browser:** [febpf WebAssembly playground](https://stdio.be/febpf/)
 
-```
+```console
 $ febpf run examples/fib.s --ctx 0b
 r0 = 89 (0x59)   [interp, 1.9µs]
 
@@ -45,8 +45,10 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
   stats, and a listing annotated with the verifier's abstract state at
   every instruction — watch ranges tighten as null checks and bounds
   checks refine them.
-- **Interactive debugger**: breakpoints, single-stepping, register/stack/
-  memory inspection, map dumps, `trace_printk` capture, per-insn tracing.
+- **Interactive, source-aware debugger**: breakpoints, stepping, reverse
+  stepping/continue, watchpoints, register/stack/memory inspection, map dumps,
+  `trace_printk` capture, dataflow queries (`origin`/`when`/`who`), and C source
+  lines and typed globals from BTF debug info.
 - **Maps & helpers**: array/hash/per-CPU/LRU/ring/perf/stack/program maps,
   typed `ARRAY_OF_MAPS` nested lookup, and kernel-compatible helper ids
   (`map_lookup_elem`, `map_update_elem`, `map_delete_elem`,
@@ -70,18 +72,32 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
 - **Execution profiler**: `febpf profile` runs the program and prints a
   per-instruction heatmap (counts, %, log-scaled bar) plus hottest-block
   summary.
+- **Deterministic replay and race exploration**: self-contained `.febpf`
+  captures preserve program graphs, maps, context or packet input, and debugger
+  position for exact reproduction and time-travel debugging. `febpf race`
+  explores concurrent instances sharing maps and emits replayable schedules for
+  lost updates and other map-level races.
+- **Equivalence checking and optimization**: compare observable behavior
+  (return value, context/map mutations, output records and `trace_printk`) and
+  apply verifier-guided rewrites that are reverified and equivalence-checked.
 - **ELF loader** for real `clang -target bpf` objects: sections/symbols,
   `R_BPF_64_64` map relocations and `R_BPF_64_32` bpf-to-bpf calls (with
-  cross-`.text` subprogram stitching), legacy `maps` **and** minimal
-  BTF-defined `.maps`, plus global data sections (`.data`/`.bss`/`.rodata*`
+  cross-`.text` subprogram stitching), legacy `maps` **and** BTF-defined
+  `.maps`, plus global data sections (`.data`/`.bss`/`.rodata*`
   as initialized single-entry array maps, `.rodata` frozen — string literals,
   lookup tables and persistent globals just work). Tested against genuine
   clang output, including sparse static program-array and map-in-map initializers
   (`docs/specs/elf-loading.md`).
+- **BTF, CO-RE and XDP tooling**: all 19 BTF kinds, `.BTF.ext` function/line
+  info, source-level debugging, and CO-RE relocation against a supplied target
+  or the running kernel's BTF. XDP programs get verifier-tracked
+  `data`/`data_end` packet bounds and can run deterministically over a raw packet
+  or every packet in a classic pcap, with failing packets exportable as replay
+  files.
 
 ## CLI
 
-```
+```text
 febpf asm      prog.s -o prog.bin    # assemble to raw bytecode
 febpf disasm   prog.bin              # disassemble
 febpf verify   prog.s                # run the verifier, report stats
@@ -91,7 +107,19 @@ febpf run      prog.s [--ctx <hex|@file>] [--no-verify] [--jit]
 febpf debug    prog.s                # interactive debugger
 febpf profile  prog.s                # per-instruction execution heatmap
 febpf bench    prog.s --iters 30000 [--jit]   # throughput (interp or JIT)
+febpf record   prog.s -o run.febpf   # capture input/state for deterministic replay
+febpf replay   run.febpf             # time-travel debug a captured execution
+febpf race     prog.s --procs 2      # explore shared-map interleavings
+febpf equiv    before.s after.s      # check observable equivalence
+febpf optimize prog.s -o smaller.bin # verifier-guided, checked optimization
+febpf conftest prog.s                # diff interpreter, JIT and real kernel
+febpf fuzz     --iters 1000          # differential interpreter/JIT fuzzer
+febpf vfuzz    --iters 1000          # verifier-frontier differential fuzzer
 ```
+
+ELF inputs can select a section with `--prog`; CO-RE accepts `--target-btf`.
+For XDP, use `--packet <file>` or `--pcap <file>`. Kernel differential modes
+require Linux privileges and otherwise report that they were skipped.
 
 ## Assembly syntax
 
@@ -121,14 +149,18 @@ miss:
 use febpf::{asm, Program, Vm, verifier::Config};
 
 let a = asm::assemble("r0 = 42\n exit").unwrap();
-let mut vm = Vm::new(Program { insns: a.insns, maps: a.maps }).unwrap();
+let mut vm = Vm::new(Program {
+    insns: a.insns,
+    maps: a.maps,
+    btf_ctx: None,
+}).unwrap();
 vm.verify(Config::default()).unwrap();      // kernel-style verification
 assert_eq!(vm.run(&mut []).unwrap(), 42);
 ```
 
 Custom helpers get bounds-checked memory access and a verifier signature:
 
-```rust
+```rust,ignore
 use febpf::helpers::{id, ArgKind, HelperSig, MemBus, RetKind};
 
 vm.user_helpers.register(
@@ -149,7 +181,7 @@ own tooling: step, inspect `regs`/`pc`, read memory.
 
 `febpf analyze` shows the abstract state the verifier proves at each insn:
 
-```
+```text
    0: r6 = *(u8 *)(r1)
       ; r1=ctx r6=scalar(u=[0,255] t=(v=0x0 m=0xff))
    2: if r6 == 0 goto +7 <10>
@@ -172,7 +204,7 @@ assembler or drop a clang `.o`, then verify / run / disassemble / analyze /
 step (and *un*-step). The x86-64 JIT is feature-gated off for this build
 (`default = ["jit"]`), so nothing pulls `asm!` into wasm.
 
-```
+```sh
 rustup target add wasm32-unknown-unknown
 cd web && make            # → web/dist/  (index.html, febpf.js, febpf.wasm)
 cd dist && python3 -m http.server 8000      # then open http://localhost:8000
@@ -211,18 +243,33 @@ including time-travel `rstep`.
 - **CI**: `.github/workflows/ci.yml` runs the suite, clippy (`-D warnings`) and
   the differential fuzzer on all three JIT platforms — each runner executes
   machine code generated for that exact CPU.
-- **ELF loading**: `docs/specs/elf-loading.md`.
-- **Not implemented (yet)**: full BTF (CO-RE, func/line info), kfuncs,
-  per-CPU/ringbuf map types, legacy packet-access instructions, aarch64/riscv
-  JIT backends.
+- **ELF/BTF/CO-RE loading**: `docs/specs/elf-loading.md` and
+  `docs/specs/core-relocations.md`.
+- **Known gaps**: kfuncs, dynptrs, spin locks, `bpf_loop`/iterators,
+  `R_BPF_64_ABS*` relocations, static multi-object linking, legacy
+  `ld_abs`/`ld_ind`, and a riscv64 JIT backend. XDP execution currently uses
+  the interpreter; `--jit` rejects it explicitly.
 
 ## Tests
 
-`cargo test` — 56 tests: ISA semantics (div/mod-by-zero, sign extension,
-byte swaps, atomics), verifier accept/reject cases, map round-trips,
-bpf-to-bpf calls, custom helpers, assembler/disassembler round-tripping,
-**JIT-vs-interpreter differential** tests, and **ELF loading** against real
-clang output (legacy `maps`, BTF `.maps`, cross-`.text` calls). The ELF
-tests consume committed `tests/*.o` fixtures without modifying them. To
+The current suite has **328 passing tests** with default features and **314**
+with `--no-default-features`, plus four intentionally ignored exhaustive
+soundness sweeps in each configuration. Coverage includes ISA semantics,
+verifier acceptance and rejection, abstract-operator soundness, maps/helpers,
+tail-call graphs, XDP, assembler/disassembler round-tripping, time travel,
+replay, race exploration, equivalence/optimization, **JIT-vs-interpreter
+differentials**, and **ELF/BTF/CO-RE loading** against genuine clang output.
+Privilege-gated tests additionally compare execution and verifier verdicts
+with the live Linux kernel when available.
+
+Run both supported configurations before submitting changes:
+
+```sh
+cargo test
+cargo test --no-default-features
+```
+
+ELF tests consume committed `tests/*.o` fixtures without modifying them. To
 explicitly rebuild fixtures with a BPF-capable clang, run
-`FEBPF_REGENERATE_FIXTURES=1 cargo test`.
+`FEBPF_REGENERATE_FIXTURES=1 cargo test`. The four larger soundness sweeps run
+separately with `cargo test --release -- --ignored soundness`.
