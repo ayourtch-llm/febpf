@@ -3,6 +3,101 @@
 _A note from past-me to future-me (or whoever picks this up). Read this before
 diving in; it's the context that isn't obvious from the code._
 
+## CONTEXT REFRESH PROTOCOL (use this autonomously)
+
+When the working context becomes long, stale, or difficult to navigate, do not
+wait for the user to request a refresh. Perform this exact protocol yourself:
+
+1. Finish or stop at a coherent boundary. Do not leave an edit half-applied or
+   a destructive command in flight. Check `git status --short`, active test or
+   build processes, and any active subagents/terminal collaborators.
+2. Rewrite the newest `ACTIVE RESUME CHECKPOINT` at the top of this file. It
+   must record the current commit and worktree state, what was actually
+   completed, exact validation/measurement results, decisions and invariants
+   that must survive the reset, unfinished investigation findings, and a
+   concrete ordered resume list. Preserve older checkpoints as history unless
+   they are actively misleading; clearly say which checkpoint is authoritative.
+3. If work is intentionally uncommitted, list every modified file and describe
+   the partial state precisely. Never call a dirty tree clean. Record whether
+   any subagent or external terminal session is still active and what it owns.
+4. Invoke the tttt MCP tool `tttt_clear_and_read_handoff_md` with
+   `filename: "HANDOFF.md"`. Do not substitute a shell reread: this MCP tool is
+   the operation that schedules `/clear` and then injects the instruction to
+   reread this file and continue.
+5. Return control and allow tttt's two-stage refresh to happen. After the
+   injected resume prompt arrives, reread this file from the beginning, verify
+   the recorded repository state against reality, and continue from only the
+   newest active checkpoint. Do not redo completed work or trust superseded
+   measurements from older sections.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-13 attach-target batch complete; authoritative)
+
+The production-corpus moonshot remains active. Explicit application attach
+targets are implemented and committed at `143e1ed` (`elf: support explicit
+attach targets`). At checkpoint-writing time that implementation was committed
+and the only worktree modification was this `HANDOFF.md` update. No Codex
+subagent or external terminal collaborator is active.
+
+Completed in `143e1ed`:
+
+- The public typed API is `AttachTarget { selector, function }` with exact
+  `AttachTargetSelector::Program` and `::Section` variants, consumed through
+  `load_with_target_btf_and_attach_targets`. The old
+  `load_with_target_btf` API remains the empty-override wrapper.
+- Overrides support fentry/fexit/fmod_ret function targets and are applied to
+  ctx prototype resolution without changing the original ELF section or
+  program identity. They require supplied target BTF and a real function
+  prototype. Missing BTF/function, empty function, duplicate, overlapping,
+  unmatched, non-BTF, iterator, and tp_btf misuse are fatal; no prototype is
+  fabricated and no explicit override can fall back to an untyped ctx.
+- The CLI accepts repeatable, unambiguous
+  `--attach-target program:<name>=<function>` and
+  `--attach-target section:<section>=<function>` options. The same overrides
+  are applied by both `programs` enumeration and selected-program loading.
+- The scanner mirrors evidence from the pinned BCC userspace loaders for
+  cachestat (`folio_account_dirtied`), ext4 fsdist/fsslower, and the documented
+  funclatency `vfs_read` case. It does not invent replacements for alternate
+  programs that their applications disable or for functions absent from the
+  running target BTF. Scanner tests prove propagation to enumeration and
+  verification and prove a missing real function cannot be counted as OK.
+- A self-contained committed `attach_target.o` fixture makes strict success
+  and validation tests independent of the running kernel BTF.
+
+Exact validation and measurement:
+
+- Default all-target tests: **442 passed + 4 ignored**.
+- Std interpreter-only all-target tests: **424 passed + 4 ignored**.
+- Strict Clippy passes in default and
+  `--no-default-features --features std` profiles.
+- True thumb no-std check and strict Clippy both pass.
+- `cargo build --release` passes.
+- `NO_BUILD=1 ./scripts/scan-corpus.sh`: all **114/114 families** and
+  **787/787 entries** load; **106/114 families** are compatible and **776/787
+  entries verify (98.6%)**, comprising 627 strict and 149 explicitly privileged
+  uninitialized-stack entries. This closes 21 application-retargeted entries
+  and four families versus 755/787 and 102/114.
+- Remaining outcomes are exactly four honest attach-environment gaps in three
+  families (`biostacks` done, numamove page entry/exit, readahead
+  `__page_cache_alloc`) and seven poisoned application-supplied CO-RE entries
+  in five Gadget families. Unsupported-map and unknown-helper histograms remain
+  empty; there is no ordinary verifier rejection.
+
+Immediate resume order:
+
+1. Commit this checkpoint/protocol documentation, verify a clean tree, then
+   expand the pinned source corpus with the next reproducible production
+   families. Rank blockers by distinct family first and entry count second.
+2. Preserve application/autoload and missing-target cases as explicit
+   environment/configuration outcomes. Do not retarget disabled numamove lanes,
+   invent a biostacks done function, or weaken poisoned CO-RE handling merely
+   to improve the percentage.
+3. For each new evidence-selected batch: implement the smallest general
+   kernel-compatible behavior, test verifier/interpreter/JIT/replay surfaces as
+   applicable, run the full matrix and scanner, commit, then widen again.
+4. When production compatibility is genuinely saturated (the user's target is
+   real-world 99.9%, not a denominator trick), continue with high-value items
+   from `IDEAS.md` using the same committed-batch discipline.
+
 ## ACTIVE RESUME CHECKPOINT (2026-07-12 22:50 UTC, read this first)
 
 The production-corpus moonshot is active. The portable CI closure remains
