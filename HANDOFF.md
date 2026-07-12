@@ -21,8 +21,8 @@ between corpus loops so they can interject.
 
 Current workspace state:
 
-- Branch `main` is 19 commits ahead of `origin/main` after the two outstanding
-  batches were committed.
+- Branch `main` is 20 commits ahead of `origin/main` after the README,
+  redirect-map, and rbpf-audit batches were committed.
 - `README.md` was committed as `f4b8cae`. It now
   documents current BTF/CO-RE/XDP/replay/race/equiv/optimizer functionality,
   fixes the `Program { btf_ctx: None }` example, expands the CLI list, updates
@@ -36,8 +36,8 @@ Current workspace state:
   absent in this checkout despite the historical note; do not treat any old
   object as proof that its source cache exists. The offline fetch rebuilt 56
   BCC objects, one Cilium fixture, and five xdp-tools objects (62 total).
-  The prior 57/57 baseline was measured before this lane; no expanded scan has
-  run yet.
+  The prior 57/57 baseline was measured before this lane; the expanded scan is
+  complete at 62/62.
 - The xdp-tools tag was verified remotely: annotated tag object `63a210f...`
   peels to the shallow checkout's commit `8fbad9f...`. The selected glob is
   `xdp-bench/*.bpf.c`; all five files compiled successfully using the added
@@ -55,9 +55,7 @@ Current workspace state:
 - The measured blocker batch is documented in `docs/specs/map-types-3.md` and
   covers distinct ELF/UAPI map kinds, generic array/hash-backed VM behavior,
   assembler keywords, raw kernel map creation constants, replay v1 kind codes,
-  and integration/replay tests. Targeted tests pass. Because the usage display
-  is inconsistent and warns that the limit may be stale, do not begin the
-  optional `docs/ideas.md` items until a fresh budget is clearly available.
+  and integration/replay tests. Targeted tests pass.
 - Final validation for this batch is green: default tests **330 passed + 4
   ignored**, `--no-default-features` **316 passed + 4 ignored**, clippy with
   `-D warnings` passes in both configurations, and `git diff --check` passes.
@@ -68,13 +66,11 @@ Current workspace state:
 
 The active plan is:
 
-1. Write the rbpf feature-parity matrix/spec using public documentation and
-   behavior only; do not copy rbpf code.
-2. Distinguish Linux eBPF semantic/tooling coverage from portable embedding
-   APIs before making any strict-superset claim.
-3. If bandwidth remains, choose one small, non-critical item from
+1. The rbpf feature-parity audit is complete in
+   `docs/specs/rbpf-feature-parity.md`; preserve its qualified claim language.
+2. If bandwidth remains, choose one small, non-critical item from
    `docs/ideas.md`; keep the corpus-driven production loop as the main thrust.
-4. Keep both feature configurations and clippy `-D warnings` green and commit
+3. Keep both feature configurations and clippy `-D warnings` green and commit
    coherent batches.
 
 The first new lane is `xdp-project/xdp-tools` pinned at release **v1.6.3**
@@ -85,7 +81,7 @@ contract in `docs/specs/corpus-tooling.md`: shallow, single branch, pinned,
 sequential, cached. Other candidates considered were Tracee and Inspektor
 Gadget; xdp-tools looked more self-contained and focused.
 
-rbpf audit so far (public docs for rbpf 0.4.1, published 2026-06-22):
+rbpf audit complete (public docs for rbpf 0.4.1, published 2026-02-06):
 
 - Reference: https://github.com/qmonnet/rbpf and
   https://docs.rs/rbpf/latest/rbpf/
@@ -93,24 +89,24 @@ rbpf audit so far (public docs for rbpf 0.4.1, published 2026-06-22):
   handling, safe JIT runtime faults, maps/helpers, tail calls, modern ISA,
   ELF/BTF/BTF.ext/CO-RE, x86-64 + AArch64 JITs, debugger/replay/race/equiv/
   optimizer tooling, and direct clang object support.
-- rbpf surfaces that need an honest matrix rather than a premature blanket
+- rbpf surfaces that prevent a blanket superset claim:
   superset claim: four VM input modes (raw packet, caller metadata buffer,
   fixed synthesized metadata buffer, no-data), replaceable verifier callback,
   arbitrary allowed-memory ranges, a fluent Rust instruction-builder API,
   `no_std` interpreter/assembler support, Windows interpreter support, and
   runtime program replacement. rbpf also documents x86-64 JIT only, unsafe JIT
   memory accesses, a simple non-kernel verifier, few built-in helpers, no
-  built-in maps, and no tail calls. Its docs list optional Cranelift
-  dependencies, so inspect current feature flags/source metadata before making
-  any JIT-backend comparison claim.
-- “Strict superset” must distinguish Linux eBPF semantics/tooling from portable
-  embedding APIs. Record evidence in a new spec/matrix (suggested:
-  `docs/specs/rbpf-feature-parity.md`). Do not implement cosmetic API parity
-  ahead of measured corpus blockers unless it closes a genuine capability gap.
+  built-in maps, and no tail calls. Version 0.4.1 has an optional `cranelift`
+  feature; the audit records its existence without inferring backend coverage
+  or safety from dependency metadata.
+- `docs/specs/rbpf-feature-parity.md` distinguishes Linux eBPF
+  semantics/tooling from portable embedding APIs and concludes that febpf is
+  materially broader on the former axis but is not a strict global superset.
+  Do not implement cosmetic API parity ahead of measured corpus blockers.
 
-Immediate resume action: write `docs/specs/rbpf-feature-parity.md` after
-checking rbpf's current public feature metadata. The corpus cache is already
-green at 62/62 and does not need another scan unless the implementation changes.
+Immediate resume action: pause for user direction or take one small optional
+item from `docs/ideas.md`. The corpus cache is green at 62/62 and does not need
+another scan unless the implementation changes.
 
 ## What this is
 
@@ -123,8 +119,8 @@ load-bearing constraint. Don't add any without a very good reason and the
 user's OK (raw Linux syscalls via `asm!` are used instead of libc — see the
 JIT's `sys` module).
 
-Everything works today: the full default-feature suite is **328 green + 4
-intentional heavy soundness sweeps ignored**; `--no-default-features` is **314
+Everything works today: the full default-feature suite is **330 green + 4
+intentional heavy soundness sweeps ignored**; `--no-default-features` is **316
 green + the same 4 ignored** (2026-07-12, after map-in-map support).
 `cargo clippy --all-targets -- -D warnings` is clean in both configs. **Keep
 BOTH configs green** — the JIT is now behind `default = ["jit"]`, so always
