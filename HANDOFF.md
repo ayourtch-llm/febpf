@@ -3,21 +3,24 @@
 _A note from past-me to future-me (or whoever picks this up). Read this before
 diving in; it's the context that isn't obvious from the code._
 
-## ACTIVE RESUME CHECKPOINT (2026-07-12 22:05 UTC, read this first)
+## ACTIVE RESUME CHECKPOINT (2026-07-12 22:27 UTC, read this first)
 
 The production-corpus moonshot is active. The portable CI closure remains
-fully green at `932060e`; local development has advanced through `d7c1bb7`.
+fully green at `932060e`; local development has advanced through `84b1970`.
 Do not resume from older 62/62 object-level or 600/785 entry-level claims:
 measurement is per ELF entry function and preserves static graph grouping.
 
-The worktree is clean. No Codex subagent is active. The Claude peer in the
-user's `tttt` session completed both the design audit and final adversarial
-review of the JMP32 batch with no blocking findings. Continue with one
-evidence-selected batch at a time and commit before widening scope.
+The worktree is clean. No Codex subagent is active. Claude is intentionally
+offline to conserve memory. A lightweight Codex subagent adversarially audited
+the HASH_OF_MAPS batch; its capacity-normalization, template-invariant,
+userspace-update/delete, and static-initializer findings were fixed before the
+batch was committed. Continue with one evidence-selected batch at a time and
+commit before widening scope.
 
 Completed and committed since the prior refresh:
 
 ```
+84b1970 maps: support hash-of-maps templates
 d7c1bb7 verifier: track 32-bit conditional bounds
 188e641 tracing: add deterministic pid namespace helper
 58bdecf tracing: implement variadic printk helper
@@ -31,24 +34,31 @@ f60e2f6 helpers: type iterator socket conversions
 
 Current measured corpus:
 
-- 114 pinned object families and 785 entry programs: BCC/libbpf-tools,
+- 114 pinned object families and 787 enumerable entry programs: BCC/libbpf-tools,
   libbpf-bootstrap, xdp-tools, Cilium fixture, and 39/39 production Inspektor
   Gadget v0.54.0 sources.
-- Latest stable full scan: **103/114 fully compatible families** and **626/785
-  verified entries (79.7%)**. All 785 entries load; one `HASH_OF_MAPS` family
-  still fails object-level map construction, so 113/114 families instantiate.
-- The unknown-helper histogram is now empty. Remaining buckets are five
-  `VERIFY-REJECT:other` families / 152 entries, five poisoned-CO-RE families /
-  seven entries, and one `HASH_OF_MAPS` load failure.
+- Latest stable full scan: **104/114 fully compatible families** and **628/787
+  verified entries (79.8%)**. All 787 entries load and all 114 families
+  instantiate; Gadget `traceloop` contributes the two newly enumerable entries.
+- The unsupported-map and unknown-helper histograms are now empty. Remaining
+  buckets are five `VERIFY-REJECT:other` families / 152 entries and five
+  poisoned-CO-RE families / seven entries.
 - The Gadget lane remains reproducible at manifest digest
   `cc4b5fdff7392995183181692f328dbb063356d8004bd88b5fdb96b9847bb62d`.
-- Default tests: **425 passed + 4 ignored**. Std interpreter-only: **407 passed
+- Default tests: **432 passed + 4 ignored**. Std interpreter-only: **414 passed
   + 4 ignored**. Both strict Clippy profiles and true thumb no-std check/Clippy
   are green. The last full GitHub portable matrix remains run `29207495214`;
   no new remote CI run has been claimed for the post-checkpoint commits.
 
 Important correctness and breadth now landed:
 
+- `HASH_OF_MAPS` preserves arbitrary hash key widths and typed nullable inner
+  lookups across verifier, interpreter/JIT, replay, assembler, and kernel map
+  creation. BTF-only anonymous inner templates are materialized explicitly;
+  Gadget `traceloop`'s anonymous `PERF_EVENT_ARRAY` template receives the same
+  dynamic defaults in VM and kernel paths. Safe userspace update/delete APIs
+  enforce template compatibility and kernel update modes. Static `values[]`
+  initializers work for four-byte keys and reject wider keys explicitly.
 - Iterator conversions #137-#139 require exact `sock_common` target-BTF input
   and return nullable exact TCP target types; standalone execution returns
   null rather than fabricating host or synthetic sockets.
@@ -76,12 +86,10 @@ Important correctness and breadth now landed:
 
 Immediate resume order:
 
-1. Add generalized `HASH_OF_MAPS` plus anonymous inner-map templates for
-   Gadget `traceloop`; do not silently coerce it to `ARRAY_OF_MAPS`.
-2. Design the explicit privileged uninitialized-stack verification policy for
+1. Design the explicit privileged uninitialized-stack verification policy for
    `snapshot_file`, `top_blockio`, and generated `trace_lsm` hooks. Strict must
    remain the default; differential-test bytes before changing corpus policy.
-3. Keep application-supplied/missing CO-RE targets (Gadget DNS/SNI/tcpdump,
+2. Keep application-supplied/missing CO-RE targets (Gadget DNS/SNI/tcpdump,
    tcpdrop/tcpretrans, missing fentry targets/socket BTF) classified as
    environment/configuration artifacts, not reasons to loosen verification.
 
