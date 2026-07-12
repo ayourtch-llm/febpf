@@ -1,7 +1,7 @@
 use febpf::insn::{class, mode, size, Insn};
 use febpf::builder::{Builder, MemSize};
 use febpf::verifier::{Config, LegacyPacketProfile};
-use febpf::{asm, disasm, MetadataLayout, Program, RegionAccess, Vm};
+use febpf::{asm, disasm, kbpf, MetadataLayout, Program, RegionAccess, Vm};
 
 fn program(source: &str) -> Program {
     let assembled = asm::assemble(source).expect("assembly failed");
@@ -176,6 +176,33 @@ fn rbpf_profile_supports_little_endian_dw_without_r6() {
 }
 
 #[test]
+fn rbpf_041_public_raw_vectors_match_all_legacy_encodings() {
+    let packet = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    ];
+    let cases = [
+        ("ldabsb 3\nexit", 0x33),
+        ("ldabsh 3\nexit", 0x4433),
+        ("ldabsw 3\nexit", 0x6655_4433),
+        ("ldabsdw 3\nexit", 0xaa99_8877_6655_4433),
+        ("r1 = 5\nldindb r1, 3\nexit", 0x88),
+        ("r1 = 5\nldindh r1, 3\nexit", 0x9988),
+        ("r1 = 4\nldindw r1, 1\nexit", 0x8877_6655),
+        ("r1 = 2\nldinddw r1, 3\nexit", 0xccbb_aa99_8877_6655),
+    ];
+    for (source, expected) in cases {
+        let mut vm = Vm::new(program(source)).unwrap();
+        vm.verify(Config {
+            ctx_size: packet.len(),
+            legacy_packet: LegacyPacketProfile::Rbpf041,
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(vm.run_raw(&mut packet.clone()).unwrap(), expected, "{source}");
+    }
+}
+
+#[test]
 fn rbpf_profile_preserves_r1_through_r5() {
     let source = "\
 r1 = 1
@@ -315,4 +342,95 @@ fn hybrid_jit_matches_interpreter_for_packet_load_and_oob_exit() {
     let error = jitted.run_raw_jit(&mut packet).unwrap_err();
     assert_eq!(error.pc, 0);
     assert!(error.to_string().contains("out of bounds"));
+}
+
+/// Compare Linux-profile legacy packet loads with the real socket-filter
+/// implementation. The febpf half always runs; only the raw `bpf(2)` oracle
+/// is privilege- and kernel-support-gated.
+#[test]
+fn linux_legacy_packet_loads_match_kernel_if_available() {
+    struct Case {
+        name: &'static str,
+        source: &'static str,
+        expected: u64,
+    }
+
+    let packet = [
+        0xff, 0x12, 0x34, 0x56, 0x78, 0xab, 0xcd, 0x80,
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0xbe, 0xef,
+    ];
+    let cases = [
+        Case {
+            name: "ABS W network byte order",
+            source: "r6 = r1\nldabsw 1\nexit",
+            expected: 0x1234_5678,
+        },
+        Case {
+            name: "IND H exact end",
+            source: "r6 = r1\nr2 = 14\nldindh r2, 0\nexit",
+            expected: 0xbeef,
+        },
+        Case {
+            name: "IND B",
+            source: "r6 = r1\nr2 = 5\nldindb r2, 2\nexit",
+            expected: 0x80,
+        },
+        Case {
+            name: "OOB implicit zero exit",
+            source: "r6 = r1\nr0 = 99\nldabsw 13\nr0 = 77\nexit",
+            expected: 0,
+        },
+    ];
+
+    let programs = cases.iter().map(|case| {
+        let program = program(case.source);
+        let config = Config {
+            ctx_size: packet.len(),
+            ctx_writable: false,
+            legacy_packet: LegacyPacketProfile::Linux,
+            ..Default::default()
+        };
+        let mut interpreted = Vm::new(program.clone()).unwrap();
+        interpreted.verify(config.clone()).unwrap();
+        let mut input = packet;
+        assert_eq!(interpreted.run_raw(&mut input).unwrap(), case.expected,
+            "{}: interpreter", case.name);
+        #[cfg(feature = "jit")]
+        {
+            let mut jitted = Vm::new(program.clone()).unwrap();
+            jitted.verify(config).unwrap();
+            let mut input = packet;
+            assert_eq!(jitted.run_raw_jit(&mut input).unwrap(), case.expected,
+                "{}: JIT", case.name);
+        }
+        program
+    }).collect::<Vec<_>>();
+
+    match kbpf::has_privilege() {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("skipped kernel half: no bpf privilege");
+            return;
+        }
+        Err(error) if error.is_unsupported() || matches!(error.errno, 22 | 95) => {
+            eprintln!("skipped kernel half: kernel BPF unavailable: {error}");
+            return;
+        }
+        Err(error) => panic!("kernel privilege probe failed: {error}"),
+    }
+
+    for (index, (case, program)) in cases.iter().zip(programs).enumerate() {
+        let mut log = String::new();
+        match kbpf::run_program(&program.insns, &[], &packet, Some(&mut log)) {
+            Ok(result) => assert_eq!(result as u64, case.expected, "{}: kernel", case.name),
+            Err(error) if index == 0 && (error.is_permission()
+                || error.is_unsupported() || matches!(error.errno, 22 | 95)) => {
+                eprintln!("skipped kernel half: legacy socket-filter loads unavailable: {error}\n{}",
+                    log.trim_end());
+                return;
+            }
+            Err(error) => panic!("{}: kernel execution failed: {error}\n{}",
+                case.name, log.trim_end()),
+        }
+    }
 }
