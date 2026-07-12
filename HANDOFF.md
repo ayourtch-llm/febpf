@@ -5,8 +5,9 @@ diving in; it's the context that isn't obvious from the code._
 
 ## ACTIVE RESUME CHECKPOINT (2026-07-12 20:05 UTC, read this first)
 
-The production-corpus moonshot is active. The iterator helper batch is clean
-and committed at `f1f8ff0` on top of the user's `39366b8` refresh checkpoint.
+The production-corpus moonshot is active. The tree is clean through `2fcc237`;
+the iterator helper batch is `f1f8ff0` on top of the user's `39366b8` refresh
+checkpoint.
 Do not resume from the older 62/62 object-level claim: measurement is now per
 ELF entry function and preserves static graph grouping.
 
@@ -17,6 +18,7 @@ time and commit before widening scope.
 Completed and committed in this wave:
 
 ```
+2fcc237 ci: isolate fixtures and preserve arm registers
 f1f8ff0 helpers: complete iterator output layer
 e811bb8 verifier: type kernel iterator contexts
 dae2029 loader: fix corpus-driven relocation and DCE cases
@@ -39,7 +41,7 @@ Current measured corpus:
 - The Gadget lane is reproducible: two offline rebuilds produced identical
   39-source/39-object manifest digest
   `cc4b5fdff7392995183181692f328dbb063356d8004bd88b5fdb96b9847bb62d`.
-- Default tests: **405 passed + 4 ignored**. Std interpreter-only: **388 passed
+- Default tests: **406 passed + 4 ignored**. Std interpreter-only: **388 passed
   + 4 ignored**. Both strict Clippy profiles are green; true thumb no-std
   check/Clippy, wasm/std, Windows/std, and shell syntax gates were green in
   the completed batches.
@@ -80,13 +82,15 @@ Immediate resume order:
 4. Treat missing fentry targets and Gadget application-supplied socket BTF as
    environment/configuration artifacts, not reasons to loosen verification.
 
-CI watch (not explained yet): GitHub runs at `23eef18` and `39366b8` reproduce
-the same failures. x86-64 Linux passes default JIT and fails interpreter-only;
-aarch64 Linux and macOS fail default JIT. Windows, wasm, and true no-std pass.
-Both exact Linux commands, including fixture regeneration followed by the
-interpreter-only pass and doctests, are green locally. Public annotations show
-only exit 101, so use the next pushed run or authenticated logs to identify the
-test name before changing CI or architecture code.
+CI failures were identified from the `27a3404` logs and fixed at `2fcc237`.
+Linux's JIT pass regenerated toolchain-specific committed objects, then the
+no-JIT pass consumed them; CI now checks for fixture deletion and restores the
+committed objects between passes. On aarch64, deferred rbpf-profile packet
+loads reloaded stale in-memory r1-r5 values without first spilling the live
+callee-saved registers; the classifier now spills r1-r6 before the trampoline.
+The classifier regression, exact regeneration/restore/no-JIT sequence, default
+Clippy, and aarch64 cross-check are green locally. The next pushed CI run is
+still required as the native aarch64 execution oracle.
 
 Privileged-kernel oracle result that changes the earlier audit:
 
