@@ -294,11 +294,13 @@ agent from the last checkpoint had died leaving only the btf.rs foundation
 uncommitted; it was salvaged, finished, reviewed and committed on main.
 Known deliberate divergences + replay-file limitation are in the spec §1/§3.
 
-**CURRENT NEXT OPTIONS:** exhaustive small-width operator soundness and the
-first XDP packet-access/pcap/replay slices are DONE (see LATEST above). The
-user explicitly parked the oside-backed web packet workbench for now. Good
-next technical continuations are: kernel `BPF_PROG_TEST_RUN` differential
-validation for XDP packets; XDP JIT ctx-load support; or another ranked item
+**CURRENT NEXT OPTIONS:** exhaustive small-width operator soundness, the first
+XDP packet-access/pcap/replay slices, and kernel `BPF_PROG_TEST_RUN`
+differential validation are DONE (see LATEST above). The kernel is only an
+oracle: `conftest --packet` compares both verifier verdicts, then the verdict
+and exact output bytes. The user explicitly parked the oside-backed web packet
+workbench for now. Good next technical continuations are: XDP JIT ctx-load
+support; or another ranked item
 from `docs/ideas.md` (extension-mechanism packaging, CI/LSP packaging,
 `snapshot-kernel`). Do not silently start the oside integration until the user
 unparks it. GPUs remain parked.
@@ -730,23 +732,19 @@ batch — item 1 of the previous list is DONE, `btf-ctx-pointers.md`):
 
 ## Known limitations / where to go next (roughly prioritized)
 
-1. **XDP kernel differential** — use `BPF_PROG_TEST_RUN` for XDP to compare
-   verifier verdicts, r0 verdicts and (where supported) output packet bytes
-   against the live kernel. This is the natural correctness follow-up to the
-   userspace pcap harness and fits febpf's differential-testing philosophy.
-2. **XDP web packet workbench** — parked by the user for now. When unparked,
+1. **XDP web packet workbench** — parked by the user for now. When unparked,
    add pcap upload/verdict table/click-to-debug/export `.febpf`; see LATEST's
    oside notes. Do not make febpf core depend on current oside.
-3. **XDP JIT execution** — interpreter is complete; `--jit` rejects XDP
+2. **XDP JIT execution** — interpreter is complete; `--jit` rejects XDP
    clearly. Teach the native/deferred path to synthesize full virtual packet
    addresses for u32 xdp_md data/data_end loads, then differential-test
    interpreter vs JIT across capture packets.
-4. **Real-world map/helper coverage** — still missing PROG_ARRAY/tail-calls,
+3. **Real-world map/helper coverage** — still missing PROG_ARRAY/tail-calls,
    maps-of-maps, SK/TASK/INODE_STORAGE, LPM_TRIE, sock/dev/xsk maps and many
    helpers. Re-run the pinned corpus before choosing a batch.
-5. **Verifier depth** — dynptr, spin locks, bpf_loop/iterators, linked scalar
+4. **Verifier depth** — dynptr, spin locks, bpf_loop/iterators, linked scalar
    ids. `vfuzz --kernel` (keep at 0 FEBPF-LAX) is the conformance check.
-6. **ELF/kfunc/legacy gaps** — `R_BPF_64_ABS*`, static multi-object linking,
+5. **ELF/kfunc/legacy gaps** — `R_BPF_64_ABS*`, static multi-object linking,
    kfuncs, and legacy `ld_abs`/`ld_ind`; add when real workloads demand them.
 
 ## Working style the user likes

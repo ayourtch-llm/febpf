@@ -737,10 +737,11 @@ fn run() -> Result<ExitCode, String> {
         && !matches!(
             o.cmd.as_str(),
             "asm" | "disasm" | "verify" | "analyze" | "dot" | "run" | "profile" | "record"
+                | "conftest"
         )
     {
         return Err(format!(
-            "{} does not support XDP packet context yet; use verify, analyze, run, or profile",
+            "{} does not support XDP packet context yet; use verify, analyze, run, profile, record, or conftest",
             o.cmd
         ));
     }
@@ -751,7 +752,7 @@ fn run() -> Result<ExitCode, String> {
         return cmd_optimize(&o, prog);
     }
     if o.cmd == "conftest" {
-        return conftest::conftest(&o, prog);
+        return conftest::conftest(&o, prog, xdp);
     }
     if o.cmd == "race" {
         return cmd_race(&o, prog);

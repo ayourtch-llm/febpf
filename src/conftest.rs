@@ -41,7 +41,10 @@ fn run_febpf(prog: &Program, ctx: &[u8]) -> Result<(u64, Option<u64>), String> {
     Ok((r_interp, r_jit))
 }
 
-pub fn conftest(o: &Opts, prog: Program) -> Result<ExitCode, String> {
+pub fn conftest(o: &Opts, prog: Program, xdp: bool) -> Result<ExitCode, String> {
+    if xdp {
+        return conftest_xdp(o, prog);
+    }
     let ctx = make_ctx(o)?;
 
     // febpf side (always available, unprivileged).
@@ -93,6 +96,133 @@ pub fn conftest(o: &Opts, prog: Program) -> Result<ExitCode, String> {
             Ok(ExitCode::from(3))
         }
     }
+}
+
+/// XDP conformance keeps the two verification decisions separate, then —
+/// only when both accept — compares verdict and exact output packet bytes.
+fn conftest_xdp(o: &Opts, prog: Program) -> Result<ExitCode, String> {
+    let input = crate::read_packet(o)?;
+
+    let mut vm = Vm::new(prog.clone())?;
+    let febpf_verify = vm.verify(crate::verifier_config(o, 24, true));
+    let febpf_run = match &febpf_verify {
+        Ok(_) => {
+            println!("febpf verifier : ACCEPT");
+            let mut packet = input.clone();
+            let retval = vm.run_xdp(&mut packet).map_err(|e| e.to_string())?;
+            println!(
+                "interp        : verdict {} ({retval}), output {} bytes",
+                crate::xdp_verdict(retval),
+                packet.len()
+            );
+            Some(kbpf::TestRun {
+                retval: retval as u32,
+                data_out: packet,
+            })
+        }
+        Err(e) => {
+            println!("febpf verifier : REJECT: {e}");
+            print!("{}", crate::explain(&prog.insns, e, o));
+            None
+        }
+    };
+
+    match kbpf::has_privilege() {
+        Ok(false) => {
+            println!("kernel verifier: unavailable (permission denied); run as root");
+            return Ok(ExitCode::from(2));
+        }
+        Err(e) => {
+            println!("kernel verifier: probe failed unexpectedly: {e}");
+            return Ok(ExitCode::from(2));
+        }
+        Ok(true) => {}
+    }
+
+    let mut log = String::new();
+    let kernel_prog = kbpf::load_xdp_program(&prog.insns, &prog.maps, Some(&mut log));
+    match (febpf_run, kernel_prog) {
+        (None, Err(e)) => {
+            println!("kernel verifier: REJECT: {e}");
+            print_kernel_log(&log);
+            println!("OK: both verifiers reject");
+            Ok(ExitCode::from(3))
+        }
+        (None, Ok(_)) => {
+            println!("kernel verifier: ACCEPT");
+            println!("MISMATCH: febpf rejects an XDP program accepted by the kernel");
+            print!("{}", disasm::disasm_program(&prog.insns));
+            Ok(ExitCode::from(1))
+        }
+        (Some(_), Err(e)) => {
+            println!("kernel verifier: REJECT: {e}");
+            print_kernel_log(&log);
+            println!("MISMATCH: febpf accepts an XDP program rejected by the kernel");
+            print!("{}", disasm::disasm_program(&prog.insns));
+            Ok(ExitCode::from(1))
+        }
+        (Some(febpf), Ok(kernel_prog)) => {
+            println!("kernel verifier: ACCEPT");
+            let kernel = match kernel_prog.test_run(&input) {
+                Ok(run) => run,
+                Err(e) => {
+                    println!("kernel test-run: failed: {e}");
+                    return Ok(ExitCode::from(3));
+                }
+            };
+            println!(
+                "kernel        : verdict {} ({}), output {} bytes",
+                crate::xdp_verdict(kernel.retval as u64),
+                kernel.retval,
+                kernel.data_out.len()
+            );
+            if febpf.retval != kernel.retval {
+                println!(
+                    "MISMATCH: kernel verdict {} != febpf verdict {}",
+                    kernel.retval, febpf.retval
+                );
+                print!("{}", disasm::disasm_program(&prog.insns));
+                return Ok(ExitCode::from(1));
+            }
+            if febpf.data_out != kernel.data_out {
+                match first_packet_difference(&febpf.data_out, &kernel.data_out) {
+                    Some(off) => println!(
+                        "MISMATCH: output packets first differ at byte {off}: febpf={:?}, kernel={:?}",
+                        febpf.data_out.get(off),
+                        kernel.data_out.get(off)
+                    ),
+                    None => unreachable!(),
+                }
+                println!(
+                    "output lengths: febpf={}, kernel={}",
+                    febpf.data_out.len(),
+                    kernel.data_out.len()
+                );
+                print!("{}", disasm::disasm_program(&prog.insns));
+                return Ok(ExitCode::from(1));
+            }
+            println!(
+                "OK: both verifiers accept; verdict and {} output packet bytes agree",
+                febpf.data_out.len()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+fn print_kernel_log(log: &str) {
+    if !log.trim().is_empty() {
+        println!("--- kernel verifier log ---\n{}", log.trim_end());
+    }
+}
+
+fn first_packet_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    let shared = a.len().min(b.len());
+    a[..shared]
+        .iter()
+        .zip(&b[..shared])
+        .position(|(x, y)| x != y)
+        .or((a.len() != b.len()).then_some(shared))
 }
 
 pub fn fuzz(o: &Opts) -> Result<ExitCode, String> {

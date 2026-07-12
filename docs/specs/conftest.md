@@ -3,6 +3,8 @@
 This document specifies `febpf conftest` and `febpf fuzz`: two tools that
 validate febpf's interpreter and JIT against each other and, when privileges
 allow, against the **real Linux kernel** via the `bpf(2)` syscall.
+For XDP, `conftest --packet` independently compares both verifier verdicts,
+then the XDP return verdict and exact output packet bytes.
 
 > Status: see the STATUS section at the bottom of this file.
 
@@ -40,9 +42,12 @@ Commands used (`enum bpf_cmd` ordinals, stable UAPI):
 | `BPF_PROG_LOAD`     | 5  | load + verify a program |
 | `BPF_PROG_TEST_RUN` | 10 | run the loaded program on supplied input |
 
-Program type used: `BPF_PROG_TYPE_SOCKET_FILTER` (value `1`) — loadable and
-`TEST_RUN`-able without attaching to anything, and its `TEST_RUN` returns the
-program's `r0` (truncated to `u32`) which is exactly what we diff against.
+Program types used:
+
+- `BPF_PROG_TYPE_SOCKET_FILTER` (value `1`) for ordinary conformance runs.
+- `BPF_PROG_TYPE_XDP` (value `6`) for packet-context programs. XDP TEST_RUN
+  returns `r0` as `retval` and copies the possibly-mutated packet to
+  `data_out`; `data_size_out` is read back and bounds-checked.
 
 ### 1.1 `BPF_PROG_LOAD` field offsets (bytes, from start of the union)
 
@@ -109,6 +114,25 @@ log_size/log_buf to capture the kernel verifier's rejection reason.
 For `SOCKET_FILTER`, `TEST_RUN` builds an `skb` from `data_in`; the kernel
 requires `data_size_in >= ETH_HLEN` (14). We always pass at least 16 bytes of
 input (zero-padded when the caller gives less).
+
+XDP receives the exact packet without padding. Both the attr and output packet
+buffers retain mutable Rust pointer provenance across the syscall because the
+kernel writes through both.
+
+### 1.5 XDP differential sequence
+
+`febpf conftest --packet frame.bin program.bpf.o` treats the kernel strictly as
+an oracle; it does not replace febpf verification or execution:
+
+1. Verify with febpf's `Config::xdp`, preserving its rejection trace.
+2. When accepted, execute with `Vm::run_xdp` and retain the mutated packet.
+3. Independently load as `BPF_PROG_TYPE_XDP` and compare verifier verdicts.
+4. When both accept, TEST_RUN the original packet and compare `retval` plus
+   every output byte.
+
+A mismatch prints the first differing byte and both lengths. Exit code `1`
+identifies either verifier or output disagreement; `2` remains unavailable
+kernel access; `3` means rejection/test-run failure without a verdict mismatch.
 
 ---
 
@@ -211,10 +235,10 @@ program via `disasm::disasm_program` so it is immediately replayable with
 
 ## 5. Module layout
 
-- `src/kbpf.rs` — raw `bpf(2)` wrapper (`sys_bpf`), the `attr` byte-buffer
-  builder, capability probe, `map_create`/`map_update`/`prog_load`/`test_run`,
-  and a `run_program` convenience that loads a `Program` (creating maps,
-  rewriting lddw) and test-runs it. Guarded to x86-64 Linux; a stub elsewhere.
+- `src/kbpf.rs` — raw `bpf(2)` wrapper (`sys_bpf`), capability probe, map
+  handling, typed socket-filter/XDP load paths, and TEST_RUN output capture.
+  `KernelProgram` keeps rewritten map fds alive through execution. Guarded to
+  x86-64 Linux; a stub elsewhere.
 - `src/fuzz.rs` — SplitMix64 PRNG and the conservative program generator, plus
   the fuzz driver (`interp` vs `jit` vs optional `kernel`).
 - `main.rs` — `conftest` and `fuzz` subcommands + CLI flags.
@@ -245,6 +269,14 @@ program via `disasm::disasm_program` so it is immediately replayable with
   contract above.
 - `tests/conftest.rs` — probe/skip kernel tests + always-on interp-vs-JIT
   differential.
+
+**XDP extension (2026-07-12):** `conftest --packet` performs independent
+febpf/kernel XDP verification and, on mutual acceptance, compares verdict plus
+output packet. An always-on regression proves febpf verifier-backed mutation;
+the privilege-gated regression requires exact kernel TEST_RUN agreement.
+Validated as root on this host: the bounded packet writer was accepted by both
+verifiers, returned `XDP_PASS` from both engines, and produced byte-identical
+mutated output through both the regression test and the end-to-end CLI.
 
 **Validated:** interp-vs-JIT agree over tens of thousands of generated
 programs (fuzzer + unit test + integration test). The fuzzer already caught one

@@ -50,7 +50,12 @@ virtual addresses when the ABI's 32-bit `data` fields are loaded. Packet
 writes are copied back to the caller on exit or runtime error.
 
 This slice covers verifier semantics, deterministic interpreter execution,
-automatic ELF program-type selection, raw packet-file CLI runs, and a
-pcap-in/verdict-out harness, and selected-packet `.febpf` replay/debugging. JIT
-execution and kernel `BPF_PROG_TEST_RUN` differential validation are follow-up
-layers.
+automatic ELF program-type selection, raw packet-file CLI runs, a
+pcap-in/verdict-out harness, selected-packet `.febpf` replay/debugging, and
+kernel differential validation. `febpf conftest --packet frame.bin prog.bpf.o`
+compares febpf and kernel verifier verdicts independently, then compares XDP
+verdict and exact mutated output bytes through `BPF_PROG_TEST_RUN`. The kernel
+is only an oracle: febpf verification, rejection explanations, and
+`Vm::run_xdp` remain the userspace side of the comparison.
+
+JIT execution remains a follow-up layer.

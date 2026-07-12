@@ -11,6 +11,28 @@ use febpf::fuzz::{
 };
 use febpf::insn::Insn;
 use febpf::kbpf;
+use febpf::{asm, verifier, Program, Vm};
+
+fn xdp_byte_writer() -> Program {
+    let assembled = asm::assemble(
+        "
+        r2 = *(u32 *)(r1 + 0)
+        r3 = *(u32 *)(r1 + 4)
+        r4 = r2
+        r4 += 1
+        if r4 > r3 goto out
+        *(u8 *)(r2 + 0) = 0xaa
+    out:
+        r0 = 2
+        exit",
+    )
+    .unwrap();
+    Program {
+        insns: assembled.insns,
+        maps: assembled.maps,
+        btf_ctx: None,
+    }
+}
 
 /// The capability probe must never panic and must return a definite answer.
 #[test]
@@ -69,6 +91,53 @@ fn kernel_roundtrip_if_privileged() {
     let retval = kbpf::run_program(&prog, &[], &[0u8; 16], Some(&mut log))
         .unwrap_or_else(|e| panic!("kernel run failed: {e}\nlog: {log}"));
     assert_eq!(retval, 42, "kernel retval mismatch");
+}
+
+/// The febpf half of the XDP differential remains an ordinary verifier-backed
+/// execution and is always tested, even on hosts without kernel BPF access.
+#[test]
+fn xdp_febpf_verifier_and_packet_output() {
+    let prog = xdp_byte_writer();
+    let mut vm = Vm::new(prog).unwrap();
+    vm.verify(verifier::Config {
+        ctx_size: 24,
+        ctx_writable: false,
+        xdp: true,
+        ..Default::default()
+    })
+    .expect("febpf XDP verifier rejected bounded packet write");
+    let mut packet = vec![1, 2, 3, 4];
+    assert_eq!(vm.run_xdp(&mut packet).unwrap(), 2);
+    assert_eq!(packet, [0xaa, 2, 3, 4]);
+}
+
+/// End-to-end XDP oracle check: both verifiers accept, and TEST_RUN returns
+/// the same verdict and mutated packet as febpf. Skipped without privilege.
+#[test]
+fn xdp_kernel_differential_if_privileged() {
+    if !matches!(kbpf::has_privilege(), Ok(true)) {
+        eprintln!("skipped: no bpf privilege");
+        return;
+    }
+    let prog = xdp_byte_writer();
+    let input = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+
+    let mut vm = Vm::new(prog.clone()).unwrap();
+    vm.verify(verifier::Config {
+        ctx_size: 24,
+        ctx_writable: false,
+        xdp: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut febpf_packet = input.clone();
+    let febpf_retval = vm.run_xdp(&mut febpf_packet).unwrap() as u32;
+
+    let mut log = String::new();
+    let kernel = kbpf::run_xdp_program(&prog.insns, &prog.maps, &input, Some(&mut log))
+        .unwrap_or_else(|e| panic!("kernel XDP run failed: {e}\nlog: {log}"));
+    assert_eq!(kernel.retval, febpf_retval, "XDP verdict mismatch");
+    assert_eq!(kernel.data_out, febpf_packet, "XDP output packet mismatch");
 }
 
 /// Differential fuzz against the real kernel when privileged: interp, JIT and

@@ -57,6 +57,7 @@ fn errno_str(e: i32) -> &'static str {
         22 => "EINVAL",
         28 => "ENOSPC",
         38 => "ENOSYS",
+        75 => "EOVERFLOW",
         _ => "?",
     }
 }
@@ -80,6 +81,9 @@ mod uapi {
     /// `BPF_PROG_TYPE_SOCKET_FILTER`: loadable and TEST_RUN-able unprivileged
     /// of attachment, and its TEST_RUN returns the program's `r0` as `retval`.
     pub const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
+    /// `BPF_PROG_TYPE_XDP`: direct packet access through `xdp_md.data` /
+    /// `data_end`, and TEST_RUN copies the possibly-mutated packet back.
+    pub const BPF_PROG_TYPE_XDP: u32 = 6;
     pub const BPF_MAP_TYPE_HASH: u32 = 1;
     pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
     pub const BPF_MAP_TYPE_PERF_EVENT_ARRAY: u32 = 4;
@@ -172,6 +176,9 @@ mod imp {
     fn ptr(v: &[u8]) -> u64 {
         v.as_ptr() as u64
     }
+    fn mut_ptr(v: &mut [u8]) -> u64 {
+        v.as_mut_ptr() as u64
+    }
 
     /// An owned kernel fd, closed on drop.
     pub struct Fd(pub i32);
@@ -194,16 +201,20 @@ mod imp {
         Ok(())
     }
 
-    /// `BPF_PROG_LOAD` a SOCKET_FILTER program. On rejection, if `log` is
-    /// `Some`, the kernel verifier's message is captured into it.
-    pub fn prog_load(insns: &[Insn], log: Option<&mut String>) -> KResult<Fd> {
+    /// `BPF_PROG_LOAD` with the selected program type. On rejection, if
+    /// `log` is `Some`, the kernel verifier's message is captured into it.
+    fn prog_load_type(
+        insns: &[Insn],
+        prog_type: u32,
+        log: Option<&mut String>,
+    ) -> KResult<Fd> {
         let code = encode_program(insns);
         let license = b"GPL\0";
         // Optional verifier-log buffer.
         let logbuf = vec![0u8; if log.is_some() { 16 * 1024 } else { 0 }];
 
         let mut a = [0u8; ATTR_SIZE];
-        put_u32(&mut a, 0, BPF_PROG_TYPE_SOCKET_FILTER);
+        put_u32(&mut a, 0, prog_type);
         put_u32(&mut a, 4, insns.len() as u32);
         put_u64(&mut a, 8, ptr(&code));
         put_u64(&mut a, 16, ptr(license));
@@ -219,6 +230,14 @@ mod imp {
             *dst = String::from_utf8_lossy(&logbuf[..end]).into_owned();
         }
         r.map(Fd)
+    }
+
+    pub fn prog_load(insns: &[Insn], log: Option<&mut String>) -> KResult<Fd> {
+        prog_load_type(insns, BPF_PROG_TYPE_SOCKET_FILTER, log)
+    }
+
+    pub fn prog_load_xdp(insns: &[Insn], log: Option<&mut String>) -> KResult<Fd> {
+        prog_load_type(insns, BPF_PROG_TYPE_XDP, log)
     }
 
     /// `BPF_MAP_CREATE` a map matching `def`. Returns the new map fd.
@@ -256,24 +275,42 @@ mod imp {
         call(BPF_MAP_UPDATE_ELEM, &mut a, "BPF_MAP_UPDATE_ELEM").map(|_| ())
     }
 
-    /// `BPF_PROG_TEST_RUN`. Returns the program's `retval` (its `r0` as u32).
-    pub fn test_run(prog_fd: i32, data_in: &[u8]) -> KResult<u32> {
-        // SOCKET_FILTER TEST_RUN needs at least ETH_HLEN (14) input bytes.
+    /// `BPF_PROG_TEST_RUN`. Returns `retval` and the exact output packet.
+    pub fn test_run(prog_fd: i32, data_in: &[u8], pad_socket_input: bool) -> KResult<TestRun> {
+        if data_in.len() > u32::MAX as usize {
+            return Err(KError {
+                errno: 7, // E2BIG
+                what: "BPF_PROG_TEST_RUN data_size_in".into(),
+            });
+        }
         let mut input = data_in.to_vec();
-        if input.len() < 16 {
+        // SOCKET_FILTER TEST_RUN needs at least ETH_HLEN (14) input bytes.
+        // XDP must see the caller's exact packet, including short packets.
+        if pad_socket_input && input.len() < 16 {
             input.resize(16, 0);
         }
-        let out = vec![0u8; input.len()];
+        let mut out = vec![0u8; input.len()];
         let mut a = [0u8; ATTR_SIZE];
         put_u32(&mut a, 0, prog_fd as u32);
         put_u32(&mut a, 8, input.len() as u32); // data_size_in
         put_u32(&mut a, 12, out.len() as u32); // data_size_out
         put_u64(&mut a, 16, ptr(&input)); // data_in
-        put_u64(&mut a, 24, ptr(&out)); // data_out
+        // The kernel writes through data_out. Preserve mutable provenance all
+        // the way to the syscall, just as `call` does for the attr itself.
+        put_u64(&mut a, 24, mut_ptr(&mut out)); // data_out
         put_u32(&mut a, 32, 1); // repeat
         call(BPF_PROG_TEST_RUN, &mut a, "BPF_PROG_TEST_RUN")?;
-        // retval is written back into the attr buffer at offset 4.
-        Ok(u32::from_le_bytes([a[4], a[5], a[6], a[7]]))
+        // retval and data_size_out are written back into the attr buffer.
+        let retval = u32::from_le_bytes([a[4], a[5], a[6], a[7]]);
+        let out_len = u32::from_le_bytes([a[12], a[13], a[14], a[15]]) as usize;
+        if out_len > out.len() {
+            return Err(KError {
+                errno: 75, // EOVERFLOW: successful syscall returned impossible size
+                what: "BPF_PROG_TEST_RUN data_size_out".into(),
+            });
+        }
+        out.truncate(out_len);
+        Ok(TestRun { retval, data_out: out })
     }
 }
 
@@ -306,18 +343,47 @@ mod imp {
     pub fn prog_load(_insns: &[Insn], _log: Option<&mut String>) -> KResult<Fd> {
         Err(unsupported("BPF_PROG_LOAD"))
     }
+    pub fn prog_load_xdp(_insns: &[Insn], _log: Option<&mut String>) -> KResult<Fd> {
+        Err(unsupported("BPF_PROG_LOAD"))
+    }
     pub fn map_create(_def: &MapDef) -> KResult<Fd> {
         Err(unsupported("BPF_MAP_CREATE"))
     }
     pub fn map_update(_fd: i32, _key: &[u8], _value: &[u8]) -> KResult<()> {
         Err(unsupported("BPF_MAP_UPDATE_ELEM"))
     }
-    pub fn test_run(_prog_fd: i32, _data_in: &[u8]) -> KResult<u32> {
+    pub fn test_run(
+        _prog_fd: i32,
+        _data_in: &[u8],
+        _pad_socket_input: bool,
+    ) -> KResult<TestRun> {
         Err(unsupported("BPF_PROG_TEST_RUN"))
     }
 }
 
 pub use imp::Fd;
+
+/// Result fields written back by `BPF_PROG_TEST_RUN`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestRun {
+    pub retval: u32,
+    pub data_out: Vec<u8>,
+}
+
+/// A loaded kernel program and the map fds its rewritten instructions refer
+/// to. Field order is intentional: the program closes before its maps.
+pub struct KernelProgram {
+    prog_fd: Fd,
+    _map_fds: Vec<Fd>,
+    xdp: bool,
+}
+
+impl KernelProgram {
+    /// Execute once through `BPF_PROG_TEST_RUN`.
+    pub fn test_run(&self, data_in: &[u8]) -> KResult<TestRun> {
+        imp::test_run(self.prog_fd.0, data_in, !self.xdp)
+    }
+}
 
 /// Does this process have the privilege to load BPF programs? Probes by
 /// loading a trivial program. Returns `Ok(true)` if yes, `Ok(false)` on a
@@ -345,16 +411,17 @@ pub fn verdict(insns: &[Insn], log: Option<&mut String>) -> KResult<()> {
     imp::prog_load(insns, log).map(|_fd| ())
 }
 
-/// Load a program (creating its maps and rewriting map-reference `lddw`
-/// instructions to kernel fds), TEST_RUN it on `data_in`, and return the
-/// kernel `retval`. The created fds live until the returned value drops — but
-/// since we only need `retval`, everything is closed before returning.
-pub fn run_program(
+/// The kernel XDP verifier's verdict for a map-free program.
+pub fn xdp_verdict(insns: &[Insn], log: Option<&mut String>) -> KResult<()> {
+    imp::prog_load_xdp(insns, log).map(|_fd| ())
+}
+
+fn load_program_type(
     insns: &[Insn],
     maps: &[MapDef],
-    data_in: &[u8],
+    xdp: bool,
     log: Option<&mut String>,
-) -> KResult<u32> {
+) -> KResult<KernelProgram> {
     // Create kernel maps and remember their fds by original map index.
     let mut map_fds: Vec<Fd> = Vec::with_capacity(maps.len());
     for def in maps {
@@ -381,24 +448,20 @@ pub fn run_program(
             match ins.src {
                 // src=1 (MAP_ID/MAP_FD): dst gets a map object pointer.
                 1 => {
-                    let fd = map_fds
-                        .get(m)
-                        .ok_or_else(|| KError {
-                            errno: 22,
-                            what: format!("lddw references unknown map {m}"),
-                        })?;
+                    let fd = map_fds.get(m).ok_or_else(|| KError {
+                        errno: 22,
+                        what: format!("lddw references unknown map {m}"),
+                    })?;
                     prog[pc].src = BPF_PSEUDO_MAP_FD;
                     prog[pc].imm = fd.0;
                 }
                 // src=2 (MAP_VALUE): dst gets a pointer to a map value; the
                 // second slot's imm carries the byte offset (kept as-is).
                 2 => {
-                    let fd = map_fds
-                        .get(m)
-                        .ok_or_else(|| KError {
-                            errno: 22,
-                            what: format!("lddw references unknown map {m}"),
-                        })?;
+                    let fd = map_fds.get(m).ok_or_else(|| KError {
+                        errno: 22,
+                        what: format!("lddw references unknown map {m}"),
+                    })?;
                     prog[pc].src = BPF_PSEUDO_MAP_VALUE;
                     prog[pc].imm = fd.0;
                 }
@@ -410,9 +473,48 @@ pub fn run_program(
         }
     }
 
-    let prog_fd = imp::prog_load(&prog, log)?;
-    let retval = imp::test_run(prog_fd.0, data_in)?;
-    drop(prog_fd);
-    drop(map_fds);
-    Ok(retval)
+    let prog_fd = if xdp {
+        imp::prog_load_xdp(&prog, log)?
+    } else {
+        imp::prog_load(&prog, log)?
+    };
+    Ok(KernelProgram {
+        prog_fd,
+        _map_fds: map_fds,
+        xdp,
+    })
+}
+
+/// Load an XDP program into the kernel, retaining all referenced map fds.
+pub fn load_xdp_program(
+    insns: &[Insn],
+    maps: &[MapDef],
+    log: Option<&mut String>,
+) -> KResult<KernelProgram> {
+    load_program_type(insns, maps, true, log)
+}
+
+/// Load a program (creating its maps and rewriting map-reference `lddw`
+/// instructions to kernel fds), TEST_RUN it on `data_in`, and return the
+/// kernel `retval`. The created fds live until the returned value drops — but
+/// since we only need `retval`, everything is closed before returning.
+pub fn run_program(
+    insns: &[Insn],
+    maps: &[MapDef],
+    data_in: &[u8],
+    log: Option<&mut String>,
+) -> KResult<u32> {
+    let prog = load_program_type(insns, maps, false, log)?;
+    prog.test_run(data_in).map(|run| run.retval)
+}
+
+/// Load and test-run an XDP program, returning its verdict and output packet.
+pub fn run_xdp_program(
+    insns: &[Insn],
+    maps: &[MapDef],
+    packet: &[u8],
+    log: Option<&mut String>,
+) -> KResult<TestRun> {
+    let prog = load_xdp_program(insns, maps, log)?;
+    prog.test_run(packet)
 }
