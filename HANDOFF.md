@@ -14,12 +14,134 @@ load-bearing constraint. Don't add any without a very good reason and the
 user's OK (raw Linux syscalls via `asm!` are used instead of libc — see the
 JIT's `sys` module).
 
-Everything works today: `cargo test` is 250 green (240 with
-`--no-default-features`, i.e. no JIT), `cargo clippy --all-targets` is 0
-warnings in both configs, release builds clean. **Keep BOTH configs green** —
-the JIT is now behind `default = ["jit"]`, so always run `cargo test` AND
+Everything works today: the full default-feature suite is **303 green + 4
+intentional heavy soundness sweeps ignored**; `--no-default-features` is **292
+green + the same 4 ignored** (2026-07-11, after the XDP work below).
+`cargo clippy --all-targets -- -D warnings` is clean in both configs. **Keep
+BOTH configs green** — the JIT is now behind `default = ["jit"]`, so always
+run `cargo test` AND
 `cargo test --no-default-features` (and clippy in both) before calling
 anything done.
+
+## LATEST (2026-07-11): verifier soundness + the XDP packet workbench foundation
+
+This is the current tip and the context a fresh agent is most likely to need.
+The work is committed linearly on `main`:
+
+```
+2ec0fef xdp: replay selected packets in time-travel debugger
+a4b83d2 xdp: run classic pcap captures with verdicts
+86fac0b xdp: recognize ELF programs and run packet files
+a4b7857 xdp: verify and execute bounded packet access
+426ea87 verifier: fix 3 soundness bugs found by new exhaustive operator harness
+25414e7 verifier: extract analyze_cond_jmp + pub(crate) transfer-function hooks
+```
+
+The old Claude worktree `.claude/worktrees/agent-aee527c2832b79ec3` was
+successfully rescued: its two commits were rebased onto `main`, validated, and
+integrated. Its branch still points at `426ea87`; it is no longer ahead of
+`main` and contains no unique work.
+
+### Exhaustive verifier-operator soundness (DONE)
+
+`src/soundness.rs` runs the production 64-bit tnum/scalar/branch operators on
+exhaustively enumerable small windows placed at low, u64 top, i64/i32 sign,
+and u32 truncation boundaries. The exact obligation and inventory are in
+`docs/specs/operator-soundness.md`. Default tests stay fast; four larger w=8/
+w=4 sweeps are ignored and run with:
+
+```
+cargo test --release -- --ignored soundness
+```
+
+The first run found and fixed three real bugs, each with program-level
+regressions in `tests/integration.rs`: signed JMP32 decisions/refinement were
+using zero-extended bounds, ALU32 signed div/mod constant folding used i64
+semantics, and `Scalar::sync()` was not idempotent. `sync()` now reaches a
+fixpoint; signed JMP32 uses a sign-extended view and maps refinement back.
+
+### XDP verifier model (DONE, first useful slice)
+
+Read `docs/specs/xdp-packet-access.md` before extending this. `Config::xdp`
+turns `r1` into a read-only `struct xdp_md` context: u32 loads at offset 0/4
+produce `PtrKind::Packet { range }` and `PtrKind::PacketEnd`. Packet pointers
+start with range 0. Unsigned relational comparisons against data_end refine
+the safe successor with the exact proven prefix; the proof propagates through
+register aliases and stack spills. Loads/stores must fit entirely in that
+prefix. Inclusive/strict forms and both operand orders are handled.
+
+Runtime packet bytes live in a dedicated `Region::Packet` using the normal
+`handle << 32 | offset` safety model. Never put host packet pointers in guest
+registers. Because the kernel ABI exposes `xdp_md.data`/`data_end` as u32 but
+febpf handles are 64-bit, verified XDP ctx loads synthesize the full virtual
+addresses at the interpreter load boundary. `Vm::prepare_xdp()` installs a
+packet for debugger/replay use; `Vm::run_xdp(&mut packet)` runs it and copies
+packet writes back. Packet backing is included in `Snapshot`, so reverse
+execution rewinds packet writes as well as ctx/maps/stack.
+
+Known limitation: XDP execution is interpreter-only. The CLI rejects
+`--jit` clearly; JIT support needs the XDP ctx-load synthesis represented in
+the JIT path. This is a performance limitation, not a verifier/runtime gap.
+
+### ELF, raw packet and pcap CLI (DONE)
+
+`LoadedProgram::xdp` recognizes entry sections named exactly `xdp` or
+`xdp/*`; the CLI automatically verifies them with XDP rules. `--packet` also
+selects XDP for assembler/raw programs. Examples:
+
+```
+febpf verify program.bpf.o
+febpf run --packet frame.bin program.bpf.o
+febpf run --pcap traffic.pcap program.bpf.o
+```
+
+`src/pcap.rs` is a zero-dependency classic-pcap parser: both byte orders,
+micro/nanosecond timestamp magics, strict truncation/snaplen checks, explicit
+pcapng rejection. One VM is reused across capture records so maps persist.
+The CLI prints packet index/timestamp/length and named XDP verdicts
+ABORTED/DROP/PASS/TX/REDIRECT. The parser is pure slice code and therefore
+WASM-friendly.
+
+### Packet `.febpf` replay and time-travel debugging (DONE)
+
+Replay format version stays **1**: the sectioned format already promises
+unknown-tag skipping, so optional tag `0x09 PACKET` was added compatibly.
+Presence selects XDP verification/execution; CTX remains the synthetic
+24-byte xdp_md image. Existing v1 files without PACKET round-trip unchanged.
+Native CLI and playground/WASM replay both reconstruct the packet region.
+
+```
+febpf record program.bpf.o --packet frame.bin --stop-at 20 -o packet.febpf
+febpf record program.bpf.o --pcap traffic.pcap --packet-index 37 \
+  --stop-at 20 -o packet.febpf
+febpf replay packet.febpf --run   # reproduce verdict + determinism guard
+febpf replay packet.febpf         # open at cursor in time-travel debugger
+```
+
+`Replay::record_xdp`, `Replay::build_vm`, `playground::Session::from_replay`,
+and `Vm::prepare_xdp` are the load-bearing chain. Tests cover binary
+round-trip, reproduced r0, native replay CLI manually, and browser/playground
+debugger continuation on the recorded packet.
+
+### Parked web direction: “Wireshark + eBPF”, possibly using oside
+
+The user likes a browser packet workbench: upload XDP `.bpf.o` + pcap, table
+of packets/verdicts, protocol tree + hex view, click a packet to time-travel
+debug it, export `.febpf`. This is a strong next product/demo direction, but
+was explicitly **parked for a second** after investigation.
+
+Candidate decoder: https://github.com/ayourtch/oside (Apache-2.0, same
+author), a Scapy-inspired Rust layer stack with Ethernet/VLAN/ARP/IPv4/IPv6/
+TCP/UDP/ICMP/DNS/DHCP/GRE/VXLAN/Geneve/etc and Serde-friendly layer output.
+Do **not** add current oside directly to febpf core: its Cargo.toml has many
+unconditional dependencies (`serde`/`typetag`, `linkme`, rand, host MAC,
+crypto/SNMP, tracing...), likely WASM friction, and would violate febpf's
+zero-dependency load-bearing constraint. Preferred future shape: refactor
+oside upstream into a small decode-only/WASM-friendly feature or crate, then
+consume it only in a web companion layer. Especially valuable API addition:
+decoded fields should carry byte ranges, enabling protocol-field ⇄ hex bytes
+⇄ eBPF load/instruction/branch provenance. Keep febpf and oside separate at
+the library boundary.
 
 **DONE (2026-07-11, session 7): aarch64 Linux JIT + CI on all three
 platforms.** `.github/workflows/ci.yml` runs the suite, both feature configs,
@@ -172,13 +294,14 @@ agent from the last checkpoint had died leaving only the btf.rs foundation
 uncommitted; it was salvaged, finished, reviewed and committed on main.
 Known deliberate divergences + replay-file limitation are in the spec §1/§3.
 
-**QUEUED NEXT (user-approved):** an agent batch for exhaustive
-small-bit-width soundness checks of the verifier's abstract operators
-(tnum + ranges) — see "Formal methods" in `docs/ideas.md` item 1; verifier.rs
-is now conflict-free for it. After that, pick from the user-endorsed roadmap
-in `docs/ideas.md` (extension-mechanism packaging ≥ XDP/packet-access >
-CI/LSP packaging; `febpf snapshot-kernel` as migration phase 1 — note it can
-now also back `Region::KernelMem` with real struct contents; GPUs parked).
+**CURRENT NEXT OPTIONS:** exhaustive small-width operator soundness and the
+first XDP packet-access/pcap/replay slices are DONE (see LATEST above). The
+user explicitly parked the oside-backed web packet workbench for now. Good
+next technical continuations are: kernel `BPF_PROG_TEST_RUN` differential
+validation for XDP packets; XDP JIT ctx-load support; or another ranked item
+from `docs/ideas.md` (extension-mechanism packaging, CI/LSP packaging,
+`snapshot-kernel`). Do not silently start the oside integration until the user
+unparks it. GPUs remain parked.
 
 Merged earlier (sessions 1–3, all on main): map-types-2 (perf/cgroup/stack
 maps, tracing helpers #14–16/#35, get_stackid #27), probe_read family
@@ -214,10 +337,10 @@ get_func_ip #173, scan-corpus helper-name fix.
 | `asm.rs` | assembler for kernel "pseudo-C" syntax; `.map name kind key val entries` (kinds: hash/array/percpu_hash/percpu_array/lru_hash/ringbuf) |
 | `disasm.rs` | disassembler (round-trips with asm) |
 | `tnum.rs` | tracked-numbers (known-bits) abstract domain, mirrors kernel `tnum.c` |
-| `verifier.rs` (2806) | the big one: path-sensitive abstract interpreter; rejection explainer; per-PC joined abstract state (`pc_regs`/`regs_at`) used by the optimizer |
+| `verifier.rs` | the big one: path-sensitive abstract interpreter; rejection explainer; XDP packet/data_end range tracking; per-PC joined abstract state (`pc_regs`/`regs_at`) used by the optimizer |
 | `maps.rs` (516) | hash/array + per-CPU array/hash + LRU hash + ringbuf; stable value storage (safety note #5); record capture for ringbuf |
 | `helpers.rs` | helper id/name/signature registry + user-helper API |
-| `interp.rs` (1455) | the VM: `Vm`, `Machine`, virtual-address memory model, snapshot/restore (time travel), multi-instance activate/deactivate (race), JIT glue |
+| `interp.rs` | the VM: `Vm`, `Machine`, virtual-address memory model (including `Region::Packet`), snapshot/restore, multi-instance activate/deactivate, JIT glue |
 | `jit/*` | arch-independent frontend + `JitBackend` trait + x86-64 and aarch64 encoders (riscv64 TODO) |
 | `elf.rs` (1126) | ELF64 loader + BTF `.maps` + CO-RE relocation application; `map_kind`/`map_type_name` |
 | `btf.rs` (1002) | full BTF type graph (all 19 kinds), scales to vmlinux; `.BTF.ext` |
@@ -229,7 +352,8 @@ get_func_ip #173, scan-corpus helper-name fix.
 | `race.rs` (688) | deterministic concurrency race explorer (`febpf race`) |
 | `equiv.rs` (463) | observable-equivalence checker (`febpf equiv`) |
 | `optimize.rs` (648) | verifier-guided, equivalence-checked optimizer (`febpf optimize`) |
-| `replay.rs` (534) | `.febpf` shareable replay-file container (record/replay) |
+| `replay.rs` | `.febpf` shareable replay-file container, including optional XDP PACKET input |
+| `pcap.rs` | zero-dependency classic-pcap parser used by the XDP verdict harness |
 | `analysis.rs` | CFG, DOT export, stats, annotated listing, heatmap (source-aware) |
 | `debug.rs` (1301) | debugger REPL: breakpoints, time travel (rstep/rcontinue/goto), watchpoints, dataflow queries (origin/when/who), source stepping |
 | `playground.rs` (517) / `wasm.rs` (193) | pure-std playground API + hand-written WASM ABI (no wasm-bindgen) for `web/` |
@@ -410,12 +534,20 @@ buggy program replays identically under the debugger. Keep it that way.
 
 ## How to verify you haven't broken anything
 ```
-cargo test                     # 62 tests
-cargo clippy --all-targets     # must stay 0 warnings
+cargo test --all-targets
+cargo test --all-targets --no-default-features
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --no-default-features -- -D warnings
 cargo build --release
 ./target/release/febpf bench examples/sum_loop.s --iters 50000 --jit   # ~11 GIPS
-./target/release/febpf run tests/../examples/... # etc
+cargo test --release -- --ignored soundness     # optional heavy verifier sweep
 ```
+Latest host result after `2ec0fef`: default **303 passed / 4 ignored**;
+no-default-features **292 passed / 4 ignored**; both strict clippy invocations
+clean. The full tests may regenerate tracked `tests/*.o` fixtures with the
+host clang. Those are toolchain-byte differences, not intended edits: inspect
+and restore only the known regenerated fixtures before committing. Never
+delete or blindly rewrite user changes.
 The **differential tests are the safety net**: `tests/jit.rs` and the
 `jit_matches_interpreter_on_objects` test in `tests/elf.rs` run programs under
 both interpreter and JIT and require identical results. If you touch codegen,
@@ -489,7 +621,9 @@ what makes them feasible here when they aren't elsewhere:
    grows vecs per bounds-checked element — do NOT reintroduce
    `Vec::with_capacity(untrusted_count)` (that was a real multi-GB-alloc DoS
    the corruption fuzz test caught). Playground/WASM entry `febpf_dbg_replay`
-   opens a `.febpf` in the browser.
+   opens a `.febpf` in the browser. **Extended for XDP:** optional v1 PACKET
+   section; raw frame or selected pcap record reopens with data/data_end and
+   packet mutations intact in native and playground time-travel debuggers.
 9. **Verifier differential fuzzing** — `docs/specs/verifier-diff.md`. `febpf
    vfuzz [--frontier|--conservative] [--kernel]` diffs febpf-verifier vs
    kernel-verifier *verdicts* (not just execution). Four cells; the
@@ -596,19 +730,24 @@ batch — item 1 of the previous list is DONE, `btf-ctx-pointers.md`):
 
 ## Known limitations / where to go next (roughly prioritized)
 
-1. **Real-world map/helper coverage** — the corpus loop above is the active
-   thrust. After `feat/map-types-2`, the next histogram picks the batch. Still
-   missing: PROG_ARRAY/tail-calls, maps-of-maps, SK/TASK/INODE_STORAGE, LPM_TRIE,
-   sock/dev/xsk maps; the `probe_read` family and most of the ~200 helpers;
-   program-type-specific ctx (esp. XDP/TC **direct packet access** with
-   data/data_end — the biggest verifier-side gap).
-2. **aarch64 JIT backend** — the trait is ready, spec is written. The user wants
-   it; needs the macOS/arm64 exec-mem layer (see toolchain notes). Then riscv64.
-3. **Verifier depth** — dynptr, spin locks, bpf_loop/iterators, packet bounds.
-   `vfuzz --kernel` (keep at 0 FEBPF-LAX) is the conformance regression check.
-4. **ELF gaps** — `R_BPF_64_ABS*`, static linking of multiple objects.
-5. **kfuncs**, legacy packet-access (`ld_abs`/`ld_ind`) — deliberately
-   unsupported; add only if a real program needs them.
+1. **XDP kernel differential** — use `BPF_PROG_TEST_RUN` for XDP to compare
+   verifier verdicts, r0 verdicts and (where supported) output packet bytes
+   against the live kernel. This is the natural correctness follow-up to the
+   userspace pcap harness and fits febpf's differential-testing philosophy.
+2. **XDP web packet workbench** — parked by the user for now. When unparked,
+   add pcap upload/verdict table/click-to-debug/export `.febpf`; see LATEST's
+   oside notes. Do not make febpf core depend on current oside.
+3. **XDP JIT execution** — interpreter is complete; `--jit` rejects XDP
+   clearly. Teach the native/deferred path to synthesize full virtual packet
+   addresses for u32 xdp_md data/data_end loads, then differential-test
+   interpreter vs JIT across capture packets.
+4. **Real-world map/helper coverage** — still missing PROG_ARRAY/tail-calls,
+   maps-of-maps, SK/TASK/INODE_STORAGE, LPM_TRIE, sock/dev/xsk maps and many
+   helpers. Re-run the pinned corpus before choosing a batch.
+5. **Verifier depth** — dynptr, spin locks, bpf_loop/iterators, linked scalar
+   ids. `vfuzz --kernel` (keep at 0 FEBPF-LAX) is the conformance check.
+6. **ELF/kfunc/legacy gaps** — `R_BPF_64_ABS*`, static multi-object linking,
+   kfuncs, and legacy `ld_abs`/`ld_ind`; add when real workloads demand them.
 
 ## Working style the user likes
 - They're hands-on and technical (wrote the "fun challenge" framing, asked for
@@ -620,4 +759,4 @@ batch — item 1 of the previous list is DONE, `btf-ctx-pointers.md`):
   JIT I validated against the interpreter; when I built the ELF loader I
   validated against real clang + bpftool. Match that bar.
 
-— past-me, 2026-07-10
+— past-me, updated 2026-07-11
