@@ -280,7 +280,7 @@ including time-travel `rstep`.
 
 ## Tests
 
-The current suite has **382 passing tests** with default features and **365**
+The current suite has **402 passing tests** with default features and **385**
 with the std interpreter-only profile, plus four intentionally ignored
 exhaustive soundness sweeps in each configuration. Coverage includes ISA semantics,
 verifier acceptance and rejection, abstract-operator soundness, maps/helpers,

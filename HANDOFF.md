@@ -3,7 +3,99 @@
 _A note from past-me to future-me (or whoever picks this up). Read this before
 diving in; it's the context that isn't obvious from the code._
 
-## ACTIVE RESUME CHECKPOINT (2026-07-12, read this first)
+## ACTIVE RESUME CHECKPOINT (2026-07-12 16:00 UTC, read this first)
+
+The production-corpus moonshot is active. The tree is clean at `e811bb8`.
+Do not resume from the older 62/62 object-level claim: measurement is now per
+ELF entry function and preserves static graph grouping.
+
+Completed and committed in this wave:
+
+```
+e811bb8 verifier: type kernel iterator contexts
+dae2029 loader: fix corpus-driven relocation and DCE cases
+f2fae21 xdp: preserve program kind and metadata fields
+8207531 elf: support explicit map capacity overrides
+3203f79 helpers: add deterministic boot time
+40a98a2 corpus: add Gadget lane and preserve ELF entries
+4f953c0 corpus: measure every ELF entry program
+```
+
+Current measured corpus:
+
+- 114 pinned object families and 785 entry programs: BCC/libbpf-tools,
+  libbpf-bootstrap, xdp-tools, Cilium fixture, and 39/39 production Inspektor
+  Gadget v0.54.0 sources.
+- Latest stable full scan before iterator typing: **89/114 fully compatible
+  families** and **597/785 verified entries (76.1%)**, with all 785 entries
+  loading. Iterator typing advances five rejections to their next helpers but
+  does not yet increase these totals.
+- The Gadget lane is reproducible: two offline rebuilds produced identical
+  39-source/39-object manifest digest
+  `cc4b5fdff7392995183181692f328dbb063356d8004bd88b5fdb96b9847bb62d`.
+- Default tests: **402 passed + 4 ignored**. Std interpreter-only: **385 passed
+  + 4 ignored**. Both strict Clippy profiles are green; true thumb no-std
+  check/Clippy, wasm/std, Windows/std, and shell syntax gates were green in
+  the completed batches.
+
+Important correctness fixes already landed:
+
+- `R_BPF_64_32` REL call addends are preserved; seven previously false-OK BCC
+  entries had silently called the wrong first `.text` subprogram.
+- Multiple global `STT_FUNC` entries sharing one executable section are sliced
+  and enumerated individually while retaining their section-derived
+  `ProgramKind`.
+- Exact application map sizing (`--map-max-entries`) makes six Gadget families
+  and 42 entries compatible without a global silent default.
+- Helper #125 `ktime_get_boot_ns` uses a snapshotted logical boot clock and
+  removed 210 first-visible blockers, raising fully compatible families by 10.
+- XDP `xdp_md` scalar fields at offsets 12/16/20 are modeled; CO-RE flavored
+  enum enumerators match correctly; the narrow rodata-DCE call removal was
+  hardened so it cannot erase observable r1-r5 call clobbers.
+- Typed `iter/task`, `iter/task_file`, `iter/tcp`, and `iter/udp` contexts use
+  exact target-BTF layouts, nullable element pointers, and safe terminal
+  runtime records. Their next blockers are #127 `seq_write` (three entries),
+  #137 `skc_to_tcp_sock` (TCP), and #141 `get_task_stack` (task_iter).
+
+Immediate resume order:
+
+1. Finish the iterator helper layer. A partial #127/#141 implementation was
+   intentionally discarded at handoff because it had no completed tests.
+   Re-spec and implement exact BTF pointer signatures, VM-owned seq output,
+   snapshots, and deterministic task-stack behavior; then handle #137-#139
+   typed socket conversions separately.
+2. Close SKB/networking breadth. `ProgramKind` is ready. Implement an explicit
+   safe SKB packet/context adapter and helper #26 `skb_load_bytes` (now four
+   families), then #51 `redirect_map` (three families/13 entries), #189+#190
+   XDP load/store bytes, #23 redirect, and #39 pull-data with packet-pointer
+   invalidation. See the prior agent plan in conversation context if present.
+3. Implement sound 32-bit conditional range refinement (advise_seccomp and
+   ttysnoop), then generalized `HASH_OF_MAPS`/anonymous inner templates.
+4. Treat missing fentry targets and Gadget application-supplied socket BTF as
+   environment/configuration artifacts, not reasons to loosen verification.
+
+Privileged-kernel oracle result that changes the earlier audit:
+
+- On Linux 7.0.0-27 as root, the real `top_blockio` object loaded all three
+  programs, and 13 representative `trace_lsm` hooks verified despite partially
+  initialized stack bytes passed to `map_update_elem`/`ringbuf_output`.
+  febpf's 148 rejections are therefore false negatives, not source defects.
+- Primary kernel verifier source explains the policy: `env->allow_uninit_stack`
+  accepts `STACK_INVALID` reads for privileged programs. Do **not** globally
+  weaken febpf. Design an explicit verifier/CLI privilege policy (strict by
+  default) and remember febpf zeroes VM stack memory, then differential-test
+  semantic bytes and unchecked execution before applying it to the corpus.
+- Full `trace_lsm` kernel load eventually stopped at disabled hook
+  `bpf_lsm_vm_enough_memory` before instruction verification; that one stop is
+  an attach-environment artifact and does not invalidate the representative
+  verifier results.
+
+Workflow remains: implement one evidence-selected batch, commit immediately,
+`cargo build --release`, run `NO_BUILD=1 ./scripts/scan-corpus.sh`, and rank by
+distinct families first, entries second. Keep generated 147-hook LSM counts
+from masquerading as 147 independent workloads.
+
+## PRIOR CHECKPOINT (embedding and legacy/backend closure)
 
 Embedding parity and the legacy-opcode/Cranelift closure are complete through
 `b30a42a`. Commit the current documentation checkpoint separately.
