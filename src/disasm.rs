@@ -167,7 +167,22 @@ pub fn disasm_insn(insns: &[Insn], pc: usize) -> String {
                     _ => format!("r{dst} = {v} ll"),
                 }
             } else {
-                format!("<legacy ld 0x{:02x}>", ins.opcode)
+                let suffix = match ins.mem_size() {
+                    1 => "b",
+                    2 => "h",
+                    4 => "w",
+                    _ => "dw",
+                };
+                let text = if ins.mem_mode() == mode::IND {
+                    format!("ldind{suffix} r{src}, {imm}")
+                } else {
+                    format!("ldabs{suffix} {imm}")
+                };
+                if dst != 0 || off != 0 || (ins.mem_mode() == mode::ABS && src != 0) {
+                    format!("{text} <invalid reserved fields>")
+                } else {
+                    text
+                }
             }
         }
         class::LDX => {

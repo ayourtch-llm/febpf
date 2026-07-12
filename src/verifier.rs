@@ -34,6 +34,18 @@ use alloc::{
 use std::collections::HashMap as LookupMap;
 use core::fmt::Write as _;
 
+/// Semantics selected for deprecated `LD_ABS`/`LD_IND` packet loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LegacyPacketProfile {
+    /// Reject every legacy packet-load instruction.
+    #[default]
+    Disabled,
+    /// Linux B/H/W semantics: network byte order and implicit zero exit.
+    Linux,
+    /// rbpf 0.4.1 compatibility, including little-endian DW loads.
+    Rbpf041,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Size of the memory region r1 points to on entry (0 = no context).
@@ -59,6 +71,8 @@ pub struct Config {
     /// Treat exact 64-bit loads at caller-selected context offsets as packet
     /// start/end virtual pointers.
     pub metadata_layout: Option<crate::interp::MetadataLayout>,
+    /// Explicit semantics for deprecated legacy packet loads.
+    pub legacy_packet: LegacyPacketProfile,
 }
 
 impl Default for Config {
@@ -72,6 +86,7 @@ impl Default for Config {
             btf_ctx: None,
             xdp: false,
             metadata_layout: None,
+            legacy_packet: LegacyPacketProfile::Disabled,
         }
     }
 }
@@ -1645,6 +1660,13 @@ impl<'a> Verifier<'a> {
                     v.push(ins.src);
                 }
             }
+            class::LD if !ins.is_wide() => {
+                v.push(6);
+                if ins.mem_mode() == mode::IND {
+                    v.push(ins.src);
+                }
+            }
+            class::LD => {}
             class::LDX => v.push(ins.src),
             class::ST => v.push(ins.dst),
             class::STX => {
@@ -1830,7 +1852,9 @@ impl<'a> Verifier<'a> {
         if ins.dst >= NUM_REGS as u8 {
             return Err(bad(format!("invalid dst register r{}", ins.dst)));
         }
-        if ins.src >= NUM_REGS as u8 && ins.class() != class::LD {
+        if ins.src >= NUM_REGS as u8
+            && !(ins.class() == class::LD && ins.mem_mode() != mode::IND)
+        {
             return Err(bad(format!("invalid src register r{}", ins.src)));
         }
         match ins.class() {
@@ -1883,11 +1907,24 @@ impl<'a> Verifier<'a> {
                         }
                         s => Err(bad(format!("unsupported lddw pseudo src {s}"))),
                     }
-                } else {
+                } else if self.cfg.legacy_packet == LegacyPacketProfile::Disabled {
                     Err(bad(format!(
-                        "legacy packet access (opcode {:#04x}) is not supported",
-                        ins.opcode
+                        "legacy packet profile disabled for opcode {:#04x}", ins.opcode
                     )))
+                } else if !matches!(ins.mem_mode(), mode::ABS | mode::IND) {
+                    Err(bad(format!("invalid LD mode {:#x}", ins.mem_mode())))
+                } else if ins.mem_size() == 8
+                    && self.cfg.legacy_packet != LegacyPacketProfile::Rbpf041
+                {
+                    Err(bad("legacy packet DW loads require the Rbpf041 profile".into()))
+                } else if ins.dst != 0 || ins.off != 0 {
+                    Err(bad("legacy packet loads require dst=0 and off=0".into()))
+                } else if ins.mem_mode() == mode::ABS && ins.src != 0 {
+                    Err(bad("LD_ABS requires src=0".into()))
+                } else if ins.mem_mode() == mode::ABS && ins.imm < 0 {
+                    Err(bad("LD_ABS packet offset must be nonnegative".into()))
+                } else {
+                    Ok(())
                 }
             }
             class::LDX => match ins.mem_mode() {
@@ -3064,6 +3101,46 @@ impl<'a> Verifier<'a> {
                 Ok(StepOutcome::Next(vec![(pc + 1, state)]))
             }
             class::LD => {
+                if !ins.is_wide() {
+                    if self.cfg.legacy_packet == LegacyPacketProfile::Linux {
+                        let r6 = self.read_reg(&state, pc, 6)?;
+                        if !matches!(
+                            r6,
+                            RegState::Ptr(Ptr {
+                                kind: PtrKind::Ctx,
+                                off: 0,
+                                var,
+                            }) if var.is_const() && var.umin == 0
+                        ) {
+                            return Err(self.err(
+                                pc,
+                                "legacy packet access requires r6 to hold the packet context",
+                            ));
+                        }
+                    }
+                    if ins.mem_mode() == mode::IND {
+                        match self.read_reg(&state, pc, ins.src)? {
+                            RegState::Scalar(_) => {}
+                            RegState::Ptr(_) => {
+                                return Err(self.err(
+                                    pc,
+                                    format!("legacy packet index r{} must be a scalar", ins.src),
+                                ));
+                            }
+                            RegState::Uninit => unreachable!(),
+                        }
+                    }
+                    let f = state.cur_mut();
+                    if self.cfg.legacy_packet == LegacyPacketProfile::Linux {
+                        for r in 1..=5 {
+                            f.regs[r] = RegState::Uninit;
+                            f.scalar_ids[r] = 0;
+                        }
+                    }
+                    f.regs[0] = RegState::Scalar(Scalar::unknown());
+                    f.scalar_ids[0] = 0;
+                    return Ok(StepOutcome::Next(vec![(pc + 1, state)]));
+                }
                 // lddw variants
                 match ins.src {
                     pseudo::IMM64 => {

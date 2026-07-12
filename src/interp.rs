@@ -202,6 +202,8 @@ pub struct Vm {
     xdp: bool,
     /// Configurable pointer-bearing metadata layout armed by verification.
     metadata_layout: Option<MetadataLayout>,
+    legacy_packet: crate::verifier::LegacyPacketProfile,
+    legacy_packet_used: bool,
     tail_programs: Vec<TailProgram>,
 }
 
@@ -296,6 +298,8 @@ impl Vm {
             packet: Vec::new(),
             xdp: false,
             metadata_layout: None,
+            legacy_packet: crate::verifier::LegacyPacketProfile::Disabled,
+            legacy_packet_used: false,
             tail_programs: Vec::new(),
         };
 
@@ -411,6 +415,9 @@ impl Vm {
         if cfg.btf_ctx.is_none() {
             cfg.btf_ctx = prog.btf_ctx.clone();
         }
+        if cfg.legacy_packet != self.legacy_packet {
+            return Err("tail-call target legacy packet profile must match the entry program".into());
+        }
         let ok = crate::verifier::verify(&prog.insns, &prog.maps, self.user_helpers.sigs(), cfg)
             .map_err(|e| format!("tail-call target verification failed: {e}"))?;
         let exec = self.patch_bundle_program(&prog.insns)?;
@@ -425,6 +432,7 @@ impl Vm {
         }
         map.set_program(index, program_id)
             .map_err(|e| format!("cannot set {map_name}[{index}]: errno {}", -e))?;
+        let uses_legacy_packet = prog.insns.iter().any(is_legacy_packet_load);
         self.tail_programs.push(TailProgram {
             insns: prog.insns,
             exec,
@@ -432,6 +440,7 @@ impl Vm {
             #[cfg(feature = "jit")]
             jit: None,
         });
+        self.legacy_packet_used |= uses_legacy_packet;
         Ok(program_id)
     }
 
@@ -515,10 +524,13 @@ impl Vm {
         }
         let xdp = cfg.xdp;
         let metadata_layout = cfg.metadata_layout;
+        let legacy_packet = cfg.legacy_packet;
         let ok =
             crate::verifier::verify(&self.insns, &self.map_defs, self.user_helpers.sigs(), cfg)?;
         self.xdp = xdp;
         self.metadata_layout = metadata_layout;
+        self.legacy_packet = legacy_packet;
+        self.legacy_packet_used = self.insns.iter().any(is_legacy_packet_load);
         self.probe_mem = ok.probe_mem.clone();
         Ok(ok)
     }
@@ -544,6 +556,7 @@ impl Vm {
         }
         let xdp = cfg.xdp;
         let metadata_layout = cfg.metadata_layout;
+        let legacy_packet = cfg.legacy_packet;
         let ok = crate::verifier::verify(
             &self.insns,
             &self.map_defs,
@@ -559,6 +572,8 @@ impl Vm {
         .map_err(VerifyWithPolicyError::Policy)?;
         self.xdp = xdp;
         self.metadata_layout = metadata_layout;
+        self.legacy_packet = legacy_packet;
+        self.legacy_packet_used = self.insns.iter().any(is_legacy_packet_load);
         self.probe_mem = ok.probe_mem.clone();
         Ok(ok)
     }
@@ -578,6 +593,16 @@ impl Vm {
 
     pub fn insns(&self) -> &[Insn] {
         &self.insns
+    }
+
+    /// Legacy packet semantics armed by the most recent successful verify.
+    pub fn legacy_packet_profile(&self) -> crate::verifier::LegacyPacketProfile {
+        self.legacy_packet
+    }
+
+    /// Whether the entry/tail-call bundle contains a legacy packet load.
+    pub fn uses_legacy_packet(&self) -> bool {
+        self.legacy_packet_used
     }
 
     /// Records submitted/output to a named ringbuf map (for tests and tooling).
@@ -626,7 +651,16 @@ impl Vm {
 
     /// Execute the program with `ctx` as the memory r1 points to.
     pub fn run(&mut self, ctx: &mut [u8]) -> Result<u64, EbpfError> {
-        let mut m = Machine::new(self, ctx);
+        self.run_with_packet(ctx, LegacyPacketBacking::None)
+    }
+
+    fn run_with_packet(
+        &mut self,
+        ctx: &mut [u8],
+        packet: LegacyPacketBacking,
+    ) -> Result<u64, EbpfError> {
+        self.require_packet_backing(packet)?;
+        let mut m = Machine::new_with_packet(self, ctx, packet);
         loop {
             if let Some(ret) = m.step()? {
                 return Ok(ret);
@@ -648,10 +682,10 @@ impl Vm {
     /// the buffer's host pointer to the program. Writes made by the program are
     /// visible in `buffer` when execution returns.
     pub fn run_raw(&mut self, buffer: &mut [u8]) -> Result<u64, EbpfError> {
-        self.run(buffer)
+        self.run_with_packet(buffer, LegacyPacketBacking::Context)
     }
 
-    fn prepare_metadata(&self, metadata: &mut [u8], packet_base: u64) -> Result<(), EbpfError> {
+    fn prepare_metadata(&self, metadata: &mut [u8], packet_base: u64) -> Result<u32, EbpfError> {
         let fail = |msg: String| EbpfError { pc: 0, msg };
         let layout = self.metadata_layout.ok_or_else(|| fail(
             "metadata execution requires successful metadata-layout verification".into()))?;
@@ -678,15 +712,15 @@ impl Vm {
             .copy_from_slice(&packet_base.to_le_bytes());
         metadata[layout.data_end_offset()..layout.data_end_offset() + 8]
             .copy_from_slice(&packet_end.to_le_bytes());
-        Ok(())
+        Ok(index)
     }
 
     /// Execute with caller metadata containing a registered owned packet's
     /// virtual start/end addresses. The layout must first be armed by a
     /// successful verification.
     pub fn run_metadata(&mut self, metadata: &mut [u8], packet_base: u64) -> Result<u64, EbpfError> {
-        self.prepare_metadata(metadata, packet_base)?;
-        self.run(metadata)
+        let index = self.prepare_metadata(metadata, packet_base)?;
+        self.run_with_packet(metadata, LegacyPacketBacking::Owned(index))
     }
 
     /// Execute with a zero-filled fixed metadata buffer of the verified size.
@@ -703,8 +737,8 @@ impl Vm {
         metadata: &mut [u8],
         packet_base: u64,
     ) -> Result<u64, EbpfError> {
-        self.prepare_metadata(metadata, packet_base)?;
-        self.run_jit(metadata)
+        let index = self.prepare_metadata(metadata, packet_base)?;
+        self.run_jit_with_packet(metadata, LegacyPacketBacking::Owned(index))
     }
 
     /// JIT counterpart of [`Vm::run_fixed_metadata`].
@@ -720,7 +754,16 @@ impl Vm {
     /// the caller on both successful exit and runtime error.
     pub fn run_xdp(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
         let mut ctx = self.prepare_xdp(packet).map_err(|msg| EbpfError { pc: 0, msg })?;
-        let result = self.run(&mut ctx);
+        let result = self.run_with_packet(&mut ctx, LegacyPacketBacking::VmPacket);
+        packet.copy_from_slice(&self.packet);
+        result
+    }
+
+    /// JIT counterpart of [`Vm::run_xdp`].
+    #[cfg(feature = "jit")]
+    pub fn run_xdp_jit(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
+        let mut ctx = self.prepare_xdp(packet).map_err(|msg| EbpfError { pc: 0, msg })?;
+        let result = self.run_jit_with_packet(&mut ctx, LegacyPacketBacking::VmPacket);
         packet.copy_from_slice(&self.packet);
         result
     }
@@ -764,6 +807,22 @@ impl Vm {
     /// if the host architecture is unsupported.
     #[cfg(feature = "jit")]
     pub fn run_jit(&mut self, ctx: &mut [u8]) -> Result<u64, EbpfError> {
+        self.run_jit_with_packet(ctx, LegacyPacketBacking::None)
+    }
+
+    /// JIT counterpart of [`Vm::run_raw`].
+    #[cfg(feature = "jit")]
+    pub fn run_raw_jit(&mut self, buffer: &mut [u8]) -> Result<u64, EbpfError> {
+        self.run_jit_with_packet(buffer, LegacyPacketBacking::Context)
+    }
+
+    #[cfg(feature = "jit")]
+    fn run_jit_with_packet(
+        &mut self,
+        ctx: &mut [u8],
+        packet: LegacyPacketBacking,
+    ) -> Result<u64, EbpfError> {
+        self.require_packet_backing(packet)?;
         if let Err(e) = self.compile() {
             return Err(EbpfError { pc: 0, msg: e });
         }
@@ -773,7 +832,7 @@ impl Vm {
             .iter_mut()
             .map(|p| p.jit.take().unwrap())
             .collect();
-        let mut m = Machine::new(self, ctx);
+        let mut m = Machine::new_with_packet(self, ctx, packet);
         let r = loop {
             let native = if m.active_program == 0 {
                 &jit
@@ -799,6 +858,21 @@ impl Vm {
         }
         r
     }
+
+    fn require_packet_backing(&self, packet: LegacyPacketBacking) -> Result<(), EbpfError> {
+        if self.legacy_packet_used && packet == LegacyPacketBacking::None {
+            Err(EbpfError {
+                pc: 0,
+                msg: "legacy packet input unavailable for this execution adapter".into(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn is_legacy_packet_load(ins: &Insn) -> bool {
+    ins.class() == class::LD && matches!(ins.mem_mode(), mode::ABS | mode::IND)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -969,6 +1043,15 @@ pub struct Machine<'a> {
     jit_switch_pending: bool,
     active_program: u32,
     tail_call_count: u32,
+    legacy_packet_backing: LegacyPacketBacking,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyPacketBacking {
+    None,
+    Context,
+    VmPacket,
+    Owned(u32),
 }
 
 /// Memory bus for user helpers: bounds-checked access to the VM's regions.
@@ -1088,6 +1171,14 @@ impl<'a> Machine<'a> {
     }
 
     fn new(vm: &'a mut Vm, ctx: &'a mut [u8]) -> Machine<'a> {
+        Self::new_with_packet(vm, ctx, LegacyPacketBacking::None)
+    }
+
+    fn new_with_packet(
+        vm: &'a mut Vm,
+        ctx: &'a mut [u8],
+        legacy_packet_backing: LegacyPacketBacking,
+    ) -> Machine<'a> {
         vm.stack.iter_mut().for_each(|b| *b = 0);
         // BTF-typed programs: the ctx is an array of 8-byte arguments, and
         // pointer arguments must hold kernel-memory addresses. Prefill each
@@ -1122,6 +1213,7 @@ impl<'a> Machine<'a> {
             jit_switch_pending: false,
             active_program: 0,
             tail_call_count: 0,
+            legacy_packet_backing,
         }
     }
 
@@ -1635,7 +1727,79 @@ impl<'a> Machine<'a> {
             }
             class::LD => {
                 if !ins.is_wide() {
-                    return Err(self.err("legacy packet access is not supported"));
+                    if !matches!(ins.mem_mode(), mode::ABS | mode::IND)
+                        || (ins.mem_size() == 8
+                            && self.vm.legacy_packet
+                                != crate::verifier::LegacyPacketProfile::Rbpf041)
+                    {
+                        return Err(self.err("invalid legacy packet-load instruction"));
+                    }
+                    if self.vm.legacy_packet == crate::verifier::LegacyPacketProfile::Disabled {
+                        return Err(self.err("legacy packet profile is disabled"));
+                    }
+                    let effective = if ins.mem_mode() == mode::IND {
+                        i128::from(self.regs[src]) + i128::from(ins.imm)
+                    } else {
+                        i128::from(ins.imm)
+                    };
+                    let size = ins.mem_size();
+                    let range = u64::try_from(effective)
+                        .ok()
+                        .and_then(|off| usize::try_from(off).ok())
+                        .and_then(|start| start.checked_add(size).map(|end| (start, end)))
+                        .and_then(|(start, end)| {
+                            let packet: &[u8] = match self.legacy_packet_backing {
+                                LegacyPacketBacking::None => return None,
+                                LegacyPacketBacking::Context => self.ctx,
+                                LegacyPacketBacking::VmPacket => &self.vm.packet,
+                                LegacyPacketBacking::Owned(index) => self
+                                    .vm
+                                    .owned_regions
+                                    .get(index as usize)
+                                    .map(|region| region.bytes.as_slice())?,
+                            };
+                            (end <= packet.len()).then_some((start, end, packet))
+                        });
+                    let Some((start, end, packet)) = range else {
+                        return match self.vm.legacy_packet {
+                            crate::verifier::LegacyPacketProfile::Linux => {
+                                self.regs[0] = 0;
+                                for r in 1..=5 {
+                                    self.regs[r] = 0;
+                                }
+                                Ok(Some(0))
+                            }
+                            crate::verifier::LegacyPacketProfile::Rbpf041 => {
+                                Err(self.err("legacy packet access out of bounds"))
+                            }
+                            crate::verifier::LegacyPacketProfile::Disabled => unreachable!(),
+                        };
+                    };
+                    let bytes = &packet[start..end];
+                    self.regs[0] = match size {
+                        1 => bytes[0] as u64,
+                        2 if self.vm.legacy_packet
+                            == crate::verifier::LegacyPacketProfile::Linux =>
+                        {
+                            u16::from_be_bytes(bytes.try_into().unwrap()) as u64
+                        }
+                        4 if self.vm.legacy_packet
+                            == crate::verifier::LegacyPacketProfile::Linux =>
+                        {
+                            u32::from_be_bytes(bytes.try_into().unwrap()) as u64
+                        }
+                        2 => u16::from_le_bytes(bytes.try_into().unwrap()) as u64,
+                        4 => u32::from_le_bytes(bytes.try_into().unwrap()) as u64,
+                        8 => u64::from_le_bytes(bytes.try_into().unwrap()),
+                        _ => unreachable!("legacy load form checked by verifier"),
+                    };
+                    if self.vm.legacy_packet == crate::verifier::LegacyPacketProfile::Linux {
+                        for r in 1..=5 {
+                            self.regs[r] = 0;
+                        }
+                    }
+                    self.pc += 1;
+                    return Ok(None);
                 }
                 self.regs[dst] = wide_imm(self.current_exec(), self.pc);
                 self.pc += 2;

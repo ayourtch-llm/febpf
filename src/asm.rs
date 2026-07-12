@@ -511,6 +511,43 @@ pub fn assemble(source: &str) -> Result<Assembled, AsmError> {
                     }
                     Ok(())
                 }
+                Tok::Ident(w) if w.starts_with("ldabs") || w.starts_with("ldind") => {
+                    let (m, suffix) = if let Some(suffix) = w.strip_prefix("ldabs") {
+                        (mode::ABS, suffix)
+                    } else {
+                        (mode::IND, w.strip_prefix("ldind").unwrap())
+                    };
+                    let sz = match suffix {
+                        "b" => size::B,
+                        "h" => size::H,
+                        "w" => size::W,
+                        "dw" => size::DW,
+                        _ => return Err(format!("bad legacy packet-load mnemonic '{w}'")),
+                    };
+                    let src_reg = if m == mode::IND {
+                        let name = p.expect_ident()?;
+                        let (reg, is32) = parse_reg_name(&name)
+                            .ok_or(format!("bad packet index register '{name}'"))?;
+                        if is32 {
+                            return Err("packet index needs a 64-bit register (rN)".into());
+                        }
+                        p.expect_op(",")?;
+                        reg
+                    } else {
+                        0
+                    };
+                    let offset = p.number()?;
+                    let imm = i32::try_from(offset)
+                        .map_err(|_| format!("packet offset {offset} out of i32 range"))?;
+                    insns.push(Insn {
+                        opcode: class::LD | m | sz,
+                        dst: 0,
+                        src: src_reg,
+                        off: 0,
+                        imm,
+                    });
+                    Ok(())
+                }
                 Tok::Ident(w) if w == "exit" => {
                     insns.push(Insn {
                         opcode: class::JMP | jmp::EXIT,

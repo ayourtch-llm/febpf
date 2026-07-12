@@ -303,6 +303,36 @@ impl Builder {
         )
     }
 
+    /// Emit deprecated `LD_ABS` packet access. Prefer direct packet pointers
+    /// for new programs; verification requires an explicit legacy profile.
+    pub fn legacy_packet_abs(self, size: MemSize, offset: i32) -> Self {
+        self.push(
+            Insn {
+                opcode: class::LD | mode::ABS | size.opcode(),
+                dst: 0,
+                src: 0,
+                off: 0,
+                imm: offset,
+            },
+            &[],
+        )
+    }
+
+    /// Emit deprecated `LD_IND` packet access. Prefer direct packet pointers
+    /// for new programs; verification requires an explicit legacy profile.
+    pub fn legacy_packet_ind(self, size: MemSize, index: u8, offset: i32) -> Self {
+        self.push(
+            Insn {
+                opcode: class::LD | mode::IND | size.opcode(),
+                dst: 0,
+                src: index,
+                off: 0,
+                imm: offset,
+            },
+            &[index],
+        )
+    }
+
     pub fn store_imm(self, size: MemSize, base: u8, off: i16, imm: i32) -> Self {
         self.push(
             Insn {

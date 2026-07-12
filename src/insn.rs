@@ -74,8 +74,8 @@ pub mod size {
 /// Memory access mode (bits 5-7 of opcode for LD/LDX/ST/STX).
 pub mod mode {
     pub const IMM: u8 = 0x00; // lddw
-    pub const ABS: u8 = 0x20; // legacy packet access (unsupported)
-    pub const IND: u8 = 0x40; // legacy packet access (unsupported)
+    pub const ABS: u8 = 0x20; // legacy packet access at immediate offset
+    pub const IND: u8 = 0x40; // legacy packet access at register + immediate
     pub const MEM: u8 = 0x60; // regular load/store
     pub const MEMSX: u8 = 0x80; // sign-extending load
     pub const ATOMIC: u8 = 0xc0; // atomic operation

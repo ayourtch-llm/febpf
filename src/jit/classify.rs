@@ -147,10 +147,17 @@ pub fn deferred_regs(ins: Insn) -> DeferredRegs {
             }
             DeferredRegs::flow(spill, bit(dst))
         }
-        // `lddw` takes its value from the instruction stream. Legacy packet
-        // loads (non-wide LD) are rejected by the interpreter, so they never
-        // reach a register — but fall back to ALL for them anyway.
+        // `lddw` takes its value from the instruction stream.
         class::LD if ins.is_wide() => DeferredRegs::flow(0, bit(dst)),
+        // Legacy packet loads read r6 implicitly and, for IND, the encoded
+        // source register. They write r0 and clobber r1-r5.
+        class::LD => {
+            let mut spill = bit(6);
+            if ins.mem_mode() == mode::IND {
+                spill |= bit(src);
+            }
+            DeferredRegs::flow(spill, 0x3f)
+        }
         // dst = *(src + off)
         class::LDX => DeferredRegs::flow(bit(src), bit(dst)),
         class::ST | class::STX => {

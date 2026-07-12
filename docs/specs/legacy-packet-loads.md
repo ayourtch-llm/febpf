@@ -64,6 +64,7 @@ program and every tail-call target.
   test vectors deterministically on every host;
 - obtain the packet from febpf's explicit input adapter, so no meaningful
   `r6` value is required (matching rbpf's raw/fixed-metadata public behavior);
+- preserve `r1..r5`, matching rbpf 0.4.1's observable register behavior;
 - report invalid packet loads as an `EbpfError`, matching rbpf's checked
   interpreter behavior rather than Linux's implicit zero-return exit.
 
@@ -121,13 +122,13 @@ and liveness documentation but is not required or dereferenced. This permits
 rbpf's public raw-buffer examples, which execute `LD_ABS` without first
 initializing `r6`.
 
-On every successful load, write the unsigned result to all 64 bits of `r0`
-and set `r1..r5` to zero. Linux only promises that these registers are
-clobbered; deterministic zeroing follows febpf's existing helper/tail-call
-scrubbing convention. `IND` reads its source before scrubbing, including when
-the source is one of `r1..r5`. `r6..r10` otherwise remain unchanged. Verifier
-state after the instruction is `r0 = known scalar of the selected width`,
-`r1..r5 = unreadable/clobbered`, and preserved state for `r6..r10`.
+On every successful load, write the unsigned result to all 64 bits of `r0`.
+In `Linux`, set `r1..r5` to zero at runtime and mark them unreadable/clobbered
+in verifier state; deterministic zeroing implements Linux's permission to
+clobber while keeping replay stable. `IND` reads its source before scrubbing,
+including when the source is one of `r1..r5`. In `Rbpf041`, preserve `r1..r5`
+exactly, matching rbpf's observable behavior. `r6..r10` otherwise remain
+unchanged in both profiles.
 
 ## Data and byte-order semantics
 
@@ -330,7 +331,8 @@ and each one-byte OOB boundary. Assert:
 - Linux big-endian B/H/W results;
 - rbpf little-endian B/H/W/DW results matching its public vectors;
 - `IND` reads its source before `r1..r5` are zeroed;
-- `r0` zero-extension, `r1..r5 == 0`, and preservation of `r6..r10`;
+- `r0` zero-extension, Linux `r1..r5 == 0`, rbpf-profile preservation of
+  `r1..r5`, and preservation of `r6..r10`;
 - Linux implicit `Ok(0)` versus rbpf-profile `EbpfError`;
 - interpreter/JIT/debugger/snapshot agreement.
 

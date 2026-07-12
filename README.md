@@ -99,6 +99,10 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
   `data`/`data_end` packet bounds and can run deterministically over a raw packet
   or every packet in a classic pcap, with failing packets exportable as replay
   files.
+- **Legacy packet compatibility**: explicit Linux and rbpf 0.4.1 profiles for
+  deprecated `LD_ABS`/`LD_IND` programs, with kernel network-byte-order and
+  implicit-exit behavior kept separate from rbpf's little-endian `DW`
+  extension. All accesses remain bounds-checked under interpreter and JIT.
 
 ## CLI
 
@@ -276,7 +280,7 @@ including time-travel `rstep`.
 
 ## Tests
 
-The current suite has **357 passing tests** with default features and **342**
+The current suite has **368 passing tests** with default features and **352**
 with the std interpreter-only profile, plus four intentionally ignored
 exhaustive soundness sweeps in each configuration. Coverage includes ISA semantics,
 verifier acceptance and rejection, abstract-operator soundness, maps/helpers,
