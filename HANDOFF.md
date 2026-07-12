@@ -3,23 +3,24 @@
 _A note from past-me to future-me (or whoever picks this up). Read this before
 diving in; it's the context that isn't obvious from the code._
 
-## ACTIVE RESUME CHECKPOINT (2026-07-12 22:40 UTC, read this first)
+## ACTIVE RESUME CHECKPOINT (2026-07-12 22:50 UTC, read this first)
 
 The production-corpus moonshot is active. The portable CI closure remains
-fully green at `932060e`; implementation has advanced through `feedac1`.
+fully green at `932060e`; implementation has advanced through `5415b76`.
 Do not resume from older 62/62 object-level or 600/785 entry-level claims:
 measurement is per ELF entry function and preserves static graph grouping.
 
 The worktree is clean. No Codex subagent is active. Claude is intentionally
 offline to conserve memory. A lightweight Codex subagent adversarially audited
-the HASH_OF_MAPS batch; its capacity-normalization, template-invariant,
-userspace-update/delete, and static-initializer findings were fixed before the
-batch was committed. Continue with one evidence-selected batch at a time and
-commit before widening scope.
+the recent map, privileged-stack, and final ordinary-verifier batches. Its
+capacity normalization, template invariant, frame-reuse, replay provenance,
+and scanner-classification findings were fixed before their commits. Continue
+with one evidence-selected batch at a time and commit before widening scope.
 
 Completed and committed since the prior refresh:
 
 ```
+5415b76 skb: model protocol context field
 feedac1 verifier: add privileged stack policy
 84b1970 maps: support hash-of-maps templates
 d7c1bb7 verifier: track 32-bit conditional bounds
@@ -38,23 +39,30 @@ Current measured corpus:
 - 114 pinned object families and 787 enumerable entry programs: BCC/libbpf-tools,
   libbpf-bootstrap, xdp-tools, Cilium fixture, and 39/39 production Inspektor
   Gadget v0.54.0 sources.
-- Latest stable full scan: **107/114 compatible families** and **777/787
-  verified entries (98.7%)** under explicit per-object policy. The strict
-  baseline remains **104/114 families and 628/787 entries (79.8%)**; exactly
+- Latest stable full scan: **102/114 compatible families** and **755/787
+  verified entries (95.9%)** under explicit per-object policy. The strict
+  baseline is **99/114 families and 606/787 entries (77.0%)**; exactly
   three audited Gadget families / 149 entries are separately reported as
   `OK-PRIVILEGED-UNINIT`. All 787 entries load and all 114 families instantiate.
 - The unsupported-map and unknown-helper histograms are now empty. Remaining
-  buckets are two `VERIFY-REJECT:other` families / three entries and five
-  poisoned-CO-RE families / seven entries.
+  buckets are seven application-retargeting families / 25 entries labeled
+  `ENVIRONMENT:missing-attach-target`, plus five poisoned-CO-RE families /
+  seven entries. No ordinary verifier rejection remains.
 - The Gadget lane remains reproducible at manifest digest
   `cc4b5fdff7392995183181692f328dbb063356d8004bd88b5fdb96b9847bb62d`.
-- Default tests: **437 passed + 4 ignored**. Std interpreter-only: **419 passed
+- Default tests: **438 passed + 4 ignored**. Std interpreter-only: **420 passed
   + 4 ignored**. Both strict Clippy profiles and true thumb no-std check/Clippy
   are green. The last full GitHub portable matrix remains run `29207495214`;
   no new remote CI run has been claimed for the post-checkpoint commits.
 
 Important correctness and breadth now landed:
 
+- The skb context models `protocol` at offset 16 and derives its host-visible
+  `__be16` value from Ethernet packet input. This closes libbpf-bootstrap `tc`
+  across verifier, interpreter, and JIT. Exact selected-program warning
+  matching now separates every deliberate dummy fentry target from genuine
+  verifier outcomes instead of counting untyped fallback success as kernel
+  compatibility.
 - `UninitStackPolicy` is strict by default and has one explicit privileged
   `Allow` mode matching Linux `allow_uninit_stack` for direct and helper stack
   reads. The CLI never infers it from uid or `--kernel`. VM stack holes are
@@ -97,10 +105,13 @@ Important correctness and breadth now landed:
 
 Immediate resume order:
 
-1. Inspect the last three ordinary verifier rejections: BCC `fsslower`'s two
-   entries and libbpf-bootstrap `tc`'s one entry. Keep this separate from the
-   privileged policy and rank distinct-family correctness first.
-2. Keep application-supplied/missing CO-RE targets (Gadget DNS/SNI/tcpdump,
+1. Add an explicit application attach-target override (section/program to real
+   target-BTF function) and configure the seven BCC dummy-target families with
+   their actual filesystem/kernel functions. Never fabricate dummy prototypes.
+2. After the retargeted lane is measured, expand the pinned source corpus with
+   the next reproducible production families and rank new blockers by distinct
+   family first, entry count second.
+3. Keep application-supplied/missing CO-RE targets (Gadget DNS/SNI/tcpdump,
    tcpdrop/tcpretrans, missing fentry targets/socket BTF) classified as
    environment/configuration artifacts, not reasons to loosen verification.
 
