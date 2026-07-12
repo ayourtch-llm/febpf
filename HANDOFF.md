@@ -5,9 +5,16 @@ diving in; it's the context that isn't obvious from the code._
 
 ## ACTIVE RESUME CHECKPOINT (2026-07-12 16:00 UTC, read this first)
 
-The production-corpus moonshot is active. The tree is clean at `e811bb8`.
+The production-corpus moonshot is active. The tree is clean at `23eef18`.
 Do not resume from the older 62/62 object-level claim: measurement is now per
 ELF entry function and preserves static graph grouping.
+
+Refresh/pause note: the user explicitly stopped agent respawning immediately
+before this context refresh. The attempted iterator-helper restart was
+interrupted before it changed files. No subagent is active and the working
+tree is clean. After reading this handoff, wait for the user's direction; do
+not automatically restart #127/#141 implementation merely because it is first
+in the technical resume order below.
 
 Completed and committed in this wave:
 
