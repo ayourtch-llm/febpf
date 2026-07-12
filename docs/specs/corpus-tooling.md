@@ -134,10 +134,57 @@ need a repo-specific build system), and always pinned.
 
 ## Categorization taxonomy (`scan-corpus.sh`)
 
-For each `corpus/obj/*.o`, the scanner runs:
+### Program enumeration and aggregation contract
+
+Corpus measurement is per ELF entry program, not merely per object. Before
+verification the scanner runs:
 
 ```
-febpf verify <obj> --target-btf /sys/kernel/btf/vmlinux
+febpf programs <object> [--target-btf <path>]
+```
+
+`programs` is a stable, machine-readable interface. It writes one
+tab-delimited record per line, in the executable-section order preserved by
+the ELF loader:
+
+```
+program<TAB><zero-based-index><TAB><kind><TAB><section-name>
+link<TAB><map-name><TAB><map-slot><TAB><target-section-name>
+```
+
+`kind` is `xdp`, `socket`, or `other`. Names are copied verbatim from the
+loaded object; `/` and `:` are ordinary name bytes and are never separators.
+The loader already requires UTF-8 names. Tabs and newlines are rejected for
+this line-oriented interface rather than escaped ambiguously. Diagnostics and
+non-fatal loader warnings go to stderr, so successful stdout contains records
+only. A load failure is a non-zero exit and produces no partial records.
+
+The scanner invokes `verify --prog <exact-name>` once for every `program`
+record, using a tab-aware `read` loop rather than shell word splitting. A
+socket entry rejected specifically because legacy packet loads are disabled is
+retried with the Linux legacy profile and an empty, armed packet input. No
+other entry or rejection is retried with a compatibility profile.
+
+Reports retain two levels of aggregation:
+
+- an **entry program** is the verification unit and contributes one outcome;
+- an **object/family** is fully compatible only when enumeration succeeds and
+  every entry program, including the targets needed by its static links,
+  verifies.
+
+`link` records are graph edges, not additional entry programs. The report
+counts objects containing static graphs and link edges separately. A broken or
+unverifiable link makes the containing object incompatible, but never inflates
+the entry-program denominator. This prevents a large multi-hook object from
+being flattened into a misleading object success and prevents graph edges
+from being advertised as independent workloads.
+
+For each entry returned from a successfully enumerated
+`corpus/obj/*.o`, the scanner runs:
+
+```
+febpf verify <obj> --prog <exact-section-name> \
+    --target-btf /sys/kernel/btf/vmlinux
 ```
 
 and captures **combined stdout+stderr**. Classification keys off the output

@@ -16,6 +16,7 @@ usage: febpf <command> [options] <file>
 commands:
   asm <file.s> -o <out.bin>   assemble pseudo-C source to raw bytecode
   disasm <file>               disassemble a program
+  programs <file.o>           list ELF entry programs as tab-delimited records
   verify <file>               run the verifier and report the result
   analyze <file>              CFG, stats, and verifier-annotated listing
   dot <file>                  print the control-flow graph in Graphviz DOT
@@ -273,6 +274,77 @@ fn read_target_btf(path: &str) -> Result<Vec<u8>, String> {
 }
 
 const VMLINUX_BTF: &str = "/sys/kernel/btf/vmlinux";
+
+fn load_elf_object(path: &str, target_btf: Option<&str>) -> Result<febpf::elf::Object, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    if bytes.len() < 4 || &bytes[..4] != b"\x7fELF" {
+        return Err(format!("{path}: programs requires an ELF object"));
+    }
+    let target = match target_btf {
+        Some(p) => Some(read_target_btf(p)?),
+        None if febpf::elf::needs_kernel_btf(&bytes)
+            && std::path::Path::new(VMLINUX_BTF).exists() =>
+        {
+            Some(read_target_btf(VMLINUX_BTF)?)
+        }
+        None => None,
+    };
+    febpf::elf::load_with_target_btf(&bytes, target.as_deref())
+        .map_err(|e| format!("{path}: {e}"))
+}
+
+fn machine_field(value: &str) -> Result<&str, String> {
+    if value.contains(['\t', '\n', '\r']) {
+        Err("ELF name contains a tab or newline and cannot be listed safely".into())
+    } else {
+        Ok(value)
+    }
+}
+
+fn program_kind_name(name: &str, xdp: bool) -> &'static str {
+    if xdp {
+        "xdp"
+    } else if name == "socket"
+        || name.starts_with("socket/")
+        || name
+            .strip_prefix("socket")
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+    {
+        "socket"
+    } else {
+        "other"
+    }
+}
+
+fn program_kind(program: &febpf::elf::LoadedProgram) -> &'static str {
+    program_kind_name(&program.name, program.xdp)
+}
+
+fn cmd_programs(o: &Opts) -> Result<ExitCode, String> {
+    if o.prog.is_some() {
+        return Err("programs lists every entry; --prog is not applicable".into());
+    }
+    let obj = load_elf_object(&o.file, o.target_btf.as_deref())?;
+    for warning in &obj.warnings {
+        eprintln!("warning: {warning}");
+    }
+    for (index, program) in obj.programs.iter().enumerate() {
+        println!(
+            "program\t{index}\t{}\t{}",
+            program_kind(program),
+            machine_field(&program.name)?
+        );
+    }
+    for link in &obj.prog_array_inits {
+        println!(
+            "link\t{}\t{}\t{}",
+            machine_field(&obj.maps[link.map_index].name)?,
+            link.index,
+            machine_field(&link.program)?
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
 
 #[derive(Clone)]
 struct TailLink {
@@ -885,6 +957,9 @@ fn run() -> Result<ExitCode, String> {
     if o.cmd == "equiv" {
         return cmd_equiv(&o);
     }
+    if o.cmd == "programs" {
+        return cmd_programs(&o);
+    }
     let (prog, debug, elf_xdp, tail_links) =
         load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
     if o.packet.is_some() && o.pcap.is_some() {
@@ -1294,5 +1369,17 @@ mod cli_tests {
         ]).unwrap();
         let error = validate_legacy_options(&unsupported).unwrap_err();
         assert!(error.contains("not supported by bench"), "{error}");
+    }
+
+    #[test]
+    fn machine_program_records_classify_socket_sections_without_splitting_names() {
+        assert_eq!(program_kind_name("socket", false), "socket");
+        assert_eq!(program_kind_name("socket/entry:name", false), "socket");
+        assert_eq!(program_kind_name("socket1", false), "socket");
+        assert_eq!(program_kind_name("tracepoint/socket", false), "other");
+        assert_eq!(program_kind_name("anything", true), "xdp");
+        assert_eq!(machine_field("uprobe/lib:name").unwrap(), "uprobe/lib:name");
+        assert!(machine_field("bad\tname").is_err());
+        assert!(machine_field("bad\nname").is_err());
     }
 }

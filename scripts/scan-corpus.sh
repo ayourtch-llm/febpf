@@ -25,20 +25,21 @@
 #   VERIFY-REJECT:other                      any other "verification FAILED:"
 
 set -u
+export LC_ALL=C
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CORPUS="$ROOT/corpus"
-REPORT="$CORPUS/coverage-report.txt"
+REPORT="${CORPUS_REPORT:-$CORPUS/coverage-report.txt}"
 TARGET_BTF="${TARGET_BTF:-/sys/kernel/btf/vmlinux}"
 
 # Collect the object list: explicit args, else corpus/obj/*.o.
 if [ "$#" -gt 0 ]; then
-    OBJS="$*"
+    OBJS=("$@")
 else
-    OBJS=$(ls -1 "$CORPUS"/obj/*.o 2>/dev/null)
+    mapfile -t OBJS < <(find "$CORPUS/obj" -maxdepth 1 -type f -name '*.o' -print 2>/dev/null | sort)
 fi
-if [ -z "${OBJS:-}" ]; then
+if [ "${#OBJS[@]}" -eq 0 ]; then
     echo "no objects to scan (pass paths, or run scripts/fetch-corpus.sh first)" >&2
     exit 1
 fi
@@ -51,8 +52,8 @@ if [ "${NO_BUILD:-0}" != 1 ] && [ ! -x "$FEBPF" ]; then
 fi
 [ -x "$FEBPF" ] || { echo "febpf binary not found at $FEBPF" >&2; exit 1; }
 
-BTF_ARG=""
-[ -r "$TARGET_BTF" ] && BTF_ARG="--target-btf $TARGET_BTF"
+BTF_ARGS=()
+[ -r "$TARGET_BTF" ] && BTF_ARGS=(--target-btf "$TARGET_BTF")
 
 mkdir -p "$CORPUS"
 
@@ -94,49 +95,106 @@ trap 'rm -rf "$TMP"' EXIT
 BUCKETS="$TMP/buckets"      # one bucket label per line
 MAPHIST="$TMP/maphist"      # one map-type NAME per blocked object
 HELPHIST="$TMP/helphist"    # one helper id per blocked object
-DETAIL="$TMP/detail"        # "<bucket>\t<obj>" per object
+DETAIL="$TMP/detail"        # "<bucket>\t<obj>::<program>" per entry
+OBJECT_DETAIL="$TMP/object-detail"
+OBJECT_BUCKETS="$TMP/object-buckets"
 GRAPHS="$TMP/graphs"        # one object name per detected static tail-call graph
-: > "$BUCKETS"; : > "$MAPHIST"; : > "$HELPHIST"; : > "$DETAIL"; : > "$GRAPHS"
+LINKS="$TMP/links"          # one line per static tail-call edge
+EMPTY_PACKET="$TMP/empty-packet"
+: > "$BUCKETS"; : > "$MAPHIST"; : > "$HELPHIST"; : > "$DETAIL"
+: > "$OBJECT_DETAIL"; : > "$OBJECT_BUCKETS"; : > "$GRAPHS"; : > "$LINKS"
+: > "$EMPTY_PACKET"
 
-total=0
-for obj in $OBJS; do
-    [ -f "$obj" ] || continue
-    total=$((total + 1))
-    name=$(basename "$obj")
-    # shellcheck disable=SC2086
-    out=$("$FEBPF" verify "$obj" $BTF_ARG 2>&1)
-
-    if printf '%s' "$out" | grep -q "static tail-call link"; then
-        echo "$name" >> "$GRAPHS"
-    fi
-
-    if printf '%s' "$out" | grep -q "verification PASSED"; then
+classify() {
+    classified_output="$1"
+    if printf '%s' "$classified_output" | grep -q "verification PASSED"; then
         bucket="OK"
-    elif line=$(printf '%s\n' "$out" | grep -m1 "unsupported map type"); then
-        # "error: ... unsupported map type 27 (RINGBUF); ..."
+    elif line=$(printf '%s\n' "$classified_output" | grep -m1 "unsupported map type"); then
         mt=$(printf '%s' "$line" | sed -n 's/.*unsupported map type [0-9]* (\([A-Za-z0-9_]*\)).*/\1/p')
         [ -z "$mt" ] && mt=$(printf '%s' "$line" | sed -n 's/.*unsupported map type \([0-9]*\).*/type-\1/p')
         [ -z "$mt" ] && mt="unknown"
         bucket="LOAD-FAIL:unsupported-map-type:$mt"
         echo "$mt" >> "$MAPHIST"
-    elif line=$(printf '%s\n' "$out" | grep -m1 "verification FAILED:.*unknown helper #"); then
+    elif line=$(printf '%s\n' "$classified_output" | grep -m1 "verification FAILED:.*unknown helper #"); then
         hid=$(printf '%s' "$line" | sed -n 's/.*unknown helper #\([0-9]*\).*/\1/p')
         bucket="VERIFY-REJECT:unsupported-helper:#$hid"
         echo "$hid" >> "$HELPHIST"
-    elif printf '%s' "$out" | grep -q "verification FAILED:.*unresolved CO-RE"; then
+    elif printf '%s' "$classified_output" | grep -q "verification FAILED:.*unresolved CO-RE"; then
         bucket="VERIFY-REJECT:poisoned-relocation"
-    elif printf '%s' "$out" | grep -q "verification FAILED:"; then
+    elif printf '%s' "$classified_output" | grep -q "verification FAILED:"; then
         bucket="VERIFY-REJECT:other"
-    elif printf '%s' "$out" | grep -qiE "error:.*(relocation|CO-RE|unknown symbol)"; then
+    elif printf '%s' "$classified_output" | grep -qiE "error:.*(relocation|CO-RE|unknown symbol)"; then
         bucket="LOAD-FAIL:relocation"
-    elif printf '%s' "$out" | grep -q "error:"; then
-        bucket="LOAD-FAIL:other"
     else
         bucket="LOAD-FAIL:other"
     fi
+}
 
-    echo "$bucket" >> "$BUCKETS"
-    printf '%s\t%s\n' "$bucket" "$name" >> "$DETAIL"
+total=0
+objects_loaded=0
+objects_ok=0
+entry_total=0
+for obj in "${OBJS[@]}"; do
+    [ -f "$obj" ] || continue
+    total=$((total + 1))
+    name=$(basename "$obj")
+    listing="$TMP/programs.$total"
+    listing_err="$TMP/programs.$total.err"
+    if ! "$FEBPF" programs "$obj" "${BTF_ARGS[@]}" >"$listing" 2>"$listing_err"; then
+        out="$(<"$listing_err")"
+        classify "$out"
+        echo "$bucket" >> "$OBJECT_BUCKETS"
+        printf '%s\t%s\n' "$bucket" "$name" >> "$OBJECT_DETAIL"
+        continue
+    fi
+
+    objects_loaded=$((objects_loaded + 1))
+    object_ok=1
+    object_bucket="OK"
+    object_entries=0
+    object_links=0
+    while IFS=$'\t' read -r record field2 field3 field4 extra; do
+        [ -z "$record" ] && continue
+        case "$record" in
+            program)
+                object_entries=$((object_entries + 1))
+                entry_total=$((entry_total + 1))
+                kind="$field3"
+                program_name="$field4"
+                out=$("$FEBPF" verify "$obj" --prog "$program_name" "${BTF_ARGS[@]}" 2>&1)
+                if [ "$kind" = socket ] \
+                    && printf '%s' "$out" | grep -q "legacy packet access"; then
+                    out=$("$FEBPF" verify "$obj" --prog "$program_name" \
+                        "${BTF_ARGS[@]}" --legacy-packet linux --packet "$EMPTY_PACKET" 2>&1)
+                fi
+                classify "$out"
+                echo "$bucket" >> "$BUCKETS"
+                printf '%s\t%s::%s\n' "$bucket" "$name" "$program_name" >> "$DETAIL"
+                if [ "$bucket" != OK ]; then
+                    object_ok=0
+                    [ "$object_bucket" = OK ] && object_bucket="$bucket"
+                fi
+                ;;
+            link)
+                object_links=$((object_links + 1))
+                printf '%s::%s[%s]->%s\n' "$name" "$field2" "$field3" "$field4" >> "$LINKS"
+                ;;
+            *)
+                object_ok=0
+                [ "$object_bucket" = OK ] && object_bucket="LOAD-FAIL:other"
+                ;;
+        esac
+    done < "$listing"
+    if [ "$object_entries" -eq 0 ]; then
+        object_ok=0
+        object_bucket="LOAD-FAIL:other"
+    fi
+    [ "$object_links" -gt 0 ] && echo "$name" >> "$GRAPHS"
+    if [ "$object_ok" -eq 1 ]; then
+        objects_ok=$((objects_ok + 1))
+    fi
+    echo "$object_bucket" >> "$OBJECT_BUCKETS"
+    printf '%s\t%s\n' "$object_bucket" "$name" >> "$OBJECT_DETAIL"
 done
 
 # --- Aggregate ------------------------------------------------------------
@@ -146,6 +204,7 @@ n_verify_reject=$(grep -c '^VERIFY-REJECT:' "$BUCKETS" || true)
 # "loaded" = reached the verifier (OK or any VERIFY-REJECT).
 n_loaded=$((n_ok + n_verify_reject))
 n_graphs=$(wc -l < "$GRAPHS" | tr -d ' ')
+n_links=$(wc -l < "$LINKS" | tr -d ' ')
 
 pct() { # pct <num> <den>
     if [ "$2" -eq 0 ]; then echo "0.0"; else
@@ -157,17 +216,26 @@ pct() { # pct <num> <den>
     echo "======================================================================"
     echo " febpf corpus coverage report"
     echo " generated: $(date -u '+%Y-%m-%d %H:%M:%SZ')   febpf: $FEBPF"
-    echo " target BTF: ${BTF_ARG:-<none>}"
+    echo " target BTF: ${BTF_ARGS[*]:-<none>}"
     echo "======================================================================"
     echo ""
-    echo "objects scanned : $total"
-    echo "loaded (reached verifier) : $n_loaded  ($(pct "$n_loaded" "$total")%)"
-    echo "verified OK               : $n_ok  ($(pct "$n_ok" "$total")%)"
-    echo "load failures             : $n_load_fail  ($(pct "$n_load_fail" "$total")%)"
-    echo "verify rejections         : $n_verify_reject  ($(pct "$n_verify_reject" "$total")%)"
+    echo "objects/families scanned  : $total"
+    echo "objects loaded            : $objects_loaded  ($(pct "$objects_loaded" "$total")%)"
+    echo "objects fully compatible  : $objects_ok  ($(pct "$objects_ok" "$total")%)"
+    echo "entry programs scanned    : $entry_total"
+    echo "entries loaded            : $n_loaded  ($(pct "$n_loaded" "$entry_total")%)"
+    echo "entries verified OK       : $n_ok  ($(pct "$n_ok" "$entry_total")%)"
+    echo "entry load failures       : $n_load_fail  ($(pct "$n_load_fail" "$entry_total")%)"
+    echo "entry verify rejections   : $n_verify_reject  ($(pct "$n_verify_reject" "$entry_total")%)"
     echo "static tail-call graphs   : $n_graphs  ($(pct "$n_graphs" "$total")%)"
+    echo "static tail-call links    : $n_links"
     echo ""
-    echo "---- outcome buckets (by count) --------------------------------------"
+    echo "---- object/family outcome buckets -----------------------------------"
+    sort "$OBJECT_BUCKETS" | uniq -c | sort -rn | while read -r c b; do
+        printf "  %5d  %s\n" "$c" "$b"
+    done
+    echo ""
+    echo "---- entry outcome buckets -------------------------------------------"
     sort "$BUCKETS" | uniq -c | sort -rn | while read -r c b; do
         printf "  %5d  %s\n" "$c" "$b"
     done
@@ -190,7 +258,12 @@ pct() { # pct <num> <den>
         echo "  (none — no object was blocked by an unknown helper)"
     fi
     echo ""
-    echo "---- per-object detail -----------------------------------------------"
+    echo "---- per-object/family detail ----------------------------------------"
+    sort "$OBJECT_DETAIL" | while IFS="$(printf '\t')" read -r b n; do
+        printf "  %-48s %s\n" "$n" "$b"
+    done
+    echo ""
+    echo "---- per-entry detail ------------------------------------------------"
     sort "$DETAIL" | while IFS="$(printf '\t')" read -r b n; do
         printf "  %-48s %s\n" "$n" "$b"
     done
