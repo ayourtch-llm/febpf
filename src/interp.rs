@@ -16,28 +16,34 @@
 use crate::helpers::{self, MemBus, UserHelpers};
 use crate::insn::*;
 use crate::maps::{Map, MapDef, MapSnapshot, ValueRef};
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
 /// Monotonic clock for the `ktime_get_ns` helper. `std::time::Instant` panics
-/// on `wasm32-unknown-unknown` (no time source), so that target gets a stub
-/// that reports 0 — deterministic, and fine for the browser playground.
+/// on `wasm32-unknown-unknown` (no time source), so that target and `no_std`
+/// builds get a stub that reports 0 — deterministic and host-independent.
 struct Clock {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     start: std::time::Instant,
 }
 
 impl Clock {
     fn start() -> Clock {
         Clock {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             start: std::time::Instant::now(),
         }
     }
     fn elapsed_nanos(&self) -> u64 {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         {
             self.start.elapsed().as_nanos() as u64
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
         {
             0
         }
@@ -50,12 +56,12 @@ pub struct EbpfError {
     pub msg: String,
 }
 
-impl std::fmt::Display for EbpfError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for EbpfError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "runtime error at insn {}: {}", self.pc, self.msg)
     }
 }
-impl std::error::Error for EbpfError {}
+impl core::error::Error for EbpfError {}
 
 /// A program ready to be loaded into a [`Vm`]: instructions plus map
 /// definitions referenced by `lddw` pseudo instructions, plus — for
@@ -353,7 +359,7 @@ impl Vm {
         if self.profile.is_some() {
             replacement.enable_profiling();
         }
-        replacement.user_helpers = std::mem::take(&mut self.user_helpers);
+        replacement.user_helpers = core::mem::take(&mut self.user_helpers);
 
         *self = replacement;
         Ok(())
@@ -1228,7 +1234,7 @@ impl<'a> Machine<'a> {
     /// Toggle printk echoing (the debugger suppresses it during replay so
     /// reverse execution doesn't repeat output). Returns the previous value.
     pub fn set_echo_printk(&mut self, on: bool) -> bool {
-        std::mem::replace(&mut self.vm.echo_printk, on)
+        core::mem::replace(&mut self.vm.echo_printk, on)
     }
 
     /// A pointer to the register file, for the JIT prologue to load from and
@@ -1862,6 +1868,7 @@ impl<'a> Machine<'a> {
             helpers::id::TRACE_PRINTK => {
                 let fmt = self.read_bytes(args[0], args[1] as usize)?;
                 let line = self.format_printk(&fmt, [args[2], args[3], args[4]])?;
+                #[cfg(feature = "std")]
                 if self.vm.echo_printk {
                     eprintln!("printk: {line}");
                 }

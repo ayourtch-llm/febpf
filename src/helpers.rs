@@ -1,6 +1,13 @@
 //! Helper function registry: kernel-compatible ids, names, and the type
 //! signatures the verifier uses to check calls.
 
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+
 /// Kernel-compatible helper ids implemented by the runtime.
 pub mod id {
     pub const MAP_LOOKUP_ELEM: u32 = 1;

@@ -2,6 +2,7 @@
 //! e.g. `r0 = 42`, `r1 += r2`, `if r3 > 7 goto +5`, `*(u32 *)(r10 - 8) = r1`.
 
 use crate::insn::*;
+use alloc::{format, string::{String, ToString}};
 
 fn alu_op_str(op: u8) -> &'static str {
     match op {

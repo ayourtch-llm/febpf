@@ -15,6 +15,12 @@
 use crate::insn::{self, Insn};
 use crate::interp::{Program, Vm};
 use crate::maps::{MapDef, MapKind};
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
 /// Container magic; the first 8 bytes of every replay file.
 pub const MAGIC: &[u8; 8] = b"FEBPFRPL";

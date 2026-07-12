@@ -14,7 +14,7 @@ This is item #5 in `HANDOFF.md`'s wow list.
   hand-written JS glue.
 - `cargo clippy --all-targets` stays at 0 warnings.
 - All existing native tests stay green, **with and without** the `jit` feature
-  (`cargo test` and `cargo test --no-default-features`).
+  (`cargo test` and `cargo test --no-default-features --features std`).
 - The native default build keeps the JIT; `bench --jit` must still work.
 
 ## Stage 1 — feature-gate the JIT
@@ -28,8 +28,9 @@ core is JIT-independent.
 
 ```toml
 [features]
-default = ["jit"]
-jit = []
+default = ["std", "jit"]
+std = []
+jit = ["std"]
 ```
 
 - `src/lib.rs`: `#[cfg(feature = "jit")] pub mod jit;`
@@ -38,17 +39,18 @@ jit = []
   `regs_ptr` behind `#[cfg(feature = "jit")]`.
 - `src/main.rs`: gate `--jit` handling; without the feature, `--jit` is a clear
   error.
-- `tests/jit.rs`: `#![cfg(feature = "jit")]` so `--no-default-features` skips it.
+- `tests/jit.rs`: `#![cfg(feature = "jit")]` so the std interpreter-only profile skips it.
 
-The wasm build uses `--no-default-features`, so the whole `jit` module is gone
-and no `asm!` reaches the wasm backend. Native builds keep `default = ["jit"]`.
+The wasm build uses `--no-default-features --features std`, so the whole `jit`
+module is gone and no `asm!` reaches the wasm backend. Native builds keep
+`default = ["std", "jit"]`.
 
 Verification loop for this stage:
 
 ```
-cargo test                       # jit on   (all tests incl. tests/jit.rs)
-cargo test --no-default-features  # jit off  (tests/jit.rs skipped)
-cargo clippy --all-targets        # 0 warnings, both ways
+cargo test                                           # std + jit
+cargo test --no-default-features --features std      # std, jit off
+cargo clippy --all-targets                            # 0 warnings, both ways
 cargo build --release && ./target/release/febpf bench examples/sum_loop.s --iters 50000 --jit
 ```
 
@@ -154,20 +156,21 @@ cd web && make        # → web/dist/  (index.html, febpf.js, febpf.wasm)
 make clean            # removes web/dist and the build artifact
 ```
 
-`make` runs `cargo build --target wasm32-unknown-unknown --release
---no-default-features`, then copies the `.wasm` and the static files into
+`make` runs `cargo rustc --lib --target wasm32-unknown-unknown --release
+--no-default-features --features std -- --crate-type=cdylib`, then copies the
+`.wasm` and the static files into
 `web/dist/`. `web/dist/` is fully self-contained — `rsync` it to any static
 host. Serving needs a real server for the `application/wasm` MIME type
 (`file://` will not instantiate streaming); `python3 -m http.server` works.
 
 ## Verification / test bar
 
-- `cargo test` and `cargo test --no-default-features`: all native tests green
+- `cargo test` and `cargo test --no-default-features --features std`: all native tests green
   (adds `tests/playground.rs`, which exercises the `playground` layer end-to-end
   independent of the wasm ABI).
 - `cargo clippy --all-targets` clean both ways.
-- `cargo build --target wasm32-unknown-unknown --release --no-default-features`
-  produces a valid `.wasm`.
+- The `cargo rustc --lib ... --no-default-features --features std --
+  --crate-type=cdylib` command used by `make` produces a valid `.wasm`.
 - **Real wasm execution.** No node/browser is installed in this environment, but
   a `wasmtime` binary is available. `web/test/smoke.sh` invokes the exported
   `febpf_selftest` (and `febpf_alloc`/`febpf_free`) via
@@ -196,9 +199,9 @@ host. Serving needs a real server for the `application/wasm` MIME type
 
 Run in this environment (no node/browser; wasmtime 27 + wasmi 0.36 used):
 
-- `cargo test` and `cargo test --no-default-features`: all green (55 native
+- `cargo test` and `cargo test --no-default-features --features std`: all green (55 native
   tests incl. the new 8 `tests/playground.rs`).
-- `cargo clippy --all-targets` and `... --no-default-features`: 0 warnings.
+- `cargo clippy --all-targets` and the std interpreter-only equivalent: 0 warnings.
 - `cargo build --release && ./target/release/febpf bench examples/sum_loop.s
   --iters 50000 --jit` → 9.5 GIPS (JIT still works on the default build).
 - `cd web && make` → `web/dist/{index.html,febpf.js,febpf.wasm}` (356K wasm).

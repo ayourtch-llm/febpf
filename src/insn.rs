@@ -7,6 +7,8 @@
 //! `lddw` (BPF_LD | BPF_IMM | BPF_DW) occupies two consecutive slots; the
 //! second slot carries the upper 32 bits of the immediate in its `imm` field.
 
+use alloc::{format, string::String, vec::Vec};
+
 /// Instruction classes (low 3 bits of opcode).
 pub mod class {
     pub const LD: u8 = 0x00;

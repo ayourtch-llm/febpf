@@ -221,7 +221,7 @@ replay-based time-travel debugger are pure-std, zero-dependency Rust, so they
 compile to `wasm32-unknown-unknown` and run **entirely in the browser** — paste
 assembler or drop a clang `.o`, then verify / run / disassemble / analyze /
 step (and *un*-step). The x86-64 JIT is feature-gated off for this build
-(`default = ["jit"]`), so nothing pulls `asm!` into wasm.
+(`--no-default-features --features std`), so nothing pulls `asm!` into wasm.
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -272,8 +272,8 @@ including time-travel `rstep`.
 ## Tests
 
 The current suite has **348 passing tests** with default features and **334**
-with `--no-default-features`, plus four intentionally ignored exhaustive
-soundness sweeps in each configuration. Coverage includes ISA semantics,
+with the std interpreter-only profile, plus four intentionally ignored
+exhaustive soundness sweeps in each configuration. Coverage includes ISA semantics,
 verifier acceptance and rejection, abstract-operator soundness, maps/helpers,
 tail-call graphs, XDP, assembler/disassembler round-tripping, time travel,
 replay, race exploration, equivalence/optimization, **JIT-vs-interpreter
@@ -281,11 +281,13 @@ differentials**, and **ELF/BTF/CO-RE loading** against genuine clang output.
 Privilege-gated tests additionally compare execution and verifier verdicts
 with the live Linux kernel when available.
 
-Run both supported configurations before submitting changes:
+Run the default, std interpreter-only, and `no_std + alloc` configurations
+before submitting changes:
 
 ```sh
 cargo test
-cargo test --no-default-features
+cargo test --no-default-features --features std
+cargo check --lib --target thumbv7em-none-eabihf --no-default-features
 ```
 
 ELF tests consume committed `tests/*.o` fixtures without modifying them. To

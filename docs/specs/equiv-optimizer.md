@@ -170,13 +170,13 @@ The join and the public accessor live in `verifier.rs`; recording is always on
   preserves r0+map+printk (checked via equiv AND a direct run), leaves an
   already-optimal program unchanged, and its output re-verifies.
 - Both feature configs stay green: `cargo test` and
-  `cargo test --no-default-features`; `cargo clippy --all-targets` 0 warnings in
+  `cargo test --no-default-features --features std`; `cargo clippy --all-targets` 0 warnings in
   both.
 
 ## STATUS
 
 **DONE.** All stages complete and green in both feature configs
-(`cargo test`: 180 / `--no-default-features`: 173; `cargo clippy --all-targets`
+(`cargo test`: 180 / std interpreter-only: 173; `cargo clippy --all-targets`
 0 warnings in both).
 
 Implemented:

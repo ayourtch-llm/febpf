@@ -1,5 +1,5 @@
 //! End-to-end tests for the playground back-end (the layer the WASM ABI wraps).
-//! These run under both `cargo test` and `cargo test --no-default-features`.
+//! These run under both `cargo test` and the std interpreter-only profile.
 
 use febpf::playground::{analyze_text, disasm_text, run_text, verify_text, Session};
 

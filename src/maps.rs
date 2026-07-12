@@ -8,7 +8,11 @@
 //! RCU-grace-period semantics — a stale pointer reads recycled memory but is
 //! never unsafe. See `docs/specs/map-types.md` for the userland model.
 
-use std::collections::HashMap;
+#[cfg(not(feature = "std"))]
+use alloc::collections::BTreeMap as LookupMap;
+use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
+#[cfg(feature = "std")]
+use std::collections::HashMap as LookupMap;
 
 /// Number of logical CPUs modelled for per-CPU maps. The VM has a single
 /// execution CPU (`get_smp_processor_id` returns 0), so in-program helpers
@@ -79,8 +83,8 @@ impl MapKind {
     }
 }
 
-impl std::fmt::Display for MapKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for MapKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let s = match self {
             MapKind::Array => "array",
             MapKind::Hash => "hash",
@@ -155,7 +159,7 @@ enum Storage {
     /// Flat storage of `max_entries * per_cpu` value cells.
     Array(Vec<u8>),
     Hash {
-        index: HashMap<Vec<u8>, u32>,
+        index: LookupMap<Vec<u8>, u32>,
         /// Each slab entry is `per_cpu * value_size` bytes wide.
         slab: Vec<Box<[u8]>>,
         free: Vec<u32>,
@@ -318,7 +322,7 @@ impl Map {
             }
             (
                 Storage::Hash {
-                    index: HashMap::new(),
+                    index: LookupMap::new(),
                     slab: Vec::new(),
                     free: Vec::new(),
                     last_used: Vec::new(),
@@ -648,7 +652,7 @@ impl Map {
                 }
                 r.live = false;
                 if submit {
-                    emitted.push(std::mem::take(&mut r.data));
+                    emitted.push(core::mem::take(&mut r.data));
                 }
                 Ok(())
             }

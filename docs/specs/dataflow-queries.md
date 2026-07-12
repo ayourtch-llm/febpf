@@ -160,7 +160,7 @@ address).
   store->load->exit names the originating insns in order and terminates at the
   born-constant; `whenwrite`/`who` resolve a stack slot to the writing pc and
   value; `origin`/`who` reach a helper-updated map value. `cargo test` green
-  in both `--features jit` and `--no-default-features`; `cargo clippy
+  in both the default and `--no-default-features --features std` profiles; `cargo clippy
   --all-targets` 0 warnings in both.
 
 Deliberate limitations (documented, not blocking):

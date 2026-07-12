@@ -21,7 +21,12 @@
 
 use crate::insn::*;
 use crate::maps::{MapDef, MapKind};
-use std::collections::HashMap;
+use alloc::{
+    collections::BTreeMap,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 #[derive(Debug)]
 pub struct AsmError {
@@ -29,19 +34,19 @@ pub struct AsmError {
     pub msg: String,
 }
 
-impl std::fmt::Display for AsmError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for AsmError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "line {}: {}", self.line, self.msg)
     }
 }
-impl std::error::Error for AsmError {}
+impl core::error::Error for AsmError {}
 
 /// Result of assembling a source file.
 pub struct Assembled {
     pub insns: Vec<Insn>,
     pub maps: Vec<MapDef>,
     /// label -> instruction index
-    pub labels: HashMap<String, usize>,
+    pub labels: BTreeMap<String, usize>,
 }
 
 const OPERATORS: &[&str] = &[
@@ -309,8 +314,8 @@ fn alu_op_of(op: &str) -> Option<(u8, i16)> {
 pub fn assemble(source: &str) -> Result<Assembled, AsmError> {
     let mut insns: Vec<Insn> = Vec::new();
     let mut maps: Vec<MapDef> = Vec::new();
-    let mut map_ids: HashMap<String, u32> = HashMap::new();
-    let mut labels: HashMap<String, usize> = HashMap::new();
+    let mut map_ids: BTreeMap<String, u32> = BTreeMap::new();
+    let mut labels: BTreeMap<String, usize> = BTreeMap::new();
     let mut fixups: Vec<Fixup> = Vec::new();
 
     for (lineno, raw) in source.lines().enumerate() {
@@ -680,7 +685,7 @@ fn parse_reg_insn(
     p: &mut Parser,
     dst: u8,
     is32: bool,
-    map_ids: &HashMap<String, u32>,
+    map_ids: &BTreeMap<String, u32>,
     insns: &mut Vec<Insn>,
 ) -> Result<(), String> {
     let alu_cls = if is32 { class::ALU } else { class::ALU64 };
@@ -730,7 +735,7 @@ fn parse_assignment(
     dst: u8,
     is32: bool,
     alu_cls: u8,
-    map_ids: &HashMap<String, u32>,
+    map_ids: &BTreeMap<String, u32>,
     insns: &mut Vec<Insn>,
 ) -> Result<(), String> {
     match p.peek().cloned() {

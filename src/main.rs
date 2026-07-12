@@ -222,7 +222,7 @@ fn jit_compile(vm: &mut Vm) -> Result<(), String> {
 }
 #[cfg(not(feature = "jit"))]
 fn jit_compile(_vm: &mut Vm) -> Result<(), String> {
-    Err("this build has no JIT (rebuilt with --no-default-features)".into())
+    Err("this build has no JIT (enable the `jit` feature for native execution)".into())
 }
 
 /// Run the VM, via the JIT when `jit` is set and this build supports it.

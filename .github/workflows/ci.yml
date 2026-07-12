@@ -63,13 +63,13 @@ jobs:
           FEBPF_REGENERATE_FIXTURES: ${{ runner.os == 'Linux' && '1' || '0' }}
 
       - name: Test (no jit)
-        run: cargo test --no-default-features
+        run: cargo test --no-default-features --features std
 
       - name: Clippy (jit)
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Clippy (no jit)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
+        run: cargo clippy --all-targets --no-default-features --features std -- -D warnings
 
       # The differential fuzzer is the real test of the JIT: it runs random
       # programs under the interpreter and the JIT and requires identical r0.
@@ -99,8 +99,7 @@ jobs:
         if: runner.os == 'macOS'
         run: git diff --exit-code -- 'tests/*.o'
 
-  # The wasm build has no JIT (pure interpreter + verifier + analysis) and is
-  # the reason the crate must keep compiling with --no-default-features.
+  # The wasm build has std but no JIT (pure interpreter + verifier + analysis).
   wasm:
     name: wasm32
     runs-on: ubuntu-latest
@@ -112,9 +111,24 @@ jobs:
           rustup default stable
           rustup target add wasm32-unknown-unknown
       - name: Build
-        run: cargo build --target wasm32-unknown-unknown --no-default-features --release
+        run: cargo rustc --lib --target wasm32-unknown-unknown --no-default-features --features std --release -- --crate-type=cdylib
       - name: Clippy
-        run: cargo clippy --target wasm32-unknown-unknown --no-default-features -- -D warnings
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features --features std -- -D warnings
+
+  no-std:
+    name: no_std + alloc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustup target add thumbv7em-none-eabihf
+      - name: Check core library
+        run: cargo check --lib --target thumbv7em-none-eabihf --no-default-features
+      - name: Clippy core library
+        run: cargo clippy --lib --target thumbv7em-none-eabihf --no-default-features -- -D warnings
 
   # Windows has no native JIT or Linux kernel-BPF backend. Exercise the
   # portable library and CLI directly on Windows so interpreter, assembler,
@@ -134,8 +148,8 @@ jobs:
       - name: Check default-feature compatibility
         run: cargo check --all-targets
       - name: Build (interpreter only)
-        run: cargo build --all-targets --no-default-features
+        run: cargo build --all-targets --no-default-features --features std
       - name: Test (interpreter only)
-        run: cargo test --no-default-features
+        run: cargo test --no-default-features --features std
       - name: Clippy (interpreter only)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
+        run: cargo clippy --all-targets --no-default-features --features std -- -D warnings

@@ -5,6 +5,9 @@
 //! explicit, then emits the same instruction slots accepted by [`crate::Vm`].
 
 use crate::insn::{alu, call_kind, class, jmp, mode, pseudo, size, Insn, NUM_REGS};
+use alloc::vec::Vec;
+#[cfg(all(test, not(feature = "std")))]
+use alloc::{string::ToString, vec};
 
 /// An error found while constructing an instruction stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,8 +22,8 @@ impl BuildError {
     }
 }
 
-impl std::fmt::Display for BuildError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
             "invalid eBPF register r{} (expected r0..r{})",
@@ -30,7 +33,7 @@ impl std::fmt::Display for BuildError {
     }
 }
 
-impl std::error::Error for BuildError {}
+impl core::error::Error for BuildError {}
 
 /// Width of a memory load or store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

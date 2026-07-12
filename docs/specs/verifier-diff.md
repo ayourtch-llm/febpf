@@ -187,7 +187,7 @@ Exit codes (scriptable, consistent with `conftest.rs`):
 ## STATUS
 
 **Done (harness).** All four stages (a–d) are implemented, tested and green in
-**both** the default and `--no-default-features` configurations, with
+**both** the default and std interpreter-only configurations, with
 `cargo clippy --all-targets` at zero warnings in each.
 
 - `src/fuzz.rs` — `febpf_verdict`, `is_safety_error`, `SelfConsistency` +

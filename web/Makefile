@@ -20,10 +20,10 @@ all: wasm
 	cp $(STATIC) $(DIST)/
 	@echo "==> $(DIST)/ is ready ($$(du -h $(DIST)/febpf.wasm | cut -f1) wasm). rsync it anywhere."
 
-# Cargo decides whether a rebuild is needed; --no-default-features drops the
-# x86-64 JIT so nothing pulls asm!/executable memory into the wasm build.
+# Cargo decides whether a rebuild is needed. This keeps std for the browser ABI
+# while dropping the native JIT, and explicitly requests the wasm cdylib.
 wasm:
-	cd .. && cargo build --target wasm32-unknown-unknown --release --no-default-features --lib
+	cd .. && cargo rustc --lib --target wasm32-unknown-unknown --release --no-default-features --features std -- --crate-type=cdylib
 
 # Convenience: serve the built dist/ locally.
 serve: all

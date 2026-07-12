@@ -6,7 +6,17 @@
 //! indexed by name so candidate lookup stays O(1) at vmlinux scale
 //! (~150k types). See `docs/specs/core-relocations.md` §1.1.
 
-use std::collections::HashMap;
+#[cfg(not(feature = "std"))]
+use alloc::collections::BTreeMap as LookupMap;
+use alloc::{
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
+#[cfg(feature = "std")]
+use std::collections::HashMap as LookupMap;
 
 pub const BTF_MAGIC: u16 = 0xEB9F;
 
@@ -193,7 +203,7 @@ pub struct Btf {
     types: Vec<Type>,
     strs: Vec<u8>,
     /// name → type ids bearing that exact name (all named kinds).
-    by_name: HashMap<String, Vec<u32>>,
+    by_name: LookupMap<String, Vec<u32>>,
 }
 
 /// Little/big-endian u32 reader over the blob.
@@ -435,7 +445,7 @@ impl Btf {
         }
 
         // Index named types for candidate lookup.
-        let mut by_name: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut by_name: LookupMap<String, Vec<u32>> = LookupMap::new();
         for (id, t) in types.iter().enumerate().skip(1) {
             let name = str_at(&strs, t.name_off);
             if !name.is_empty() {
@@ -640,11 +650,11 @@ pub enum CtxSlot {
 #[derive(Clone)]
 pub struct BtfCtx {
     pub args: Vec<CtxSlot>,
-    pub btf: Option<std::sync::Arc<Btf>>,
+    pub btf: Option<Arc<Btf>>,
 }
 
-impl std::fmt::Debug for BtfCtx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for BtfCtx {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // The type graph can be all of vmlinux; print the slots only.
         f.debug_struct("BtfCtx")
             .field("args", &self.args)
@@ -761,7 +771,7 @@ fn str_at(strs: &[u8], off: u32) -> &str {
         .position(|&b| b == 0)
         .map(|p| off + p)
         .unwrap_or(strs.len());
-    std::str::from_utf8(&strs[off..end]).unwrap_or("")
+    core::str::from_utf8(&strs[off..end]).unwrap_or("")
 }
 
 // ---------------------------------------------------------------------------

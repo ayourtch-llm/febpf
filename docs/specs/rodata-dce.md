@@ -136,7 +136,7 @@ old→new map by `optimize::apply_actions` (shared with `febpf optimize`;
 ## STATUS
 
 **DONE (2026-07-11).** Both configs green (`cargo test` 225 /
-`--no-default-features` 216; `cargo clippy --all-targets` 0 warnings in
+std interpreter-only 216; `cargo clippy --all-targets` 0 warnings in
 both). Corpus (56 objects, `scripts/scan-corpus.sh`): verified OK
 **38 → 44 (67.9% → 78.6%)** — fixed `biolatency`, `hardirqs`, `javagc`,
 `llcstat`, `memleak`, `wakeuptime`; `tcppktlat` moved past the unreachable

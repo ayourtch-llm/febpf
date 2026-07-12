@@ -21,8 +21,18 @@ use crate::helpers::{builtin_sig, ArgKind, HelperSig, RetKind};
 use crate::insn::*;
 use crate::maps::MapDef;
 use crate::tnum::Tnum;
-use std::collections::{HashMap, VecDeque};
-use std::fmt::Write as _;
+#[cfg(not(feature = "std"))]
+use alloc::collections::BTreeMap as LookupMap;
+use alloc::collections::VecDeque;
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+#[cfg(feature = "std")]
+use std::collections::HashMap as LookupMap;
+use core::fmt::Write as _;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -95,12 +105,12 @@ pub struct TraceStep {
     pub branch: Option<(bool, usize)>,
 }
 
-impl std::fmt::Display for VerifyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "at insn {}: {}", self.pc, self.msg)
     }
 }
-impl std::error::Error for VerifyError {}
+impl core::error::Error for VerifyError {}
 
 /// Immutable input supplied to an application verification policy after the
 /// core memory-safety verifier has accepted a program.
@@ -118,8 +128,8 @@ pub enum VerifyWithPolicyError {
     Policy(String),
 }
 
-impl std::fmt::Display for VerifyWithPolicyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for VerifyWithPolicyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             VerifyWithPolicyError::Core(error) => write!(f, "core verification failed: {error}"),
             VerifyWithPolicyError::Policy(message) => {
@@ -129,8 +139,8 @@ impl std::fmt::Display for VerifyWithPolicyError {
     }
 }
 
-impl std::error::Error for VerifyWithPolicyError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for VerifyWithPolicyError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             VerifyWithPolicyError::Core(error) => Some(error),
             VerifyWithPolicyError::Policy(_) => None,
@@ -375,8 +385,8 @@ impl Scalar {
     }
 }
 
-impl std::fmt::Display for Scalar {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Scalar {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if self.is_const() {
             return write!(f, "{}", self.umin as i64);
         }
@@ -506,8 +516,8 @@ impl RegState {
     }
 }
 
-impl std::fmt::Display for RegState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for RegState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             RegState::Uninit => write!(f, "?"),
             RegState::Scalar(s) => write!(f, "{s}"),
@@ -665,7 +675,7 @@ impl VState {
         };
         let new_ids = ids(self);
         let old_ids = ids(old);
-        let mut classes = HashMap::new();
+        let mut classes = LookupMap::new();
         for (&old_id, &new_id) in old_ids.iter().zip(&new_ids) {
             if old_id == 0 {
                 continue;
@@ -1271,7 +1281,7 @@ pub struct Verifier<'a> {
     stats: Stats,
     warnings: Vec<String>,
     /// Remembered states per prune point.
-    seen: HashMap<usize, PruneList>,
+    seen: LookupMap<usize, PruneList>,
     prune_points: Vec<bool>,
     insn_state: Vec<Option<(String, usize)>>,
     /// Join-over-all-visits of the current frame's registers per insn (see
@@ -1281,7 +1291,7 @@ pub struct Verifier<'a> {
     next_scalar_id: u32,
     /// Intern deterministic scalar expressions so applying the same operation
     /// later to another copy recovers the same equality class.
-    scalar_expr_ids: HashMap<(u32, u8, bool, u64, i16), u32>,
+    scalar_expr_ids: LookupMap<(u32, u8, bool, u64, i16), u32>,
     /// Per-insn: loads that go through a BTF pointer and must execute as
     /// fault-tolerant probe reads (kernel `BPF_PROBE_MEM`). See
     /// [`VerifyOk::probe_mem`].
@@ -1295,7 +1305,7 @@ pub struct Verifier<'a> {
     path_nodes: Vec<PathNode>,
     /// During trace replay: map from maybe-null pointer id to the pc and
     /// helper name that created it.
-    replay_null_origin: Option<HashMap<u32, (usize, String)>>,
+    replay_null_origin: Option<LookupMap<u32, (usize, String)>>,
 }
 
 /// One branch decision on a verification path (see `Verifier::path_nodes`).
@@ -1327,13 +1337,13 @@ impl<'a> Verifier<'a> {
             cfg,
             stats: Stats::default(),
             warnings: Vec::new(),
-            seen: HashMap::new(),
+            seen: LookupMap::new(),
             prune_points: Vec::new(),
             insn_state: Vec::new(),
             pc_regs: Vec::new(),
             next_null_id: 1,
             next_scalar_id: 1,
-            scalar_expr_ids: HashMap::new(),
+            scalar_expr_ids: LookupMap::new(),
             probe_mem: Vec::new(),
             mem_class: Vec::new(),
             path_nodes: Vec::new(),
@@ -1516,7 +1526,7 @@ impl<'a> Verifier<'a> {
             n = nd.parent;
         }
         decisions.reverse();
-        self.replay_null_origin = Some(HashMap::new());
+        self.replay_null_origin = Some(LookupMap::new());
         self.replay(err_pc, &decisions, len)
     }
 
@@ -3293,7 +3303,7 @@ impl<'a> Verifier<'a> {
                 alu::SUB => {
                     match (a, b) {
                         (RegState::Ptr(pa), RegState::Ptr(pb)) => {
-                            if std::mem::discriminant(&pa.kind) != std::mem::discriminant(&pb.kind)
+                            if core::mem::discriminant(&pa.kind) != core::mem::discriminant(&pb.kind)
                             {
                                 return Err(self.err(
                                     pc,

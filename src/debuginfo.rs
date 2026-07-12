@@ -10,6 +10,13 @@
 //! `docs/specs/source-debug.md`.
 
 use crate::btf::{int_enc, Btf, Kind};
+#[cfg(all(test, not(feature = "std")))]
+use alloc::vec;
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 /// The source location covering a range of instructions (addr2line-style: a
 /// record covers instructions from `insn` up to the next record's `insn`).

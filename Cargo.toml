@@ -8,20 +8,22 @@ license = "MIT OR Apache-2.0"
 [lib]
 name = "febpf"
 path = "src/lib.rs"
-# rlib for the binary and tests; cdylib so `--target wasm32-unknown-unknown`
-# emits a .wasm exporting the hand-written extern "C" ABI (see src/wasm.rs).
-crate-type = ["rlib", "cdylib"]
+# Keep the library embeddable on allocator-providing `no_std` targets. The web
+# build requests `cdylib` explicitly when emitting the wasm ABI artifact.
+crate-type = ["rlib"]
 
 [features]
-default = ["jit"]
+default = ["std", "jit"]
+std = []
 # The native JIT (x86-64 Linux, arm64 Linux/macOS). Unsupported targets keep a
 # compile-time-compatible stub; portable interpreter-only builds (including
-# Windows and wasm) use `--no-default-features`.
-jit = []
+# Windows and wasm) use `--no-default-features --features std`.
+jit = ["std"]
 
 [[bin]]
 name = "febpf"
 path = "src/main.rs"
+required-features = ["std"]
 
 [profile.release]
 lto = true
