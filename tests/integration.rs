@@ -1436,12 +1436,65 @@ fn prog_array_slots_store_program_identities() {
         max_entries: 2,
         readonly: false,
         init: Vec::new(),
+        inner_map_idx: None,
+        map_in_map_values: Vec::new(),
     })
     .unwrap();
     assert_eq!(map.program_at(0), None);
     map.set_program(0, 42).unwrap();
     assert_eq!(map.program_at(0), Some(42));
     assert_eq!(map.set_program(2, 9), Err(-7));
+}
+
+fn nested_map_program(null_check: bool) -> Program {
+    let check = if null_check {
+        "if r0 == 0 goto miss"
+    } else {
+        ""
+    };
+    let mut prog = program(&format!(
+        ".map inner array 4 8 1
+         .map outer array_of_maps 4 4 2 inner
+         *(u32 *)(r10 - 4) = 1
+         r1 = map[outer]
+         r2 = r10
+         r2 += -4
+         call map_lookup_elem
+         {check}
+         r1 = r0
+         *(u32 *)(r10 - 4) = 0
+         r2 = r10
+         r2 += -4
+         call map_lookup_elem
+         if r0 == 0 goto miss
+         r0 = *(u64 *)(r0 + 0)
+         exit
+       miss:
+         r0 = 0
+         exit"
+    ));
+    prog.maps[0].init = 42u64.to_ne_bytes().to_vec();
+    prog.maps[1].map_in_map_values = vec![(1, 0)];
+    prog
+}
+
+#[test]
+fn array_of_maps_lookup_returns_typed_inner_map() {
+    let prog = nested_map_program(true);
+    let mut vm = Vm::new(prog).unwrap();
+    vm.verify(Config::default()).unwrap();
+    assert_eq!(vm.run(&mut []).unwrap(), 42);
+}
+
+#[test]
+fn array_of_maps_lookup_requires_null_check() {
+    let prog = nested_map_program(false);
+    let mut vm = Vm::new(prog).unwrap();
+    let err = match vm.verify(Config::default()) {
+        Ok(_) => panic!("array_of_maps lookup without a null check verified"),
+        Err(err) => err,
+    };
+    assert!(err.msg.contains("expected map pointer"), "{err}");
 }
 
 #[test]

@@ -83,6 +83,11 @@ fn static_prog_array_initializers_link_programs() {
     );
     assert_eq!(init.index, 0);
     assert_eq!(init.program, "socket/target");
+    let outer = obj.maps.iter().position(|map| map.name == "outer").unwrap();
+    let inner = obj.maps.iter().position(|map| map.name == "inner").unwrap();
+    assert_eq!(obj.maps[outer].kind, febpf::maps::MapKind::ArrayOfMaps);
+    assert_eq!(obj.maps[outer].inner_map_idx, Some(inner as u32));
+    assert_eq!(obj.maps[outer].map_in_map_values, [(1, inner as u32)]);
 
     let entry = obj.programs.iter().find(|p| p.name == "socket/entry").unwrap();
     let target = obj

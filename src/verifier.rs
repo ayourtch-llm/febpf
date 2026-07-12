@@ -387,6 +387,9 @@ pub enum PtrKind {
     MapValue { map: u32 },
     /// Result of map_lookup_elem before the null check.
     MapValueOrNull { map: u32, id: u32 },
+    /// Result of looking up an `ARRAY_OF_MAPS`; becomes a map pointer after a
+    /// null check. `map` is the verifier's inner-map template index.
+    MapOrNull { map: u32, id: u32 },
     /// Writable ringbuf record of `size` bytes (from ringbuf_reserve, after the
     /// null check). `id` ties every copy together for consume-tracking.
     RingbufMem { id: u32, size: u32 },
@@ -479,6 +482,7 @@ impl std::fmt::Display for RegState {
                     PtrKind::Map { map } => write!(f, "map{map}")?,
                     PtrKind::MapValue { map } => write!(f, "map{map}_value")?,
                     PtrKind::MapValueOrNull { map, .. } => write!(f, "map{map}_value_or_null")?,
+                    PtrKind::MapOrNull { map, .. } => write!(f, "map{map}_or_null")?,
                     PtrKind::RingbufMem { size, .. } => write!(f, "ringbuf_mem[{size}]")?,
                     PtrKind::RingbufMemOrNull { size, .. } => {
                         write!(f, "ringbuf_mem_or_null[{size}]")?
@@ -1587,7 +1591,9 @@ impl<'a> Verifier<'a> {
                      before insn {err_pc}"
                 )),
                 RegState::Ptr(p) => {
-                    if let PtrKind::MapValueOrNull { map, id } = p.kind {
+                    if let PtrKind::MapValueOrNull { map, id } | PtrKind::MapOrNull { map, id } =
+                        p.kind
+                    {
                         let name = &self.maps[map as usize].name;
                         match self.replay_null_origin.as_ref().and_then(|m| m.get(&id)) {
                             Some((opc, helper)) => notes.push(format!(
@@ -2055,6 +2061,12 @@ impl<'a> Verifier<'a> {
                 return Err(self.err(
                     pc,
                     "map value pointer may be NULL; compare it against 0 first",
+                ));
+            }
+            PtrKind::MapOrNull { .. } => {
+                return Err(self.err(
+                    pc,
+                    "inner map pointer may be NULL; compare it against 0 first",
                 ));
             }
             PtrKind::RingbufMem { size, .. } => (size as u64, "ringbuf record"),
@@ -2579,6 +2591,21 @@ impl<'a> Verifier<'a> {
                     ),
                 ));
             }
+            if def.kind == crate::maps::MapKind::ArrayOfMaps
+                && matches!(
+                    hid,
+                    crate::helpers::id::MAP_UPDATE_ELEM
+                        | crate::helpers::id::MAP_DELETE_ELEM
+                )
+            {
+                return Err(self.err(
+                    pc,
+                    format!(
+                        "helper {} cannot modify array_of_maps '{}' from a BPF program",
+                        sig.name, def.name
+                    ),
+                ));
+            }
             // Helpers that require a specific map kind (see docs/specs/map-types-2.md).
             let required = match hid {
                 crate::helpers::id::PERF_EVENT_OUTPUT => Some(crate::maps::MapKind::PerfEventArray),
@@ -2621,7 +2648,18 @@ impl<'a> Verifier<'a> {
                 if let Some(origins) = &mut self.replay_null_origin {
                     origins.insert(id, (pc, sig.name.to_string()));
                 }
-                RegState::Ptr(Ptr::new(PtrKind::MapValueOrNull { map, id }))
+                let def = &self.maps[map as usize];
+                if def.kind == crate::maps::MapKind::ArrayOfMaps {
+                    let inner = def.inner_map_idx.ok_or_else(|| {
+                        self.err(
+                            pc,
+                            format!("array_of_maps '{}' has no inner-map template", def.name),
+                        )
+                    })?;
+                    RegState::Ptr(Ptr::new(PtrKind::MapOrNull { map: inner, id }))
+                } else {
+                    RegState::Ptr(Ptr::new(PtrKind::MapValueOrNull { map, id }))
+                }
             }
             RetKind::RingbufMemOrNull { size_arg } => {
                 let size = match args[size_arg as usize] {
@@ -2692,6 +2730,13 @@ impl<'a> Verifier<'a> {
                                 *r = RegState::Scalar(Scalar::constant(0));
                             } else {
                                 p.kind = PtrKind::MapValue { map };
+                            }
+                        }
+                        PtrKind::MapOrNull { map, id: pid } if pid == id => {
+                            if becomes_null {
+                                *r = RegState::Scalar(Scalar::constant(0));
+                            } else {
+                                p.kind = PtrKind::Map { map };
                             }
                         }
                         PtrKind::RingbufMemOrNull { id: pid, size } if pid == id => {
@@ -3067,6 +3112,7 @@ impl<'a> Verifier<'a> {
             p.kind,
             PtrKind::Map { .. }
                 | PtrKind::MapValueOrNull { .. }
+                | PtrKind::MapOrNull { .. }
                 | PtrKind::RingbufMemOrNull { .. }
                 | PtrKind::RingbufConsumed { .. }
                 | PtrKind::PacketEnd
@@ -3193,6 +3239,7 @@ impl<'a> Verifier<'a> {
                     RegState::Ptr(Ptr {
                         kind:
                             PtrKind::MapValueOrNull { id, .. }
+                            | PtrKind::MapOrNull { id, .. }
                             | PtrKind::RingbufMemOrNull { id, .. },
                         ..
                     }) => Some(id),

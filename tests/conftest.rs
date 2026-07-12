@@ -232,6 +232,52 @@ fn static_elf_tail_call_kernel_differential_if_privileged() {
     assert_eq!(kernel.test_run(&[0u8; 16]).unwrap().retval, 42);
 }
 
+#[test]
+fn array_of_maps_kernel_differential_if_privileged() {
+    let mut assembled = asm::assemble(
+        ".map inner array 4 8 1
+         .map outer array_of_maps 4 4 2 inner
+         *(u32 *)(r10 - 4) = 1
+         r1 = map[outer]
+         r2 = r10
+         r2 += -4
+         call map_lookup_elem
+         if r0 == 0 goto miss
+         r1 = r0
+         *(u32 *)(r10 - 4) = 0
+         r2 = r10
+         r2 += -4
+         call map_lookup_elem
+         if r0 == 0 goto miss
+         r0 = *(u64 *)(r0 + 0)
+         exit
+       miss:
+         r0 = 0
+         exit",
+    )
+    .unwrap();
+    assembled.maps[0].init = 42u64.to_ne_bytes().to_vec();
+    assembled.maps[1].map_in_map_values = vec![(1, 0)];
+    let prog = Program {
+        insns: assembled.insns,
+        maps: assembled.maps,
+        btf_ctx: None,
+    };
+
+    let mut vm = Vm::new(prog.clone()).unwrap();
+    vm.verify(verifier::Config::default()).unwrap();
+    assert_eq!(vm.run(&mut []).unwrap(), 42);
+
+    if !matches!(kbpf::has_privilege(), Ok(true)) {
+        eprintln!("skipped kernel half: no bpf privilege");
+        return;
+    }
+    let mut log = String::new();
+    let kernel = kbpf::run_program(&prog.insns, &prog.maps, &[], Some(&mut log))
+        .unwrap_or_else(|e| panic!("kernel map-in-map run failed: {e}\n{log}"));
+    assert_eq!(kernel, 42);
+}
+
 /// Differential fuzz against the real kernel when privileged: interp, JIT and
 /// kernel must agree (low 32 bits) on every program the kernel accepts.
 #[test]

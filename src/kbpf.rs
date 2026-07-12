@@ -242,10 +242,11 @@ mod imp {
     }
 
     /// `BPF_MAP_CREATE` a map matching `def`. Returns the new map fd.
-    pub fn map_create(def: &MapDef) -> KResult<Fd> {
+    pub fn map_create(def: &MapDef, inner_map_fd: Option<i32>) -> KResult<Fd> {
         let map_type = match def.kind {
             MapKind::Array => BPF_MAP_TYPE_ARRAY,
             MapKind::ProgArray => BPF_MAP_TYPE_PROG_ARRAY,
+            MapKind::ArrayOfMaps => 12,
             MapKind::Hash => BPF_MAP_TYPE_HASH,
             MapKind::PerCpuArray => BPF_MAP_TYPE_PERCPU_ARRAY,
             MapKind::PerCpuHash => BPF_MAP_TYPE_PERCPU_HASH,
@@ -260,6 +261,9 @@ mod imp {
         put_u32(&mut a, 4, def.key_size);
         put_u32(&mut a, 8, def.value_size);
         put_u32(&mut a, 12, def.max_entries);
+        if let Some(fd) = inner_map_fd {
+            put_u32(&mut a, 20, fd as u32);
+        }
         // map_name[16] at offset 28 (best-effort, truncated).
         let name = def.name.as_bytes();
         let n = name.len().min(15);
@@ -348,7 +352,7 @@ mod imp {
     pub fn prog_load_xdp(_insns: &[Insn], _log: Option<&mut String>) -> KResult<Fd> {
         Err(unsupported("BPF_PROG_LOAD"))
     }
-    pub fn map_create(_def: &MapDef) -> KResult<Fd> {
+    pub fn map_create(_def: &MapDef, _inner_map_fd: Option<i32>) -> KResult<Fd> {
         Err(unsupported("BPF_MAP_CREATE"))
     }
     pub fn map_update(_fd: i32, _key: &[u8], _value: &[u8]) -> KResult<()> {
@@ -459,18 +463,78 @@ fn load_program_type(
     log: Option<&mut String>,
 ) -> KResult<KernelProgram> {
     // Create kernel maps and remember their fds by original map index.
-    let mut map_fds: Vec<Fd> = Vec::with_capacity(maps.len());
-    for def in maps {
-        let fd = imp::map_create(def)?;
+    let mut pending: Vec<usize> = (0..maps.len()).collect();
+    let mut created: Vec<Option<Fd>> = (0..maps.len()).map(|_| None).collect();
+    while !pending.is_empty() {
+        let before = pending.len();
+        let mut next = Vec::new();
+        for i in pending {
+            let def = &maps[i];
+            if def.kind != MapKind::ArrayOfMaps
+                && (def.inner_map_idx.is_some() || !def.map_in_map_values.is_empty())
+            {
+                return Err(KError {
+                    errno: 22,
+                    what: format!(
+                        "map '{}' has map-in-map metadata but is a {} map",
+                        def.name, def.kind
+                    ),
+                });
+            }
+            let inner_fd = match (def.kind, def.inner_map_idx) {
+                (MapKind::ArrayOfMaps, Some(inner)) => {
+                    match created.get(inner as usize).and_then(Option::as_ref) {
+                        Some(fd) => Some(fd.0),
+                        None => {
+                            next.push(i);
+                            continue;
+                        }
+                    }
+                }
+                (MapKind::ArrayOfMaps, None) => None,
+                (_, _) => None,
+            };
+            if def.kind == MapKind::ArrayOfMaps && inner_fd.is_none() {
+                return Err(KError {
+                    errno: 22,
+                    what: format!("array_of_maps '{}' has no inner-map template", def.name),
+                });
+            }
+            let fd = imp::map_create(def, inner_fd)?;
+            created[i] = Some(fd);
+        }
+        if next.len() == before {
+            return Err(KError {
+                errno: 22,
+                what: "cyclic or invalid map-in-map template graph".into(),
+            });
+        }
+        pending = next;
+    }
+    let map_fds: Vec<Fd> = created
+        .into_iter()
+        .map(|fd| fd.expect("all map dependencies were created"))
+        .collect();
+    for (i, def) in maps.iter().enumerate() {
         // Seed initial contents for global-data maps (single array element 0).
         if !def.init.is_empty() && def.kind == MapKind::Array {
             let key = 0u32.to_ne_bytes();
             let mut val = vec![0u8; def.value_size as usize];
             let n = def.init.len().min(val.len());
             val[..n].copy_from_slice(&def.init[..n]);
-            imp::map_update(fd.0, &key, &val)?;
+            imp::map_update(map_fds[i].0, &key, &val)?;
         }
-        map_fds.push(fd);
+        for &(slot, inner) in &def.map_in_map_values {
+            let inner_fd = map_fds.get(inner as usize).ok_or_else(|| KError {
+                errno: 22,
+                what: format!("map '{}' references unknown inner map {inner}", def.name),
+            })?;
+            imp::map_update(
+                map_fds[i].0,
+                &slot.to_ne_bytes(),
+                &inner_fd.0.to_ne_bytes(),
+            )?;
+        }
     }
 
     let prog = rewrite_map_refs(insns, &map_fds)?;

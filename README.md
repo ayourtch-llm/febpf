@@ -46,7 +46,8 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
   checks refine them.
 - **Interactive debugger**: breakpoints, single-stepping, register/stack/
   memory inspection, map dumps, `trace_printk` capture, per-insn tracing.
-- **Maps & helpers**: array + hash maps, kernel-compatible helper ids
+- **Maps & helpers**: array/hash/per-CPU/LRU/ring/perf/stack/program maps,
+  typed `ARRAY_OF_MAPS` nested lookup, and kernel-compatible helper ids
   (`map_lookup_elem`, `map_update_elem`, `map_delete_elem`,
   `ktime_get_ns`, `trace_printk`, `get_prandom_u32`, …), plus an API to
   register **custom helpers** with verifier-checked signatures.
@@ -74,7 +75,7 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
   BTF-defined `.maps`, plus global data sections (`.data`/`.bss`/`.rodata*`
   as initialized single-entry array maps, `.rodata` frozen — string literals,
   lookup tables and persistent globals just work). Tested against genuine
-  clang output, including sparse static program-array initializers
+  clang output, including sparse static program-array and map-in-map initializers
   (`docs/specs/elf-loading.md`).
 
 ## CLI

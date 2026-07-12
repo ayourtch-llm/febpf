@@ -378,3 +378,44 @@ fn jit_tail_call_cycle_matches_exact_chain_boundary() {
     assert_eq!(linked_vm(source).run(&mut []).unwrap(), 34);
     assert_eq!(linked_vm(source).run_jit(&mut []).unwrap(), 34);
 }
+
+#[test]
+fn jit_nested_map_lookup_matches_interpreter() {
+    fn nested_vm() -> Vm {
+        let mut assembled = asm::assemble(
+            ".map inner array 4 8 1
+             .map outer array_of_maps 4 4 2 inner
+             *(u32 *)(r10 - 4) = 1
+             r1 = map[outer]
+             r2 = r10
+             r2 += -4
+             call map_lookup_elem
+             if r0 == 0 goto miss
+             r1 = r0
+             *(u32 *)(r10 - 4) = 0
+             r2 = r10
+             r2 += -4
+             call map_lookup_elem
+             if r0 == 0 goto miss
+             r0 = *(u64 *)(r0 + 0)
+             exit
+           miss:
+             r0 = 0
+             exit",
+        )
+        .unwrap();
+        assembled.maps[0].init = 42u64.to_ne_bytes().to_vec();
+        assembled.maps[1].map_in_map_values = vec![(1, 0)];
+        let mut vm = Vm::new(Program {
+            insns: assembled.insns,
+            maps: assembled.maps,
+            btf_ctx: None,
+        })
+        .unwrap();
+        vm.verify(Config::default()).unwrap();
+        vm
+    }
+
+    assert_eq!(nested_vm().run(&mut []).unwrap(), 42);
+    assert_eq!(nested_vm().run_jit(&mut []).unwrap(), 42);
+}

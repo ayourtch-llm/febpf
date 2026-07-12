@@ -14,9 +14,9 @@ load-bearing constraint. Don't add any without a very good reason and the
 user's OK (raw Linux syscalls via `asm!` are used instead of libc — see the
 JIT's `sys` module).
 
-Everything works today: the full default-feature suite is **320 green + 4
-intentional heavy soundness sweeps ignored**; `--no-default-features` is **307
-green + the same 4 ignored** (2026-07-12, after the static tail-call ELF work).
+Everything works today: the full default-feature suite is **325 green + 4
+intentional heavy soundness sweeps ignored**; `--no-default-features` is **311
+green + the same 4 ignored** (2026-07-12, after map-in-map support).
 `cargo clippy --all-targets -- -D warnings` is clean in both configs. **Keep
 BOTH configs green** — the JIT is now behind `default = ["jit"]`, so always
 run `cargo test` AND
@@ -38,8 +38,27 @@ corpus includes Cilium v0.21.0's sparse program-array loader fixture and the
 scanner reports program graphs separately. The static ELF regression passed
 against the real kernel as root: the entry and target loaded, the program fd
 populated the real program array, and `BPF_PROG_TEST_RUN` returned 42. The
-complete upstream Cilium object also contains `ARRAY_OF_MAPS`; that is now the
-next independent measured loader blocker, not remaining tail-call work.
+complete upstream Cilium object also contains `ARRAY_OF_MAPS`; that next
+measured blocker is now implemented too (see below).
+
+**DONE (2026-07-12): `ARRAY_OF_MAPS`, selected by the corpus.**
+`docs/specs/map-in-map.md` is the contract. Map definitions carry an explicit
+inner-map template and sparse map identities; outer lookup produces a nullable
+typed map pointer, and verifier null refinement turns it into the template map
+type for nested helper calls. Static BTF `values[]` relocations, dependency-
+ordered kernel creation with `inner_map_fd`, userspace population, snapshots,
+replay v1 optional tag `0x0b`, interpreter, and JIT are covered. Root kernel
+differentials passed both nested lookup and the combined static ELF fixture.
+The unchanged pinned Cilium v0.21.0 `testdata/btf_map_init.c` now loads,
+verifies, and returns 42 under interpreter and JIT; its focused corpus scan is
+100% loaded/verified and reports one static tail-call graph.
+
+The refreshed cached corpus is now **57/57 loaded, 56/57 verified (98.2%)**.
+The only rejection is BCC `ksnoop`: it copies an ALU32-derived size between
+scalar registers, bounds-checks one copy, then passes the other to
+`perf_event_output`. The kernel verifier propagates bounds through scalar ids;
+febpf currently loses that equality when registers are copied. This is the
+next measured verifier-precision item—do not weaken the helper bounds check.
 
 This is the current tip and the context a fresh agent is most likely to need.
 The work is committed linearly on `main`:

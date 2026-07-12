@@ -32,6 +32,7 @@ const TAG_PRELOAD: u8 = 0x07;
 const TAG_OUTCOME: u8 = 0x08;
 const TAG_PACKET: u8 = 0x09;
 const TAG_TAIL_CALLS: u8 = 0x0a;
+const TAG_MAP_IN_MAP: u8 = 0x0b;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TailCallProgram {
@@ -339,6 +340,7 @@ impl Replay {
                 MapKind::CgroupArray => 7,
                 MapKind::StackTrace => 8,
                 MapKind::ProgArray => 9,
+                MapKind::ArrayOfMaps => 10,
             });
             p.extend_from_slice(&m.key_size.to_le_bytes());
             p.extend_from_slice(&m.value_size.to_le_bytes());
@@ -347,6 +349,27 @@ impl Replay {
             w_bytes(&mut p, &m.init);
         }
         section(&mut out, TAG_MAPS, &p);
+
+        let nested: Vec<(usize, &MapDef)> = self
+            .maps
+            .iter()
+            .enumerate()
+            .filter(|(_, map)| map.kind == MapKind::ArrayOfMaps)
+            .collect();
+        if !nested.is_empty() {
+            let mut p = Vec::new();
+            p.extend_from_slice(&(nested.len() as u32).to_le_bytes());
+            for (outer, map) in nested {
+                p.extend_from_slice(&(outer as u32).to_le_bytes());
+                p.extend_from_slice(&map.inner_map_idx.unwrap_or(u32::MAX).to_le_bytes());
+                p.extend_from_slice(&(map.map_in_map_values.len() as u32).to_le_bytes());
+                for &(slot, inner) in &map.map_in_map_values {
+                    p.extend_from_slice(&slot.to_le_bytes());
+                    p.extend_from_slice(&inner.to_le_bytes());
+                }
+            }
+            section(&mut out, TAG_MAP_IN_MAP, &p);
+        }
 
         // CTX (raw bytes, length is the section length)
         section(&mut out, TAG_CTX, &self.ctx);
@@ -434,6 +457,7 @@ impl Replay {
         let mut outcome = None;
         let mut packet = None;
         let mut tail_calls = Vec::new();
+        let mut map_in_map = Vec::new();
 
         let mut pos = 10usize;
         while pos < bytes.len() {
@@ -484,6 +508,7 @@ impl Replay {
                             7 => MapKind::CgroupArray,
                             8 => MapKind::StackTrace,
                             9 => MapKind::ProgArray,
+                            10 => MapKind::ArrayOfMaps,
                             k => return Err(format!("unknown map kind {k}")),
                         };
                         let key_size = r.u32()?;
@@ -499,6 +524,8 @@ impl Replay {
                             max_entries,
                             readonly,
                             init,
+                            inner_map_idx: None,
+                            map_in_map_values: Vec::new(),
                         });
                     }
                     maps = Some(v);
@@ -560,14 +587,39 @@ impl Replay {
                         });
                     }
                 }
+                TAG_MAP_IN_MAP => {
+                    let mut r = Reader::new(payload);
+                    let n = r.u32()? as usize;
+                    for _ in 0..n {
+                        let outer = r.u32()?;
+                        let template = r.u32()?;
+                        let count = r.u32()? as usize;
+                        let mut values = Vec::new();
+                        for _ in 0..count {
+                            values.push((r.u32()?, r.u32()?));
+                        }
+                        map_in_map.push((outer, template, values));
+                    }
+                }
                 _ => {} // unknown section: skip (forward compatibility)
             }
         }
 
+        let mut maps = maps.ok_or("replay file missing MAPS section")?;
+        for (outer, template, values) in map_in_map {
+            let map = maps
+                .get_mut(outer as usize)
+                .ok_or("MAP_IN_MAP references an unknown outer map")?;
+            if map.kind != MapKind::ArrayOfMaps || template == u32::MAX {
+                return Err("invalid MAP_IN_MAP template".into());
+            }
+            map.inner_map_idx = Some(template);
+            map.map_in_map_values = values;
+        }
         Ok(Replay {
             febpf_version: febpf_version.ok_or("replay file missing META section")?,
             insns: insns.ok_or("replay file missing INSNS section")?,
-            maps: maps.ok_or("replay file missing MAPS section")?,
+            maps,
             ctx: ctx.ok_or("replay file missing CTX section")?,
             packet,
             seed: seed.ok_or("replay file missing SEED section")?,

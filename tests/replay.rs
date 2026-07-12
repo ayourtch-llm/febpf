@@ -282,3 +282,39 @@ fn xdp_tail_call_bundle_round_trips_and_replays() {
     let (mut vm, mut ctx) = parsed.build_vm().unwrap();
     assert_eq!(vm.run(&mut ctx).unwrap(), 2);
 }
+
+#[test]
+fn array_of_maps_round_trips_and_replays() {
+    let mut p = prog(
+        ".map inner array 4 8 1
+         .map outer array_of_maps 4 4 2 inner
+         *(u32 *)(r10 - 4) = 1
+         r1 = map[outer]
+         r2 = r10
+         r2 += -4
+         call map_lookup_elem
+         if r0 == 0 goto miss
+         r1 = r0
+         *(u32 *)(r10 - 4) = 0
+         r2 = r10
+         r2 += -4
+         call map_lookup_elem
+         if r0 == 0 goto miss
+         r0 = *(u64 *)(r0 + 0)
+         exit
+       miss:
+         r0 = 0
+         exit",
+    );
+    p.maps[0].init = 42u64.to_ne_bytes().to_vec();
+    p.maps[1].map_in_map_values = vec![(1, 0)];
+
+    let replay = Replay::record(&p, Vec::new(), DEFAULT_PRANDOM_SEED, None, Vec::new()).unwrap();
+    assert_eq!(replay.outcome, Some(Outcome::Exit(42)));
+    let parsed = Replay::from_bytes(&replay.to_bytes()).unwrap();
+    assert_eq!(parsed, replay);
+    assert_eq!(parsed.maps[1].inner_map_idx, Some(0));
+    assert_eq!(parsed.maps[1].map_in_map_values, [(1, 0)]);
+    let (mut vm, ctx) = parsed.build_vm().unwrap();
+    assert_eq!(run_capture(&mut vm, &ctx).0, Some(42));
+}

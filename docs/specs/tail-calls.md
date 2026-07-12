@@ -4,9 +4,9 @@ Status: **complete.** Userspace-populated and static ELF program bundles are
 implemented across verifier, interpreter, JIT, snapshots/debugger, replay,
 CLI, and kernel conformance APIs. A privileged kernel differential loaded and
 executed the static ELF graph successfully on 2026-07-12. The pinned corpus
-includes Cilium's sparse static program-array loader fixture; loading that
-complete object is blocked only by its separate `ARRAY_OF_MAPS` declaration,
-which is the next independent coverage item rather than a tail-call gap.
+includes Cilium's sparse static program-array loader fixture. Its separate
+`ARRAY_OF_MAPS` declaration is now supported as well, so the complete upstream
+object loads unchanged.
 
 ## Goal
 

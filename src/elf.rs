@@ -52,6 +52,7 @@ const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
 const BPF_MAP_TYPE_STACK_TRACE: u32 = 7;
 const BPF_MAP_TYPE_CGROUP_ARRAY: u32 = 8;
 const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
+const BPF_MAP_TYPE_ARRAY_OF_MAPS: u32 = 12;
 const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 
 /// Default for a BTF map def that omits `max_entries` entirely (libbpf leaves
@@ -259,6 +260,7 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
     let (mut maps, mut map_by_symval) = load_maps(&r, bytes, &sections, &symbols)?;
     let prog_array_inits =
         load_prog_array_inits(&r, &sections, &symbols, &maps, &map_by_symval)?;
+    load_map_in_map_inits(&r, &sections, &symbols, &mut maps, &map_by_symval)?;
 
     // Global data sections become single-entry array maps; `ld_imm64`
     // relocations against their symbols resolve to value pointers.
@@ -895,6 +897,8 @@ struct MapIndex {
     kconfig: Vec<(String, usize, u32)>,
     /// (map index, section, map base, byte offset of flexible `values[]`).
     prog_arrays: Vec<(usize, u16, u64, u32)>,
+    /// Static initializer layout for `ARRAY_OF_MAPS.values[]`.
+    map_arrays: Vec<(usize, u16, u64, u32)>,
 }
 
 impl MapIndex {
@@ -948,6 +952,7 @@ fn load_maps(
             data_secs: Vec::new(),
             kconfig: Vec::new(),
             prog_arrays: Vec::new(),
+            map_arrays: Vec::new(),
         },
     ))
 }
@@ -1022,6 +1027,90 @@ fn load_prog_array_inits(
     Ok(out)
 }
 
+fn load_map_in_map_inits(
+    r: &Reader,
+    sections: &[Section],
+    symbols: &[Symbol],
+    maps: &mut [MapDef],
+    index: &MapIndex,
+) -> Result<(), String> {
+    for &(outer, shndx, base, values_off) in &index.map_arrays {
+        let values_start = base + values_off as u64;
+        let values_end = values_start + u64::from(maps[outer].max_entries) * 8;
+        let Some(rel) = sections
+            .iter()
+            .find(|s| s.kind == SHT_REL && s.info as u16 == shndx)
+        else {
+            continue;
+        };
+        let entsize = if rel.entsize == 0 { 16 } else { rel.entsize };
+        for i in 0..rel.size / entsize {
+            let pos = rel.offset + i * entsize;
+            let offset = r.u64(pos)?;
+            let info = r.u64(pos + 8)?;
+            if info as u32 != R_BPF_64_ABS64
+                || offset < values_start
+                || offset >= values_end
+            {
+                continue;
+            }
+            let byte = offset - values_start;
+            if !byte.is_multiple_of(8) {
+                return Err(format!(
+                    "array_of_maps relocation at {offset} is not slot-aligned"
+                ));
+            }
+            let slot = (byte / 8) as u32;
+            let sym = symbols
+                .get((info >> 32) as usize)
+                .ok_or("array_of_maps relocation references invalid symbol")?;
+            let inner = match index.resolve(sym) {
+                Some(MapRef::Obj(map)) => map as u32,
+                _ => {
+                    return Err(format!(
+                        "array_of_maps '{}' slot {slot} targets non-map symbol '{}'",
+                        maps[outer].name, sym.name
+                    ));
+                }
+            };
+            if maps[outer]
+                .map_in_map_values
+                .iter()
+                .any(|&(existing, _)| existing == slot)
+            {
+                return Err(format!(
+                    "array_of_maps '{}' has duplicate initializer for slot {slot}",
+                    maps[outer].name
+                ));
+            }
+            match maps[outer].inner_map_idx {
+                Some(template)
+                    if !map_templates_compatible(
+                        &maps[template as usize],
+                        &maps[inner as usize],
+                    ) =>
+                {
+                    return Err(format!(
+                        "array_of_maps '{}' slot {slot} has an incompatible inner map '{}'",
+                        maps[outer].name, maps[inner as usize].name
+                    ));
+                }
+                None => maps[outer].inner_map_idx = Some(inner),
+                _ => {}
+            }
+            maps[outer].map_in_map_values.push((slot, inner));
+        }
+    }
+    Ok(())
+}
+
+fn map_templates_compatible(a: &MapDef, b: &MapDef) -> bool {
+    a.kind == b.kind
+        && a.key_size == b.key_size
+        && a.value_size == b.value_size
+        && a.max_entries == b.max_entries
+}
+
 /// Is this a global data section we expose as a map?
 fn is_data_section(s: &Section) -> bool {
     (s.kind == SHT_PROGBITS || s.kind == SHT_NOBITS)
@@ -1062,6 +1151,8 @@ fn load_data_maps(
             max_entries: 1,
             readonly: sec.name.starts_with(".rodata"),
             init,
+            inner_map_idx: None,
+            map_in_map_values: Vec::new(),
         });
     }
     Ok(())
@@ -1122,6 +1213,8 @@ fn load_kconfig_map(
         max_entries: 1,
         readonly: true,
         init,
+        inner_map_idx: None,
+        map_in_map_values: Vec::new(),
     });
     for (name, off) in externs {
         index.kconfig.push((name, map_idx, off));
@@ -1175,6 +1268,8 @@ fn load_legacy_maps(
             max_entries,
             readonly: false,
             init: Vec::new(),
+            inner_map_idx: None,
+            map_in_map_values: Vec::new(),
         });
         index.push((sym.value, sym.shndx, i));
     }
@@ -1185,6 +1280,7 @@ fn load_legacy_maps(
             data_secs: Vec::new(),
             kconfig: Vec::new(),
             prog_arrays: Vec::new(),
+            map_arrays: Vec::new(),
         },
     ))
 }
@@ -1200,11 +1296,12 @@ fn map_kind(ty: u32) -> Result<MapKind, String> {
         BPF_MAP_TYPE_STACK_TRACE => Ok(MapKind::StackTrace),
         BPF_MAP_TYPE_CGROUP_ARRAY => Ok(MapKind::CgroupArray),
         BPF_MAP_TYPE_LRU_HASH => Ok(MapKind::LruHash),
+        BPF_MAP_TYPE_ARRAY_OF_MAPS => Ok(MapKind::ArrayOfMaps),
         BPF_MAP_TYPE_RINGBUF => Ok(MapKind::RingBuf),
         other => Err(format!(
             "unsupported map type {other} ({}); supported: hash/array/\
              perf_event_array/percpu_hash/percpu_array/stack_trace/cgroup_array/\
-             lru_hash/ringbuf/prog_array",
+             lru_hash/ringbuf/prog_array/array_of_maps",
             map_type_name(other)
         )),
     }
@@ -1320,14 +1417,23 @@ mod btf_maps {
         let mut maps = Vec::new();
         let mut index = Vec::new();
         let mut prog_arrays = Vec::new();
-        // secinfo entries point at VARs; the DATASEC offset matches the map
-        // variable's symbol value in the `.maps` section.
+        let mut map_arrays = Vec::new();
+        let mut map_struct_ids = Vec::new();
+        let mut values_target_ids = Vec::new();
+        // secinfo entries point at VARs. Prefer the ELF symbol value as the
+        // actual `.maps` byte offset: real loader fixtures may leave DATASEC
+        // offsets zero or otherwise non-distinct.
         for si in &ordered {
             let var = btf.ty(si.type_id)?;
             let Kind::Var { type_id, .. } = var.kind else {
                 continue;
             };
             let map_name = btf.str_at(var.name_off).to_string();
+            let map_base = symbols
+                .iter()
+                .find(|sym| sym.shndx as usize == dotmaps_idx && sym.name == map_name)
+                .map(|sym| sym.value)
+                .unwrap_or(si.offset as u64);
             let st_id = btf.resolve(type_id)?;
             let Kind::Struct { members, .. } = &btf.ty(st_id)?.kind else {
                 return Err(format!("map '{map_name}' is not a struct"));
@@ -1335,6 +1441,7 @@ mod btf_maps {
             let (mut kind, mut key_size, mut value_size, mut max_entries) =
                 (None, None, None, None);
             let mut values_off = None;
+            let mut values_target = None;
             for m in members {
                 match btf.str_at(m.name_off) {
                     "type" => kind = Some(map_kind(ptr_array_nelems(m.type_id)?)?),
@@ -1344,12 +1451,26 @@ mod btf_maps {
                     "value_size" => value_size = Some(ptr_array_nelems(m.type_id)?),
                     "key" => key_size = Some(ptr_pointee_size(m.type_id)?),
                     "value" => value_size = Some(ptr_pointee_size(m.type_id)?),
-                    "values" => values_off = Some(m.bit_offset / 8),
+                    "values" => {
+                        values_off = Some(m.bit_offset / 8);
+                        if let Kind::Array { elem_type, .. } =
+                            btf.ty(btf.resolve(m.type_id)?)?.kind
+                        {
+                            if let Kind::Ptr { type_id } =
+                                btf.ty(btf.resolve(elem_type)?)?.kind
+                            {
+                                values_target = Some(btf.resolve(type_id)?);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
             let kind = kind.ok_or_else(|| format!("map '{map_name}': missing type"))?;
-            if kind == crate::maps::MapKind::ProgArray {
+            if matches!(
+                kind,
+                crate::maps::MapKind::ProgArray | crate::maps::MapKind::ArrayOfMaps
+            ) {
                 key_size.get_or_insert(4);
                 value_size.get_or_insert(4);
             }
@@ -1382,13 +1503,32 @@ mod btf_maps {
                     .unwrap_or(DEFAULT_MAX_ENTRIES),
                 readonly: false,
                 init: Vec::new(),
+                inner_map_idx: None,
+                map_in_map_values: Vec::new(),
             });
             if kind == crate::maps::MapKind::ProgArray {
                 if let Some(off) = values_off {
-                    prog_arrays.push((maps.len() - 1, dotmaps_idx as u16, si.offset as u64, off));
+                    prog_arrays.push((maps.len() - 1, dotmaps_idx as u16, map_base, off));
+                }
+            } else if kind == crate::maps::MapKind::ArrayOfMaps {
+                if let Some(off) = values_off {
+                    map_arrays.push((maps.len() - 1, dotmaps_idx as u16, map_base, off));
                 }
             }
-            index.push((si.offset as u64, dotmaps_idx as u16, maps.len() - 1));
+            map_struct_ids.push(st_id);
+            values_target_ids.push(values_target);
+            index.push((map_base, dotmaps_idx as u16, maps.len() - 1));
+        }
+        for outer in 0..maps.len() {
+            if maps[outer].kind != crate::maps::MapKind::ArrayOfMaps {
+                continue;
+            }
+            if let Some(target) = values_target_ids[outer] {
+                maps[outer].inner_map_idx = map_struct_ids
+                    .iter()
+                    .position(|&candidate| candidate == target)
+                    .map(|map| map as u32);
+            }
         }
         // Map symbols may not be at DATASEC offsets in every toolchain; also
         // index by symbol order as a fallback.
@@ -1409,6 +1549,7 @@ mod btf_maps {
                 data_secs: Vec::new(),
                 kconfig: Vec::new(),
                 prog_arrays,
+                map_arrays,
             },
         ))
     }
@@ -1433,6 +1574,7 @@ mod tests {
         assert!(map_kind(1).is_ok()); // HASH
         assert!(map_kind(2).is_ok()); // ARRAY
         assert!(map_kind(3).is_ok()); // PROG_ARRAY
+        assert!(map_kind(12).is_ok()); // ARRAY_OF_MAPS
         assert!(map_kind(27).is_ok()); // RINGBUF (now supported)
         assert!(map_kind(4).is_ok()); // PERF_EVENT_ARRAY (now supported)
         assert!(map_kind(8).is_ok()); // CGROUP_ARRAY (now supported)

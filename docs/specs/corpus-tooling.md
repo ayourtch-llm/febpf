@@ -6,6 +6,19 @@ objects from libbpf-bootstrap + bcc and the scanner produced the histogram
 below. The coordinator can re-run `fetch` + `scan` to refresh the numbers on
 their kernel. See "Sample run" at the end.
 
+The Cilium v0.21.0 loader fixture added on 2026-07-12 contains sparse static
+program-array and array-of-maps initializers. After implementing both, a
+focused scan of the unchanged object reports 100% load/verify success and one
+static tail-call graph. This is the intended workflow: each newly exposed
+blocker becomes the next implementation item, then the same upstream object
+proves that the blocker is gone.
+
+A full cached scan after this work built/scanned 57 objects: all 57 loaded, 56
+verified (98.2%), with no unsupported map types or helpers. The sole remaining
+rejection is BCC `ksnoop`, whose bounds-check pattern needs kernel-style scalar
+identity propagation between register copies. That verifier precision gap is
+the next ranked work item.
+
 ## Why
 
 febpf can load, verify, run and JIT hand-written and small clang-compiled

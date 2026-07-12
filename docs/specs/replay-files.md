@@ -52,13 +52,15 @@ N     payload        (payload_len bytes; parsed per-tag below)
 |------|---------|----------|---------|
 | 0x01 | META    | yes      | `str(febpf_version)` — the recorder's `CARGO_PKG_VERSION` |
 | 0x02 | INSNS   | yes      | `u32 count`, then `count*8` bytes of encoded instruction slots (same wire format as raw bytecode / `insn::encode_program`; map-`lddw` pseudo `src` values are preserved) |
-| 0x03 | MAPS    | yes      | `u32 nmaps`, then per map: `str(name)`, `u8 kind` (0=array,1=hash), `u32 key_size`, `u32 value_size`, `u32 max_entries`, `u8 readonly`, `bytes(init)` |
+| 0x03 | MAPS    | yes      | `u32 nmaps`, then per map: `str(name)`, `u8 kind` (0=array, 1=hash, 2=percpu-array, 3=percpu-hash, 4=LRU-hash, 5=ringbuf, 6=perf-event-array, 7=cgroup-array, 8=stack-trace, 9=prog-array, 10=array-of-maps), `u32 key_size`, `u32 value_size`, `u32 max_entries`, `u8 readonly`, `bytes(init)` |
 | 0x04 | CTX     | yes      | raw context bytes (length = `payload_len`) |
 | 0x05 | SEED    | yes      | `u64` prandom seed |
 | 0x06 | CURSOR  | no       | `u64` stop-at instruction count (absent ⇒ no cursor) |
 | 0x07 | PRELOAD | no       | `u32 nentries`, then per entry: `u32 map_index`, `bytes(key)`, `bytes(value)` (user-supplied map contents applied *after* map init, *before* the run) |
 | 0x08 | OUTCOME | no       | determinism guard: `u8 kind` (0=exit,1=error); if 0 then `u64 r0`, if 1 then `str(message)` |
 | 0x09 | PACKET  | no       | original XDP packet bytes; presence selects XDP verification/execution and makes CTX the synthetic 24-byte `xdp_md` image |
+| 0x0a | TAIL_CALLS | no    | `u32 count`, then per static link: `str(map_name)`, `u32 slot`, `u32 insn_count`, encoded target instructions |
+| 0x0b | MAP_IN_MAP | no    | `u32 outer_count`, then per outer map: `u32 outer_index`, `u32 template_index`, `u32 value_count`, followed by `(u32 slot, u32 inner_index)` pairs |
 
 Round-trip is exact: `from_bytes(to_bytes(r)) == r` for every field.
 

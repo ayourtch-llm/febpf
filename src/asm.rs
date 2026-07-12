@@ -340,7 +340,7 @@ pub fn assemble(source: &str) -> Result<Assembled, AsmError> {
             let first = p.next()?.clone();
             match first {
                 Tok::Ident(w) if w == ".map" => {
-                    // .map name kind key_size value_size max_entries [ro]
+                    // .map name kind key_size value_size max_entries [inner_map] [ro]
                     let name = p.expect_ident()?;
                     let kind_s = p.expect_ident()?;
                     let kind = match kind_s.as_str() {
@@ -354,11 +354,22 @@ pub fn assemble(source: &str) -> Result<Assembled, AsmError> {
                         "cgroup_array" => MapKind::CgroupArray,
                         "stack_trace" => MapKind::StackTrace,
                         "prog_array" => MapKind::ProgArray,
+                        "array_of_maps" => MapKind::ArrayOfMaps,
                         _ => return Err(format!("unknown map kind '{kind_s}'")),
                     };
                     let key_size = p.number()? as u32;
                     let value_size = p.number()? as u32;
                     let max_entries = p.number()? as u32;
+                    let inner_map_idx = if kind == MapKind::ArrayOfMaps {
+                        let inner = p.expect_ident()?;
+                        Some(
+                            *map_ids.get(&inner).ok_or_else(|| {
+                                format!("array_of_maps '{name}' references unknown map '{inner}'")
+                            })?,
+                        )
+                    } else {
+                        None
+                    };
                     let readonly = match p.peek() {
                         Some(Tok::Ident(f)) if f == "ro" => {
                             p.next()?;
@@ -378,6 +389,8 @@ pub fn assemble(source: &str) -> Result<Assembled, AsmError> {
                         max_entries,
                         readonly,
                         init: Vec::new(),
+                        inner_map_idx,
+                        map_in_map_values: Vec::new(),
                     });
                     Ok(())
                 }

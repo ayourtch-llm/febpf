@@ -169,6 +169,44 @@ impl Vm {
         }
         regions.push(Region::KernelMem); // KMEM_HANDLE
         regions.push(Region::Packet); // PACKET_HANDLE
+        for (outer, def) in prog.maps.iter().enumerate() {
+            if def.kind != crate::maps::MapKind::ArrayOfMaps {
+                continue;
+            }
+            let template = def.inner_map_idx.ok_or_else(|| {
+                format!("array_of_maps '{}' has no inner-map template", def.name)
+            })? as usize;
+            let template_def = prog.maps.get(template).ok_or_else(|| {
+                format!(
+                    "array_of_maps '{}' references unknown template map {template}",
+                    def.name
+                )
+            })?;
+            if template == outer || template_def.kind == crate::maps::MapKind::ArrayOfMaps {
+                return Err(format!(
+                    "array_of_maps '{}' has invalid template '{}'",
+                    def.name, template_def.name
+                ));
+            }
+            for &(_, inner) in &def.map_in_map_values {
+                let inner_def = prog.maps.get(inner as usize).ok_or_else(|| {
+                    format!(
+                        "array_of_maps '{}' references unknown inner map {inner}",
+                        def.name
+                    )
+                })?;
+                if inner_def.kind != template_def.kind
+                    || inner_def.key_size != template_def.key_size
+                    || inner_def.value_size != template_def.value_size
+                    || inner_def.max_entries != template_def.max_entries
+                {
+                    return Err(format!(
+                        "array_of_maps '{}' contains incompatible inner map '{}'",
+                        def.name, inner_def.name
+                    ));
+                }
+            }
+        }
         let maps: Vec<Map> = prog
             .maps
             .iter()
@@ -1624,13 +1662,31 @@ impl<'a> Machine<'a> {
             helpers::id::MAP_LOOKUP_ELEM => {
                 let m = self.map_from_ptr(args[0])?;
                 let key = self.read_bytes(args[1], self.vm.maps[m].def.key_size as usize)?;
-                match self.vm.maps[m].lookup(&key) {
-                    Some(vref) => {
-                        // LRU maps: mark the entry recently used (no-op for others).
-                        self.vm.maps[m].touch(&key);
-                        self.vm.value_addr(m as u32, vref)
+                if self.vm.maps[m].def.kind == crate::maps::MapKind::ArrayOfMaps {
+                    let index = u32::from_ne_bytes(
+                        key.try_into()
+                            .map_err(|_| self.err("array_of_maps key is not a u32"))?,
+                    );
+                    match self.vm.maps[m].inner_map_at(index) {
+                        Some(inner) => {
+                            let handle = *self
+                                .vm
+                                .map_obj_handles
+                                .get(inner as usize)
+                                .ok_or_else(|| self.err("array_of_maps contains an invalid map"))?;
+                            mkaddr(handle, 0)
+                        }
+                        None => 0,
                     }
-                    None => 0,
+                } else {
+                    match self.vm.maps[m].lookup(&key) {
+                        Some(vref) => {
+                            // LRU maps: mark the entry recently used (no-op for others).
+                            self.vm.maps[m].touch(&key);
+                            self.vm.value_addr(m as u32, vref)
+                        }
+                        None => 0,
+                    }
                 }
             }
             helpers::id::MAP_UPDATE_ELEM => {
