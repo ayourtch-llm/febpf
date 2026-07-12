@@ -115,3 +115,27 @@ jobs:
         run: cargo build --target wasm32-unknown-unknown --no-default-features --release
       - name: Clippy
         run: cargo clippy --target wasm32-unknown-unknown --no-default-features -- -D warnings
+
+  # Windows has no native JIT or Linux kernel-BPF backend. Exercise the
+  # portable library and CLI directly on Windows so interpreter, assembler,
+  # verifier, maps, helpers and replay cannot silently acquire Unix-only
+  # assumptions. A default-feature check also keeps the unsupported-JIT stub
+  # compiling cleanly for downstream crates that do not disable defaults.
+  windows:
+    name: x86-64 Windows (interpreter)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc -vV
+      - name: Check default-feature compatibility
+        run: cargo check --all-targets
+      - name: Build (interpreter only)
+        run: cargo build --all-targets --no-default-features
+      - name: Test (interpreter only)
+        run: cargo test --no-default-features
+      - name: Clippy (interpreter only)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings

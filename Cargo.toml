@@ -14,8 +14,9 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = ["jit"]
-# The native JIT (x86-64 Linux, arm64 macOS). Off for the wasm build, which is
-# pure-std interpreter + verifier + analysis.
+# The native JIT (x86-64 Linux, arm64 Linux/macOS). Unsupported targets keep a
+# compile-time-compatible stub; portable interpreter-only builds (including
+# Windows and wasm) use `--no-default-features`.
 jit = []
 
 [[bin]]
