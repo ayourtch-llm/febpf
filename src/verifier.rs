@@ -541,7 +541,11 @@ impl SlotState {
 #[derive(Debug, Clone, PartialEq)]
 struct Frame {
     regs: [RegState; NUM_REGS],
+    /// Equality class for scalar registers (0 = no tracked equality).
+    scalar_ids: [u32; NUM_REGS],
     stack: [SlotState; SLOTS],
+    /// Scalar equality class for aligned 8-byte spills.
+    spill_ids: [u32; SLOTS],
     /// Where execution resumes in the caller (frames > 0).
     ret_pc: usize,
 }
@@ -550,7 +554,9 @@ impl Frame {
     fn new(ret_pc: usize) -> Frame {
         Frame {
             regs: [RegState::Uninit; NUM_REGS],
+            scalar_ids: [0; NUM_REGS],
             stack: [SlotState::EMPTY; SLOTS],
+            spill_ids: [0; SLOTS],
             ret_pc,
         }
     }
@@ -600,6 +606,33 @@ impl VState {
                 if !nf.stack[s].subsumed_by(&of.stack[s]) {
                     return false;
                 }
+            }
+        }
+        // An old equality relation is an assumption its future branch
+        // refinement may use, so the new state is covered only if it carries
+        // at least the same relation. Numeric ids are path-local; compare the
+        // induced equivalence pattern, not the numbers themselves.
+        let ids = |state: &VState| {
+            let mut out = Vec::new();
+            for frame in &state.frames {
+                out.extend_from_slice(&frame.scalar_ids);
+                out.extend_from_slice(&frame.spill_ids);
+            }
+            out
+        };
+        let new_ids = ids(self);
+        let old_ids = ids(old);
+        let mut classes = HashMap::new();
+        for (&old_id, &new_id) in old_ids.iter().zip(&new_ids) {
+            if old_id == 0 {
+                continue;
+            }
+            if let Some(&first_new) = classes.get(&old_id) {
+                if first_new == 0 || new_id == 0 || first_new != new_id {
+                    return false;
+                }
+            } else {
+                classes.insert(old_id, new_id);
             }
         }
         true
@@ -1202,6 +1235,10 @@ pub struct Verifier<'a> {
     /// [`VerifyOk::pc_regs`]).
     pc_regs: Vec<Option<[RegState; NUM_REGS]>>,
     next_null_id: u32,
+    next_scalar_id: u32,
+    /// Intern deterministic scalar expressions so applying the same operation
+    /// later to another copy recovers the same equality class.
+    scalar_expr_ids: HashMap<(u32, u8, bool, u64, i16), u32>,
     /// Per-insn: loads that go through a BTF pointer and must execute as
     /// fault-tolerant probe reads (kernel `BPF_PROBE_MEM`). See
     /// [`VerifyOk::probe_mem`].
@@ -1252,6 +1289,8 @@ impl<'a> Verifier<'a> {
             insn_state: Vec::new(),
             pc_regs: Vec::new(),
             next_null_id: 1,
+            next_scalar_id: 1,
+            scalar_expr_ids: HashMap::new(),
             probe_mem: Vec::new(),
             mem_class: Vec::new(),
             path_nodes: Vec::new(),
@@ -1911,8 +1950,77 @@ impl<'a> Verifier<'a> {
         if r == REG_FP {
             return Err(self.err(pc, "r10 (frame pointer) is read-only"));
         }
-        state.cur_mut().regs[r as usize] = v;
+        let frame = state.cur_mut();
+        frame.regs[r as usize] = v;
+        frame.scalar_ids[r as usize] = 0;
         Ok(())
+    }
+
+    fn fresh_scalar_id(&mut self) -> u32 {
+        let id = self.next_scalar_id;
+        self.next_scalar_id = self.next_scalar_id.wrapping_add(1).max(1);
+        id
+    }
+
+    fn scalar_expr_id(
+        &mut self,
+        parent: u32,
+        op: u8,
+        is32: bool,
+        rhs: u64,
+        off: i16,
+    ) -> u32 {
+        let key = (parent, op, is32, rhs, off);
+        if let Some(&id) = self.scalar_expr_ids.get(&key) {
+            id
+        } else {
+            let id = self.fresh_scalar_id();
+            self.scalar_expr_ids.insert(key, id);
+            id
+        }
+    }
+
+    fn scalar_meet(a: Scalar, b: Scalar) -> Option<Scalar> {
+        let mut value = Scalar {
+            tnum: a.tnum.intersect(b.tnum),
+            umin: a.umin.max(b.umin),
+            umax: a.umax.min(b.umax),
+            smin: a.smin.max(b.smin),
+            smax: a.smax.min(b.smax),
+        };
+        value.sync().then_some(value)
+    }
+
+    /// Assign a scalar expression id to `reg` and reconcile its bounds with
+    /// every live register/spill carrying the same expression. If two paths
+    /// have contradictory facts the current path is infeasible; dropping the
+    /// new relation is the conservative fallback.
+    fn set_scalar_id(state: &mut VState, reg: u8, id: u32, value: Scalar) {
+        let mut common = value;
+        for frame in &state.frames {
+            for (slot, &scalar_id) in frame.regs.iter().zip(&frame.scalar_ids) {
+                if scalar_id == id {
+                    if let RegState::Scalar(other) = slot {
+                        let Some(meet) = Self::scalar_meet(common, *other) else {
+                            return;
+                        };
+                        common = meet;
+                    }
+                }
+            }
+            for (slot, &scalar_id) in frame.stack.iter().zip(&frame.spill_ids) {
+                if scalar_id == id {
+                    if let SlotState::Spill(RegState::Scalar(other)) = slot {
+                        let Some(meet) = Self::scalar_meet(common, *other) else {
+                            return;
+                        };
+                        common = meet;
+                    }
+                }
+            }
+        }
+        state.cur_mut().scalar_ids[reg as usize] = id;
+        Self::mark_scalar_id(state, id, common);
     }
 
     // -- memory access checking ---------------------------------------------
@@ -2260,6 +2368,7 @@ impl<'a> Verifier<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // stack location + value provenance are one transfer
     fn stack_store(
         &mut self,
         state: &mut VState,
@@ -2268,11 +2377,14 @@ impl<'a> Verifier<'a> {
         off: i64,
         size: u64,
         val: RegState,
+        scalar_id: u32,
     ) -> Result<(), VerifyError> {
         let base = (STACK_SIZE as i64 + off) as usize;
-        let stack = &mut state.frames[frame].stack;
+        let frame = &mut state.frames[frame];
+        let stack = &mut frame.stack;
         if size == 8 && base.is_multiple_of(8) {
             stack[base / 8] = SlotState::Spill(val);
+            frame.spill_ids[base / 8] = scalar_id;
             return Ok(());
         }
         if matches!(val, RegState::Ptr(_)) {
@@ -2285,6 +2397,7 @@ impl<'a> Verifier<'a> {
                 SlotState::Spill(_) => SlotState::Bytes(0xff), // overwrite keeps init
                 SlotState::Bytes(m) => SlotState::Bytes(m | bit),
             };
+            frame.spill_ids[slot] = 0;
         }
         Ok(())
     }
@@ -2348,7 +2461,15 @@ impl<'a> Verifier<'a> {
         }
         if let Some((frame, off)) = self.check_mem_access(state, pc, p, 0, len, write, false)? {
             if write {
-                self.stack_store(state, pc, frame, off, len, RegState::Scalar(Scalar::unknown()))?;
+                self.stack_store(
+                    state,
+                    pc,
+                    frame,
+                    off,
+                    len,
+                    RegState::Scalar(Scalar::unknown()),
+                    0,
+                )?;
             } else {
                 // every byte must be initialized
                 let base = (STACK_SIZE as i64 + off) as usize;
@@ -2631,6 +2752,9 @@ impl<'a> Verifier<'a> {
 
         // effects: r1-r5 clobbered, r0 = return value
         let f = state.cur_mut();
+        for id in &mut f.scalar_ids[..=5] {
+            *id = 0;
+        }
         for r in 1..=5 {
             f.regs[r] = RegState::Uninit;
         }
@@ -2761,6 +2885,29 @@ impl<'a> Verifier<'a> {
         }
     }
 
+    /// Refine every register/spill known equal to the scalar carrying `id`.
+    /// Arithmetic clears an individual location's id; plain register moves
+    /// and aligned full-width spills preserve it.
+    fn mark_scalar_id(state: &mut VState, id: u32, value: Scalar) {
+        if id == 0 {
+            return;
+        }
+        for frame in &mut state.frames {
+            for (reg, scalar_id) in frame.regs.iter_mut().zip(&frame.scalar_ids) {
+                if *scalar_id == id && matches!(reg, RegState::Scalar(_)) {
+                    *reg = RegState::Scalar(value);
+                }
+            }
+            for (slot, scalar_id) in frame.stack.iter_mut().zip(&frame.spill_ids) {
+                if *scalar_id == id {
+                    if let SlotState::Spill(RegState::Scalar(scalar)) = slot {
+                        *scalar = value;
+                    }
+                }
+            }
+        }
+    }
+
     /// A successful `data`/`data_end` comparison proves a prefix of the
     /// packet accessible. Propagate it to every alias, like the kernel's
     /// packet-pointer id/range tracking.
@@ -2873,6 +3020,13 @@ impl<'a> Verifier<'a> {
                 let stack =
                     self.check_mem_access(&state, pc, &p, ins.off as i64, size, false, true)?;
                 self.note_ldx_class(pc, matches!(p.kind, PtrKind::BtfId { .. }))?;
+                let loaded_id = stack
+                    .filter(|(_, off)| size == 8 && (STACK_SIZE as i64 + *off) % 8 == 0)
+                    .map(|(frame, off)| {
+                        state.frames[frame].spill_ids
+                            [((STACK_SIZE as i64 + off) as usize) / 8]
+                    })
+                    .unwrap_or(0);
                 let loaded = match stack {
                     Some((frame, off)) => self.stack_load(&state, pc, frame, off, size)?,
                     None => self.typed_load(pc, &p, ins.off as i64, size)?,
@@ -2906,6 +3060,9 @@ impl<'a> Verifier<'a> {
                     loaded
                 };
                 self.write_reg(&mut state, pc, ins.dst, loaded)?;
+                if loaded_id != 0 && matches!(loaded, RegState::Scalar(_)) {
+                    state.cur_mut().scalar_ids[ins.dst as usize] = loaded_id;
+                }
                 Ok(StepOutcome::Next(vec![(pc + 1, state)]))
             }
             class::ST | class::STX => {
@@ -2935,7 +3092,12 @@ impl<'a> Verifier<'a> {
                     ));
                 }
                 if let Some((frame, off)) = self.check_mem_access(&state, pc, &p, ins.off as i64, size, true, true)? {
-                    self.stack_store(&mut state, pc, frame, off, size, val)?
+                    let scalar_id = if cls == class::STX {
+                        state.cur().scalar_ids[ins.src as usize]
+                    } else {
+                        0
+                    };
+                    self.stack_store(&mut state, pc, frame, off, size, val, scalar_id)?
                 }
                 Ok(StepOutcome::Next(vec![(pc + 1, state)]))
             }
@@ -2967,6 +3129,7 @@ impl<'a> Verifier<'a> {
                 off,
                 size,
                 RegState::Scalar(Scalar::unknown()),
+                0,
             )?;
         }
         // source operand must be an initialized scalar
@@ -2989,6 +3152,12 @@ impl<'a> Verifier<'a> {
     fn step_alu(&mut self, pc: usize, state: &mut VState, ins: Insn) -> Result<(), VerifyError> {
         let is32 = ins.class() == class::ALU;
         let op = ins.op();
+        let dst_scalar_id = state.cur().scalar_ids[ins.dst as usize];
+        let src_scalar_id = if ins.is_src_reg() {
+            state.cur().scalar_ids[ins.src as usize]
+        } else {
+            0
+        };
 
         // operand b
         let b: RegState = if op == alu::NEG || op == alu::END {
@@ -3000,8 +3169,10 @@ impl<'a> Verifier<'a> {
         };
 
         if op == alu::MOV {
+            let mut scalar_copy = false;
             let v = match b {
                 RegState::Scalar(s) => {
+                    let original = s;
                     let s = if ins.off != 0 {
                         // movsx
                         let s = if is32 { s.truncate32() } else { s };
@@ -3015,6 +3186,7 @@ impl<'a> Verifier<'a> {
                     } else {
                         s
                     };
+                    scalar_copy = ins.is_src_reg() && s == original && !s.is_const();
                     RegState::Scalar(s)
                 }
                 RegState::Ptr(p) => {
@@ -3033,7 +3205,18 @@ impl<'a> Verifier<'a> {
                 }
                 RegState::Uninit => unreachable!(),
             };
-            return self.write_reg(state, pc, ins.dst, v);
+            self.write_reg(state, pc, ins.dst, v)?;
+            if scalar_copy {
+                let id = if src_scalar_id == 0 {
+                    let id = self.fresh_scalar_id();
+                    state.cur_mut().scalar_ids[ins.src as usize] = id;
+                    id
+                } else {
+                    src_scalar_id
+                };
+                state.cur_mut().scalar_ids[ins.dst as usize] = id;
+            }
+            return Ok(());
         }
 
         let a = self.read_reg(state, pc, ins.dst)?;
@@ -3104,7 +3287,28 @@ impl<'a> Verifier<'a> {
             }
             op => alu_scalar(op, is32, ins.off == 1, sa, sb).map_err(|m| self.err(pc, m))?,
         };
-        self.write_reg(state, pc, ins.dst, RegState::Scalar(result))
+        let expression_id = if dst_scalar_id != 0 && sb.is_const() && !result.is_const() {
+            let rhs = if op == alu::END {
+                ins.imm as i64 as u64
+            } else {
+                sb.umin
+            };
+            // For values already known zero-extended to 32 bits, bitwise
+            // ALU32 and ALU64 forms compute the same mathematical expression.
+            // Clang mixes those encodings in real bounds-check patterns.
+            let expr_is32 = is32
+                && !(matches!(op, alu::AND | alu::OR | alu::XOR)
+                    && sa.umax <= u32::MAX as u64
+                    && sb.umax <= u32::MAX as u64);
+            Some(self.scalar_expr_id(dst_scalar_id, op, expr_is32, rhs, ins.off))
+        } else {
+            None
+        };
+        self.write_reg(state, pc, ins.dst, RegState::Scalar(result))?;
+        if let Some(id) = expression_id {
+            Self::set_scalar_id(state, ins.dst, id, result);
+        }
+        Ok(())
     }
 
     fn adjust_ptr(&self, pc: usize, p: Ptr, s: Scalar, sub: bool) -> Result<Ptr, VerifyError> {
@@ -3160,6 +3364,7 @@ impl<'a> Verifier<'a> {
             }
             jmp::EXIT => {
                 let r0 = state.cur().regs[0];
+                let r0_scalar_id = state.cur().scalar_ids[0];
                 if state.frames.len() > 1 {
                     match r0 {
                         RegState::Scalar(_) => {}
@@ -3189,8 +3394,10 @@ impl<'a> Verifier<'a> {
                     state.frames.pop();
                     let f = state.cur_mut();
                     f.regs[0] = r0;
+                    f.scalar_ids[0] = r0_scalar_id;
                     for r in 1..=5 {
                         f.regs[r] = RegState::Uninit;
+                        f.scalar_ids[r] = 0;
                     }
                     Ok(StepOutcome::Next(vec![(ret_pc, state)]))
                 } else {
@@ -3215,6 +3422,7 @@ impl<'a> Verifier<'a> {
                     let caller = state.cur().clone();
                     let mut callee = Frame::new(pc + 1);
                     callee.regs[1..6].copy_from_slice(&caller.regs[1..6]);
+                    callee.scalar_ids[1..6].copy_from_slice(&caller.scalar_ids[1..6]);
                     let frame_idx = state.frames.len();
                     callee.regs[REG_FP as usize] =
                         RegState::Ptr(Ptr::new(PtrKind::Stack { frame: frame_idx }));
@@ -3289,6 +3497,12 @@ impl<'a> Verifier<'a> {
                         ]));
                     }
                 };
+                let dst_scalar_id = state.cur().scalar_ids[ins.dst as usize];
+                let src_scalar_id = if ins.is_src_reg() {
+                    state.cur().scalar_ids[ins.src as usize]
+                } else {
+                    0
+                };
 
                 let refined = match analyze_cond_jmp(op, is32, sa, sb) {
                     CondOutcome::Decided(taken) => {
@@ -3304,6 +3518,8 @@ impl<'a> Verifier<'a> {
                         continue; // contradictory: path is dead
                     };
                     let mut ns = state.clone();
+                    Self::mark_scalar_id(&mut ns, dst_scalar_id, ra);
+                    Self::mark_scalar_id(&mut ns, src_scalar_id, rb);
                     let f = ns.cur_mut();
                     f.regs[ins.dst as usize] = RegState::Scalar(ra);
                     if ins.is_src_reg() {

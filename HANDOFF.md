@@ -14,8 +14,8 @@ load-bearing constraint. Don't add any without a very good reason and the
 user's OK (raw Linux syscalls via `asm!` are used instead of libc — see the
 JIT's `sys` module).
 
-Everything works today: the full default-feature suite is **325 green + 4
-intentional heavy soundness sweeps ignored**; `--no-default-features` is **311
+Everything works today: the full default-feature suite is **328 green + 4
+intentional heavy soundness sweeps ignored**; `--no-default-features` is **314
 green + the same 4 ignored** (2026-07-12, after map-in-map support).
 `cargo clippy --all-targets -- -D warnings` is clean in both configs. **Keep
 BOTH configs green** — the JIT is now behind `default = ["jit"]`, so always
@@ -53,12 +53,20 @@ The unchanged pinned Cilium v0.21.0 `testdata/btf_map_init.c` now loads,
 verifies, and returns 42 under interpreter and JIT; its focused corpus scan is
 100% loaded/verified and reports one static tail-call graph.
 
-The refreshed cached corpus is now **57/57 loaded, 56/57 verified (98.2%)**.
-The only rejection is BCC `ksnoop`: it copies an ALU32-derived size between
-scalar registers, bounds-checks one copy, then passes the other to
-`perf_event_output`. The kernel verifier propagates bounds through scalar ids;
-febpf currently loses that equality when registers are copied. This is the
-next measured verifier-precision item—do not weaken the helper bounds check.
+**DONE (2026-07-12): scalar identity closes the refreshed corpus.**
+`docs/specs/scalar-identity.md` records the soundness invariants. BCC `ksnoop`
+copies a derived size, masks and bounds-checks one copy, then applies the same
+mask to the original before `perf_event_output`. Register/spill equality ids
+and interned deterministic expression ids now propagate that proof without
+weakening helper bounds. A mismatched-mask regression remains rejected. The
+refreshed cached corpus is **57/57 loaded and 57/57 verified (100%)**, with no
+unsupported map types, unknown helpers, load failures, or verifier rejections.
+The current host kernel rejects a minimal version of this safe pattern after
+dropping the id at the first mask; febpf's acceptance is a deliberate,
+soundly-tested precision extension, not kernel-verdict parity.
+The complete root conformance suite remains green: 500 accepted-program
+runtime differentials and 1,000 verifier-frontier verdicts agree with the
+kernel, alongside the XDP, tail-call, and map-in-map differentials.
 
 This is the current tip and the context a fresh agent is most likely to need.
 The work is committed linearly on `main`:

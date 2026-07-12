@@ -1497,6 +1497,80 @@ fn array_of_maps_lookup_requires_null_check() {
     assert!(err.msg.contains("expected map pointer"), "{err}");
 }
 
+fn copied_scalar_size_program(second_mask: u64) -> Program {
+    program(&format!(
+        ".map buf array 4 16296 1
+         .map events perf_event_array 4 4 1
+         r6 = r1
+         r5 = *(u16 *)(r1 + 0)
+         if r5 == 0 goto out
+         w5 += 4008
+         w1 = w5
+         w1 &= 65535
+         if w1 > 16296 goto out
+         r5 &= {second_mask}
+         r1 = r6
+         r2 = map[events]
+         r3 = -1
+         r4 = map[buf][0] + 0
+         call perf_event_output
+       out:
+         r0 = 0
+         exit"
+    ))
+}
+
+#[test]
+fn copied_scalar_expression_propagates_bounds() {
+    let mut vm = Vm::new(copied_scalar_size_program(65535)).unwrap();
+    vm.verify(Config {
+        ctx_size: 2,
+        ..Default::default()
+    })
+    .unwrap();
+}
+
+#[test]
+fn different_scalar_expression_does_not_inherit_bounds() {
+    let mut vm = Vm::new(copied_scalar_size_program(32767)).unwrap();
+    let err = match vm.verify(Config {
+        ctx_size: 2,
+        ..Default::default()
+    }) {
+        Ok(_) => panic!("different masked expression inherited an unrelated bound"),
+        Err(err) => err,
+    };
+    assert!(err.msg.contains("out of bounds"), "{err}");
+}
+
+#[test]
+fn copied_scalar_bounds_follow_aligned_spill() {
+    let prog = program(
+        ".map buf array 4 100 1
+         .map events perf_event_array 4 4 1
+         r6 = r1
+         r5 = *(u16 *)(r1 + 0)
+         r1 = r5
+         *(u64 *)(r10 - 8) = r5
+         if r1 > 100 goto out
+         r5 = *(u64 *)(r10 - 8)
+         r1 = r6
+         r2 = map[events]
+         r3 = -1
+         r4 = map[buf][0] + 0
+         call perf_event_output
+       out:
+         r0 = 0
+         exit",
+    );
+    let mut vm = Vm::new(prog).unwrap();
+    vm.verify(Config {
+        ctx_size: 2,
+        ..Default::default()
+    })
+    .unwrap();
+}
+
 #[test]
 fn tail_call_dispatches_and_miss_falls_through() {
     let entry = program(

@@ -13,11 +13,13 @@ static tail-call graph. This is the intended workflow: each newly exposed
 blocker becomes the next implementation item, then the same upstream object
 proves that the blocker is gone.
 
-A full cached scan after this work built/scanned 57 objects: all 57 loaded, 56
-verified (98.2%), with no unsupported map types or helpers. The sole remaining
-rejection is BCC `ksnoop`, whose bounds-check pattern needs kernel-style scalar
-identity propagation between register copies. That verifier precision gap is
-the next ranked work item.
+A full cached scan after this work built/scanned 57 objects: all 57 loaded and
+all 57 verified (100%), with no unsupported map types/helpers, load failures,
+or verifier rejections. The final rejection, BCC `ksnoop`, was resolved with
+scalar copy/expression identity propagation while retaining the helper
+memory-bounds check. The host kernel rejects a minimal version of the same
+safe relation, so this 100% figure measures febpf coverage rather than kernel
+verdict parity.
 
 ## Why
 

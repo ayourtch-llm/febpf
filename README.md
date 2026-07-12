@@ -29,7 +29,8 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
   kernel's: tnums (known-bits tracking), signed + unsigned range analysis,
   branch-condition refinement, pointer typestate (stack/context/map value/
   maybe-NULL), byte-granular stack initialization tracking, pointer-spill
-  restore, helper signature checking, subsumption-based state pruning with
+  restore, scalar copy/expression identities, helper signature checking,
+  subsumption-based state pruning with
   miss-streak backoff, and a 1M-instruction complexity budget.
 - **Memory-safe by construction**: guest pointers are virtual addresses
   (`region_handle << 32 | offset`) resolved through a region table with O(1)
