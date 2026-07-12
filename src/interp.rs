@@ -103,6 +103,34 @@ pub enum RegionAccess {
     ReadWrite,
 }
 
+/// Locations of 64-bit packet start/end virtual addresses in caller metadata.
+///
+/// The two fields may appear anywhere in the metadata buffer but must not
+/// overlap. Addresses use febpf's stable little-endian guest ABI and never
+/// contain host pointers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataLayout {
+    data_offset: usize,
+    data_end_offset: usize,
+}
+
+impl MetadataLayout {
+    pub fn new(data_offset: usize, data_end_offset: usize) -> Result<Self, String> {
+        let data_end = data_offset.checked_add(8)
+            .ok_or_else(|| "metadata data offset overflows address space".to_string())?;
+        let data_end_end = data_end_offset.checked_add(8)
+            .ok_or_else(|| "metadata data_end offset overflows address space".to_string())?;
+        if data_offset < data_end_end && data_end_offset < data_end {
+            return Err("metadata data and data_end fields overlap".into());
+        }
+        Ok(Self { data_offset, data_end_offset })
+    }
+
+    pub fn data_offset(self) -> usize { self.data_offset }
+    pub fn data_end_offset(self) -> usize { self.data_end_offset }
+    pub fn required_len(self) -> usize { self.data_offset.max(self.data_end_offset) + 8 }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct OwnedRegion {
     bytes: Vec<u8>,
@@ -172,6 +200,8 @@ pub struct Vm {
     /// Set after verification with [`crate::verifier::Config::xdp`]; causes
     /// xdp_md data/data_end loads to synthesize full virtual addresses.
     xdp: bool,
+    /// Configurable pointer-bearing metadata layout armed by verification.
+    metadata_layout: Option<MetadataLayout>,
     tail_programs: Vec<TailProgram>,
 }
 
@@ -265,6 +295,7 @@ impl Vm {
             kmem: Vec::new(),
             packet: Vec::new(),
             xdp: false,
+            metadata_layout: None,
             tail_programs: Vec::new(),
         };
 
@@ -483,9 +514,11 @@ impl Vm {
             cfg.btf_ctx = self.btf_ctx.clone();
         }
         let xdp = cfg.xdp;
+        let metadata_layout = cfg.metadata_layout;
         let ok =
             crate::verifier::verify(&self.insns, &self.map_defs, self.user_helpers.sigs(), cfg)?;
         self.xdp = xdp;
+        self.metadata_layout = metadata_layout;
         self.probe_mem = ok.probe_mem.clone();
         Ok(ok)
     }
@@ -510,6 +543,7 @@ impl Vm {
             cfg.btf_ctx = self.btf_ctx.clone();
         }
         let xdp = cfg.xdp;
+        let metadata_layout = cfg.metadata_layout;
         let ok = crate::verifier::verify(
             &self.insns,
             &self.map_defs,
@@ -524,6 +558,7 @@ impl Vm {
         })
         .map_err(VerifyWithPolicyError::Policy)?;
         self.xdp = xdp;
+        self.metadata_layout = metadata_layout;
         self.probe_mem = ok.probe_mem.clone();
         Ok(ok)
     }
@@ -614,6 +649,70 @@ impl Vm {
     /// visible in `buffer` when execution returns.
     pub fn run_raw(&mut self, buffer: &mut [u8]) -> Result<u64, EbpfError> {
         self.run(buffer)
+    }
+
+    fn prepare_metadata(&self, metadata: &mut [u8], packet_base: u64) -> Result<(), EbpfError> {
+        let fail = |msg: String| EbpfError { pc: 0, msg };
+        let layout = self.metadata_layout.ok_or_else(|| fail(
+            "metadata execution requires successful metadata-layout verification".into()))?;
+        if metadata.len() < layout.required_len() {
+            return Err(fail(format!("metadata buffer is too short: need {} bytes, got {}",
+                layout.required_len(), metadata.len())));
+        }
+        if packet_base as u32 != 0 {
+            return Err(fail("packet address is not an owned-region base".into()));
+        }
+        let handle = (packet_base >> 32) as usize;
+        let Region::Owned(index) = self.regions.get(handle).copied().ok_or_else(|| fail(
+            "packet address does not name a registered owned region".into()))? else {
+            return Err(fail("packet address does not name a registered owned region".into()));
+        };
+        let packet = self.owned_regions.get(index as usize)
+            .ok_or_else(|| fail("packet address names a stale owned region".into()))?;
+        if packet.access != RegionAccess::ReadWrite {
+            return Err(fail("metadata packet region must be read-write".into()));
+        }
+        let packet_end = packet_base.checked_add(packet.bytes.len() as u64)
+            .ok_or_else(|| fail("packet end virtual address overflows".into()))?;
+        metadata[layout.data_offset()..layout.data_offset() + 8]
+            .copy_from_slice(&packet_base.to_le_bytes());
+        metadata[layout.data_end_offset()..layout.data_end_offset() + 8]
+            .copy_from_slice(&packet_end.to_le_bytes());
+        Ok(())
+    }
+
+    /// Execute with caller metadata containing a registered owned packet's
+    /// virtual start/end addresses. The layout must first be armed by a
+    /// successful verification.
+    pub fn run_metadata(&mut self, metadata: &mut [u8], packet_base: u64) -> Result<u64, EbpfError> {
+        self.prepare_metadata(metadata, packet_base)?;
+        self.run(metadata)
+    }
+
+    /// Execute with a zero-filled fixed metadata buffer of the verified size.
+    pub fn run_fixed_metadata(&mut self, packet_base: u64) -> Result<u64, EbpfError> {
+        let layout = self.metadata_layout.ok_or_else(|| EbpfError { pc: 0, msg:
+            "metadata execution requires successful metadata-layout verification".into() })?;
+        self.run_metadata(&mut vec![0u8; layout.required_len()], packet_base)
+    }
+
+    /// JIT counterpart of [`Vm::run_metadata`].
+    #[cfg(feature = "jit")]
+    pub fn run_metadata_jit(
+        &mut self,
+        metadata: &mut [u8],
+        packet_base: u64,
+    ) -> Result<u64, EbpfError> {
+        self.prepare_metadata(metadata, packet_base)?;
+        self.run_jit(metadata)
+    }
+
+    /// JIT counterpart of [`Vm::run_fixed_metadata`].
+    #[cfg(feature = "jit")]
+    pub fn run_fixed_metadata_jit(&mut self, packet_base: u64) -> Result<u64, EbpfError> {
+        let layout = self.metadata_layout.ok_or_else(|| EbpfError { pc: 0, msg:
+            "metadata execution requires successful metadata-layout verification".into() })?;
+        self.run_metadata_jit(&mut vec![0u8; layout.required_len()], packet_base)
     }
 
     /// Execute an XDP program over `packet`. The method constructs the

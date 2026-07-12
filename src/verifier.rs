@@ -56,6 +56,9 @@ pub struct Config {
     /// yield the packet start and end pointers. Packet memory may only be
     /// accessed after a comparison against `data_end` proves the range safe.
     pub xdp: bool,
+    /// Treat exact 64-bit loads at caller-selected context offsets as packet
+    /// start/end virtual pointers.
+    pub metadata_layout: Option<crate::interp::MetadataLayout>,
 }
 
 impl Default for Config {
@@ -68,6 +71,7 @@ impl Default for Config {
             max_states_per_pc: 4096,
             btf_ctx: None,
             xdp: false,
+            metadata_layout: None,
         }
     }
 }
@@ -2160,6 +2164,23 @@ impl<'a> Verifier<'a> {
                     }
                     return Ok(None);
                 }
+                if let Some(layout) = self.cfg.metadata_layout {
+                    let overlaps = |field: usize| {
+                        let start = disp as i128;
+                        let end = start + size as i128;
+                        let field = field as i128;
+                        start < field + 8 && field < end
+                    };
+                    if write && (overlaps(layout.data_offset()) || overlaps(layout.data_end_offset())) {
+                        return Err(self.err(pc, "cannot write metadata packet-pointer fields"));
+                    }
+                    let exact_pointer = size == 8 && (disp == layout.data_offset() as i64
+                        || disp == layout.data_end_offset() as i64);
+                    if exact_pointer && align && self.cfg.strict_alignment && disp % 8 != 0 {
+                        return Err(self.err(pc,
+                            format!("misaligned metadata pointer access off {disp} size 8")));
+                    }
+                }
                 if let Some(bc) = &self.cfg.btf_ctx {
                     // BTF-typed ctx: an array of 8-byte typed arguments. The
                     // kernel's btf_ctx_access() (kernel/bpf/btf.c) requires
@@ -2376,6 +2397,14 @@ impl<'a> Verifier<'a> {
                         4 => Ok(RegState::Ptr(Ptr::new(PtrKind::PacketEnd))),
                         _ => unreachable!("validated XDP ctx offset"),
                     };
+                }
+                if let Some(layout) = self.cfg.metadata_layout {
+                    if size == 8 && disp == layout.data_offset() as i64 {
+                        return Ok(RegState::Ptr(Ptr::new(PtrKind::Packet { range: 0 })));
+                    }
+                    if size == 8 && disp == layout.data_end_offset() as i64 {
+                        return Ok(RegState::Ptr(Ptr::new(PtrKind::PacketEnd)));
+                    }
                 }
                 if let Some(bc) = &self.cfg.btf_ctx {
                     if size == 8 {
@@ -3646,5 +3675,22 @@ pub fn verify(
     user_sigs: &[(u32, HelperSig)],
     cfg: Config,
 ) -> Result<VerifyOk, VerifyError> {
+    if cfg.xdp && cfg.metadata_layout.is_some() {
+        return Err(VerifyError { pc: 0,
+            msg: "XDP and configurable metadata layouts are mutually exclusive".into(),
+            trace: None });
+    }
+    if cfg.btf_ctx.is_some() && cfg.metadata_layout.is_some() {
+        return Err(VerifyError { pc: 0,
+            msg: "BTF and configurable metadata context models are mutually exclusive".into(),
+            trace: None });
+    }
+    if let Some(layout) = cfg.metadata_layout {
+        if cfg.ctx_size < layout.required_len() {
+            return Err(VerifyError { pc: 0, msg: format!(
+                "metadata layout needs {} context bytes, but ctx_size is {}",
+                layout.required_len(), cfg.ctx_size), trace: None });
+        }
+    }
     Verifier::new(insns, maps, user_sigs, cfg).verify()
 }

@@ -177,6 +177,11 @@ it never places the buffer's host pointer in a guest register. A successful
 helpers and execution configuration; if construction fails, the original
 program and its live map state remain unchanged.
 
+Pointer-bearing packet metadata is also configurable through `MetadataLayout`
+and `run_metadata`/`run_fixed_metadata` (with JIT counterparts). The selected
+fields contain bounded guest virtual addresses into a registered owned region,
+never host pointers.
+
 Custom helpers get bounds-checked memory access and a verifier signature:
 
 ```rust,ignore
@@ -271,7 +276,7 @@ including time-travel `rstep`.
 
 ## Tests
 
-The current suite has **348 passing tests** with default features and **334**
+The current suite has **357 passing tests** with default features and **342**
 with the std interpreter-only profile, plus four intentionally ignored
 exhaustive soundness sweeps in each configuration. Coverage includes ISA semantics,
 verifier acceptance and rejection, abstract-operator soundness, maps/helpers,

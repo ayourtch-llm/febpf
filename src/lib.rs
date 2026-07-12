@@ -68,5 +68,5 @@ mod soundness;
 #[cfg(all(target_arch = "wasm32", feature = "std"))]
 mod wasm;
 
-pub use interp::{EbpfError, Machine, Program, Vm};
+pub use interp::{EbpfError, Machine, MetadataLayout, Program, RegionAccess, Vm};
 pub use verifier::{Config as VerifierConfig, VerifyError};
