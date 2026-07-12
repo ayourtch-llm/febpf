@@ -53,6 +53,9 @@ const BPF_MAP_TYPE_STACK_TRACE: u32 = 7;
 const BPF_MAP_TYPE_CGROUP_ARRAY: u32 = 8;
 const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
 const BPF_MAP_TYPE_ARRAY_OF_MAPS: u32 = 12;
+const BPF_MAP_TYPE_DEVMAP: u32 = 14;
+const BPF_MAP_TYPE_CPUMAP: u32 = 16;
+const BPF_MAP_TYPE_DEVMAP_HASH: u32 = 25;
 const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 
 /// Default for a BTF map def that omits `max_entries` entirely (libbpf leaves
@@ -1297,11 +1300,14 @@ fn map_kind(ty: u32) -> Result<MapKind, String> {
         BPF_MAP_TYPE_CGROUP_ARRAY => Ok(MapKind::CgroupArray),
         BPF_MAP_TYPE_LRU_HASH => Ok(MapKind::LruHash),
         BPF_MAP_TYPE_ARRAY_OF_MAPS => Ok(MapKind::ArrayOfMaps),
+        BPF_MAP_TYPE_DEVMAP => Ok(MapKind::DevMap),
+        BPF_MAP_TYPE_CPUMAP => Ok(MapKind::CpuMap),
+        BPF_MAP_TYPE_DEVMAP_HASH => Ok(MapKind::DevMapHash),
         BPF_MAP_TYPE_RINGBUF => Ok(MapKind::RingBuf),
         other => Err(format!(
             "unsupported map type {other} ({}); supported: hash/array/\
              perf_event_array/percpu_hash/percpu_array/stack_trace/cgroup_array/\
-             lru_hash/ringbuf/prog_array/array_of_maps",
+             lru_hash/ringbuf/prog_array/array_of_maps/devmap/cpumap/devmap_hash",
             map_type_name(other)
         )),
     }
@@ -1579,6 +1585,9 @@ mod tests {
         assert!(map_kind(4).is_ok()); // PERF_EVENT_ARRAY (now supported)
         assert!(map_kind(8).is_ok()); // CGROUP_ARRAY (now supported)
         assert!(map_kind(7).is_ok()); // STACK_TRACE (now supported)
+        assert!(map_kind(14).is_ok()); // DEVMAP
+        assert!(map_kind(16).is_ok()); // CPUMAP
+        assert!(map_kind(25).is_ok()); // DEVMAP_HASH
         let e = map_kind(11).unwrap_err(); // LPM_TRIE (still unsupported)
         assert!(e.contains("unsupported map type 11"), "{e}");
         assert!(e.contains("LPM_TRIE"), "{e}");

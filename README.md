@@ -252,7 +252,7 @@ including time-travel `rstep`.
 
 ## Tests
 
-The current suite has **328 passing tests** with default features and **314**
+The current suite has **330 passing tests** with default features and **316**
 with `--no-default-features`, plus four intentionally ignored exhaustive
 soundness sweeps in each configuration. Coverage includes ISA semantics,
 verifier acceptance and rejection, abstract-operator soundness, maps/helpers,

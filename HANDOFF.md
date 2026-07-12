@@ -3,6 +3,115 @@
 _A note from past-me to future-me (or whoever picks this up). Read this before
 diving in; it's the context that isn't obvious from the code._
 
+## ACTIVE RESUME CHECKPOINT (2026-07-12, read this first)
+
+Refresh experiment note: recurring job `cron-1` was deleted after tttt wrapped
+its payload as `[CRON cron-1]: /clear` instead of executing the slash command.
+No cleanup job remains active.
+
+Context refresh completed on 2026-07-12. The xdp-tools v1.6.3 audit, expanded
+scan, and measured redirect-map blocker batch are complete and committed.
+
+The user asked to expand the real-world eBPF corpus iteratively, implement the
+highest-impact measured blockers, and independently compare febpf with
+qmonnet/rbpf so febpf can honestly claim a strict feature superset where
+possible. **Do not copy any rbpf code.** Use its public documentation and
+behavior only as an inventory/reference. The user also asked for a short pause
+between corpus loops so they can interject.
+
+Current workspace state:
+
+- Branch `main` is 19 commits ahead of `origin/main` after the two outstanding
+  batches were committed.
+- `README.md` was committed as `f4b8cae`. It now
+  documents current BTF/CO-RE/XDP/replay/race/equiv/optimizer functionality,
+  fixes the `Program { btf_ctx: None }` example, expands the CLI list, updates
+  the test counts, and labels fences correctly. `rustdoc --test README.md ...`
+  passed (1 passed, the intentionally partial helper snippet ignored), and
+  `git diff --check` passed. Preserve this work.
+- Before that edit, both suites passed on this exact checkout: default **328
+  passed + 4 ignored**, and `--no-default-features` **314 passed + 4 ignored**.
+- The current ignored cache has `bcc` v0.31.0, `cilium-ebpf` v0.21.0, pinned
+  `libbpf` headers, and `xdp-tools` v1.6.3. `libbpf-bootstrap` is unexpectedly
+  absent in this checkout despite the historical note; do not treat any old
+  object as proof that its source cache exists. The offline fetch rebuilt 56
+  BCC objects, one Cilium fixture, and five xdp-tools objects (62 total).
+  The prior 57/57 baseline was measured before this lane; no expanded scan has
+  run yet.
+- The xdp-tools tag was verified remotely: annotated tag object `63a210f...`
+  peels to the shallow checkout's commit `8fbad9f...`. The selected glob is
+  `xdp-bench/*.bpf.c`; all five files compiled successfully using the added
+  `headers/` include root, host multiarch `asm/` include, and
+  `HAVE_LIBBPF_BPF_PROGRAM__TYPE` define.
+- The xdp-tools lane, redirect-map implementation, tests, specs, and this
+  handoff are committed together in the commit following `f4b8cae`.
+- Resume progress: `cargo build --release` and the expanded scan completed.
+  Before the redirect-map batch, the 62-object corpus was 59/62 loaded and
+  verified; the three failures were exactly one each of `DEVMAP`, `CPUMAP`,
+  and `DEVMAP_HASH`. After implementing them, the unchanged corpus is **62/62
+  loaded and 62/62 verified (100%)**, with one static tail-call graph and no
+  map/helper/load/verifier blockers. The report is in the ignored
+  `corpus/coverage-report.txt`.
+- The measured blocker batch is documented in `docs/specs/map-types-3.md` and
+  covers distinct ELF/UAPI map kinds, generic array/hash-backed VM behavior,
+  assembler keywords, raw kernel map creation constants, replay v1 kind codes,
+  and integration/replay tests. Targeted tests pass. Because the usage display
+  is inconsistent and warns that the limit may be stale, do not begin the
+  optional `docs/ideas.md` items until a fresh budget is clearly available.
+- Final validation for this batch is green: default tests **330 passed + 4
+  ignored**, `--no-default-features` **316 passed + 4 ignored**, clippy with
+  `-D warnings` passes in both configurations, and `git diff --check` passes.
+- The user is happy for the resumed session to explore `docs/ideas.md` and
+  sneak in one or two small, non-critical items if the corpus loop leaves
+  bandwidth. Keep that optional work after the scan/blocker checkpoint and
+  avoid expanding it into a new product direction.
+
+The active plan is:
+
+1. Write the rbpf feature-parity matrix/spec using public documentation and
+   behavior only; do not copy rbpf code.
+2. Distinguish Linux eBPF semantic/tooling coverage from portable embedding
+   APIs before making any strict-superset claim.
+3. If bandwidth remains, choose one small, non-critical item from
+   `docs/ideas.md`; keep the corpus-driven production loop as the main thrust.
+4. Keep both feature configurations and clippy `-D warnings` green and commit
+   coherent batches.
+
+The first new lane is `xdp-project/xdp-tools` pinned at release **v1.6.3**
+(latest observed on 2026-07-12), because it adds a production networking/XDP
+axis missing from the tracing-heavy BCC lane. The audit selected only
+`xdp-bench/*.bpf.c`, not the whole repository. Follow the gentle-fetch
+contract in `docs/specs/corpus-tooling.md`: shallow, single branch, pinned,
+sequential, cached. Other candidates considered were Tracee and Inspektor
+Gadget; xdp-tools looked more self-contained and focused.
+
+rbpf audit so far (public docs for rbpf 0.4.1, published 2026-06-22):
+
+- Reference: https://github.com/qmonnet/rbpf and
+  https://docs.rs/rbpf/latest/rbpf/
+- febpf is already materially ahead in kernel-style verification, bounded-loop
+  handling, safe JIT runtime faults, maps/helpers, tail calls, modern ISA,
+  ELF/BTF/BTF.ext/CO-RE, x86-64 + AArch64 JITs, debugger/replay/race/equiv/
+  optimizer tooling, and direct clang object support.
+- rbpf surfaces that need an honest matrix rather than a premature blanket
+  superset claim: four VM input modes (raw packet, caller metadata buffer,
+  fixed synthesized metadata buffer, no-data), replaceable verifier callback,
+  arbitrary allowed-memory ranges, a fluent Rust instruction-builder API,
+  `no_std` interpreter/assembler support, Windows interpreter support, and
+  runtime program replacement. rbpf also documents x86-64 JIT only, unsafe JIT
+  memory accesses, a simple non-kernel verifier, few built-in helpers, no
+  built-in maps, and no tail calls. Its docs list optional Cranelift
+  dependencies, so inspect current feature flags/source metadata before making
+  any JIT-backend comparison claim.
+- “Strict superset” must distinguish Linux eBPF semantics/tooling from portable
+  embedding APIs. Record evidence in a new spec/matrix (suggested:
+  `docs/specs/rbpf-feature-parity.md`). Do not implement cosmetic API parity
+  ahead of measured corpus blockers unless it closes a genuine capability gap.
+
+Immediate resume action: write `docs/specs/rbpf-feature-parity.md` after
+checking rbpf's current public feature metadata. The corpus cache is already
+green at 62/62 and does not need another scan unless the implementation changes.
+
 ## What this is
 
 **febpf** is a from-scratch, **zero-dependency** userland eBPF engine in Rust.

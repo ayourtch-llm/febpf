@@ -355,6 +355,9 @@ pub fn assemble(source: &str) -> Result<Assembled, AsmError> {
                         "stack_trace" => MapKind::StackTrace,
                         "prog_array" => MapKind::ProgArray,
                         "array_of_maps" => MapKind::ArrayOfMaps,
+                        "devmap" => MapKind::DevMap,
+                        "cpumap" => MapKind::CpuMap,
+                        "devmap_hash" => MapKind::DevMapHash,
                         _ => return Err(format!("unknown map kind '{kind_s}'")),
                     };
                     let key_size = p.number()? as u32;

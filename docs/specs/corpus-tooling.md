@@ -13,13 +13,27 @@ static tail-call graph. This is the intended workflow: each newly exposed
 blocker becomes the next implementation item, then the same upstream object
 proves that the blocker is gone.
 
-A full cached scan after this work built/scanned 57 objects: all 57 loaded and
-all 57 verified (100%), with no unsupported map types/helpers, load failures,
-or verifier rejections. The final rejection, BCC `ksnoop`, was resolved with
+The xdp-tools v1.6.3 lane added on 2026-07-12 is intentionally shallow:
+`xdp-bench/*.bpf.c` only. It contributes five production networking objects
+covering direct XDP packet parsing and writes, the XDP load/store-bytes helpers,
+DEVMAP/DEVMAP_HASH/CPUMAP redirect paths, and multi-program XDP sections. Its
+source headers are included from the pinned checkout's `headers/` directory;
+the fetch script also supplies the host multiarch include directory required by
+the distro's `asm/types.h` include and advertises the pinned libbpf helper API.
+
+A previous full cached scan built/scanned 57 objects: all 57 loaded and all 57
+verified (100%), with no unsupported map types/helpers, load failures, or
+verifier rejections. The final rejection, BCC `ksnoop`, was resolved with
 scalar copy/expression identity propagation while retaining the helper
 memory-bounds check. The host kernel rejects a minimal version of the same
 safe relation, so this 100% figure measures febpf coverage rather than kernel
 verdict parity.
+
+The expanded scan after adding `xdp-tools` and implementing its measured
+redirect-map blockers built/scanned 62 objects: all 62 loaded and all 62
+verified (100%). It includes five XDP networking objects and reports one
+static tail-call graph; no unsupported map types, unknown helpers, load
+failures, or verifier rejections remain in this pinned cache.
 
 ## Why
 
@@ -76,6 +90,7 @@ corpus/
     libbpf-bootstrap/    examples/c/*.bpf.c
     bcc/                 libbpf-tools/*.bpf.c
     cilium-ebpf/         testdata/btf_map_init.c (ELF loader fixture)
+    xdp-tools/           xdp-bench/*.bpf.c (XDP networking lane)
   include/
     vmlinux.h            generated locally: bpftool btf dump file
                          /sys/kernel/btf/vmlinux format c
@@ -110,6 +125,7 @@ REPOS="
 libbpf-bootstrap|libbpf/libbpf-bootstrap|<tag>|examples/c/*.bpf.c
 bcc|iovisor/bcc|<tag>|libbpf-tools/*.bpf.c
 cilium-ebpf|cilium/ebpf|<tag>|testdata/btf_map_init.c
+xdp-tools|xdp-project/xdp-tools|v1.6.3|xdp-bench/*.bpf.c
 "
 ```
 

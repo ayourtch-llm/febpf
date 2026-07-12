@@ -1,6 +1,6 @@
 //! eBPF map implementations for the userland runtime.
 //!
-//! Supported kinds: array, hash, per-CPU array/hash, LRU hash, and ringbuf.
+//! Supported kinds: array/hash families, XDP redirect maps, and ringbuf.
 //! Values live in stable storage so the VM can hand out bounds-checked
 //! references to them: array maps use one flat allocation, hash maps use a
 //! slab of fixed-size boxed values. Deleted hash values are tombstoned (and
@@ -39,6 +39,12 @@ pub enum MapKind {
     ProgArray,
     /// Array whose values are references to compatible inner maps.
     ArrayOfMaps,
+    /// Device-indexed array used by `bpf_redirect_map`.
+    DevMap,
+    /// CPU-indexed array used by XDP CPU redirection.
+    CpuMap,
+    /// Hash variant of a device redirect map.
+    DevMapHash,
 }
 
 impl MapKind {
@@ -53,14 +59,22 @@ impl MapKind {
     fn is_arraylike(self) -> bool {
         matches!(
             self,
-            MapKind::Array | MapKind::PerCpuArray | MapKind::CgroupArray
+            MapKind::Array
+            | MapKind::PerCpuArray
+            | MapKind::CgroupArray
+            | MapKind::DevMap
+            | MapKind::CpuMap
         )
     }
     /// Whether this kind is backed by hash (slab) storage.
     fn is_hashlike(self) -> bool {
         matches!(
             self,
-            MapKind::Hash | MapKind::PerCpuHash | MapKind::LruHash | MapKind::StackTrace
+            MapKind::Hash
+            | MapKind::PerCpuHash
+            | MapKind::LruHash
+            | MapKind::StackTrace
+            | MapKind::DevMapHash
         )
     }
 }
@@ -79,6 +93,9 @@ impl std::fmt::Display for MapKind {
             MapKind::StackTrace => "stack_trace",
             MapKind::ProgArray => "prog_array",
             MapKind::ArrayOfMaps => "array_of_maps",
+            MapKind::DevMap => "devmap",
+            MapKind::CpuMap => "cpumap",
+            MapKind::DevMapHash => "devmap_hash",
         };
         write!(f, "{s}")
     }

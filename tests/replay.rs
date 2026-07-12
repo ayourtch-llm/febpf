@@ -152,6 +152,20 @@ fn xdp_packet_round_trips_and_replays() {
 }
 
 #[test]
+fn redirect_map_kinds_round_trip() {
+    let p = prog(
+        ".map dm devmap 4 4 4
+         .map cm cpumap 4 8 4
+         .map dh devmap_hash 4 8 4
+         r0 = 0
+         exit",
+    );
+    let rec = Replay::record(&p, vec![], DEFAULT_PRANDOM_SEED, None, Vec::new()).unwrap();
+    let parsed = Replay::from_bytes(&rec.to_bytes()).unwrap();
+    assert_eq!(parsed.maps, p.maps);
+}
+
+#[test]
 fn preload_round_trips_and_reproduces() {
     // Look up preloaded hash key 7 and return its value.
     let p = prog("

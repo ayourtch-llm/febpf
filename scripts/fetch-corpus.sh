@@ -40,6 +40,7 @@ REPOS="
 libbpf-bootstrap|libbpf/libbpf-bootstrap|v1.4|examples/c/*.bpf.c
 bcc|iovisor/bcc|v0.31.0|libbpf-tools/*.bpf.c
 cilium-ebpf|cilium/ebpf|v0.21.0|testdata/btf_map_init.c
+xdp-tools|xdp-project/xdp-tools|v1.6.3|xdp-bench/*.bpf.c
 "
 
 # libbpf itself: source of the header files programs #include. Pinned.
@@ -157,6 +158,22 @@ CFLAGS="-O2 -g -target bpf -D__TARGET_ARCH_x86 -Wno-unknown-attributes -Wno-comp
 INCLUDES="-I$INCLUDE -I$INCLUDE/bpf"
 [ -d "$LIBBPF_DIR/src" ] && INCLUDES="$INCLUDES -I$LIBBPF_DIR/src"
 
+# xdp-tools follows the host distro's Linux headers for asm/types.h. Clang's
+# BPF target does not automatically add the host multiarch include directory,
+# so add the first installed linux-gnu directory that provides asm/. This is
+# optional for the older lanes and keeps the script usable on non-Debian hosts.
+for arch_inc in /usr/include/*-linux-gnu; do
+    if [ -d "$arch_inc/asm" ]; then
+        INCLUDES="$INCLUDES -I$arch_inc"
+        break
+    fi
+done
+
+# libbpf v1.4.7 exposes the xdp load/store helpers used by xdp-tools. The
+# pinned xdp-tools sources retain fallback declarations unless this feature is
+# advertised, matching their configure-time HAVE_LIBBPF_BPF_PROGRAM__TYPE.
+CFLAGS="$CFLAGS -DHAVE_LIBBPF_BPF_PROGRAM__TYPE"
+
 n_repos=0
 n_found=0
 n_built=0
@@ -189,7 +206,7 @@ printf '%s\n' "$REPOS" | while IFS='|' read -r name path pin globs; do
 
     # Extra include dirs some repos want (their own headers next to sources).
     repo_inc=""
-    for d in "$dest" "$dest/libbpf-tools" "$dest/examples/c" "$dest/testdata"; do
+    for d in "$dest" "$dest/headers" "$dest/libbpf-tools" "$dest/examples/c" "$dest/testdata"; do
         [ -d "$d" ] && repo_inc="$repo_inc -I$d"
     done
 

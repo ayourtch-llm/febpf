@@ -341,6 +341,9 @@ impl Replay {
                 MapKind::StackTrace => 8,
                 MapKind::ProgArray => 9,
                 MapKind::ArrayOfMaps => 10,
+                MapKind::DevMap => 11,
+                MapKind::CpuMap => 12,
+                MapKind::DevMapHash => 13,
             });
             p.extend_from_slice(&m.key_size.to_le_bytes());
             p.extend_from_slice(&m.value_size.to_le_bytes());
@@ -509,6 +512,9 @@ impl Replay {
                             8 => MapKind::StackTrace,
                             9 => MapKind::ProgArray,
                             10 => MapKind::ArrayOfMaps,
+                            11 => MapKind::DevMap,
+                            12 => MapKind::CpuMap,
+                            13 => MapKind::DevMapHash,
                             k => return Err(format!("unknown map kind {k}")),
                         };
                         let key_size = r.u32()?;

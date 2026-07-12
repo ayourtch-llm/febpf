@@ -796,6 +796,68 @@ fn cgroup_array_loads_and_looks_up() {
     assert_eq!(run_src(src), 0);
 }
 
+// ---------------------------------------------------------- XDP redirect maps
+
+/// The redirect-map family is modelled with ordinary keyed storage for
+/// userland execution. That is enough for map lookup/update and preserves the
+/// verifier's typed map identity; actual device/CPU redirection is a kernel
+/// attachment concern outside a standalone VM.
+#[test]
+fn xdp_redirect_map_families_load_and_roundtrip() {
+    for (kind, value) in [("devmap", 17u32), ("cpumap", 23u32)] {
+        let src = format!(
+            ".map redirect {kind} 4 4 4
+             w1 = 2
+             *(u32 *)(r10 - 4) = r1
+             r1 = {value}
+             *(u32 *)(r10 - 8) = r1
+             r1 = map[redirect]
+             r2 = r10
+             r2 += -4
+             r3 = r10
+             r3 += -8
+             r4 = 0
+             call map_update_elem
+             r1 = map[redirect]
+             r2 = r10
+             r2 += -4
+             call map_lookup_elem
+             if r0 == 0 goto miss
+             r0 = *(u32 *)(r0 + 0)
+             exit
+           miss:
+             r0 = 0
+             exit"
+        );
+        assert_eq!(run_src(&src), value as u64, "{kind} storage must round-trip");
+    }
+
+    let src = "
+        .map redirect devmap_hash 4 8 4
+        w1 = 2
+        *(u32 *)(r10 - 4) = r1
+        r1 = 0x1122334455667788 ll
+        *(u64 *)(r10 - 16) = r1
+        r1 = map[redirect]
+        r2 = r10
+        r2 += -4
+        r3 = r10
+        r3 += -16
+        r4 = 0
+        call map_update_elem
+        r1 = map[redirect]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        if r0 == 0 goto miss
+        r0 = *(u64 *)(r0 + 0)
+        exit
+      miss:
+        r0 = 0
+        exit";
+    assert_eq!(run_src(src), 0x1122334455667788);
+}
+
 // --------------------------------------------------------- stack_trace
 
 /// get_stackid returns a deterministic 31-bit id and stores the captured
