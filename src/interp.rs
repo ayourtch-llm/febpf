@@ -282,6 +282,32 @@ impl Vm {
         Ok(vm)
     }
 
+    /// Replace the entry program and all state derived from it.
+    ///
+    /// The replacement is transactional: if constructing the new program or
+    /// its maps fails, this VM is left unchanged. A successful replacement is
+    /// otherwise equivalent to constructing a fresh VM: maps, verification
+    /// state, compiled code, debug information, tail-call targets, profiling
+    /// counts and execution output are reset. Registered user helpers and the
+    /// embedding execution configuration (`echo_printk`, `insn_limit`, the
+    /// configured PRNG seed, and whether profiling is enabled) are preserved.
+    /// The replacement must be verified explicitly before execution when the
+    /// embedding requires verification.
+    pub fn replace_program(&mut self, prog: Program) -> Result<(), String> {
+        let mut replacement = Vm::new(prog)?;
+
+        replacement.echo_printk = self.echo_printk;
+        replacement.insn_limit = self.insn_limit;
+        replacement.prandom = self.prandom;
+        if self.profile.is_some() {
+            replacement.enable_profiling();
+        }
+        replacement.user_helpers = std::mem::take(&mut self.user_helpers);
+
+        *self = replacement;
+        Ok(())
+    }
+
     /// Verify and link a program into one `PROG_ARRAY` slot. Programs in a
     /// bundle share the entry VM's maps and virtual map-object addresses.
     pub fn register_tail_call(
@@ -476,6 +502,23 @@ impl Vm {
                 return Ok(ret);
             }
         }
+    }
+
+    /// Execute a program that takes no input.
+    ///
+    /// This is the explicit embedding adapter for programs whose `r1` context
+    /// is empty. It has the same semantics as `run(&mut [])`.
+    pub fn run_no_data(&mut self) -> Result<u64, EbpfError> {
+        self.run(&mut [])
+    }
+
+    /// Execute with `buffer` as the mutable memory region addressed by `r1`.
+    ///
+    /// Guest addresses remain bounded virtual addresses; this does not expose
+    /// the buffer's host pointer to the program. Writes made by the program are
+    /// visible in `buffer` when execution returns.
+    pub fn run_raw(&mut self, buffer: &mut [u8]) -> Result<u64, EbpfError> {
+        self.run(buffer)
     }
 
     /// Execute an XDP program over `packet`. The method constructs the

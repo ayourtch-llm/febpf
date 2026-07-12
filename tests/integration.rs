@@ -49,6 +49,105 @@ fn xdp_config() -> Config {
     }
 }
 
+// -------------------------------------------------------- embedding adapters
+
+#[test]
+fn explicit_no_data_adapter_runs_with_empty_context() {
+    let mut vm = Vm::new(program("r0 = 42\n exit")).unwrap();
+    vm.verify(Config::default()).unwrap();
+    assert_eq!(vm.run_no_data().unwrap(), 42);
+}
+
+#[test]
+fn raw_buffer_adapter_uses_bounded_virtual_context_memory() {
+    let mut vm = Vm::new(program(
+        "r0 = *(u8 *)(r1 + 1)\n *(u8 *)(r1 + 2) = 0x7f\n exit",
+    ))
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 3,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let mut input = [10, 42, 0];
+    assert_eq!(vm.run_raw(&mut input).unwrap(), 42);
+    assert_eq!(input, [10, 42, 0x7f]);
+}
+
+#[test]
+fn replace_program_is_transactional_on_construction_failure() {
+    let mut vm = Vm::new(program(
+        ".map state array 4 8 1\n\
+         r1 = map[state][0] + 0\n\
+         r0 = *(u64 *)(r1 + 0)\n\
+         r0 += 1\n\
+         *(u64 *)(r1 + 0) = r0\n\
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config::default()).unwrap();
+    assert_eq!(vm.run_no_data().unwrap(), 1);
+
+    let mut invalid = program(".map doomed array 4 8 1\n r0 = map[doomed][0]\n exit");
+    invalid.maps.clear();
+    assert!(vm.replace_program(invalid).is_err());
+
+    // Both the old executable and its live map state survived the failure.
+    assert_eq!(vm.run_no_data().unwrap(), 2);
+}
+
+#[test]
+fn replace_program_preserves_embedding_configuration_and_resets_program_state() {
+    use febpf::helpers::{id, ArgKind, HelperSig, RetKind};
+
+    let mut vm = Vm::new(program(
+        ".map state array 4 8 1\n\
+         r1 = map[state][0] + 0\n\
+         *(u64 *)(r1 + 0) = 99\n\
+         r0 = 0\n\
+         exit",
+    ))
+    .unwrap();
+    vm.user_helpers.register(
+        id::FIRST_USER,
+        HelperSig {
+            name: "answer",
+            args: [ArgKind::None; 5],
+            ret: RetKind::Scalar,
+        },
+        Box::new(
+            |_: [u64; 5], _: &mut dyn febpf::helpers::MemBus| -> Result<u64, String> { Ok(42) },
+        ),
+    );
+    vm.echo_printk = true;
+    vm.insn_limit = 123;
+    vm.set_prandom_seed(456);
+    vm.enable_profiling();
+    vm.verify(Config::default()).unwrap();
+    assert_eq!(vm.run_no_data().unwrap(), 0);
+
+    vm.replace_program(program(
+        ".map state array 4 8 1\n\
+         call 0x10000\n\
+         r1 = map[state][0] + 0\n\
+         r1 = *(u64 *)(r1 + 0)\n\
+         r0 += r1\n\
+         exit",
+    ))
+    .unwrap();
+
+    assert!(vm.echo_printk);
+    assert_eq!(vm.insn_limit, 123);
+    assert_eq!(vm.prandom_seed(), 456);
+    let profile = vm.profile.as_ref().expect("profiling stays enabled");
+    assert_eq!(profile.len(), vm.insns().len());
+    assert!(profile.iter().all(|&count| count == 0));
+    vm.verify(Config::default()).unwrap();
+    // The helper survived, while the identically named replacement map is new.
+    assert_eq!(vm.run_no_data().unwrap(), 42);
+}
+
 // ------------------------------------------------------------------ ALU
 
 #[test]
