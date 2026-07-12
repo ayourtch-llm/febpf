@@ -359,6 +359,10 @@ fn linux_legacy_packet_loads_match_kernel_if_available() {
         0xff, 0x12, 0x34, 0x56, 0x78, 0xab, 0xcd, 0x80,
         0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0xbe, 0xef,
     ];
+    // SOCKET_FILTER TEST_RUN consumes an Ethernet header before invoking the
+    // program. Prefix the payload so legacy offsets observe `packet[0]`.
+    let mut kernel_frame = [0u8; 30];
+    kernel_frame[14..].copy_from_slice(&packet);
     let cases = [
         Case {
             name: "ABS W network byte order",
@@ -421,7 +425,7 @@ fn linux_legacy_packet_loads_match_kernel_if_available() {
 
     for (index, (case, program)) in cases.iter().zip(programs).enumerate() {
         let mut log = String::new();
-        match kbpf::run_program(&program.insns, &[], &packet, Some(&mut log)) {
+        match kbpf::run_program(&program.insns, &[], &kernel_frame, Some(&mut log)) {
             Ok(result) => assert_eq!(result as u64, case.expected, "{}: kernel", case.name),
             Err(error) if index == 0 && (error.is_permission()
                 || error.is_unsupported() || matches!(error.errno, 22 | 95)) => {

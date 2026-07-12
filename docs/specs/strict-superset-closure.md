@@ -117,8 +117,9 @@ legacy kernel/rbpf differentials, and `git diff --check`.
 - Steps 1-3 are implemented in `legacy-packet-loads.md`: explicit Linux and
   rbpf 0.4.1 profiles cover all eight measured rbpf forms while keeping the
   standardized Linux B/H/W, byte order, register effects, and OOB exit
-  semantics distinct. The live-kernel differential is privilege-gated and
-  skipped cleanly on hosts without `BPF_PROG_TEST_RUN` authority.
+  semantics distinct. The privilege-gated live-kernel differential passed as
+  root on the Linux 7.0.0 host for ABS W, IND H/B, exact-end, byte order, and
+  OOB implicit-zero behavior.
 - Steps 4-5 are recorded in `rbpf-backend-parity.md`. The pinned Cranelift
   suite passed 134 tests with two ignored on x86-64 Linux. Cranelift adds no
   observed guest behavior or claimed target that requires a febpf dependency;

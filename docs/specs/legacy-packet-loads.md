@@ -1,6 +1,6 @@
 # Legacy eBPF packet loads
 
-STATUS: specification; implementation pending
+STATUS: implemented and differentially validated, 2026-07-12
 
 ## Goal and scope
 
@@ -355,6 +355,12 @@ The febpf XDP-adapter tests prove internal composition only. Submit `DW` to the
 kernel as a negative/non-standard case and never count its rejection against
 Linux-profile parity. Kernel tests must skip clearly when privileges or the
 required program type are unavailable.
+
+Measured on the root-enabled Linux 7.0.0 test host: ABS W, IND H at the exact
+end, IND B, and OOB implicit-zero behavior agree across febpf's interpreter,
+hybrid JIT, and socket-filter `BPF_PROG_TEST_RUN`. The kernel test input must
+include the Ethernet header consumed by the socket-filter test runner; legacy
+offset zero addresses the payload after that header.
 
 ### rbpf behavioral comparison
 

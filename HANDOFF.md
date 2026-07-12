@@ -78,9 +78,11 @@ Honest remaining differences and follow-ups:
   a real use case justifies their lifetime API.
 - Replay files do not serialize external regions. Any future support must
   capture explicit bytes or report unavailable input, never host addresses.
-- The legacy live-kernel socket-filter differential is present but skips on
-  this host because BPF privileges are unavailable. Run it on a privileged
-  Linux host when kernel evidence is required.
+- The legacy live-kernel socket-filter differential passed as root on this
+  Linux 7.0.0 host: ABS W, IND H/B, exact-end, network byte order, and OOB
+  implicit-zero behavior agree with the interpreter and hybrid JIT. Preserve
+  its 14-byte Ethernet-header prefix: TEST_RUN consumes it before invoking the
+  socket filter.
 - Universal native-target dominance is not claimed: rbpf Cranelift reach
   beyond its measured x86-64 Linux suite remains unknown.
 - Arbitrary custom-only verifier replacement is intentionally not presented
