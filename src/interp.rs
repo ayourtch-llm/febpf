@@ -2284,6 +2284,44 @@ impl<'a> Machine<'a> {
             // febpf has no attach point: the "traced function address" is an
             // opaque, nonzero, non-dereferenceable token like get_current_task.
             helpers::id::GET_FUNC_IP => 0xffff_0000_0000_0002,
+            helpers::id::XDP_LOAD_BYTES => {
+                let start = args[1] as u32 as usize;
+                let len = args[3] as u32 as usize;
+                if self.legacy_packet_backing != LegacyPacketBacking::VmPacket
+                    || start > 0xffff
+                    || len > 0xffff
+                {
+                    (-14i64) as u64 // -EFAULT
+                } else {
+                    match start.checked_add(len) {
+                        Some(end) if end <= self.vm.packet.len() => {
+                            let data = self.vm.packet[start..end].to_vec();
+                            self.mem(args[2], len, true)?.copy_from_slice(&data);
+                            0
+                        }
+                        _ => (-22i64) as u64, // -EINVAL
+                    }
+                }
+            }
+            helpers::id::XDP_STORE_BYTES => {
+                let start = args[1] as u32 as usize;
+                let len = args[3] as u32 as usize;
+                if self.legacy_packet_backing != LegacyPacketBacking::VmPacket
+                    || start > 0xffff
+                    || len > 0xffff
+                {
+                    (-14i64) as u64 // -EFAULT
+                } else {
+                    match start.checked_add(len) {
+                        Some(end) if end <= self.vm.packet.len() => {
+                            let data = self.read_bytes(args[2], len)?;
+                            self.vm.packet[start..end].copy_from_slice(&data);
+                            0
+                        }
+                        _ => (-22i64) as u64, // -EINVAL
+                    }
+                }
+            }
             helpers::id::GET_CURRENT_COMM => {
                 let size = args[1] as usize;
                 let buf = self.mem(args[0], size, true)?;

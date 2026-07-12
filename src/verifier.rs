@@ -2741,6 +2741,23 @@ impl<'a> Verifier<'a> {
                         ));
                     }
                 },
+                ArgKind::XdpCtxPtr => match val {
+                    RegState::Ptr(Ptr {
+                        kind: PtrKind::Ctx,
+                        off: 0,
+                        var,
+                    }) if self.cfg.xdp && var.is_const() && var.umin == 0 => {}
+                    _ => {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {} arg{}: expected xdp_md context pointer in r{reg}",
+                                sig.name,
+                                i + 1
+                            ),
+                        ));
+                    }
+                },
                 ArgKind::Scalar | ArgKind::Size => {
                     if !matches!(val, RegState::Scalar(_)) {
                         return Err(self.err(

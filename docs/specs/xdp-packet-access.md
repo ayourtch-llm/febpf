@@ -65,6 +65,22 @@ Packet writes are copied back to the caller on exit or runtime error. A typed
 metadata input API is intentionally deferred until a workload needs nonzero
 interface or queue identities.
 
+## Byte-copy helpers
+
+`xdp_load_bytes` (#189) and `xdp_store_bytes` (#190) require the original,
+unmodified context pointer under the explicit XDP model, a scalar u32 packet
+offset, a memory buffer, and a bounded u32 length. Load accepts writable,
+previously uninitialized stack memory and marks the full destination range
+initialized. Store requires every source byte to be initialized.
+
+Both helpers operate on the same VM-owned packet region as direct packet
+access. An offset or length above `0xffff` returns `-EFAULT`; an interval past
+the packet end returns `-EINVAL`. Failures are atomic: load preserves the
+destination and store preserves the packet. A successful store changes packet
+contents but not its extent, so existing `data_end` range proofs remain valid.
+Interpreter and hybrid JIT share this helper implementation, and packet writes
+are copied back through the ordinary `run_xdp` contract.
+
 This slice covers verifier semantics, deterministic interpreter execution,
 automatic ELF program-type selection, raw packet-file CLI runs, a
 pcap-in/verdict-out harness, selected-packet `.febpf` replay/debugging, and

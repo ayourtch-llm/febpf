@@ -46,6 +46,8 @@ pub mod id {
     pub const SKC_TO_TCP_REQUEST_SOCK: u32 = 139;
     pub const GET_TASK_STACK: u32 = 141;
     pub const GET_FUNC_IP: u32 = 173;
+    pub const XDP_LOAD_BYTES: u32 = 189;
+    pub const XDP_STORE_BYTES: u32 = 190;
     /// First id available for user-registered helpers.
     pub const FIRST_USER: u32 = 0x1_0000;
 }
@@ -63,6 +65,8 @@ pub enum ArgKind {
     CtxPtr,
     /// The original context pointer under the explicit `__sk_buff` model.
     SkbCtxPtr,
+    /// The original context pointer under the explicit `xdp_md` model.
+    XdpCtxPtr,
     /// Readable memory of exactly the map's key size (map from arg 1).
     MapKey,
     /// Readable memory of exactly the map's value size (map from arg 1).
@@ -274,6 +278,16 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [Any, None, None, None, None],
             ret: RetKind::Scalar,
         },
+        id::XDP_LOAD_BYTES => HelperSig {
+            name: "xdp_load_bytes",
+            args: [XdpCtxPtr, Scalar, MemWrite { size_arg: 3 }, Size, None],
+            ret: RetKind::Scalar,
+        },
+        id::XDP_STORE_BYTES => HelperSig {
+            name: "xdp_store_bytes",
+            args: [XdpCtxPtr, Scalar, MemRead { size_arg: 3 }, Size, None],
+            ret: RetKind::Scalar,
+        },
         id::RINGBUF_OUTPUT => HelperSig {
             name: "ringbuf_output",
             // (map, data, size, flags)
@@ -364,6 +378,8 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::CURRENT_TASK_UNDER_CGROUP,
         id::PERF_EVENT_OUTPUT,
         id::GET_FUNC_IP,
+        id::XDP_LOAD_BYTES,
+        id::XDP_STORE_BYTES,
         id::RINGBUF_OUTPUT,
         id::RINGBUF_RESERVE,
         id::RINGBUF_SUBMIT,

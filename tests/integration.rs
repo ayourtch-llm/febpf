@@ -49,6 +49,153 @@ fn xdp_config() -> Config {
     }
 }
 
+#[test]
+fn xdp_byte_helpers_copy_owned_packet_and_mark_load_destination_initialized() {
+    assert_eq!(febpf::helpers::helper_id("xdp_load_bytes"), Some(189));
+    assert_eq!(febpf::helpers::helper_id("xdp_store_bytes"), Some(190));
+    let mut vm = Vm::new(program(
+        "r6 = r1\n\
+         r1 = r6\n\
+         r2 = 1\n\
+         r3 = r10\n\
+         r3 += -4\n\
+         r4 = 4\n\
+         call xdp_load_bytes\n\
+         if r0 != 0 goto fail\n\
+         r1 = r6\n\
+         r2 = 0\n\
+         r3 = r10\n\
+         r3 += -4\n\
+         r4 = 4\n\
+         call xdp_store_bytes\n\
+         if r0 != 0 goto fail\n\
+         r0 = *(u32 *)(r10 - 4)\n\
+         exit\n\
+         fail:\n\
+         exit",
+    ))
+    .unwrap();
+    vm.verify(xdp_config()).unwrap();
+
+    let original = [1, 2, 3, 4, 5];
+    let mut packet = original;
+    assert_eq!(vm.run_xdp(&mut packet).unwrap(), 0x0504_0302);
+    assert_eq!(packet, [2, 3, 4, 5, 5]);
+    #[cfg(feature = "jit")]
+    {
+        packet = original;
+        assert_eq!(vm.run_xdp_jit(&mut packet).unwrap(), 0x0504_0302);
+        assert_eq!(packet, [2, 3, 4, 5, 5]);
+    }
+}
+
+#[test]
+fn xdp_byte_helpers_fail_atomically_and_require_xdp_context() {
+    let mut load = Vm::new(program(
+        "*(u32 *)(r10 - 4) = 0x12345678\n\
+         r6 = r1\n\
+         r2 = 3\n\
+         r3 = r10\n\
+         r3 += -4\n\
+         r4 = 2\n\
+         call xdp_load_bytes\n\
+         if r0 != -22 goto fail\n\
+         r0 = *(u32 *)(r10 - 4)\n\
+         exit\n\
+         fail:\n\
+         r0 = 0\n\
+         exit",
+    ))
+    .unwrap();
+    load.verify(xdp_config()).unwrap();
+    let mut packet = [1, 2, 3, 4];
+    assert_eq!(load.run_xdp(&mut packet).unwrap(), 0x1234_5678);
+
+    let mut store = Vm::new(program(
+        "*(u16 *)(r10 - 2) = 0xaaaa\n\
+         r2 = 3\n\
+         r3 = r10\n\
+         r3 += -2\n\
+         r4 = 2\n\
+         call xdp_store_bytes\n\
+         exit",
+    ))
+    .unwrap();
+    store.verify(xdp_config()).unwrap();
+    assert_eq!(store.run_xdp(&mut packet).unwrap(), (-22i64) as u64);
+    assert_eq!(packet, [1, 2, 3, 4]);
+
+    let mut too_large = Vm::new(program(
+        "r2 = 65536\nr3 = r10\nr4 = 0\ncall xdp_load_bytes\nexit",
+    ))
+    .unwrap();
+    too_large.verify(xdp_config()).unwrap();
+    assert_eq!(too_large.run_xdp(&mut packet).unwrap(), (-14i64) as u64);
+
+    let mut generic = Vm::new(program(
+        "r2 = 0\nr3 = r10\nr4 = 0\ncall xdp_load_bytes\nexit",
+    ))
+    .unwrap();
+    let error = generic
+        .verify(Config::default())
+        .err()
+        .expect("XDP helper under a generic context must reject")
+        .to_string();
+    assert!(error.contains("expected xdp_md context pointer"), "{error}");
+
+    let mut adjusted = Vm::new(program(
+        "r1 += 4\nr2 = 0\nr3 = r10\nr4 = 0\ncall xdp_load_bytes\nexit",
+    ))
+    .unwrap();
+    let error = adjusted
+        .verify(xdp_config())
+        .err()
+        .expect("modified XDP context must reject")
+        .to_string();
+    assert!(error.contains("expected xdp_md context pointer"), "{error}");
+
+    let mut uninitialized_store = Vm::new(program(
+        "r2 = 0\nr3 = r10\nr3 += -1\nr4 = 1\ncall xdp_store_bytes\nexit",
+    ))
+    .unwrap();
+    let error = uninitialized_store
+        .verify(xdp_config())
+        .err()
+        .expect("XDP store source must be initialized")
+        .to_string();
+    assert!(error.contains("helper reads uninitialized stack byte"), "{error}");
+}
+
+#[test]
+fn xdp_store_bytes_preserves_direct_packet_range_proofs() {
+    let mut vm = Vm::new(program(
+        "r6 = r1\n\
+         r7 = *(u32 *)(r1 + 0)\n\
+         r8 = *(u32 *)(r1 + 4)\n\
+         r2 = r7\n\
+         r2 += 1\n\
+         if r2 > r8 goto short\n\
+         *(u8 *)(r10 - 1) = 0xaa\n\
+         r1 = r6\n\
+         r2 = 0\n\
+         r3 = r10\n\
+         r3 += -1\n\
+         r4 = 1\n\
+         call xdp_store_bytes\n\
+         if r0 != 0 goto short\n\
+         r0 = *(u8 *)(r7 + 0)\n\
+         exit\n\
+         short:\n\
+         r0 = 0\n\
+         exit",
+    ))
+    .unwrap();
+    vm.verify(xdp_config()).unwrap();
+    let mut packet = [1];
+    assert_eq!(vm.run_xdp(&mut packet).unwrap(), 0xaa);
+    assert_eq!(packet, [0xaa]);
+}
+
 // -------------------------------------------------------- embedding adapters
 
 #[test]
