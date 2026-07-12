@@ -495,6 +495,7 @@ impl Replay {
                 MapKind::CpuMap => 12,
                 MapKind::DevMapHash => 13,
                 MapKind::HashOfMaps => 14,
+                MapKind::XskMap => 15,
             });
             p.extend_from_slice(&m.key_size.to_le_bytes());
             p.extend_from_slice(&m.value_size.to_le_bytes());
@@ -696,6 +697,7 @@ impl Replay {
                             12 => MapKind::CpuMap,
                             13 => MapKind::DevMapHash,
                             14 => MapKind::HashOfMaps,
+                            15 => MapKind::XskMap,
                             k => return Err(format!("unknown map kind {k}")),
                         };
                         let key_size = r.u32()?;

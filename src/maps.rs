@@ -67,6 +67,8 @@ pub enum MapKind {
     CpuMap,
     /// Hash variant of a device redirect map.
     DevMapHash,
+    /// Queue-indexed AF_XDP socket map used by `bpf_redirect_map`.
+    XskMap,
 }
 
 /// Userspace update mode for a map-in-map entry, matching the kernel's
@@ -106,6 +108,7 @@ impl MapKind {
             | MapKind::LruHash
             | MapKind::StackTrace
             | MapKind::DevMapHash
+            | MapKind::XskMap
         )
     }
 
@@ -132,6 +135,7 @@ impl core::fmt::Display for MapKind {
             MapKind::DevMap => "devmap",
             MapKind::CpuMap => "cpumap",
             MapKind::DevMapHash => "devmap_hash",
+            MapKind::XskMap => "xskmap",
         };
         write!(f, "{s}")
     }
@@ -342,6 +346,14 @@ impl Map {
                 ));
             }
         }
+        if def.kind == MapKind::XskMap
+            && (def.key_size != 4 || def.value_size != 4 || !def.init.is_empty())
+        {
+            return Err(format!(
+                "xskmap '{}' requires key_size=4, value_size=4, and no byte initializer",
+                def.name
+            ));
+        }
         let per_cpu = def.kind.per_cpu() as usize;
         let (storage, handles) = if def.kind == MapKind::ProgArray {
             if def.key_size != 4 || def.value_size != 4 || !def.init.is_empty() {
@@ -470,6 +482,11 @@ impl Map {
         if key.len() != self.def.key_size as usize {
             return None;
         }
+        if self.def.kind == MapKind::XskMap
+            && u32::from_ne_bytes(key.try_into().ok()?) >= self.def.max_entries
+        {
+            return None;
+        }
         match &self.storage {
             Storage::Array(_) => {
                 let idx = u32::from_ne_bytes(key.try_into().ok()?);
@@ -543,6 +560,11 @@ impl Map {
         }
         if key.len() != self.def.key_size as usize || value.len() != self.def.value_size as usize {
             return Err(-22); // EINVAL
+        }
+        if self.def.kind == MapKind::XskMap
+            && u32::from_ne_bytes(key.try_into().map_err(|_| -22i64)?) >= self.def.max_entries
+        {
+            return Err(-7); // E2BIG
         }
         let per_cpu = self.per_cpu();
         let vs = self.def.value_size as usize;

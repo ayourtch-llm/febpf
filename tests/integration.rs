@@ -1350,7 +1350,7 @@ fn cgroup_array_loads_and_looks_up() {
 /// attachment concern outside a standalone VM.
 #[test]
 fn xdp_redirect_map_families_load_and_roundtrip() {
-    for (kind, value) in [("devmap", 17u32), ("cpumap", 23u32)] {
+    for (kind, value) in [("devmap", 17u32), ("cpumap", 23u32), ("xskmap", 29u32)] {
         let src = format!(
             ".map redirect {kind} 4 4 4
              w1 = 2
@@ -1407,7 +1407,7 @@ fn xdp_redirect_map_families_load_and_roundtrip() {
 #[test]
 fn redirect_map_requires_redirect_kind_and_returns_deterministic_verdict() {
     assert_eq!(febpf::helpers::helper_id("redirect_map"), Some(51));
-    for kind in ["devmap", "cpumap", "devmap_hash"] {
+    for kind in ["devmap", "cpumap", "devmap_hash", "xskmap"] {
         let src = format!(
             ".map targets {kind} 4 4 4
              *(u32 *)(r10 - 4) = 2
@@ -1449,6 +1449,43 @@ fn redirect_map_requires_redirect_kind_and_returns_deterministic_verdict() {
          exit",
     );
     assert!(error.contains("requires a devmap"), "{error}");
+}
+
+#[test]
+fn xskmap_slots_are_sparse_and_queue_bounded() {
+    assert_eq!(
+        run_src(
+            ".map xs xskmap 4 4 4\n\
+             *(u32 *)(r10 - 4) = 1\n\
+             r1 = map[xs]\n\
+             r2 = r10\n\
+             r2 += -4\n\
+             call map_lookup_elem\n\
+             if r0 == 0 goto missing\n\
+             r0 = 99\n\
+             exit\n\
+           missing:\n\
+             r0 = 7\n\
+             exit"
+        ),
+        7
+    );
+
+    let mut map = febpf::maps::Map::new(febpf::maps::MapDef {
+        name: "xs".into(),
+        kind: febpf::maps::MapKind::XskMap,
+        key_size: 4,
+        value_size: 4,
+        max_entries: 4,
+        readonly: false,
+        init: Vec::new(),
+        inner_map_idx: None,
+        map_in_map_values: Vec::new(),
+        spin_lock_off: None,
+    })
+    .unwrap();
+    assert_eq!(map.update(&4u32.to_ne_bytes(), &9u32.to_ne_bytes()), Err(-7));
+    assert!(map.lookup(&4u32.to_ne_bytes()).is_none());
 }
 
 #[test]

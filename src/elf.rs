@@ -163,6 +163,7 @@ const BPF_MAP_TYPE_ARRAY_OF_MAPS: u32 = 12;
 const BPF_MAP_TYPE_HASH_OF_MAPS: u32 = 13;
 const BPF_MAP_TYPE_DEVMAP: u32 = 14;
 const BPF_MAP_TYPE_CPUMAP: u32 = 16;
+const BPF_MAP_TYPE_XSKMAP: u32 = 17;
 const BPF_MAP_TYPE_DEVMAP_HASH: u32 = 25;
 const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 
@@ -1720,12 +1721,13 @@ fn map_kind(ty: u32) -> Result<MapKind, String> {
         BPF_MAP_TYPE_HASH_OF_MAPS => Ok(MapKind::HashOfMaps),
         BPF_MAP_TYPE_DEVMAP => Ok(MapKind::DevMap),
         BPF_MAP_TYPE_CPUMAP => Ok(MapKind::CpuMap),
+        BPF_MAP_TYPE_XSKMAP => Ok(MapKind::XskMap),
         BPF_MAP_TYPE_DEVMAP_HASH => Ok(MapKind::DevMapHash),
         BPF_MAP_TYPE_RINGBUF => Ok(MapKind::RingBuf),
         other => Err(format!(
             "unsupported map type {other} ({}); supported: hash/array/\
              perf_event_array/percpu_hash/percpu_array/stack_trace/cgroup_array/\
-             lru_hash/ringbuf/prog_array/array_of_maps/hash_of_maps/devmap/cpumap/devmap_hash",
+             lru_hash/ringbuf/prog_array/array_of_maps/hash_of_maps/devmap/cpumap/devmap_hash/xskmap",
             map_type_name(other)
         )),
     }

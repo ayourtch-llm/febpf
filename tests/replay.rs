@@ -241,6 +241,7 @@ fn redirect_map_kinds_round_trip() {
         ".map dm devmap 4 4 4
          .map cm cpumap 4 8 4
          .map dh devmap_hash 4 8 4
+         .map xs xskmap 4 4 4
          r0 = 0
          exit",
     );

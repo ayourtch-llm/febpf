@@ -95,6 +95,7 @@ mod uapi {
     pub const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
     pub const BPF_MAP_TYPE_DEVMAP: u32 = 14;
     pub const BPF_MAP_TYPE_CPUMAP: u32 = 16;
+    pub const BPF_MAP_TYPE_XSKMAP: u32 = 17;
     pub const BPF_MAP_TYPE_DEVMAP_HASH: u32 = 25;
     pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 
@@ -262,6 +263,7 @@ mod imp {
             MapKind::DevMap => BPF_MAP_TYPE_DEVMAP,
             MapKind::CpuMap => BPF_MAP_TYPE_CPUMAP,
             MapKind::DevMapHash => BPF_MAP_TYPE_DEVMAP_HASH,
+            MapKind::XskMap => BPF_MAP_TYPE_XSKMAP,
         };
         let mut a = [0u8; ATTR_SIZE];
         put_u32(&mut a, 0, map_type);

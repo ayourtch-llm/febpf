@@ -41,7 +41,7 @@ REPOS="
 libbpf-bootstrap|libbpf/libbpf-bootstrap|fac4e8ddf011aead8e14962bf8db74542331264b|fac4e8ddf011aead8e14962bf8db74542331264b|examples/c/*.bpf.c
 bcc|iovisor/bcc|v0.31.0|052022b0d128f56405b0c4fab818b7479fd0eacc|libbpf-tools/*.bpf.c
 cilium-ebpf|cilium/ebpf|v0.21.0|fd33a781ea9ebf9d1bff748707793deccc412c05|testdata/btf_map_init.c
-xdp-tools|xdp-project/xdp-tools|v1.6.3|8fbad9f0af621a22aa87ff2520b3735915b1f0fd|xdp-bench/*.bpf.c xdp-dump/xdpdump_bpf.c xdp-dump/xdpdump_xdp.c xdp-filter/xdpfilt_*.c xdp-forward/*.bpf.c xdp-monitor/*.bpf.c xdp-trafficgen/*.bpf.c
+xdp-tools|xdp-project/xdp-tools|v1.6.3|8fbad9f0af621a22aa87ff2520b3735915b1f0fd|lib/libxdp/xsk_def_xdp_prog.c lib/libxdp/xsk_def_xdp_prog_5.3.c lib/util/*.bpf.c xdp-bench/*.bpf.c xdp-dump/xdpdump_bpf.c xdp-dump/xdpdump_xdp.c xdp-filter/xdpfilt_*.c xdp-forward/*.bpf.c xdp-monitor/*.bpf.c xdp-trafficgen/*.bpf.c
 inspektor-gadget|inspektor-gadget/inspektor-gadget|v0.54.0|0c733324b97dbbbe8d85b64ae93622a86fe7bf45|gadgets/*/program.bpf.c
 "
 
@@ -219,7 +219,7 @@ done
 # libbpf v1.4.7 exposes the xdp load/store helpers used by xdp-tools. The
 # pinned xdp-tools sources retain fallback declarations unless this feature is
 # advertised, matching their configure-time HAVE_LIBBPF_BPF_PROGRAM__TYPE.
-CFLAGS="$CFLAGS -DHAVE_LIBBPF_BPF_PROGRAM__TYPE"
+CFLAGS="$CFLAGS -DHAVE_LIBBPF_BPF_PROGRAM__TYPE -DHAVE_LIBBPF_BPF_PROGRAM__FLAGS"
 
 n_repos=0
 n_found=0

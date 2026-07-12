@@ -3418,12 +3418,13 @@ impl<'a> Verifier<'a> {
                     crate::maps::MapKind::DevMap
                         | crate::maps::MapKind::DevMapHash
                         | crate::maps::MapKind::CpuMap
+                        | crate::maps::MapKind::XskMap
                 )
             {
                 return Err(self.err(
                     pc,
                     format!(
-                        "helper {} requires a devmap, devmap_hash, or cpumap, but '{}' is a {} map",
+                        "helper {} requires a devmap, devmap_hash, cpumap, or xskmap, but '{}' is a {} map",
                         sig.name, def.name, def.kind
                     ),
                 ));
