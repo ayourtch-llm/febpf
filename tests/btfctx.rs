@@ -186,19 +186,108 @@ fn iterator_terminal_record_runs_without_host_pointers() {
 }
 
 #[test]
-fn iterator_corpus_advances_past_context_typing() {
+fn btf_helper_signatures_are_exact_and_task_stack_is_deterministic() {
+    assert_eq!(febpf::helpers::helper_id("seq_write"), Some(127));
+    assert_eq!(febpf::helpers::helper_id("get_task_stack"), Some(141));
+
+    // sched_switch arg1 is an exact task_struct pointer in the fixture BTF.
+    let src = "
+        r1 = *(u64 *)(r1 + 8)
+        r2 = r10
+        r2 += -24
+        r3 = 24
+        call get_task_stack
+        exit";
+    let mut vm = Vm::new(btf_prog(src)).unwrap();
+    vm.verify(Config::default()).unwrap();
+    let mut ctx = [0u8; 24];
+    assert_eq!(vm.run(&mut ctx).unwrap(), 8);
+    assert_eq!(vm.run(&mut ctx).unwrap(), 8);
+    #[cfg(feature = "jit")]
+    assert_eq!(vm.run_jit(&mut ctx).unwrap(), 8);
+
+    let wrong = verify_err(
+        "r1 = *(u64 *)(r1 + 8)\n\
+         r2 = r10\n\
+         r3 = 0\n\
+         call seq_write\n\
+         exit",
+    );
+    assert!(wrong.contains("expected pointer to struct seq_file"), "{wrong}");
+
+    let adjusted = verify_err(
+        "r1 = *(u64 *)(r1 + 8)\n\
+         r1 += 8\n\
+         r2 = r10\n\
+         r3 = 0\n\
+         r4 = 0\n\
+         call get_task_stack\n\
+         exit",
+    );
+    assert!(adjusted.contains("original struct task_struct pointer"), "{adjusted}");
+}
+
+#[test]
+fn seq_write_output_is_vm_owned_snapshotted_and_jit_stable() {
+    let Some(ctx) = live_iterator_ctx(
+        "corpus/obj/inspektor-gadget__snapshot_process.o",
+        "iter/task",
+    ) else {
+        eprintln!("skipping: live target BTF or cached iterator corpus is absent");
+        return;
+    };
+    let src = "
+        r6 = *(u64 *)(r1 + 0)
+        r1 = *(u64 *)(r6 + 0)
+        r2 = r10
+        r2 += -8
+        r0 = 0x0807060504030201 ll
+        *(u64 *)(r2 + 0) = r0
+        r3 = 8
+        call seq_write
+        exit";
+    let mut vm = Vm::new(iterator_prog(src, ctx)).unwrap();
+    vm.verify(Config::default()).unwrap();
+    let mut record = [0u8; 16];
+    {
+        let mut machine = vm.machine(&mut record);
+        let base = machine.snapshot();
+        while machine.step().unwrap().is_none() {}
+        assert_eq!(machine.vm_ref().seq_output, b"\x01\x02\x03\x04\x05\x06\x07\x08");
+        let finished = machine.snapshot();
+        machine.restore(&base);
+        assert!(machine.vm_ref().seq_output.is_empty());
+        while machine.step().unwrap().is_none() {}
+        assert_eq!(machine.snapshot(), finished);
+    }
+
+    vm.seq_output.resize(febpf::interp::SEQ_OUTPUT_CAPACITY, 0xaa);
+    assert_eq!(vm.run(&mut record).unwrap(), (-75i64) as u64);
+    assert_eq!(vm.seq_output.len(), febpf::interp::SEQ_OUTPUT_CAPACITY);
+    assert_eq!(vm.seq_output.last(), Some(&0xaa));
+
+    #[cfg(feature = "jit")]
+    {
+        vm.seq_output.clear();
+        assert_eq!(vm.run_jit(&mut record).unwrap(), 0);
+        assert_eq!(vm.seq_output, b"\x01\x02\x03\x04\x05\x06\x07\x08");
+    }
+}
+
+#[test]
+fn iterator_corpus_advances_through_seq_and_task_stack_helpers() {
     let target = match std::fs::read("/sys/kernel/btf/vmlinux") {
         Ok(v) => v,
         Err(_) => return,
     };
     let cases = [
-        ("corpus/obj/inspektor-gadget__snapshot_file.o", "iter/task_file", 127),
-        ("corpus/obj/inspektor-gadget__snapshot_process.o", "iter/task", 127),
-        ("corpus/obj/inspektor-gadget__snapshot_socket.o", "iter/tcp", 137),
-        ("corpus/obj/inspektor-gadget__snapshot_socket.o", "iter/udp", 127),
-        ("corpus/obj/libbpf-bootstrap__task_iter.o", "iter/task", 141),
+        ("corpus/obj/inspektor-gadget__snapshot_file.o", "iter/task_file", Some("uninitialized stack byte")),
+        ("corpus/obj/inspektor-gadget__snapshot_process.o", "iter/task", None),
+        ("corpus/obj/inspektor-gadget__snapshot_socket.o", "iter/tcp", Some("unknown helper #137")),
+        ("corpus/obj/inspektor-gadget__snapshot_socket.o", "iter/udp", None),
+        ("corpus/obj/libbpf-bootstrap__task_iter.o", "iter/task", None),
     ];
-    for (path, name, helper) in cases {
+    for (path, name, expected_error) in cases {
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipping: cached iterator corpus is absent");
             return;
@@ -211,16 +300,17 @@ fn iterator_corpus_advances_past_context_typing() {
             btf_ctx: loaded.btf_ctx,
         })
         .unwrap();
-        let error = vm
-            .verify(Config::default())
-            .err()
-            .expect("next helper must reject")
-            .to_string();
-        assert!(
-            error.contains(&format!("unknown helper #{helper}")),
-            "{path}::{name}: {error}"
-        );
-        assert!(!error.contains("scalar; loads need a pointer"), "{path}::{name}: {error}");
+        let result = vm.verify(Config::default());
+        match expected_error {
+            None => assert!(result.is_ok(), "{path}::{name}: {:?}", result.err()),
+            Some(expected) => {
+                let error = result.err().expect("expected rejection").to_string();
+                assert!(error.contains(expected), "{path}::{name}: {error}");
+                assert!(!error.contains("unknown helper #127"), "{path}::{name}: {error}");
+                assert!(!error.contains("unknown helper #141"), "{path}::{name}: {error}");
+                assert!(!error.contains("scalar; loads need a pointer"), "{path}::{name}: {error}");
+            }
+        }
     }
 }
 

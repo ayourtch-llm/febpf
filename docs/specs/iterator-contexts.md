@@ -58,11 +58,38 @@ typed record/collection adapter, not fabricated kernel structs or arbitrary
 address aliases. The representation and verifier are allocation-only and
 remain identical under native `std`, wasm, and `no_std + alloc`.
 
+## Iterator output and task stacks
+
+`seq_write` (#127) has the kernel prototype `(struct seq_file *seq, const
+void *data, u32 len) -> scalar`. The first argument must be an unmodified,
+non-null pointer to the exact target-BTF `seq_file` type; an arbitrary scalar,
+another BTF pointer, a nullable pointer, or an adjusted pointer rejects. The
+data argument is readable initialized memory for the bounded `len`, including
+the kernel's valid zero-length case.
+
+Standalone execution appends successful writes to the VM-owned
+`Vm::seq_output` byte vector. The synthetic sequence has a deterministic 1 MiB
+capacity. A write which would cross it is atomic, preserves earlier bytes,
+and returns `-EOVERFLOW`; otherwise it returns zero. The output is part of
+machine snapshots, so restore and debugger replay neither lose nor duplicate
+iterator bytes.
+
+`get_task_stack` (#141) likewise requires an unmodified, non-null target-BTF
+`task_struct *`, followed by writable memory, a bounded size which may be
+zero, and kernel-style unrestricted flags. febpf has no host task stack. Its
+deterministic synthetic task writes the same innermost-first sequence of BPF
+instruction indices used by `get_stack`, as whole little-endian u64 frames,
+zero-fills the rest of the requested buffer, and returns the number of bytes
+written. This uses only VM call-frame state and therefore agrees across the
+interpreter, hybrid JIT, snapshots, and portable builds.
+
 ## Acceptance
 
 - The five pinned entries in Gadget snapshot-file/process/socket and
-  libbpf-bootstrap task-iter verify against the running target BTF.
+  libbpf-bootstrap task-iter advance through helpers #127 and #141 against
+  the running target BTF.
 - Tests cover exact positive member typing, required null checks, malformed
   offsets and widths, read-only enforcement, closed section matching, and
-  deterministic interpreter/JIT agreement on the null-element path.
+  deterministic interpreter/JIT agreement on the null-element path, sequence
+  output/snapshot behavior, and deterministic task-stack bytes.
 - Generic flat-context and missing-attach behavior do not change.

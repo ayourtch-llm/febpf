@@ -34,10 +34,12 @@ pub mod id {
     pub const PROBE_READ_USER_STR: u32 = 114;
     pub const PROBE_READ_KERNEL_STR: u32 = 115;
     pub const KTIME_GET_BOOT_NS: u32 = 125;
+    pub const SEQ_WRITE: u32 = 127;
     pub const RINGBUF_OUTPUT: u32 = 130;
     pub const RINGBUF_RESERVE: u32 = 131;
     pub const RINGBUF_SUBMIT: u32 = 132;
     pub const RINGBUF_DISCARD: u32 = 133;
+    pub const GET_TASK_STACK: u32 = 141;
     pub const GET_FUNC_IP: u32 = 173;
     /// First id available for user-registered helpers.
     pub const FIRST_USER: u32 = 0x1_0000;
@@ -63,8 +65,12 @@ pub enum ArgKind {
     MemRead { size_arg: u8 },
     /// Writable memory whose length is given by the argument at `size_arg`.
     MemWrite { size_arg: u8 },
-    /// A scalar used as a memory size; must be a known bounded value > 0.
+    /// A scalar used as a memory size; the paired memory argument constrains
+    /// its upper bound. Zero is accepted for kernel `*_SIZE_OR_ZERO` forms.
     Size,
+    /// An unmodified pointer to the exact named struct/union in target BTF.
+    /// This models helpers whose kernel prototype uses `ARG_PTR_TO_BTF_ID`.
+    BtfPtr { type_name: &'static str },
     /// Anything, including uninitialized (kernel ARG_ANYTHING for varargs).
     Any,
     /// A pointer to a ringbuf-reserved record (from `ringbuf_reserve`, after a
@@ -211,6 +217,17 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [None, None, None, None, None],
             ret: RetKind::Scalar,
         },
+        id::SEQ_WRITE => HelperSig {
+            name: "seq_write",
+            args: [
+                BtfPtr { type_name: "seq_file" },
+                MemRead { size_arg: 2 },
+                Size,
+                None,
+                None,
+            ],
+            ret: RetKind::Scalar,
+        },
         id::GET_SOCKET_COOKIE => HelperSig {
             // (ctx) -> u64 cookie; the kernel also has (sk) flavors, so the
             // argument is accepted loosely like perf_event_output's ctx.
@@ -259,6 +276,17 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [RingbufReserved, Any, None, None, None],
             ret: RetKind::Scalar,
         },
+        id::GET_TASK_STACK => HelperSig {
+            name: "get_task_stack",
+            args: [
+                BtfPtr { type_name: "task_struct" },
+                MemWrite { size_arg: 2 },
+                Size,
+                Any,
+                None,
+            ],
+            ret: RetKind::Scalar,
+        },
         _ => return Option::None,
     };
     Some(sig)
@@ -295,6 +323,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::PROBE_READ_KERNEL_STR,
         id::PROBE_READ_USER_STR,
         id::KTIME_GET_BOOT_NS,
+        id::SEQ_WRITE,
         id::CURRENT_TASK_UNDER_CGROUP,
         id::PERF_EVENT_OUTPUT,
         id::GET_FUNC_IP,
@@ -302,6 +331,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::RINGBUF_RESERVE,
         id::RINGBUF_SUBMIT,
         id::RINGBUF_DISCARD,
+        id::GET_TASK_STACK,
     ].into_iter().find(|&hid| builtin_sig(hid).unwrap().name == name)
 }
 

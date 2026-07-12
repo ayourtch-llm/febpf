@@ -22,6 +22,8 @@ For a fixed input (context bytes + preloaded map contents + a fixed
 Observation = {
     outcome : Exit(r0: u64) | Fault(kind: String),
     printk  : Vec<String>,          // ordered trace_printk lines
+    seq     : Vec<u8>,              // ordered iterator seq_write bytes
+    ctx     : Vec<u8>,              // final caller-visible context
     maps    : Vec<(name, Vec<(key,value)>)>,  // final non-readonly map contents
 }
 ```
@@ -29,10 +31,9 @@ Observation = {
 Two programs are **observably equivalent** iff for *every* input they produce
 equal observations. Notes:
 
-- `r0` alone is **not** the observable — two programs that log different
-  `trace_printk` lines, or leave a map in a different state, are NOT equivalent
-  even when `r0` matches. The interpreter already records all three (`Vm::printk`,
-  `Vm::maps` with `Map::iter_entries`, and the run's return value).
+- `r0` alone is **not** the observable — different `trace_printk` lines,
+  iterator sequence bytes, context output, or map state are NOT equivalent
+  even when `r0` matches. The interpreter records each of these outputs.
 - Map contents are canonicalized (entries sorted by key) so hash-map iteration
   order is not itself observable. Read-only (`.rodata`) maps are inputs, not
   outputs, and are excluded from the output tuple.

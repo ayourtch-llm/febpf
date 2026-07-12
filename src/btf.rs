@@ -493,6 +493,16 @@ impl Btf {
         self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// Exact id of the first named struct/union in this BTF graph.
+    pub fn composite_id_by_name(&self, name: &str) -> Option<u32> {
+        self.ids_by_name(name).iter().copied().find(|&id| {
+            matches!(
+                self.ty(id).map(|t| &t.kind),
+                Ok(Kind::Struct { .. } | Kind::Union { .. })
+            )
+        })
+    }
+
     /// Iterate `(id, type)` over all types (skipping void).
     pub fn iter(&self) -> impl Iterator<Item = (u32, &Type)> {
         self.types

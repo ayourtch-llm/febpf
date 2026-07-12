@@ -146,6 +146,9 @@ const PACKET_HANDLE: u32 = KMEM_HANDLE + 1;
 /// function of (program, ctx, this seed, map preload), which is what makes
 /// replay files reproducible — see `src/replay.rs`.
 pub const DEFAULT_PRANDOM_SEED: u64 = 0x853c49e6748fea9b;
+/// Deterministic standalone capacity of the synthetic iterator `seq_file`.
+/// `seq_write` fails atomically with `-EOVERFLOW` beyond this bound.
+pub const SEQ_OUTPUT_CAPACITY: usize = 1 << 20;
 
 #[inline]
 fn mkaddr(handle: u32, off: u32) -> u64 {
@@ -168,6 +171,8 @@ pub struct Vm {
     prandom: u64,
     /// Lines emitted by trace_printk.
     pub printk: Vec<String>,
+    /// Bytes emitted through iterator helper `seq_write`.
+    pub seq_output: Vec<u8>,
     /// Echo trace_printk lines to stderr as they happen.
     pub echo_printk: bool,
     /// Abort execution after this many instructions.
@@ -287,6 +292,7 @@ impl Vm {
             start: Clock::start(),
             prandom: DEFAULT_PRANDOM_SEED,
             printk: Vec::new(),
+            seq_output: Vec::new(),
             echo_printk: false,
             insn_limit: u64::MAX,
             profile: None,
@@ -936,6 +942,7 @@ pub struct Snapshot {
     maps: Vec<MapSnapshot>,
     prandom: u64,
     printk: Vec<String>,
+    seq_output: Vec<u8>,
     profile: Option<Vec<u64>>,
     nondet_calls: u64,
     logical_boot_ns: u64,
@@ -1268,6 +1275,7 @@ impl<'a> Machine<'a> {
             maps: self.vm.maps.iter().map(Map::snapshot).collect(),
             prandom: self.vm.prandom,
             printk: self.vm.printk.clone(),
+            seq_output: self.vm.seq_output.clone(),
             profile: self.vm.profile.clone(),
             nondet_calls: self.nondet_calls,
             logical_boot_ns: self.logical_boot_ns,
@@ -1292,6 +1300,7 @@ impl<'a> Machine<'a> {
         }
         self.vm.prandom = s.prandom;
         self.vm.printk = s.printk.clone();
+        self.vm.seq_output = s.seq_output.clone();
         self.vm.profile = s.profile.clone();
         self.nondet_calls = s.nondet_calls;
         self.logical_boot_ns = s.logical_boot_ns;
@@ -2175,6 +2184,21 @@ impl<'a> Machine<'a> {
                 self.logical_boot_ns = self.logical_boot_ns.saturating_add(1);
                 self.logical_boot_ns
             }
+            helpers::id::SEQ_WRITE => {
+                let data = self.read_bytes(args[1], args[2] as usize)?;
+                let fits = self
+                    .vm
+                    .seq_output
+                    .len()
+                    .checked_add(data.len())
+                    .is_some_and(|len| len <= SEQ_OUTPUT_CAPACITY);
+                if fits {
+                    self.vm.seq_output.extend_from_slice(&data);
+                    0
+                } else {
+                    (-75i64) as u64 // -EOVERFLOW; leave prior output intact
+                }
+            }
             helpers::id::TRACE_PRINTK => {
                 let fmt = self.read_bytes(args[0], args[1] as usize)?;
                 let line = self.format_printk(&fmt, [args[2], args[3], args[4]])?;
@@ -2251,6 +2275,25 @@ impl<'a> Machine<'a> {
                 // stack's instruction indices (innermost first) as LE u64s.
                 // The buffer is zeroed first so the result is deterministic;
                 // returns the number of bytes written (a multiple of 8).
+                let size = args[2] as usize;
+                let pcs = self.backtrace_pcs();
+                let buf = self.mem(args[1], size, true)?;
+                buf.fill(0);
+                let mut written = 0usize;
+                for pc in &pcs {
+                    if written + 8 > size {
+                        break;
+                    }
+                    buf[written..written + 8].copy_from_slice(&(*pc as u64).to_le_bytes());
+                    written += 8;
+                }
+                written as u64
+            }
+            helpers::id::GET_TASK_STACK => {
+                // Standalone febpf has one synthetic task. Its stack is the
+                // same deterministic sequence of BPF call-site pcs exposed by
+                // get_stack: innermost first, whole LE u64 frames only. The
+                // exact task pointer was checked against target BTF.
                 let size = args[2] as usize;
                 let pcs = self.backtrace_pcs();
                 let buf = self.mem(args[1], size, true)?;

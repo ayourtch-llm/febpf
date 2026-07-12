@@ -1,10 +1,10 @@
 //! Observable-behavior equivalence checking for two eBPF programs.
 //!
 //! Two programs are *observably equivalent* iff, for every input, they produce
-//! the same observation: the return value `r0`, the ordered `trace_printk`
-//! lines, the final context bytes, and the final contents of every writable
-//! map. See `docs/specs/equiv-optimizer.md` for the full definition and the
-//! soundness argument.
+//! the same observation: the return value `r0`, ordered `trace_printk` lines,
+//! iterator sequence bytes, final context bytes, and final contents of every
+//! writable map. See `docs/specs/equiv-optimizer.md` for the full definition
+//! and the soundness argument.
 //!
 //! The checker is layered, cheapest first:
 //!   (a) abstract/structural proofs discharged with the verifier's tnum+range
@@ -37,6 +37,7 @@ pub type MapState = (String, Vec<(Vec<u8>, Vec<u8>)>);
 pub struct Observation {
     pub outcome: Outcome,
     pub printk: Vec<String>,
+    pub seq_output: Vec<u8>,
     /// Final context bytes (the caller-visible buffer r1 points at).
     pub ctx_out: Vec<u8>,
     /// Final contents of each writable map. Read-only maps are inputs, not
@@ -135,6 +136,7 @@ pub fn observe(
     Ok(Observation {
         outcome,
         printk: vm.printk.clone(),
+        seq_output: vm.seq_output.clone(),
         ctx_out: ctx,
         maps,
     })
@@ -374,6 +376,10 @@ pub fn render_witness(w: &Witness) -> String {
         let _ = writeln!(s, "  printk A: {:?}", w.a.printk);
         let _ = writeln!(s, "  printk B: {:?}", w.b.printk);
     }
+    if w.a.seq_output != w.b.seq_output {
+        let _ = writeln!(s, "  seq output A: {:02x?}", w.a.seq_output);
+        let _ = writeln!(s, "  seq output B: {:02x?}", w.b.seq_output);
+    }
     if w.a.ctx_out != w.b.ctx_out {
         let _ = writeln!(s, "  ctx-out A: {}", to_hex(&w.a.ctx_out));
         let _ = writeln!(s, "  ctx-out B: {}", to_hex(&w.b.ctx_out));
@@ -460,5 +466,20 @@ mod tests {
         );
         let v = check(&a, &b, &Options::default()).unwrap();
         assert!(matches!(v, Verdict::NotEquivalent(_)), "{v:?}");
+    }
+
+    #[test]
+    fn iterator_sequence_bytes_are_observable() {
+        let a = prog(
+            "r0 = 65\n*(u8 *)(r10 - 1) = r0\nr1 = 0\nr2 = r10\nr2 += -1\nr3 = 1\ncall 127\nr0 = 0\nexit\n",
+        );
+        let b = prog(
+            "r0 = 66\n*(u8 *)(r10 - 1) = r0\nr1 = 0\nr2 = r10\nr2 += -1\nr3 = 1\ncall 127\nr0 = 0\nexit\n",
+        );
+        let oa = observe(&a, &[], 1, 1_000).unwrap();
+        let ob = observe(&b, &[], 1, 1_000).unwrap();
+        assert_eq!(oa.seq_output, b"A");
+        assert_eq!(ob.seq_output, b"B");
+        assert_ne!(oa, ob);
     }
 }

@@ -2709,6 +2709,76 @@ impl<'a> Verifier<'a> {
                         ));
                     }
                 }
+                ArgKind::BtfPtr { type_name } => {
+                    let p = match val {
+                        RegState::Ptr(p) => p,
+                        _ => {
+                            return Err(self.err(
+                                pc,
+                                format!(
+                                    "helper {} arg{}: expected pointer to struct {type_name} in r{reg}",
+                                    sig.name,
+                                    i + 1
+                                ),
+                            ));
+                        }
+                    };
+                    let btf_id = match p.kind {
+                        PtrKind::BtfId { btf_id } => btf_id,
+                        PtrKind::BtfIdOrNull { .. } => {
+                            return Err(self.err(
+                                pc,
+                                format!(
+                                    "helper {} arg{} may be NULL; null-check it before the call",
+                                    sig.name,
+                                    i + 1
+                                ),
+                            ));
+                        }
+                        _ => {
+                            return Err(self.err(
+                                pc,
+                                format!(
+                                    "helper {} arg{}: expected pointer to struct {type_name} in r{reg}",
+                                    sig.name,
+                                    i + 1
+                                ),
+                            ));
+                        }
+                    };
+                    if p.off != 0 || !p.var.is_const() || p.var.umin != 0 {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {} arg{} needs the original struct {type_name} pointer (offset 0)",
+                                sig.name,
+                                i + 1
+                            ),
+                        ));
+                    }
+                    let (expected_id, actual) = self
+                        .cfg
+                        .btf_ctx
+                        .as_ref()
+                        .and_then(|ctx| ctx.btf.as_ref())
+                        .map(|btf| {
+                            (
+                                btf.composite_id_by_name(type_name),
+                                btf.type_name(btf_id),
+                            )
+                        })
+                        .unwrap_or((None, ""));
+                    if expected_id != Some(btf_id) {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {} arg{}: expected pointer to struct {type_name}, got struct {actual}",
+                                sig.name,
+                                i + 1
+                            ),
+                        ));
+                    }
+                }
                 ArgKind::ConstMapPtr => match val {
                     RegState::Ptr(Ptr {
                         kind: PtrKind::Map { map },
