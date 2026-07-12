@@ -90,25 +90,30 @@ fn static_prog_array_initializers_link_programs() {
         .iter()
         .find(|p| p.name == init.program)
         .unwrap();
-    let mut vm = Vm::new(Program {
-        insns: entry.insns.clone(),
-        maps: obj.maps.clone(),
-        btf_ctx: None,
-    })
-    .unwrap();
-    vm.verify(Config::default()).unwrap();
-    vm.register_tail_call(
-        "progs",
-        0,
-        Program {
-            insns: target.insns.clone(),
+    let linked_vm = || {
+        let mut vm = Vm::new(Program {
+            insns: entry.insns.clone(),
             maps: obj.maps.clone(),
             btf_ctx: None,
-        },
-        Config::default(),
-    )
-    .unwrap();
-    assert_eq!(vm.run(&mut [0u8; 16]).unwrap(), 42);
+        })
+        .unwrap();
+        vm.verify(Config::default()).unwrap();
+        vm.register_tail_call(
+            "progs",
+            0,
+            Program {
+                insns: target.insns.clone(),
+                maps: obj.maps.clone(),
+                btf_ctx: None,
+            },
+            Config::default(),
+        )
+        .unwrap();
+        vm
+    };
+    assert_eq!(linked_vm().run(&mut [0u8; 16]).unwrap(), 42);
+    #[cfg(feature = "jit")]
+    assert_eq!(linked_vm().run_jit(&mut [0u8; 16]).unwrap(), 42);
 }
 
 #[test]

@@ -14,7 +14,7 @@ load-bearing constraint. Don't add any without a very good reason and the
 user's OK (raw Linux syscalls via `asm!` are used instead of libc — see the
 JIT's `sys` module).
 
-Everything works today: the full default-feature suite is **319 green + 4
+Everything works today: the full default-feature suite is **320 green + 4
 intentional heavy soundness sweeps ignored**; `--no-default-features` is **307
 green + the same 4 ignored** (2026-07-12, after the static tail-call ELF work).
 `cargo clippy --all-targets -- -D warnings` is clean in both configs. **Keep

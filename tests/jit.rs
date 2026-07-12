@@ -325,3 +325,56 @@ fn jit_tail_call_bundle_matches_interpreter() {
     assert_eq!(linked_vm().run(&mut []).unwrap(), 42);
     assert_eq!(linked_vm().run_jit(&mut []).unwrap(), 42);
 }
+
+#[test]
+fn jit_tail_call_cycle_matches_exact_chain_boundary() {
+    let source =
+        ".map progs prog_array 4 4 1
+         .map count array 4 8 1
+         r7 = r1
+         *(u32 *)(r10 - 4) = 0
+         r1 = map[count]
+         r2 = r10
+         r2 += -4
+         call map_lookup_elem
+         if r0 == 0 goto done
+         r6 = *(u64 *)(r0 + 0)
+         r6 += 1
+         *(u64 *)(r0 + 0) = r6
+         r1 = r7
+         r2 = map[progs]
+         r3 = 0
+         call tail_call
+         r0 = r6
+         exit
+       done:
+         r0 = 0
+         exit";
+
+    fn linked_vm(source: &str) -> Vm {
+        let entry = asm::assemble(source).unwrap();
+        let target = asm::assemble(source).unwrap();
+        let mut vm = Vm::new(Program {
+            insns: entry.insns,
+            maps: entry.maps,
+            btf_ctx: None,
+        })
+        .unwrap();
+        vm.verify(Config::default()).unwrap();
+        vm.register_tail_call(
+            "progs",
+            0,
+            Program {
+                insns: target.insns,
+                maps: target.maps,
+                btf_ctx: None,
+            },
+            Config::default(),
+        )
+        .unwrap();
+        vm
+    }
+
+    assert_eq!(linked_vm(source).run(&mut []).unwrap(), 34);
+    assert_eq!(linked_vm(source).run_jit(&mut []).unwrap(), 34);
+}
