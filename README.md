@@ -41,6 +41,8 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
 - **Assembler & disassembler** for the kernel-documentation "pseudo-C"
   syntax (`r0 = 42`, `if r1 s> r2 goto out`, `*(u32 *)(r10 - 8) = r1`),
   with labels, map declarations, and `asm(disasm(p)) == p` round-tripping.
+  Embedders can also construct instruction streams with the typed, fluent
+  `builder::Builder` API.
 - **Analysis**: basic-block CFG (Graphviz DOT export), instruction-mix
   stats, and a listing annotated with the verifier's abstract state at
   every instruction — watch ranges tighten as null checks and bounds
@@ -69,6 +71,9 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
   architecture-independent frontend and a `JitBackend` trait; adding **riscv64**
   means implementing that one trait (see `docs/specs/jit-backend.md`).
   Differentially tested against the interpreter.
+- **Portable interpreter**: the VM, assembler, verifier, maps, helpers and
+  replay tooling target x86-64 Windows with the JIT disabled; native Windows
+  CI builds, runs the test suite and enforces strict clippy.
 - **Execution profiler**: `febpf profile` runs the program and prints a
   per-instruction heatmap (counts, %, log-scaled bar) plus hottest-block
   summary.
@@ -146,17 +151,31 @@ miss:
 ## Library use
 
 ```rust
-use febpf::{asm, Program, Vm, verifier::Config};
+use febpf::{builder::Builder, verifier::Config, Program, Vm};
 
-let a = asm::assemble("r0 = 42\n exit").unwrap();
-let mut vm = Vm::new(Program {
-    insns: a.insns,
-    maps: a.maps,
-    btf_ctx: None,
-}).unwrap();
+fn constant(value: i32) -> Program {
+    Program {
+        insns: Builder::new().mov64_imm(0, value).exit().build().unwrap(),
+        maps: Vec::new(),
+        btf_ctx: None,
+    }
+}
+
+let mut vm = Vm::new(constant(42)).unwrap();
 vm.verify(Config::default()).unwrap();      // kernel-style verification
-assert_eq!(vm.run(&mut []).unwrap(), 42);
+assert_eq!(vm.run_no_data().unwrap(), 42);  // explicit empty-input adapter
+
+vm.replace_program(constant(7)).unwrap();   // transactional on failure
+vm.verify(Config::default()).unwrap();      // replacements start unverified
+assert_eq!(vm.run_no_data().unwrap(), 7);
 ```
+
+For mutable byte input, `vm.run_raw(&mut buffer)` exposes the buffer through
+febpf's bounded guest-address region and copies program writes directly back;
+it never places the buffer's host pointer in a guest register. A successful
+`replace_program` resets program-derived state while preserving registered
+helpers and execution configuration; if construction fails, the original
+program and its live map state remain unchanged.
 
 Custom helpers get bounds-checked memory access and a verifier signature:
 
@@ -252,7 +271,7 @@ including time-travel `rstep`.
 
 ## Tests
 
-The current suite has **330 passing tests** with default features and **316**
+The current suite has **344 passing tests** with default features and **330**
 with `--no-default-features`, plus four intentionally ignored exhaustive
 soundness sweeps in each configuration. Coverage includes ISA semantics,
 verifier acceptance and rejection, abstract-operator soundness, maps/helpers,
