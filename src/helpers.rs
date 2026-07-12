@@ -11,6 +11,7 @@ pub mod id {
     pub const TRACE_PRINTK: u32 = 6;
     pub const GET_PRANDOM_U32: u32 = 7;
     pub const GET_SMP_PROCESSOR_ID: u32 = 8;
+    pub const TAIL_CALL: u32 = 12;
     pub const GET_CURRENT_PID_TGID: u32 = 14;
     pub const GET_CURRENT_UID_GID: u32 = 15;
     pub const GET_CURRENT_COMM: u32 = 16;
@@ -43,6 +44,8 @@ pub enum ArgKind {
     Scalar,
     /// A map pointer produced by `lddw rN = map[...]`.
     ConstMapPtr,
+    /// The original program context pointer (`ARG_PTR_TO_CTX`).
+    CtxPtr,
     /// Readable memory of exactly the map's key size (map from arg 1).
     MapKey,
     /// Readable memory of exactly the map's value size (map from arg 1).
@@ -116,6 +119,11 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
         id::GET_SMP_PROCESSOR_ID => HelperSig {
             name: "get_smp_processor_id",
             args: [None, None, None, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::TAIL_CALL => HelperSig {
+            name: "tail_call",
+            args: [CtxPtr, ConstMapPtr, Scalar, None, None],
             ret: RetKind::Scalar,
         },
         id::GET_CURRENT_PID_TGID => HelperSig {
@@ -254,6 +262,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::TRACE_PRINTK,
         id::GET_PRANDOM_U32,
         id::GET_SMP_PROCESSOR_ID,
+        id::TAIL_CALL,
         id::GET_CURRENT_PID_TGID,
         id::GET_CURRENT_UID_GID,
         id::GET_CURRENT_COMM,

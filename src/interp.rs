@@ -110,6 +110,7 @@ pub struct Vm {
     exec: Vec<Insn>,
     pub maps: Vec<Map>,
     map_defs: Vec<MapDef>,
+    map_obj_handles: Vec<u32>,
     pub user_helpers: UserHelpers,
     regions: Vec<Region>,
     stack: Vec<u8>,
@@ -149,6 +150,15 @@ pub struct Vm {
     /// Set after verification with [`crate::verifier::Config::xdp`]; causes
     /// xdp_md data/data_end loads to synthesize full virtual addresses.
     xdp: bool,
+    tail_programs: Vec<TailProgram>,
+}
+
+struct TailProgram {
+    insns: Vec<Insn>,
+    exec: Vec<Insn>,
+    probe_mem: Vec<bool>,
+    #[cfg(feature = "jit")]
+    jit: Option<crate::jit::JitProgram>,
 }
 
 impl Vm {
@@ -177,6 +187,7 @@ impl Vm {
             insns: prog.insns,
             maps,
             map_defs: prog.maps,
+            map_obj_handles: map_obj_handles.clone(),
             user_helpers: UserHelpers::new(),
             regions,
             stack: vec![0u8; MAX_CALL_FRAMES * STACK_SIZE],
@@ -193,6 +204,7 @@ impl Vm {
             kmem: Vec::new(),
             packet: Vec::new(),
             xdp: false,
+            tail_programs: Vec::new(),
         };
 
         // Patch map-reference lddw instructions into plain 64-bit immediates.
@@ -232,10 +244,90 @@ impl Vm {
         Ok(vm)
     }
 
+    /// Verify and link a program into one `PROG_ARRAY` slot. Programs in a
+    /// bundle share the entry VM's maps and virtual map-object addresses.
+    pub fn register_tail_call(
+        &mut self,
+        map_name: &str,
+        index: u32,
+        prog: Program,
+        mut cfg: crate::verifier::Config,
+    ) -> Result<u32, String> {
+        if prog.maps != self.map_defs {
+            return Err("tail-call target must use the bundle's identical map definitions".into());
+        }
+        if cfg.btf_ctx.is_none() {
+            cfg.btf_ctx = prog.btf_ctx.clone();
+        }
+        let ok = crate::verifier::verify(&prog.insns, &prog.maps, self.user_helpers.sigs(), cfg)
+            .map_err(|e| format!("tail-call target verification failed: {e}"))?;
+        let exec = self.patch_bundle_program(&prog.insns)?;
+        let program_id = self.tail_programs.len() as u32 + 1;
+        let map = self
+            .maps
+            .iter_mut()
+            .find(|m| m.def.name == map_name)
+            .ok_or_else(|| format!("no map named '{map_name}'"))?;
+        if map.def.kind != crate::maps::MapKind::ProgArray {
+            return Err(format!("map '{map_name}' is not a prog_array"));
+        }
+        map.set_program(index, program_id)
+            .map_err(|e| format!("cannot set {map_name}[{index}]: errno {}", -e))?;
+        self.tail_programs.push(TailProgram {
+            insns: prog.insns,
+            exec,
+            probe_mem: ok.probe_mem,
+            #[cfg(feature = "jit")]
+            jit: None,
+        });
+        Ok(program_id)
+    }
+
     fn patch_wide(&mut self, pc: usize, value: u64) {
         self.exec[pc].src = pseudo::IMM64;
         self.exec[pc].imm = value as u32 as i32;
         self.exec[pc + 1].imm = (value >> 32) as u32 as i32;
+    }
+
+    fn patch_bundle_program(&mut self, insns: &[Insn]) -> Result<Vec<Insn>, String> {
+        let mut exec = insns.to_vec();
+        let mut pc = 0;
+        while pc < exec.len() {
+            let ins = exec[pc];
+            if ins.is_wide() {
+                let map = ins.imm as usize;
+                let addr = match ins.src {
+                    pseudo::MAP_ID => mkaddr(
+                        *self.map_obj_handles.get(map).ok_or_else(|| {
+                            format!("insn {pc}: lddw references unknown map {map}")
+                        })?,
+                        0,
+                    ),
+                    pseudo::MAP_VALUE => {
+                        if self.maps.get(map).map(|m| m.def.kind)
+                            != Some(crate::maps::MapKind::Array)
+                        {
+                            return Err(format!(
+                                "insn {pc}: direct value access needs an array map"
+                            ));
+                        }
+                        self.value_addr(map as u32, ValueRef::ArrayElem(0))
+                            + exec[pc + 1].imm as u32 as u64
+                    }
+                    _ => {
+                        pc += 2;
+                        continue;
+                    }
+                };
+                exec[pc].src = pseudo::IMM64;
+                exec[pc].imm = addr as u32 as i32;
+                exec[pc + 1].imm = (addr >> 32) as u32 as i32;
+                pc += 2;
+            } else {
+                pc += 1;
+            }
+        }
+        Ok(exec)
     }
 
     /// Virtual address of a map value, creating its region on first use.
@@ -385,6 +477,11 @@ impl Vm {
         if self.jit.is_none() {
             self.jit = Some(crate::jit::compile(&self.exec)?);
         }
+        for target in &mut self.tail_programs {
+            if target.jit.is_none() {
+                target.jit = Some(crate::jit::compile(&target.exec)?);
+            }
+        }
         Ok(())
     }
 
@@ -396,9 +493,35 @@ impl Vm {
             return Err(EbpfError { pc: 0, msg: e });
         }
         let jit = self.jit.take().unwrap();
+        let mut tail_jits: Vec<crate::jit::JitProgram> = self
+            .tail_programs
+            .iter_mut()
+            .map(|p| p.jit.take().unwrap())
+            .collect();
         let mut m = Machine::new(self, ctx);
-        let r = m.run_native(&jit);
+        let r = loop {
+            let native = if m.active_program == 0 {
+                &jit
+            } else {
+                &tail_jits[m.active_program as usize - 1]
+            };
+            // Safety: same contract as Machine::run_native. A successful tail
+            // call returns through STOP and the loop enters the target JIT.
+            unsafe { native.enter(&mut m) };
+            if let Some(e) = m.jit_fault.take() {
+                break Err(e);
+            }
+            if m.jit_switch_pending {
+                m.jit_switch_pending = false;
+                continue;
+            }
+            break Ok(m.regs[0]);
+        };
+        drop(m);
         self.jit = Some(jit);
+        for (target, native) in self.tail_programs.iter_mut().zip(tail_jits.drain(..)) {
+            target.jit = Some(native);
+        }
         r
     }
 }
@@ -435,6 +558,8 @@ pub struct Snapshot {
     printk: Vec<String>,
     profile: Option<Vec<u64>>,
     nondet_calls: u64,
+    active_program: u32,
+    tail_call_count: u32,
 }
 
 impl Snapshot {
@@ -460,6 +585,8 @@ pub struct InstanceState {
     nondet_calls: u64,
     stack: Vec<u8>,
     ctx: Vec<u8>,
+    active_program: u32,
+    tail_call_count: u32,
 }
 
 impl InstanceState {
@@ -479,6 +606,8 @@ impl InstanceState {
             nondet_calls: 0,
             stack: vec![0u8; MAX_CALL_FRAMES * STACK_SIZE],
             ctx: ctx.to_vec(),
+            active_program: 0,
+            tail_call_count: 0,
         }
     }
 
@@ -560,6 +689,10 @@ pub struct Machine<'a> {
     /// Set by the JIT trampoline when a deferred instruction faults.
     #[cfg(feature = "jit")]
     jit_fault: Option<EbpfError>,
+    #[cfg(feature = "jit")]
+    jit_switch_pending: bool,
+    active_program: u32,
+    tail_call_count: u32,
 }
 
 /// Memory bus for user helpers: bounds-checked access to the VM's regions.
@@ -651,6 +784,22 @@ impl MemBus for Bus<'_> {
 }
 
 impl<'a> Machine<'a> {
+    fn current_exec(&self) -> &[Insn] {
+        if self.active_program == 0 {
+            &self.vm.exec
+        } else {
+            &self.vm.tail_programs[self.active_program as usize - 1].exec
+        }
+    }
+
+    fn current_probe_mem(&self) -> &[bool] {
+        if self.active_program == 0 {
+            &self.vm.probe_mem
+        } else {
+            &self.vm.tail_programs[self.active_program as usize - 1].probe_mem
+        }
+    }
+
     fn new(vm: &'a mut Vm, ctx: &'a mut [u8]) -> Machine<'a> {
         vm.stack.iter_mut().for_each(|b| *b = 0);
         // BTF-typed programs: the ctx is an array of 8-byte arguments, and
@@ -682,6 +831,10 @@ impl<'a> Machine<'a> {
             nondet_calls: 0,
             #[cfg(feature = "jit")]
             jit_fault: None,
+            #[cfg(feature = "jit")]
+            jit_switch_pending: false,
+            active_program: 0,
+            tail_call_count: 0,
         }
     }
 
@@ -701,6 +854,8 @@ impl<'a> Machine<'a> {
             printk: self.vm.printk.clone(),
             profile: self.vm.profile.clone(),
             nondet_calls: self.nondet_calls,
+            active_program: self.active_program,
+            tail_call_count: self.tail_call_count,
         }
     }
 
@@ -721,9 +876,12 @@ impl<'a> Machine<'a> {
         self.vm.printk = s.printk.clone();
         self.vm.profile = s.profile.clone();
         self.nondet_calls = s.nondet_calls;
+        self.active_program = s.active_program;
+        self.tail_call_count = s.tail_call_count;
         #[cfg(feature = "jit")]
         {
             self.jit_fault = None;
+            self.jit_switch_pending = false;
         }
     }
 
@@ -750,6 +908,8 @@ impl<'a> Machine<'a> {
         self.frames.clone_from(&st.frames);
         self.insn_count = st.insn_count;
         self.nondet_calls = st.nondet_calls;
+        self.active_program = st.active_program;
+        self.tail_call_count = st.tail_call_count;
         self.vm.stack.copy_from_slice(&st.stack);
         self.ctx.copy_from_slice(&st.ctx);
     }
@@ -762,6 +922,8 @@ impl<'a> Machine<'a> {
         st.frames.clone_from(&self.frames);
         st.insn_count = self.insn_count;
         st.nondet_calls = self.nondet_calls;
+        st.active_program = self.active_program;
+        st.tail_call_count = self.tail_call_count;
         st.stack.copy_from_slice(&self.vm.stack);
         st.ctx.copy_from_slice(self.ctx);
     }
@@ -771,7 +933,7 @@ impl<'a> Machine<'a> {
     /// instance-local instructions (ALU, branches, stack/ctx memory, non-map
     /// helpers, exit).
     pub fn classify_mapop(&self) -> Option<MapOp> {
-        let ins = *self.vm.exec.get(self.pc)?;
+        let ins = *self.current_exec().get(self.pc)?;
         match ins.class() {
             class::JMP | class::JMP32
                 if ins.op() == jmp::CALL && ins.src == call_kind::HELPER =>
@@ -898,8 +1060,13 @@ impl<'a> Machine<'a> {
     #[cfg(feature = "jit")]
     pub fn jit_step_at(&mut self, pc: usize) -> u64 {
         self.pc = pc;
+        let before = self.active_program;
         match self.step() {
             Ok(Some(_r0)) => crate::jit::abi::STOP, // program finished; r0 in regs[0]
+            Ok(None) if self.active_program != before => {
+                self.jit_switch_pending = true;
+                crate::jit::abi::STOP
+            }
             Ok(None) => self.pc as u64,
             Err(e) => {
                 self.jit_fault = Some(e);
@@ -911,19 +1078,6 @@ impl<'a> Machine<'a> {
     #[cfg(feature = "jit")]
     pub fn take_jit_fault(&mut self) -> Option<EbpfError> {
         self.jit_fault.take()
-    }
-
-    /// Run to completion using precompiled native code.
-    #[cfg(feature = "jit")]
-    fn run_native(&mut self, jit: &crate::jit::JitProgram) -> Result<u64, EbpfError> {
-        // Safety: `jit.enter` runs native code that only touches this
-        // machine's register file (via the pointer we hand it) and calls
-        // back exclusively through the trampoline, which operates on `self`.
-        unsafe { jit.enter(self) };
-        if let Some(e) = self.jit_fault.take() {
-            return Err(e);
-        }
-        Ok(self.regs[0])
     }
 
     pub fn current_frame(&self) -> usize {
@@ -944,6 +1098,18 @@ impl<'a> Machine<'a> {
     /// Shared access to the underlying VM (for inspection tools).
     pub fn vm_ref(&self) -> &Vm {
         self.vm
+    }
+
+    pub fn active_program(&self) -> u32 {
+        self.active_program
+    }
+
+    pub fn current_insns(&self) -> &[Insn] {
+        if self.active_program == 0 {
+            &self.vm.insns
+        } else {
+            &self.vm.tail_programs[self.active_program as usize - 1].insns
+        }
     }
 
     /// Human-readable description of a virtual address' region, for the
@@ -1045,12 +1211,13 @@ impl<'a> Machine<'a> {
             )));
         }
         let ins = *self
-            .vm
-            .exec
+            .current_exec()
             .get(self.pc)
             .ok_or_else(|| self.err("program counter out of bounds"))?;
-        if let Some(prof) = &mut self.vm.profile {
+        if self.active_program == 0 {
+            if let Some(prof) = &mut self.vm.profile {
             prof[self.pc] += 1;
+            }
         }
         let dst = ins.dst as usize;
         let src = ins.src as usize;
@@ -1178,7 +1345,7 @@ impl<'a> Machine<'a> {
                 if !ins.is_wide() {
                     return Err(self.err("legacy packet access is not supported"));
                 }
-                self.regs[dst] = wide_imm(&self.vm.exec, self.pc);
+                self.regs[dst] = wide_imm(self.current_exec(), self.pc);
                 self.pc += 2;
             }
             class::LDX => {
@@ -1205,7 +1372,7 @@ impl<'a> Machine<'a> {
                     ptr
                 } else {
                     match self.load(addr, size) {
-                        Err(_) if self.vm.probe_mem.get(self.pc) == Some(&true) => 0,
+                        Err(_) if self.current_probe_mem().get(self.pc) == Some(&true) => 0,
                         r => r?,
                     }
                 };
@@ -1269,8 +1436,9 @@ impl<'a> Machine<'a> {
                                 mkaddr(STACK0_HANDLE + self.frames.len() as u32, STACK_SIZE as u32);
                             self.jump(ins.imm as i64)?;
                         } else {
-                            self.helper_call(ins.imm as u32)?;
-                            self.pc += 1;
+                            if !self.helper_call(ins.imm as u32)? {
+                                self.pc += 1;
+                            }
                         }
                     }
                     op => {
@@ -1330,7 +1498,7 @@ impl<'a> Machine<'a> {
     #[inline]
     fn jump(&mut self, rel: i64) -> Result<(), EbpfError> {
         let t = self.pc as i64 + 1 + rel;
-        if t < 0 || t as usize >= self.vm.exec.len() {
+        if t < 0 || t as usize >= self.current_exec().len() {
             return Err(self.err(format!("jump target {t} out of bounds")));
         }
         self.pc = t as usize;
@@ -1427,8 +1595,31 @@ impl<'a> Machine<'a> {
         }
     }
 
-    fn helper_call(&mut self, hid: u32) -> Result<(), EbpfError> {
+    fn helper_call(&mut self, hid: u32) -> Result<bool, EbpfError> {
         let args = [self.regs[1], self.regs[2], self.regs[3], self.regs[4], self.regs[5]];
+        if hid == helpers::id::TAIL_CALL {
+            let map = self.map_from_ptr(args[1])?;
+            if self.vm.maps[map].def.kind != crate::maps::MapKind::ProgArray
+                || self.tail_call_count >= 33
+            {
+                return Ok(self.tail_call_fallthrough());
+            }
+            let Some(program) = self.vm.maps[map].program_at(args[2] as u32) else {
+                return Ok(self.tail_call_fallthrough());
+            };
+            if program == 0 || program as usize > self.vm.tail_programs.len() {
+                return Ok(self.tail_call_fallthrough());
+            }
+            self.tail_call_count += 1;
+            self.active_program = program;
+            self.pc = 0;
+            self.frames.clear();
+            self.vm.stack.fill(0);
+            self.regs.fill(0);
+            self.regs[1] = args[0];
+            self.regs[REG_FP as usize] = mkaddr(STACK0_HANDLE, STACK_SIZE as u32);
+            return Ok(true);
+        }
         let r0 = match hid {
             helpers::id::MAP_LOOKUP_ELEM => {
                 let m = self.map_from_ptr(args[0])?;
@@ -1694,7 +1885,15 @@ impl<'a> Machine<'a> {
         for r in 1..=5 {
             self.regs[r] = 0;
         }
-        Ok(())
+        Ok(false)
+    }
+
+    fn tail_call_fallthrough(&mut self) -> bool {
+        self.regs[0] = 0;
+        for r in 1..=5 {
+            self.regs[r] = 0;
+        }
+        false
     }
 
     /// Minimal printk-style formatter: %d %u %x %s and l/ll length modifiers.

@@ -86,6 +86,7 @@ mod uapi {
     pub const BPF_PROG_TYPE_XDP: u32 = 6;
     pub const BPF_MAP_TYPE_HASH: u32 = 1;
     pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
+    pub const BPF_MAP_TYPE_PROG_ARRAY: u32 = 3;
     pub const BPF_MAP_TYPE_PERF_EVENT_ARRAY: u32 = 4;
     pub const BPF_MAP_TYPE_PERCPU_HASH: u32 = 5;
     pub const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
@@ -244,6 +245,7 @@ mod imp {
     pub fn map_create(def: &MapDef) -> KResult<Fd> {
         let map_type = match def.kind {
             MapKind::Array => BPF_MAP_TYPE_ARRAY,
+            MapKind::ProgArray => BPF_MAP_TYPE_PROG_ARRAY,
             MapKind::Hash => BPF_MAP_TYPE_HASH,
             MapKind::PerCpuArray => BPF_MAP_TYPE_PERCPU_ARRAY,
             MapKind::PerCpuHash => BPF_MAP_TYPE_PERCPU_HASH,
@@ -375,6 +377,8 @@ pub struct TestRun {
 pub struct KernelProgram {
     prog_fd: Fd,
     _map_fds: Vec<Fd>,
+    map_names: Vec<String>,
+    tail_fds: Vec<Fd>,
     xdp: bool,
 }
 
@@ -382,6 +386,38 @@ impl KernelProgram {
     /// Execute once through `BPF_PROG_TEST_RUN`.
     pub fn test_run(&self, data_in: &[u8]) -> KResult<TestRun> {
         imp::test_run(self.prog_fd.0, data_in, !self.xdp)
+    }
+
+    /// Load a target against this program's map fds and install it into a
+    /// named `PROG_ARRAY` slot, exactly as a userspace control plane does.
+    pub fn link_tail_call(
+        &mut self,
+        map_name: &str,
+        index: u32,
+        insns: &[Insn],
+        log: Option<&mut String>,
+    ) -> KResult<()> {
+        let prog = rewrite_map_refs(insns, &self._map_fds)?;
+        let fd = if self.xdp {
+            imp::prog_load_xdp(&prog, log)?
+        } else {
+            imp::prog_load(&prog, log)?
+        };
+        let map = self
+            .map_names
+            .iter()
+            .position(|name| name == map_name)
+            .ok_or_else(|| KError {
+                errno: 2,
+                what: format!("unknown map '{map_name}'"),
+            })?;
+        imp::map_update(
+            self._map_fds[map].0,
+            &index.to_ne_bytes(),
+            &fd.0.to_ne_bytes(),
+        )?;
+        self.tail_fds.push(fd);
+        Ok(())
     }
 }
 
@@ -437,7 +473,23 @@ fn load_program_type(
         map_fds.push(fd);
     }
 
-    // Rewrite map-reference lddw instructions to carry kernel fds.
+    let prog = rewrite_map_refs(insns, &map_fds)?;
+
+    let prog_fd = if xdp {
+        imp::prog_load_xdp(&prog, log)?
+    } else {
+        imp::prog_load(&prog, log)?
+    };
+    Ok(KernelProgram {
+        prog_fd,
+        map_names: maps.iter().map(|m| m.name.clone()).collect(),
+        _map_fds: map_fds,
+        tail_fds: Vec::new(),
+        xdp,
+    })
+}
+
+fn rewrite_map_refs(insns: &[Insn], map_fds: &[Fd]) -> KResult<Vec<Insn>> {
     let mut prog: Vec<Insn> = insns.to_vec();
     let mut pc = 0;
     while pc < prog.len() {
@@ -473,16 +525,7 @@ fn load_program_type(
         }
     }
 
-    let prog_fd = if xdp {
-        imp::prog_load_xdp(&prog, log)?
-    } else {
-        imp::prog_load(&prog, log)?
-    };
-    Ok(KernelProgram {
-        prog_fd,
-        _map_fds: map_fds,
-        xdp,
-    })
+    Ok(prog)
 }
 
 /// Load an XDP program into the kernel, retaining all referenced map fds.
@@ -492,6 +535,15 @@ pub fn load_xdp_program(
     log: Option<&mut String>,
 ) -> KResult<KernelProgram> {
     load_program_type(insns, maps, true, log)
+}
+
+/// Load a socket-filter program while retaining maps for tail-call linking.
+pub fn load_kernel_program(
+    insns: &[Insn],
+    maps: &[MapDef],
+    log: Option<&mut String>,
+) -> KResult<KernelProgram> {
+    load_program_type(insns, maps, false, log)
 }
 
 /// Load a program (creating its maps and rewriting map-reference `lddw`

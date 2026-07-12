@@ -14,8 +14,8 @@ load-bearing constraint. Don't add any without a very good reason and the
 user's OK (raw Linux syscalls via `asm!` are used instead of libc — see the
 JIT's `sys` module).
 
-Everything works today: the full default-feature suite is **304 green + 4
-intentional heavy soundness sweeps ignored**; `--no-default-features` is **293
+Everything works today: the full default-feature suite is **315 green + 4
+intentional heavy soundness sweeps ignored**; `--no-default-features` is **303
 green + the same 4 ignored** (2026-07-11, after the XDP work below).
 `cargo clippy --all-targets -- -D warnings` is clean in both configs. **Keep
 BOTH configs green** — the JIT is now behind `default = ["jit"]`, so always
@@ -24,6 +24,17 @@ run `cargo test` AND
 anything done.
 
 ## LATEST (2026-07-11): verifier soundness + the XDP packet workbench foundation
+
+**IN PROGRESS (2026-07-12): real-world program graphs / tail calls.**
+`docs/specs/tail-calls.md` is the contract. The userspace-populated path is
+implemented: `MapKind::ProgArray`, helper #12 verifier rules, independently
+verified targets sharing maps, interpreter hit/miss/cycle/33-chain semantics,
+snapshot/debugger program identity, optional v1 replay bundle section, hybrid
+JIT-to-JIT dispatch, and `kbpf::KernelProgram::link_tail_call` for real
+program-fd population plus a privilege-gated differential. Remaining before
+this item is DONE: parse libbpf static `.maps` `values[]` relocations, expose
+automatic multi-program ELF/CLI bundle construction, add real tail-call corpus
+lanes, and run the privileged differential as root.
 
 This is the current tip and the context a fresh agent is most likely to need.
 The work is committed linearly on `main`:
@@ -545,8 +556,8 @@ cargo build --release
 ./target/release/febpf bench examples/sum_loop.s --iters 50000 --jit   # ~11 GIPS
 cargo test --release -- --ignored soundness     # optional heavy verifier sweep
 ```
-Latest host result after the XDP kernel-differential + read-only fixture work:
-default **304 passed / 4 ignored**; no-default-features **293 passed / 4
+Latest host result after the tail-call program-bundle foundation:
+default **315 passed / 4 ignored**; no-default-features **303 passed / 4
 ignored**; both strict clippy invocations
 clean. Ordinary tests do not regenerate tracked `tests/*.o`; any fixture diff
 without `FEBPF_REGENERATE_FIXTURES=1` is now a regression. Explicitly generated

@@ -31,6 +31,14 @@ const TAG_CURSOR: u8 = 0x06;
 const TAG_PRELOAD: u8 = 0x07;
 const TAG_OUTCOME: u8 = 0x08;
 const TAG_PACKET: u8 = 0x09;
+const TAG_TAIL_CALLS: u8 = 0x0a;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TailCallProgram {
+    pub map_name: String,
+    pub index: u32,
+    pub insns: Vec<Insn>,
+}
 
 /// The febpf version stamped into a recorded file (its `CARGO_PKG_VERSION`).
 pub fn febpf_version() -> String {
@@ -71,6 +79,7 @@ pub struct Replay {
     pub preload: Vec<MapPreload>,
     /// Recorded result, for the determinism guard (`None` if not captured).
     pub outcome: Option<Outcome>,
+    pub tail_calls: Vec<TailCallProgram>,
 }
 
 impl Replay {
@@ -103,6 +112,7 @@ impl Replay {
             stop_at,
             preload,
             outcome: Some(outcome),
+            tail_calls: Vec::new(),
         })
     }
 
@@ -140,6 +150,51 @@ impl Replay {
             stop_at,
             preload,
             outcome: Some(outcome),
+            tail_calls: Vec::new(),
+        })
+    }
+
+    pub fn record_tail_calls(
+        prog: &Program,
+        tail_calls: Vec<TailCallProgram>,
+        ctx: Vec<u8>,
+        seed: u64,
+        stop_at: Option<u64>,
+        preload: Vec<MapPreload>,
+    ) -> Result<Replay, String> {
+        let mut vm = Vm::new(prog.clone())?;
+        vm.verify(crate::verifier::Config::default())
+            .map_err(|e| format!("entry verification failed: {e}"))?;
+        for link in &tail_calls {
+            vm.register_tail_call(
+                &link.map_name,
+                link.index,
+                Program {
+                    insns: link.insns.clone(),
+                    maps: prog.maps.clone(),
+                    btf_ctx: None,
+                },
+                crate::verifier::Config::default(),
+            )?;
+        }
+        vm.set_prandom_seed(seed);
+        apply_preload(&mut vm, &preload)?;
+        let mut runctx = ctx.clone();
+        let outcome = match vm.run(&mut runctx) {
+            Ok(r0) => Outcome::Exit(r0),
+            Err(e) => Outcome::Error(e.to_string()),
+        };
+        Ok(Replay {
+            febpf_version: febpf_version(),
+            insns: prog.insns.clone(),
+            maps: prog.maps.clone(),
+            ctx,
+            packet: None,
+            seed,
+            stop_at,
+            preload,
+            outcome: Some(outcome),
+            tail_calls,
         })
     }
 
@@ -156,6 +211,22 @@ impl Replay {
     /// to run or drop into the debugger. `ctx` is the (mutable) working copy.
     pub fn build_vm(&self) -> Result<(Vm, Vec<u8>), String> {
         let mut vm = Vm::new(self.program())?;
+        if !self.tail_calls.is_empty() && self.packet.is_none() {
+            vm.verify(crate::verifier::Config::default())
+                .map_err(|e| format!("replayed entry no longer verifies: {e}"))?;
+        }
+        for link in &self.tail_calls {
+            vm.register_tail_call(
+                &link.map_name,
+                link.index,
+                Program {
+                    insns: link.insns.clone(),
+                    maps: self.maps.clone(),
+                    btf_ctx: None,
+                },
+                crate::verifier::Config::default(),
+            )?;
+        }
         vm.set_prandom_seed(self.seed);
         apply_preload(&mut vm, &self.preload)?;
         let ctx = if let Some(packet) = &self.packet {
@@ -207,6 +278,7 @@ impl Replay {
                 MapKind::PerfEventArray => 6,
                 MapKind::CgroupArray => 7,
                 MapKind::StackTrace => 8,
+                MapKind::ProgArray => 9,
             });
             p.extend_from_slice(&m.key_size.to_le_bytes());
             p.extend_from_slice(&m.value_size.to_le_bytes());
@@ -263,6 +335,18 @@ impl Replay {
             section(&mut out, TAG_OUTCOME, &p);
         }
 
+        if !self.tail_calls.is_empty() {
+            let mut p = Vec::new();
+            p.extend_from_slice(&(self.tail_calls.len() as u32).to_le_bytes());
+            for link in &self.tail_calls {
+                w_str(&mut p, &link.map_name);
+                p.extend_from_slice(&link.index.to_le_bytes());
+                p.extend_from_slice(&(link.insns.len() as u32).to_le_bytes());
+                p.extend_from_slice(&insn::encode_program(&link.insns));
+            }
+            section(&mut out, TAG_TAIL_CALLS, &p);
+        }
+
         out
     }
 
@@ -289,6 +373,7 @@ impl Replay {
         let mut preload = Vec::new();
         let mut outcome = None;
         let mut packet = None;
+        let mut tail_calls = Vec::new();
 
         let mut pos = 10usize;
         while pos < bytes.len() {
@@ -338,6 +423,7 @@ impl Replay {
                             6 => MapKind::PerfEventArray,
                             7 => MapKind::CgroupArray,
                             8 => MapKind::StackTrace,
+                            9 => MapKind::ProgArray,
                             k => return Err(format!("unknown map kind {k}")),
                         };
                         let key_size = r.u32()?;
@@ -397,6 +483,23 @@ impl Replay {
                     });
                 }
                 TAG_PACKET => packet = Some(payload.to_vec()),
+                TAG_TAIL_CALLS => {
+                    let mut r = Reader::new(payload);
+                    let n = r.u32()? as usize;
+                    for _ in 0..n {
+                        let map_name = r.str()?;
+                        let index = r.u32()?;
+                        let count = r.u32()? as usize;
+                        let raw = r.take(count.checked_mul(insn::INSN_SIZE).ok_or(
+                            "TAIL_CALLS instruction count overflow",
+                        )?)?;
+                        tail_calls.push(TailCallProgram {
+                            map_name,
+                            index,
+                            insns: insn::decode_program(raw)?,
+                        });
+                    }
+                }
                 _ => {} // unknown section: skip (forward compatibility)
             }
         }
@@ -411,6 +514,7 @@ impl Replay {
             stop_at,
             preload,
             outcome,
+            tail_calls,
         })
     }
 }

@@ -1398,6 +1398,169 @@ fn reject_unbounded_loop() {
 }
 
 #[test]
+fn tail_call_requires_prog_array() {
+    let good = "
+        .map progs prog_array 4 4 8
+        r2 = map[progs]
+        r3 = 0
+        call tail_call
+        r0 = 7
+        exit";
+    let mut vm = Vm::new(program(good)).unwrap();
+    vm.verify(Config::default())
+        .expect("tail_call with prog_array should verify");
+
+    let bad = "
+        .map values array 4 4 8
+        r2 = map[values]
+        r3 = 0
+        call tail_call
+        r0 = 7
+        exit";
+    let mut vm = Vm::new(program(bad)).unwrap();
+    let err = match vm.verify(Config::default()) {
+        Ok(_) => panic!("tail_call with an array map verified"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("requires a prog_array map"), "{err}");
+}
+
+#[test]
+fn prog_array_slots_store_program_identities() {
+    use febpf::maps::{Map, MapDef, MapKind};
+    let mut map = Map::new(MapDef {
+        name: "dispatch".into(),
+        kind: MapKind::ProgArray,
+        key_size: 4,
+        value_size: 4,
+        max_entries: 2,
+        readonly: false,
+        init: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(map.program_at(0), None);
+    map.set_program(0, 42).unwrap();
+    assert_eq!(map.program_at(0), Some(42));
+    assert_eq!(map.set_program(2, 9), Err(-7));
+}
+
+#[test]
+fn tail_call_dispatches_and_miss_falls_through() {
+    let entry = program(
+        ".map progs prog_array 4 4 2
+         r2 = map[progs]
+         r3 = 0
+         call tail_call
+         r0 = 7
+         exit",
+    );
+    let target = program(
+        ".map progs prog_array 4 4 2
+         r0 = 42
+         exit",
+    );
+    let mut vm = Vm::new(entry.clone()).unwrap();
+    vm.verify(Config::default()).unwrap();
+    vm.register_tail_call("progs", 0, target, Config::default())
+        .unwrap();
+    assert_eq!(vm.run(&mut []).unwrap(), 42);
+
+    let mut miss = Vm::new(entry).unwrap();
+    miss.verify(Config::default()).unwrap();
+    assert_eq!(miss.run(&mut []).unwrap(), 7);
+}
+
+#[test]
+fn tail_call_cycle_stops_at_kernel_chain_limit() {
+    let src = ".map progs prog_array 4 4 1
+               r2 = map[progs]
+               r3 = 0
+               call tail_call
+               r0 = 99
+               exit";
+    let mut vm = Vm::new(program(src)).unwrap();
+    vm.verify(Config::default()).unwrap();
+    vm.register_tail_call("progs", 0, program(src), Config::default())
+        .unwrap();
+    assert_eq!(vm.run(&mut []).unwrap(), 99);
+}
+
+#[test]
+fn tail_call_target_shares_maps_with_entry() {
+    let maps = ".map progs prog_array 4 4 1\n.map state array 4 8 1\n";
+    let entry = program(&format!(
+        "{maps}
+         r6 = r1
+         *(u32 *)(r10 - 4) = 0
+         *(u64 *)(r10 - 16) = 55
+         r1 = map[state]
+         r2 = r10
+         r2 += -4
+         r3 = r10
+         r3 += -16
+         r4 = 0
+         call map_update_elem
+         r1 = r6
+         r2 = map[progs]
+         r3 = 0
+         call tail_call
+         r0 = 7
+         exit"
+    ));
+    let target = program(&format!(
+        "{maps}
+         *(u32 *)(r10 - 4) = 0
+         r1 = map[state]
+         r2 = r10
+         r2 += -4
+         call map_lookup_elem
+         if r0 == 0 goto miss
+         r0 = *(u64 *)(r0 + 0)
+         exit
+       miss:
+         r0 = 0
+         exit"
+    ));
+    let mut vm = Vm::new(entry).unwrap();
+    vm.verify(Config::default()).unwrap();
+    vm.register_tail_call("progs", 0, target, Config::default())
+        .unwrap();
+    assert_eq!(vm.run(&mut []).unwrap(), 55);
+}
+
+#[test]
+fn tail_call_snapshot_restores_active_program() {
+    let entry = program(
+        ".map progs prog_array 4 4 1
+         r2 = map[progs]
+         r3 = 0
+         call tail_call
+         r0 = 7
+         exit",
+    );
+    let target = program(
+        ".map progs prog_array 4 4 1
+         r0 = 42
+         exit",
+    );
+    let mut vm = Vm::new(entry).unwrap();
+    vm.verify(Config::default()).unwrap();
+    vm.register_tail_call("progs", 0, target, Config::default())
+        .unwrap();
+    let mut ctx = [];
+    let mut machine = vm.machine(&mut ctx);
+    assert_eq!(machine.step().unwrap(), None); // map lddw
+    assert_eq!(machine.step().unwrap(), None); // index
+    assert_eq!(machine.step().unwrap(), None); // successful tail call
+    let snap = machine.snapshot();
+    assert_eq!(machine.step().unwrap(), None);
+    assert_eq!(machine.step().unwrap(), Some(42));
+    machine.restore(&snap);
+    assert_eq!(machine.step().unwrap(), None);
+    assert_eq!(machine.step().unwrap(), Some(42));
+}
+
+#[test]
 fn reject_ctx_oob() {
     let e = verify_err_ctx("r0 = *(u64 *)(r1 + 12)\n exit", 16);
     assert!(e.contains("out of bounds"), "{e}");

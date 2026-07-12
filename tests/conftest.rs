@@ -140,6 +140,60 @@ fn xdp_kernel_differential_if_privileged() {
     assert_eq!(kernel.data_out, febpf_packet, "XDP output packet mismatch");
 }
 
+#[test]
+fn tail_call_kernel_differential_if_privileged() {
+    if !matches!(kbpf::has_privilege(), Ok(true)) {
+        eprintln!("skipped: no bpf privilege");
+        return;
+    }
+    let entry = asm::assemble(
+        ".map progs prog_array 4 4 1
+         r2 = map[progs]
+         r3 = 0
+         call tail_call
+         r0 = 7
+         exit",
+    )
+    .unwrap();
+    let target = asm::assemble(
+        ".map progs prog_array 4 4 1
+         r0 = 42
+         exit",
+    )
+    .unwrap();
+
+    let entry_prog = Program {
+        insns: entry.insns,
+        maps: entry.maps,
+        btf_ctx: None,
+    };
+    let target_prog = Program {
+        insns: target.insns,
+        maps: target.maps,
+        btf_ctx: None,
+    };
+    let mut vm = Vm::new(entry_prog.clone()).unwrap();
+    vm.verify(verifier::Config::default()).unwrap();
+    vm.register_tail_call("progs", 0, target_prog.clone(), verifier::Config::default())
+        .unwrap();
+    let febpf_ret = vm.run(&mut [0u8; 16]).unwrap() as u32;
+
+    let mut log = String::new();
+    let mut kernel = kbpf::load_kernel_program(
+        &entry_prog.insns,
+        &entry_prog.maps,
+        Some(&mut log),
+    )
+    .unwrap_or_else(|e| panic!("kernel entry load failed: {e}\n{log}"));
+    log.clear();
+    kernel
+        .link_tail_call("progs", 0, &target_prog.insns, Some(&mut log))
+        .unwrap_or_else(|e| panic!("kernel target link failed: {e}\n{log}"));
+    let kernel_ret = kernel.test_run(&[0u8; 16]).unwrap().retval;
+    assert_eq!(kernel_ret, febpf_ret);
+    assert_eq!(kernel_ret, 42);
+}
+
 /// Differential fuzz against the real kernel when privileged: interp, JIT and
 /// kernel must agree (low 32 bits) on every program the kernel accepts.
 #[test]

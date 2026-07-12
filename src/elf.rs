@@ -44,6 +44,7 @@ const R_BPF_64_32: u32 = 10;
 // BPF map types we support.
 const BPF_MAP_TYPE_HASH: u32 = 1;
 const BPF_MAP_TYPE_ARRAY: u32 = 2;
+const BPF_MAP_TYPE_PROG_ARRAY: u32 = 3;
 const BPF_MAP_TYPE_PERF_EVENT_ARRAY: u32 = 4;
 const BPF_MAP_TYPE_PERCPU_HASH: u32 = 5;
 const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
@@ -1104,6 +1105,7 @@ fn map_kind(ty: u32) -> Result<MapKind, String> {
     match ty {
         BPF_MAP_TYPE_HASH => Ok(MapKind::Hash),
         BPF_MAP_TYPE_ARRAY => Ok(MapKind::Array),
+        BPF_MAP_TYPE_PROG_ARRAY => Ok(MapKind::ProgArray),
         BPF_MAP_TYPE_PERF_EVENT_ARRAY => Ok(MapKind::PerfEventArray),
         BPF_MAP_TYPE_PERCPU_HASH => Ok(MapKind::PerCpuHash),
         BPF_MAP_TYPE_PERCPU_ARRAY => Ok(MapKind::PerCpuArray),
@@ -1114,7 +1116,7 @@ fn map_kind(ty: u32) -> Result<MapKind, String> {
         other => Err(format!(
             "unsupported map type {other} ({}); supported: hash/array/\
              perf_event_array/percpu_hash/percpu_array/stack_trace/cgroup_array/\
-             lru_hash/ringbuf",
+             lru_hash/ringbuf/prog_array",
             map_type_name(other)
         )),
     }
@@ -1266,6 +1268,7 @@ mod btf_maps {
                     | crate::maps::MapKind::PerfEventArray
                     | crate::maps::MapKind::CgroupArray
                     | crate::maps::MapKind::StackTrace
+                    | crate::maps::MapKind::ProgArray
             );
             maps.push(MapDef {
                 name: map_name.clone(),
@@ -1329,6 +1332,7 @@ mod tests {
         // the corpus coverage histogram can bucket by name (PERF_EVENT_ARRAY, etc.).
         assert!(map_kind(1).is_ok()); // HASH
         assert!(map_kind(2).is_ok()); // ARRAY
+        assert!(map_kind(3).is_ok()); // PROG_ARRAY
         assert!(map_kind(27).is_ok()); // RINGBUF (now supported)
         assert!(map_kind(4).is_ok()); // PERF_EVENT_ARRAY (now supported)
         assert!(map_kind(8).is_ok()); // CGROUP_ARRAY (now supported)

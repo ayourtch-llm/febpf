@@ -1,7 +1,7 @@
 //! Drives the debugger's command handling without a TTY.
 
 use febpf::debug::{DebugSession, DebuggerOpts, Outcome};
-use febpf::{asm, Program, Vm};
+use febpf::{asm, Program, VerifierConfig, Vm};
 
 fn vm(src: &str) -> Vm {
     let a = asm::assemble(src).unwrap();
@@ -78,6 +78,40 @@ fn regs_and_info_output() {
     assert!(o.contains("[5]"), "{o}");
     let (o, _) = cmd(&mut s, "bogus");
     assert!(o.contains("unknown command"), "{o}");
+}
+
+#[test]
+fn debugger_identifies_tail_call_target() {
+    let mut v = vm(
+        ".map progs prog_array 4 4 1
+         r2 = map[progs]
+         r3 = 0
+         call tail_call
+         r0 = 7
+         exit",
+    );
+    let target = asm::assemble(
+        ".map progs prog_array 4 4 1
+         r0 = 42
+         exit",
+    )
+    .unwrap();
+    v.verify(VerifierConfig::default()).unwrap();
+    v.register_tail_call(
+        "progs",
+        0,
+        Program {
+            insns: target.insns,
+            maps: target.maps,
+            btf_ctx: None,
+        },
+        VerifierConfig::default(),
+    )
+    .unwrap();
+    let mut ctx = [];
+    let mut s = DebugSession::new(&mut v, &mut ctx, &DebuggerOpts::default());
+    let (out, _) = cmd(&mut s, "step 3");
+    assert!(out.contains("tail#1:0"), "{out}");
 }
 
 #[test]

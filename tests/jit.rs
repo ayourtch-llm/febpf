@@ -283,3 +283,45 @@ fn jit_runtime_fault_is_caught() {
     assert!(err.to_string().contains("out of bounds") || err.to_string().contains("bad pointer"),
         "unexpected error: {err}");
 }
+
+#[test]
+fn jit_tail_call_bundle_matches_interpreter() {
+    fn linked_vm() -> Vm {
+        let entry = asm::assemble(
+            ".map progs prog_array 4 4 1
+             r2 = map[progs]
+             r3 = 0
+             call tail_call
+             r0 = 7
+             exit",
+        )
+        .unwrap();
+        let target = asm::assemble(
+            ".map progs prog_array 4 4 1
+             r0 = 42
+             exit",
+        )
+        .unwrap();
+        let mut vm = Vm::new(Program {
+            insns: entry.insns,
+            maps: entry.maps,
+            btf_ctx: None,
+        })
+        .unwrap();
+        vm.verify(Config::default()).unwrap();
+        vm.register_tail_call(
+            "progs",
+            0,
+            Program {
+                insns: target.insns,
+                maps: target.maps,
+                btf_ctx: None,
+            },
+            Config::default(),
+        )
+        .unwrap();
+        vm
+    }
+    assert_eq!(linked_vm().run(&mut []).unwrap(), 42);
+    assert_eq!(linked_vm().run_jit(&mut []).unwrap(), 42);
+}

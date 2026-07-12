@@ -35,6 +35,8 @@ pub enum MapKind {
     CgroupArray,
     /// Map from a u32 stack-id to a captured stack (`bpf_get_stackid`).
     StackTrace,
+    /// Array of program identities used exclusively by `bpf_tail_call`.
+    ProgArray,
 }
 
 impl MapKind {
@@ -73,6 +75,7 @@ impl std::fmt::Display for MapKind {
             MapKind::PerfEventArray => "perf_event_array",
             MapKind::CgroupArray => "cgroup_array",
             MapKind::StackTrace => "stack_trace",
+            MapKind::ProgArray => "prog_array",
         };
         write!(f, "{s}")
     }
@@ -146,6 +149,7 @@ enum Storage {
     /// Perf-event array: no readable values, only captured output records
     /// (`bpf_perf_event_output`). All CPU lanes capture into one list.
     PerfEvent { emitted: Vec<Vec<u8>> },
+    ProgArray(Vec<Option<u32>>),
 }
 
 /// A point-in-time copy of a map's contents *and* its VM region-handle
@@ -198,18 +202,40 @@ impl Map {
                     def.max_entries = 1024;
                 }
             }
+            MapKind::ProgArray => {
+                if def.key_size == 0 {
+                    def.key_size = 4;
+                }
+                if def.value_size == 0 {
+                    def.value_size = 4;
+                }
+            }
             _ => {}
         }
         if def.max_entries == 0 {
             return Err(format!("map '{}': zero max_entries", def.name));
         }
         if def.value_size == 0
-            && !matches!(def.kind, MapKind::RingBuf | MapKind::PerfEventArray)
+            && !matches!(
+                def.kind,
+                MapKind::RingBuf | MapKind::PerfEventArray | MapKind::ProgArray
+            )
         {
             return Err(format!("map '{}': zero value_size", def.name));
         }
         let per_cpu = def.kind.per_cpu() as usize;
-        let (storage, handles) = if def.kind.is_arraylike() {
+        let (storage, handles) = if def.kind == MapKind::ProgArray {
+            if def.key_size != 4 || def.value_size != 4 || !def.init.is_empty() {
+                return Err(format!(
+                    "prog_array map '{}' requires key_size=4, value_size=4, and no byte initializer",
+                    def.name
+                ));
+            }
+            (
+                Storage::ProgArray(vec![None; def.max_entries as usize]),
+                Vec::new(),
+            )
+        } else if def.kind.is_arraylike() {
             if def.key_size != 4 {
                 return Err(format!("array map '{}' requires key_size=4", def.name));
             }
@@ -286,7 +312,7 @@ impl Map {
                     .then(|| ValueRef::ArrayElem(idx * self.def.kind.per_cpu()))
             }
             Storage::Hash { index, .. } => index.get(key).map(|&i| ValueRef::Slab(i)),
-            Storage::RingBuf { .. } | Storage::PerfEvent { .. } => None,
+            Storage::RingBuf { .. } | Storage::PerfEvent { .. } | Storage::ProgArray(_) => None,
         }
     }
 
@@ -336,7 +362,10 @@ impl Map {
         if self.def.readonly {
             return Err(-1); // EPERM: frozen map
         }
-        if matches!(self.def.kind, MapKind::RingBuf | MapKind::PerfEventArray) {
+        if matches!(
+            self.def.kind,
+            MapKind::RingBuf | MapKind::PerfEventArray | MapKind::ProgArray
+        ) {
             return Err(-22); // EINVAL: no key/value update path
         }
         if key.len() != self.def.key_size as usize || value.len() != self.def.value_size as usize {
@@ -412,7 +441,26 @@ impl Map {
                 index.insert(key.to_vec(), i);
                 Ok(ValueRef::Slab(i))
             }
-            Storage::RingBuf { .. } | Storage::PerfEvent { .. } => unreachable!(),
+            Storage::RingBuf { .. } | Storage::PerfEvent { .. } | Storage::ProgArray(_) => {
+                unreachable!()
+            }
+        }
+    }
+
+    pub fn set_program(&mut self, index: u32, program: u32) -> Result<(), i64> {
+        match &mut self.storage {
+            Storage::ProgArray(slots) => {
+                *slots.get_mut(index as usize).ok_or(-7i64)? = Some(program);
+                Ok(())
+            }
+            _ => Err(-22),
+        }
+    }
+
+    pub fn program_at(&self, index: u32) -> Option<u32> {
+        match &self.storage {
+            Storage::ProgArray(slots) => slots.get(index as usize).copied().flatten(),
+            _ => None,
         }
     }
 
@@ -442,7 +490,7 @@ impl Map {
         }
         match &mut self.storage {
             Storage::Array(_) => Err(-22), // EINVAL: array elements cannot be deleted
-            Storage::RingBuf { .. } | Storage::PerfEvent { .. } => Err(-22),
+            Storage::RingBuf { .. } | Storage::PerfEvent { .. } | Storage::ProgArray(_) => Err(-22),
             Storage::Hash { index, free, .. } => match index.remove(key) {
                 Some(i) => {
                     free.push(i);
@@ -609,7 +657,9 @@ impl Map {
                 .iter()
                 .map(|(k, &i)| (k.clone(), slab[i as usize][..vs].to_vec()))
                 .collect(),
-            Storage::RingBuf { .. } | Storage::PerfEvent { .. } => Vec::new(),
+            Storage::RingBuf { .. } | Storage::PerfEvent { .. } | Storage::ProgArray(_) => {
+                Vec::new()
+            }
         }
     }
 }

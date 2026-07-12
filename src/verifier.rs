@@ -2394,6 +2394,19 @@ impl<'a> Verifier<'a> {
             }
             match kind {
                 ArgKind::None | ArgKind::Any => {}
+                ArgKind::CtxPtr => match val {
+                    RegState::Ptr(Ptr { kind: PtrKind::Ctx, .. }) => {}
+                    _ => {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {} arg{}: expected context pointer in r{reg}",
+                                sig.name,
+                                i + 1
+                            ),
+                        ));
+                    }
+                },
                 ArgKind::Scalar | ArgKind::Size => {
                     if !matches!(val, RegState::Scalar(_)) {
                         return Err(self.err(
@@ -2573,6 +2586,7 @@ impl<'a> Verifier<'a> {
                 crate::helpers::id::CURRENT_TASK_UNDER_CGROUP => {
                     Some(crate::maps::MapKind::CgroupArray)
                 }
+                crate::helpers::id::TAIL_CALL => Some(crate::maps::MapKind::ProgArray),
                 _ => None,
             };
             if let Some(k) = required {

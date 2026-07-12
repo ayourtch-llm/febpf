@@ -6,7 +6,7 @@
 
 use febpf::interp::DEFAULT_PRANDOM_SEED;
 use febpf::maps::Map;
-use febpf::replay::{MapPreload, Outcome, Replay};
+use febpf::replay::{MapPreload, Outcome, Replay, TailCallProgram};
 use febpf::{asm, Program, Vm};
 
 fn prog(src: &str) -> Program {
@@ -211,4 +211,39 @@ fn version_mismatch_is_reported() {
     bytes[9] = 0xca;
     let err = Replay::from_bytes(&bytes).unwrap_err();
     assert!(err.contains("unsupported replay format version"), "{err}");
+}
+
+#[test]
+fn tail_call_bundle_round_trips_and_replays() {
+    let entry = prog(
+        ".map progs prog_array 4 4 1
+         r2 = map[progs]
+         r3 = 0
+         call tail_call
+         r0 = 7
+         exit",
+    );
+    let target = prog(
+        ".map progs prog_array 4 4 1
+         r0 = 42
+         exit",
+    );
+    let replay = Replay::record_tail_calls(
+        &entry,
+        vec![TailCallProgram {
+            map_name: "progs".into(),
+            index: 0,
+            insns: target.insns,
+        }],
+        Vec::new(),
+        DEFAULT_PRANDOM_SEED,
+        Some(3),
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(replay.outcome, Some(Outcome::Exit(42)));
+    let parsed = Replay::from_bytes(&replay.to_bytes()).unwrap();
+    assert_eq!(parsed, replay);
+    let (mut vm, mut ctx) = parsed.build_vm().unwrap();
+    assert_eq!(vm.run(&mut ctx).unwrap(), 42);
 }

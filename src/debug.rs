@@ -275,9 +275,18 @@ impl<'a> DebugSession<'a> {
     }
 
     fn print_insn(&self, out: &mut dyn Write, pc: usize) -> io::Result<()> {
-        let insns = self.m.vm_ref().insns();
+        let insns = self.m.current_insns();
         if pc < insns.len() {
-            writeln!(out, "{pc:4}: {}", disasm_insn(insns, pc))
+            if self.m.active_program() == 0 {
+                writeln!(out, "{pc:4}: {}", disasm_insn(insns, pc))
+            } else {
+                writeln!(
+                    out,
+                    "tail#{}:{pc}: {}",
+                    self.m.active_program(),
+                    disasm_insn(insns, pc)
+                )
+            }
         } else {
             writeln!(out, "{pc:4}: <out of bounds>")
         }
@@ -298,6 +307,9 @@ impl<'a> DebugSession<'a> {
     /// Print the C source line covering `pc` (as `func at file:line  text`),
     /// if debug info is available.
     fn print_source_line(&self, out: &mut dyn Write, pc: usize) -> io::Result<()> {
+        if self.m.active_program() != 0 {
+            return Ok(());
+        }
         let Some(di) = self.m.vm_ref().debug() else {
             return Ok(());
         };
@@ -1187,9 +1199,12 @@ impl<'a> DebugSession<'a> {
                     .and_then(parse_num)
                     .map(|v| v as usize)
                     .unwrap_or(self.m.pc);
-                let vm = self.m.vm_ref();
-                let insns = vm.insns();
-                let di = vm.debug();
+                let insns = self.m.current_insns();
+                let di = if self.m.active_program() == 0 {
+                    self.m.vm_ref().debug()
+                } else {
+                    None
+                };
                 let lo = center.saturating_sub(5);
                 let hi = (center + 6).min(insns.len().saturating_sub(1));
                 let mut lines = Vec::new();
