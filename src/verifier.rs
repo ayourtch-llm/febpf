@@ -398,6 +398,8 @@ pub enum PtrKind {
     /// A ringbuf record already submitted/discarded; any further use is an
     /// error (use-after-consume).
     RingbufConsumed { id: u32 },
+    /// Pointer into a VM-owned external region returned by a typed helper.
+    ExternalMemory { size: u32, writable: bool },
     /// A BTF-typed kernel pointer (the kernel's `PTR_TO_BTF_ID`): points at a
     /// struct/union of BTF type id `btf_id` in the target BTF (`Config::
     /// btf_ctx`). Read-only; loads are typed by `Btf::read_kind` (pointer
@@ -488,6 +490,11 @@ impl std::fmt::Display for RegState {
                         write!(f, "ringbuf_mem_or_null[{size}]")?
                     }
                     PtrKind::RingbufConsumed { .. } => write!(f, "ringbuf_consumed")?,
+                    PtrKind::ExternalMemory { size, writable } => write!(
+                        f,
+                        "external_mem[{size},{}]",
+                        if writable { "rw" } else { "ro" }
+                    )?,
                     PtrKind::BtfId { btf_id } => write!(f, "kptr(btf{btf_id})")?,
                 }
                 if p.off != 0 {
@@ -2190,6 +2197,12 @@ impl<'a> Verifier<'a> {
                     "use of a ringbuf record after it was submitted/discarded",
                 ));
             }
+            PtrKind::ExternalMemory { size, writable } => {
+                if write && !writable {
+                    return Err(self.err(pc, "cannot write to read-only external memory"));
+                }
+                (size as u64, "external memory")
+            }
             PtrKind::Packet { range } => {
                 // XDP permits both reads and writes after the same proof.
                 let lo = p.off.saturating_add(disp).saturating_add(p.var.smin);
@@ -2811,6 +2824,9 @@ impl<'a> Verifier<'a> {
                     origins.insert(id, (pc, sig.name.to_string()));
                 }
                 RegState::Ptr(Ptr::new(PtrKind::RingbufMemOrNull { id, size }))
+            }
+            RetKind::ExternalMemory { size, writable } => {
+                RegState::Ptr(Ptr::new(PtrKind::ExternalMemory { size, writable }))
             }
         };
         Ok(())

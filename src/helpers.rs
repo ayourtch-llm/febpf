@@ -73,6 +73,11 @@ pub enum RetKind {
     /// Pointer to a writable ringbuf record of `size_arg` bytes, or NULL —
     /// must be null-checked before use (from `ringbuf_reserve`).
     RingbufMemOrNull { size_arg: u8 },
+    /// Non-null pointer to a VM-owned external memory region. The helper
+    /// signature declares the byte extent visible to the program and whether
+    /// stores are permitted; runtime region resolution independently enforces
+    /// the actual registered region's bounds and access mode.
+    ExternalMemory { size: u32, writable: bool },
 }
 
 #[derive(Debug, Clone)]

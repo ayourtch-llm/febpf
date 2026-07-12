@@ -86,6 +86,21 @@ enum Region {
     KernelMem,
     /// Mutable bytes of the packet supplied to [`Vm::run_xdp`].
     Packet,
+    /// VM-owned bytes registered by the embedding host.
+    Owned(u32),
+}
+
+/// Guest access permitted for a VM-owned external region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct OwnedRegion {
+    bytes: Vec<u8>,
+    access: RegionAccess,
 }
 
 const CTX_HANDLE: u32 = 1;
@@ -113,6 +128,7 @@ pub struct Vm {
     map_obj_handles: Vec<u32>,
     pub user_helpers: UserHelpers,
     regions: Vec<Region>,
+    owned_regions: Vec<OwnedRegion>,
     stack: Vec<u8>,
     start: Clock,
     prandom: u64,
@@ -228,6 +244,7 @@ impl Vm {
             map_obj_handles: map_obj_handles.clone(),
             user_helpers: UserHelpers::new(),
             regions,
+            owned_regions: Vec::new(),
             stack: vec![0u8; MAX_CALL_FRAMES * STACK_SIZE],
             start: Clock::start(),
             prandom: DEFAULT_PRANDOM_SEED,
@@ -280,6 +297,40 @@ impl Vm {
             }
         }
         Ok(vm)
+    }
+
+    /// Register VM-owned bytes as a bounded guest virtual region.
+    ///
+    /// The returned opaque address may be returned by a typed user helper or
+    /// otherwise supplied to guest code. It contains no host address. Guest
+    /// accesses are checked against both `bytes.len()` and `access`, even when
+    /// the program is run without verification.
+    pub fn register_owned_region(
+        &mut self,
+        bytes: Vec<u8>,
+        access: RegionAccess,
+    ) -> Result<u64, String> {
+        if bytes.len() > u32::MAX as usize {
+            return Err("owned region is too large for a guest virtual address".into());
+        }
+        if self.regions.len() > u32::MAX as usize {
+            return Err("guest virtual region table is full".into());
+        }
+        let index = self.owned_regions.len() as u32;
+        self.owned_regions.push(OwnedRegion { bytes, access });
+        self.regions.push(Region::Owned(index));
+        Ok(mkaddr((self.regions.len() - 1) as u32, 0))
+    }
+
+    /// Inspect a registered owned region by its opaque base address.
+    pub fn owned_region(&self, base: u64) -> Option<&[u8]> {
+        if base as u32 != 0 {
+            return None;
+        }
+        let Region::Owned(index) = *self.regions.get((base >> 32) as usize)? else {
+            return None;
+        };
+        Some(&self.owned_regions.get(index as usize)?.bytes)
     }
 
     /// Replace the entry program and all state derived from it.
@@ -634,6 +685,7 @@ pub struct Snapshot {
     /// so replay must resume handle allocation from the snapshotted state or
     /// guest-visible virtual addresses would diverge from the original run.
     regions: Vec<Region>,
+    owned_regions: Vec<OwnedRegion>,
     maps: Vec<MapSnapshot>,
     prandom: u64,
     printk: Vec<String>,
@@ -784,6 +836,7 @@ struct Bus<'b> {
     ctx: &'b mut [u8],
     kmem: &'b mut Vec<u8>,
     packet: &'b mut [u8],
+    owned_regions: &'b mut [OwnedRegion],
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -794,6 +847,7 @@ fn resolve_slice<'s>(
     ctx: &'s mut [u8],
     kmem: &'s mut Vec<u8>,
     packet: &'s mut [u8],
+    owned_regions: &'s mut [OwnedRegion],
     addr: u64,
     len: usize,
     write: bool,
@@ -820,6 +874,15 @@ fn resolve_slice<'s>(
             return Ok(&mut kmem[..len]);
         }
         Region::Packet => packet,
+        Region::Owned(index) => {
+            let owned = owned_regions
+                .get_mut(index as usize)
+                .ok_or_else(|| format!("bad owned-region pointer {addr:#x}"))?;
+            if write && owned.access == RegionAccess::ReadOnly {
+                return Err(format!("write to read-only owned region {addr:#x}"));
+            }
+            &mut owned.bytes
+        }
         Region::Ctx => ctx,
         Region::Stack(f) => &mut stack[f as usize * STACK_SIZE..(f as usize + 1) * STACK_SIZE],
         Region::MapObj(_) => {
@@ -848,16 +911,16 @@ fn resolve_slice<'s>(
 impl MemBus for Bus<'_> {
     fn read(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), String> {
         let s = resolve_slice(
-            self.regions, self.maps, self.stack, self.ctx, self.kmem, self.packet, addr, buf.len(),
-            false,
+            self.regions, self.maps, self.stack, self.ctx, self.kmem, self.packet,
+            self.owned_regions, addr, buf.len(), false,
         )?;
         buf.copy_from_slice(s);
         Ok(())
     }
     fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), String> {
         let s = resolve_slice(
-            self.regions, self.maps, self.stack, self.ctx, self.kmem, self.packet, addr, data.len(),
-            true,
+            self.regions, self.maps, self.stack, self.ctx, self.kmem, self.packet,
+            self.owned_regions, addr, data.len(), true,
         )?;
         s.copy_from_slice(data);
         Ok(())
@@ -930,6 +993,7 @@ impl<'a> Machine<'a> {
             ctx: self.ctx.to_vec(),
             packet: self.vm.packet.clone(),
             regions: self.vm.regions.clone(),
+            owned_regions: self.vm.owned_regions.clone(),
             maps: self.vm.maps.iter().map(Map::snapshot).collect(),
             prandom: self.vm.prandom,
             printk: self.vm.printk.clone(),
@@ -950,6 +1014,7 @@ impl<'a> Machine<'a> {
         self.ctx.copy_from_slice(&s.ctx);
         self.vm.packet.clone_from(&s.packet);
         self.vm.regions = s.regions.clone();
+        self.vm.owned_regions.clone_from(&s.owned_regions);
         for (m, ms) in self.vm.maps.iter_mut().zip(&s.maps) {
             m.restore(ms);
         }
@@ -1101,6 +1166,7 @@ impl<'a> Machine<'a> {
                 &self.vm.stack[f as usize * STACK_SIZE..(f as usize + 1) * STACK_SIZE]
             }
             Region::MapValue { map, vref } => self.vm.maps[map as usize].value(vref),
+            Region::Owned(index) => &self.vm.owned_regions[index as usize].bytes,
             _ => return None,
         };
         buf.get(off..off + len).map(|s| s.to_vec())
@@ -1225,6 +1291,7 @@ impl<'a> Machine<'a> {
             }
             Some(Region::KernelMem) => format!("kernel memory +{off} (reads as zero)"),
             Some(Region::Packet) => format!("packet+{off}"),
+            Some(Region::Owned(index)) => format!("owned region {index}+{off}"),
             Some(Region::Invalid) | None => format!("<addr {addr:#x}>"),
         }
     }
@@ -1246,6 +1313,7 @@ impl<'a> Machine<'a> {
             self.ctx,
             &mut self.vm.kmem,
             &mut self.vm.packet,
+            &mut self.vm.owned_regions,
             addr,
             len,
             write,
@@ -1970,6 +2038,7 @@ impl<'a> Machine<'a> {
                     ctx: self.ctx,
                     kmem: &mut self.vm.kmem,
                     packet: &mut self.vm.packet,
+                    owned_regions: &mut self.vm.owned_regions,
                 };
                 let result = helper.call(args, &mut bus);
                 self.vm.user_helpers.put_back(hid, helper);
