@@ -68,6 +68,50 @@ fn btf_maps_object() {
 }
 
 #[test]
+fn static_prog_array_initializers_link_programs() {
+    maybe_compile("tail_call.c", "tail_call.o");
+    let obj = load("tests/tail_call.o");
+    assert_eq!(obj.prog_array_inits.len(), 1);
+    let init = &obj.prog_array_inits[0];
+    assert_eq!(obj.maps[init.map_index].name, "progs");
+    assert_eq!(
+        (
+            obj.maps[init.map_index].key_size,
+            obj.maps[init.map_index].value_size,
+        ),
+        (4, 4)
+    );
+    assert_eq!(init.index, 0);
+    assert_eq!(init.program, "socket/target");
+
+    let entry = obj.programs.iter().find(|p| p.name == "socket/entry").unwrap();
+    let target = obj
+        .programs
+        .iter()
+        .find(|p| p.name == init.program)
+        .unwrap();
+    let mut vm = Vm::new(Program {
+        insns: entry.insns.clone(),
+        maps: obj.maps.clone(),
+        btf_ctx: None,
+    })
+    .unwrap();
+    vm.verify(Config::default()).unwrap();
+    vm.register_tail_call(
+        "progs",
+        0,
+        Program {
+            insns: target.insns.clone(),
+            maps: obj.maps.clone(),
+            btf_ctx: None,
+        },
+        Config::default(),
+    )
+    .unwrap();
+    assert_eq!(vm.run(&mut [0u8; 16]).unwrap(), 42);
+}
+
+#[test]
 fn cross_text_bpf_to_bpf_call() {
     maybe_compile("subprog.c", "subprog.o");
     let obj = load("tests/subprog.o");

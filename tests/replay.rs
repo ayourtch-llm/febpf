@@ -247,3 +247,38 @@ fn tail_call_bundle_round_trips_and_replays() {
     let (mut vm, mut ctx) = parsed.build_vm().unwrap();
     assert_eq!(vm.run(&mut ctx).unwrap(), 42);
 }
+
+#[test]
+fn xdp_tail_call_bundle_round_trips_and_replays() {
+    let entry = prog(
+        ".map progs prog_array 4 4 1
+         r2 = map[progs]
+         r3 = 0
+         call tail_call
+         r0 = 1
+         exit",
+    );
+    let target = prog(
+        ".map progs prog_array 4 4 1
+         r0 = 2
+         exit",
+    );
+    let replay = Replay::record_xdp_tail_calls(
+        &entry,
+        vec![TailCallProgram {
+            map_name: "progs".into(),
+            index: 0,
+            insns: target.insns,
+        }],
+        vec![0xaa],
+        DEFAULT_PRANDOM_SEED,
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(replay.outcome, Some(Outcome::Exit(2)));
+    let parsed = Replay::from_bytes(&replay.to_bytes()).unwrap();
+    assert_eq!(parsed, replay);
+    let (mut vm, mut ctx) = parsed.build_vm().unwrap();
+    assert_eq!(vm.run(&mut ctx).unwrap(), 2);
+}

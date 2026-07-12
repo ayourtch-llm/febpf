@@ -16,15 +16,24 @@ use std::process::ExitCode;
 
 /// Run interp and (best-effort) JIT for a loaded program with the given ctx.
 /// Returns `(interp_r0, Option<jit_r0>)`; the JIT is `None` where unsupported.
-fn run_febpf(prog: &Program, ctx: &[u8]) -> Result<(u64, Option<u64>), String> {
+fn run_febpf(
+    prog: &Program,
+    ctx: &[u8],
+    links: &[crate::TailLink],
+    cfg: febpf::verifier::Config,
+) -> Result<(u64, Option<u64>), String> {
     let mut ctx_i = ctx.to_vec();
     let mut vm_i = Vm::new(prog.clone())?;
+    crate::link_tail_calls(&mut vm_i, links, &cfg)?;
+    vm_i.verify(cfg.clone()).map_err(|e| e.to_string())?;
     let r_interp = vm_i.run(&mut ctx_i).map_err(|e| e.to_string())?;
 
     #[cfg(feature = "jit")]
     let r_jit = {
         let mut ctx_j = ctx.to_vec();
         let mut vm_j = Vm::new(prog.clone())?;
+        crate::link_tail_calls(&mut vm_j, links, &cfg)?;
+        vm_j.verify(cfg.clone()).map_err(|e| e.to_string())?;
         match vm_j.run_jit(&mut ctx_j) {
             Ok(r) => Some(r),
             Err(e) => {
@@ -41,14 +50,20 @@ fn run_febpf(prog: &Program, ctx: &[u8]) -> Result<(u64, Option<u64>), String> {
     Ok((r_interp, r_jit))
 }
 
-pub fn conftest(o: &Opts, prog: Program, xdp: bool) -> Result<ExitCode, String> {
+pub fn conftest(
+    o: &Opts,
+    prog: Program,
+    xdp: bool,
+    links: &[crate::TailLink],
+) -> Result<ExitCode, String> {
     if xdp {
-        return conftest_xdp(o, prog);
+        return conftest_xdp(o, prog, links);
     }
     let ctx = make_ctx(o)?;
 
     // febpf side (always available, unprivileged).
-    let (r_interp, r_jit) = run_febpf(&prog, &ctx)?;
+    let cfg = crate::verifier_config(o, ctx.len(), false);
+    let (r_interp, r_jit) = run_febpf(&prog, &ctx, links, cfg)?;
     println!("interp : r0 = {r_interp} ({r_interp:#x})");
     if let Some(j) = r_jit {
         println!("jit    : r0 = {j} ({j:#x})");
@@ -73,7 +88,19 @@ pub fn conftest(o: &Opts, prog: Program, xdp: bool) -> Result<ExitCode, String> 
     }
 
     let mut log = String::new();
-    match kbpf::run_program(&prog.insns, &prog.maps, &ctx, Some(&mut log)) {
+    let kernel_run = (|| {
+        let mut kernel = kbpf::load_kernel_program(&prog.insns, &prog.maps, Some(&mut log))?;
+        for link in links {
+            kernel.link_tail_call(
+                &link.map_name,
+                link.index,
+                &link.program.insns,
+                Some(&mut log),
+            )?;
+        }
+        kernel.test_run(&ctx).map(|run| run.retval)
+    })();
+    match kernel_run {
         Ok(retval) => {
             println!("kernel : retval = {retval} ({retval:#x})");
             // The kernel returns retval as u32; compare against r0's low 32 bits.
@@ -100,11 +127,13 @@ pub fn conftest(o: &Opts, prog: Program, xdp: bool) -> Result<ExitCode, String> 
 
 /// XDP conformance keeps the two verification decisions separate, then —
 /// only when both accept — compares verdict and exact output packet bytes.
-fn conftest_xdp(o: &Opts, prog: Program) -> Result<ExitCode, String> {
+fn conftest_xdp(o: &Opts, prog: Program, links: &[crate::TailLink]) -> Result<ExitCode, String> {
     let input = crate::read_packet(o)?;
 
     let mut vm = Vm::new(prog.clone())?;
-    let febpf_verify = vm.verify(crate::verifier_config(o, 24, true));
+    let cfg = crate::verifier_config(o, 24, true);
+    crate::link_tail_calls(&mut vm, links, &cfg)?;
+    let febpf_verify = vm.verify(cfg);
     let febpf_run = match &febpf_verify {
         Ok(_) => {
             println!("febpf verifier : ACCEPT");
@@ -161,8 +190,19 @@ fn conftest_xdp(o: &Opts, prog: Program) -> Result<ExitCode, String> {
             print!("{}", disasm::disasm_program(&prog.insns));
             Ok(ExitCode::from(1))
         }
-        (Some(febpf), Ok(kernel_prog)) => {
+        (Some(febpf), Ok(mut kernel_prog)) => {
             println!("kernel verifier: ACCEPT");
+            for link in links {
+                if let Err(e) = kernel_prog.link_tail_call(
+                    &link.map_name,
+                    link.index,
+                    &link.program.insns,
+                    Some(&mut log),
+                ) {
+                    println!("kernel tail-call link: failed: {e}");
+                    return Ok(ExitCode::from(3));
+                }
+            }
             let kernel = match kernel_prog.test_run(&input) {
                 Ok(run) => run,
                 Err(e) => {

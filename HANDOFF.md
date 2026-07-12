@@ -14,9 +14,9 @@ load-bearing constraint. Don't add any without a very good reason and the
 user's OK (raw Linux syscalls via `asm!` are used instead of libc — see the
 JIT's `sys` module).
 
-Everything works today: the full default-feature suite is **315 green + 4
-intentional heavy soundness sweeps ignored**; `--no-default-features` is **303
-green + the same 4 ignored** (2026-07-11, after the XDP work below).
+Everything works today: the full default-feature suite is **319 green + 4
+intentional heavy soundness sweeps ignored**; `--no-default-features` is **307
+green + the same 4 ignored** (2026-07-12, after the static tail-call ELF work).
 `cargo clippy --all-targets -- -D warnings` is clean in both configs. **Keep
 BOTH configs green** — the JIT is now behind `default = ["jit"]`, so always
 run `cargo test` AND
@@ -31,10 +31,14 @@ implemented: `MapKind::ProgArray`, helper #12 verifier rules, independently
 verified targets sharing maps, interpreter hit/miss/cycle/33-chain semantics,
 snapshot/debugger program identity, optional v1 replay bundle section, hybrid
 JIT-to-JIT dispatch, and `kbpf::KernelProgram::link_tail_call` for real
-program-fd population plus a privilege-gated differential. Remaining before
-this item is DONE: parse libbpf static `.maps` `values[]` relocations, expose
-automatic multi-program ELF/CLI bundle construction, add real tail-call corpus
-lanes, and run the privileged differential as root.
+program-fd population plus a privilege-gated differential. Static BTF `.maps`
+`values[]` relocations now produce automatic multi-program ELF/CLI bundles;
+interpreter, JIT, analyze, record/replay, and conftest consume them. The pinned
+corpus includes Cilium v0.21.0's sparse program-array loader fixture and the
+scanner reports program graphs separately. That complete upstream object also
+contains `ARRAY_OF_MAPS`, now the next measured loader blocker. Remaining
+before this item is DONE: run the static-ELF privileged differential as root
+and load the upstream fixture after map-of-maps support lands.
 
 This is the current tip and the context a fresh agent is most likely to need.
 The work is committed linearly on `main`:

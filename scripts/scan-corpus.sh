@@ -95,7 +95,8 @@ BUCKETS="$TMP/buckets"      # one bucket label per line
 MAPHIST="$TMP/maphist"      # one map-type NAME per blocked object
 HELPHIST="$TMP/helphist"    # one helper id per blocked object
 DETAIL="$TMP/detail"        # "<bucket>\t<obj>" per object
-: > "$BUCKETS"; : > "$MAPHIST"; : > "$HELPHIST"; : > "$DETAIL"
+GRAPHS="$TMP/graphs"        # one object name per detected static tail-call graph
+: > "$BUCKETS"; : > "$MAPHIST"; : > "$HELPHIST"; : > "$DETAIL"; : > "$GRAPHS"
 
 total=0
 for obj in $OBJS; do
@@ -104,6 +105,10 @@ for obj in $OBJS; do
     name=$(basename "$obj")
     # shellcheck disable=SC2086
     out=$("$FEBPF" verify "$obj" $BTF_ARG 2>&1)
+
+    if printf '%s' "$out" | grep -q "static tail-call link"; then
+        echo "$name" >> "$GRAPHS"
+    fi
 
     if printf '%s' "$out" | grep -q "verification PASSED"; then
         bucket="OK"
@@ -140,6 +145,7 @@ n_load_fail=$(grep -c '^LOAD-FAIL:' "$BUCKETS" || true)
 n_verify_reject=$(grep -c '^VERIFY-REJECT:' "$BUCKETS" || true)
 # "loaded" = reached the verifier (OK or any VERIFY-REJECT).
 n_loaded=$((n_ok + n_verify_reject))
+n_graphs=$(wc -l < "$GRAPHS" | tr -d ' ')
 
 pct() { # pct <num> <den>
     if [ "$2" -eq 0 ]; then echo "0.0"; else
@@ -159,6 +165,7 @@ pct() { # pct <num> <den>
     echo "verified OK               : $n_ok  ($(pct "$n_ok" "$total")%)"
     echo "load failures             : $n_load_fail  ($(pct "$n_load_fail" "$total")%)"
     echo "verify rejections         : $n_verify_reject  ($(pct "$n_verify_reject" "$total")%)"
+    echo "static tail-call graphs   : $n_graphs  ($(pct "$n_graphs" "$total")%)"
     echo ""
     echo "---- outcome buckets (by count) --------------------------------------"
     sort "$BUCKETS" | uniq -c | sort -rn | while read -r c b; do

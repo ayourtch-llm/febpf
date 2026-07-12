@@ -39,6 +39,7 @@ set -u
 REPOS="
 libbpf-bootstrap|libbpf/libbpf-bootstrap|v1.4|examples/c/*.bpf.c
 bcc|iovisor/bcc|v0.31.0|libbpf-tools/*.bpf.c
+cilium-ebpf|cilium/ebpf|v0.21.0|testdata/btf_map_init.c
 "
 
 # libbpf itself: source of the header files programs #include. Pinned.
@@ -188,14 +189,16 @@ printf '%s\n' "$REPOS" | while IFS='|' read -r name path pin globs; do
 
     # Extra include dirs some repos want (their own headers next to sources).
     repo_inc=""
-    for d in "$dest" "$dest/libbpf-tools" "$dest/examples/c"; do
+    for d in "$dest" "$dest/libbpf-tools" "$dest/examples/c" "$dest/testdata"; do
         [ -d "$d" ] && repo_inc="$repo_inc -I$d"
     done
 
     printf '%s\n' "$files" | while read -r src; do
         [ -z "$src" ] && continue
         n_found=$((n_found + 1))
-        base=$(basename "$src" .bpf.c)
+        base=$(basename "$src")
+        base=${base%.bpf.c}
+        base=${base%.c}
         out="$OBJ/${name}__${base}.o"
         {
             echo "### $name: $src -> $out"

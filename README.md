@@ -50,6 +50,10 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
   (`map_lookup_elem`, `map_update_elem`, `map_delete_elem`,
   `ktime_get_ns`, `trace_printk`, `get_prandom_u32`, …), plus an API to
   register **custom helpers** with verifier-checked signatures.
+- **Tail-call program graphs**: `PROG_ARRAY` maps and helper 12 across the
+  verifier, interpreter, JIT, debugger/snapshots, replay, and kernel
+  differential path. ELF `values[]` relocations are linked automatically, so
+  a multi-section clang object can be verified and run directly with `--prog`.
 - **JIT compiler** (x86-64 Linux, aarch64 Linux and macOS; zero-dependency):
   hand-rolled native codegen for the ALU + branch core (~45× on tight loops on
   x86-64, ~26× on aarch64), with memory ops, calls and atomics deferred to the
@@ -70,7 +74,8 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
   BTF-defined `.maps`, plus global data sections (`.data`/`.bss`/`.rodata*`
   as initialized single-entry array maps, `.rodata` frozen — string literals,
   lookup tables and persistent globals just work). Tested against genuine
-  clang output (`docs/specs/elf-loading.md`).
+  clang output, including sparse static program-array initializers
+  (`docs/specs/elf-loading.md`).
 
 ## CLI
 

@@ -198,6 +198,56 @@ impl Replay {
         })
     }
 
+    pub fn record_xdp_tail_calls(
+        prog: &Program,
+        tail_calls: Vec<TailCallProgram>,
+        packet: Vec<u8>,
+        seed: u64,
+        stop_at: Option<u64>,
+        preload: Vec<MapPreload>,
+    ) -> Result<Replay, String> {
+        let cfg = crate::verifier::Config {
+            ctx_size: 24,
+            ctx_writable: false,
+            xdp: true,
+            ..Default::default()
+        };
+        let mut vm = Vm::new(prog.clone())?;
+        for link in &tail_calls {
+            vm.register_tail_call(
+                &link.map_name,
+                link.index,
+                Program {
+                    insns: link.insns.clone(),
+                    maps: prog.maps.clone(),
+                    btf_ctx: None,
+                },
+                cfg.clone(),
+            )?;
+        }
+        vm.verify(cfg)
+            .map_err(|e| format!("XDP entry verification failed: {e}"))?;
+        vm.set_prandom_seed(seed);
+        apply_preload(&mut vm, &preload)?;
+        let mut run_packet = packet.clone();
+        let outcome = match vm.run_xdp(&mut run_packet) {
+            Ok(r0) => Outcome::Exit(r0),
+            Err(e) => Outcome::Error(e.to_string()),
+        };
+        Ok(Replay {
+            febpf_version: febpf_version(),
+            insns: prog.insns.clone(),
+            maps: prog.maps.clone(),
+            ctx: vec![0u8; 24],
+            packet: Some(packet),
+            seed,
+            stop_at,
+            preload,
+            outcome: Some(outcome),
+            tail_calls,
+        })
+    }
+
     /// The program (instructions + map defs) this replay reproduces.
     pub fn program(&self) -> Program {
         Program {
@@ -215,6 +265,16 @@ impl Replay {
             vm.verify(crate::verifier::Config::default())
                 .map_err(|e| format!("replayed entry no longer verifies: {e}"))?;
         }
+        let link_cfg = if self.packet.is_some() {
+            crate::verifier::Config {
+                ctx_size: 24,
+                ctx_writable: false,
+                xdp: true,
+                ..Default::default()
+            }
+        } else {
+            crate::verifier::Config::default()
+        };
         for link in &self.tail_calls {
             vm.register_tail_call(
                 &link.map_name,
@@ -224,7 +284,7 @@ impl Replay {
                     maps: self.maps.clone(),
                     btf_ctx: None,
                 },
-                crate::verifier::Config::default(),
+                link_cfg.clone(),
             )?;
         }
         vm.set_prandom_seed(self.seed);

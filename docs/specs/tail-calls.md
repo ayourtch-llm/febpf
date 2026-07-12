@@ -1,8 +1,11 @@
 # Program arrays and tail calls
 
-Status: userspace-populated program bundles are implemented across verifier,
-interpreter, JIT, snapshots/debugger, replay, and kernel conformance APIs.
-Static ELF `values[]` relocation initialization and broader corpus lanes remain.
+Status: userspace-populated and static ELF program bundles are implemented
+across verifier, interpreter, JIT, snapshots/debugger, replay, CLI, and kernel
+conformance APIs. The pinned corpus now includes Cilium's sparse static
+program-array loader fixture; loading that complete object is currently
+blocked by its separate `ARRAY_OF_MAPS` declaration. Privileged execution of
+the static ELF graph remains before this item is fully closed.
 
 ## Goal
 
@@ -67,3 +70,13 @@ exact chain boundary.
 - The corpus gains at least one userspace-populated and one ELF-initialized
   real-world program graph; coverage claims report program graphs separately
   from standalone objects.
+
+## Implemented ELF form
+
+The BTF `.maps` parser records the byte offset of a `values` flexible-array
+member. `R_BPF_64_ABS64` relocations inside that map's exact slot range become
+`ProgArrayInit` edges from `(map, index)` to an executable ELF section. Sparse
+slots are preserved, duplicate and misaligned initializers are rejected, and
+each target is independently verified when the CLI constructs the VM. The
+same links are installed as real program fds for kernel conformance runs and
+serialized into optional replay bundle sections.

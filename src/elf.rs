@@ -39,6 +39,7 @@ fn is_xdp_section(name: &str) -> bool {
 
 // BPF relocation types.
 const R_BPF_64_64: u32 = 1;
+const R_BPF_64_ABS64: u32 = 2;
 const R_BPF_64_32: u32 = 10;
 
 // BPF map types we support.
@@ -75,9 +76,19 @@ pub struct LoadedProgram {
 pub struct Object {
     pub programs: Vec<LoadedProgram>,
     pub maps: Vec<MapDef>,
+    /// Static libbpf `PROG_ARRAY.values[]` initializers from `.rel.maps`.
+    pub prog_array_inits: Vec<ProgArrayInit>,
     /// Non-fatal loader notes (e.g. a BTF-typed section whose attach target
     /// is missing from the target BTF and fell back to an untyped ctx).
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgArrayInit {
+    pub map_index: usize,
+    pub index: u32,
+    /// ELF executable section name of the target program.
+    pub program: String,
 }
 
 /// Little/big-endian aware byte reader over a borrowed buffer.
@@ -246,6 +257,8 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
 
     // maps: prefer BTF-defined `.maps`, else the legacy `maps` section.
     let (mut maps, mut map_by_symval) = load_maps(&r, bytes, &sections, &symbols)?;
+    let prog_array_inits =
+        load_prog_array_inits(&r, &sections, &symbols, &maps, &map_by_symval)?;
 
     // Global data sections become single-entry array maps; `ld_imm64`
     // relocations against their symbols resolve to value pointers.
@@ -389,6 +402,7 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
     Ok(Object {
         programs: programs.into_iter().map(|(p, _, _)| p).collect(),
         maps,
+        prog_array_inits,
         warnings,
     })
 }
@@ -879,6 +893,8 @@ struct MapIndex {
     /// kconfig extern name → (map index, offset in the `.kconfig` value).
     /// These symbols are UNDefined in the ELF, so they resolve by name.
     kconfig: Vec<(String, usize, u32)>,
+    /// (map index, section, map base, byte offset of flexible `values[]`).
+    prog_arrays: Vec<(usize, u16, u64, u32)>,
 }
 
 impl MapIndex {
@@ -931,8 +947,79 @@ fn load_maps(
             by_offset: Vec::new(),
             data_secs: Vec::new(),
             kconfig: Vec::new(),
+            prog_arrays: Vec::new(),
         },
     ))
+}
+
+fn load_prog_array_inits(
+    r: &Reader,
+    sections: &[Section],
+    symbols: &[Symbol],
+    maps: &[MapDef],
+    index: &MapIndex,
+) -> Result<Vec<ProgArrayInit>, String> {
+    let mut out = Vec::new();
+    for &(map, shndx, base, values_off) in &index.prog_arrays {
+        let values_start = base + values_off as u64;
+        let values_end = values_start + u64::from(maps[map].max_entries) * 8;
+        let Some(rel) = sections
+            .iter()
+            .find(|s| s.kind == SHT_REL && s.info as u16 == shndx)
+        else {
+            continue;
+        };
+        let entsize = if rel.entsize == 0 { 16 } else { rel.entsize };
+        for i in 0..rel.size / entsize {
+            let pos = rel.offset + i * entsize;
+            let offset = r.u64(pos)?;
+            let info = r.u64(pos + 8)?;
+            if info as u32 != R_BPF_64_ABS64
+                || offset < values_start
+                || offset >= values_end
+            {
+                continue;
+            }
+            let byte = offset - values_start;
+            if !byte.is_multiple_of(8) {
+                return Err(format!("prog_array relocation at {offset} is not slot-aligned"));
+            }
+            let slot = (byte / 8) as u32;
+            if slot >= maps[map].max_entries {
+                return Err(format!(
+                    "prog_array '{}' initializer slot {slot} is out of range",
+                    maps[map].name
+                ));
+            }
+            if out
+                .iter()
+                .any(|init: &ProgArrayInit| init.map_index == map && init.index == slot)
+            {
+                return Err(format!(
+                    "prog_array '{}' has duplicate initializer for slot {slot}",
+                    maps[map].name
+                ));
+            }
+            let sym = symbols
+                .get((info >> 32) as usize)
+                .ok_or("prog_array relocation references invalid symbol")?;
+            let sec = sections
+                .get(sym.shndx as usize)
+                .ok_or("prog_array target has invalid section")?;
+            if sec.flags & SHF_EXECINSTR == 0 {
+                return Err(format!(
+                    "prog_array '{}' slot {slot} targets non-program symbol '{}'",
+                    maps[map].name, sym.name
+                ));
+            }
+            out.push(ProgArrayInit {
+                map_index: map,
+                index: slot,
+                program: sec.name.clone(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Is this a global data section we expose as a map?
@@ -1097,6 +1184,7 @@ fn load_legacy_maps(
             by_offset: index,
             data_secs: Vec::new(),
             kconfig: Vec::new(),
+            prog_arrays: Vec::new(),
         },
     ))
 }
@@ -1231,6 +1319,7 @@ mod btf_maps {
 
         let mut maps = Vec::new();
         let mut index = Vec::new();
+        let mut prog_arrays = Vec::new();
         // secinfo entries point at VARs; the DATASEC offset matches the map
         // variable's symbol value in the `.maps` section.
         for si in &ordered {
@@ -1245,6 +1334,7 @@ mod btf_maps {
             };
             let (mut kind, mut key_size, mut value_size, mut max_entries) =
                 (None, None, None, None);
+            let mut values_off = None;
             for m in members {
                 match btf.str_at(m.name_off) {
                     "type" => kind = Some(map_kind(ptr_array_nelems(m.type_id)?)?),
@@ -1254,10 +1344,15 @@ mod btf_maps {
                     "value_size" => value_size = Some(ptr_array_nelems(m.type_id)?),
                     "key" => key_size = Some(ptr_pointee_size(m.type_id)?),
                     "value" => value_size = Some(ptr_pointee_size(m.type_id)?),
+                    "values" => values_off = Some(m.bit_offset / 8),
                     _ => {}
                 }
             }
             let kind = kind.ok_or_else(|| format!("map '{map_name}': missing type"))?;
+            if kind == crate::maps::MapKind::ProgArray {
+                key_size.get_or_insert(4);
+                value_size.get_or_insert(4);
+            }
             // Ringbufs have no key/value; libbpf omits those members entirely.
             // Perf-event/cgroup/stack-trace maps also frequently omit key/value/
             // max_entries (libbpf fills them from nr_cpus); default to 0 here and
@@ -1268,7 +1363,6 @@ mod btf_maps {
                     | crate::maps::MapKind::PerfEventArray
                     | crate::maps::MapKind::CgroupArray
                     | crate::maps::MapKind::StackTrace
-                    | crate::maps::MapKind::ProgArray
             );
             maps.push(MapDef {
                 name: map_name.clone(),
@@ -1289,6 +1383,11 @@ mod btf_maps {
                 readonly: false,
                 init: Vec::new(),
             });
+            if kind == crate::maps::MapKind::ProgArray {
+                if let Some(off) = values_off {
+                    prog_arrays.push((maps.len() - 1, dotmaps_idx as u16, si.offset as u64, off));
+                }
+            }
             index.push((si.offset as u64, dotmaps_idx as u16, maps.len() - 1));
         }
         // Map symbols may not be at DATASEC offsets in every toolchain; also
@@ -1308,7 +1407,8 @@ mod btf_maps {
             MapIndex {
                 by_offset: index,
                 data_secs: Vec::new(),
-            kconfig: Vec::new(),
+                kconfig: Vec::new(),
+                prog_arrays,
             },
         ))
     }

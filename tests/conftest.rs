@@ -5,6 +5,8 @@
 //! unprivileged. The interp-vs-JIT differential fuzzing needs no privilege and
 //! is always exercised.
 
+mod common;
+
 use febpf::fuzz::{
     check_self_consistency, febpf_verdict, gen_frontier_program, gen_program, interp_vs_jit, Prng,
     SelfConsistency,
@@ -192,6 +194,42 @@ fn tail_call_kernel_differential_if_privileged() {
     let kernel_ret = kernel.test_run(&[0u8; 16]).unwrap().retval;
     assert_eq!(kernel_ret, febpf_ret);
     assert_eq!(kernel_ret, 42);
+}
+
+#[test]
+fn static_elf_tail_call_kernel_differential_if_privileged() {
+    common::maybe_compile("tail_call.c", "tail_call.o", "-O2");
+    if !matches!(kbpf::has_privilege(), Ok(true)) {
+        eprintln!("skipped: no bpf privilege");
+        return;
+    }
+    let bytes = std::fs::read("tests/tail_call.o").unwrap();
+    let obj = febpf::elf::load(&bytes).unwrap();
+    let entry = obj
+        .programs
+        .iter()
+        .find(|program| program.name == "socket/entry")
+        .unwrap();
+    let init = obj.prog_array_inits.first().unwrap();
+    let target = obj
+        .programs
+        .iter()
+        .find(|program| program.name == init.program)
+        .unwrap();
+
+    let mut log = String::new();
+    let mut kernel = kbpf::load_kernel_program(&entry.insns, &obj.maps, Some(&mut log))
+        .unwrap_or_else(|e| panic!("kernel entry load failed: {e}\n{log}"));
+    log.clear();
+    kernel
+        .link_tail_call(
+            &obj.maps[init.map_index].name,
+            init.index,
+            &target.insns,
+            Some(&mut log),
+        )
+        .unwrap_or_else(|e| panic!("kernel target link failed: {e}\n{log}"));
+    assert_eq!(kernel.test_run(&[0u8; 16]).unwrap().retval, 42);
 }
 
 /// Differential fuzz against the real kernel when privileged: interp, JIT and

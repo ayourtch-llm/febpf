@@ -17,7 +17,8 @@ worklist instead of a guess:
    `*.bpf.c` programs from a small, pinned set of upstream repos and compiles
    them to `*.o` with the locally-installed clang + bpftool.
 2. `scripts/scan-corpus.sh` — runs `febpf verify` over every object and
-   produces a coverage report: % that load, % that verify, and a **histogram
+   produces a coverage report: % that load, % that verify, the number of
+   static tail-call program graphs, and a **histogram
    ranked by the specific unsupported map types / helper ids that block the
    most programs**. That histogram is the whole point — it is the worklist.
 
@@ -59,6 +60,7 @@ corpus/
     libbpf/              pinned libbpf — source of the libbpf headers
     libbpf-bootstrap/    examples/c/*.bpf.c
     bcc/                 libbpf-tools/*.bpf.c
+    cilium-ebpf/         testdata/btf_map_init.c (ELF loader fixture)
   include/
     vmlinux.h            generated locally: bpftool btf dump file
                          /sys/kernel/btf/vmlinux format c
@@ -92,6 +94,7 @@ Add a line to the `REPOS` array at the top of `scripts/fetch-corpus.sh`:
 REPOS="
 libbpf-bootstrap|libbpf/libbpf-bootstrap|<tag>|examples/c/*.bpf.c
 bcc|iovisor/bcc|<tag>|libbpf-tools/*.bpf.c
+cilium-ebpf|cilium/ebpf|<tag>|testdata/btf_map_init.c
 "
 ```
 
@@ -130,7 +133,8 @@ histogram is about what feature is missing.
 `scan-corpus.sh` writes a human-readable report to stdout and to
 `corpus/coverage-report.txt`:
 
-- totals: objects scanned, # and % that load, # and % that verify;
+- totals: objects scanned, # and % that load, # and % that verify, and # and
+  % containing a successfully loaded static tail-call graph;
 - a bucket breakdown (count per bucket above);
 - **HISTOGRAM 1 — unsupported map types**, ranked by how many programs each
   blocks, each line naming the map type (e.g. `RINGBUF`, `PERCPU_HASH`);

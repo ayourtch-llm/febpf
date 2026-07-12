@@ -255,11 +255,19 @@ fn read_target_btf(path: &str) -> Result<Vec<u8>, String> {
 
 const VMLINUX_BTF: &str = "/sys/kernel/btf/vmlinux";
 
+#[derive(Clone)]
+struct TailLink {
+    map_name: String,
+    index: u32,
+    program_name: String,
+    program: Program,
+}
+
 fn load_program(
     path: &str,
     prog: Option<&str>,
     target_btf: Option<&str>,
-) -> Result<(Program, Option<DebugInfo>, bool), String> {
+) -> Result<(Program, Option<DebugInfo>, bool, Vec<TailLink>), String> {
     let is_source = [".s", ".asm", ".bpf"]
         .iter()
         .any(|ext| path.ends_with(ext));
@@ -275,6 +283,7 @@ fn load_program(
             },
             None,
             false,
+            Vec::new(),
         ));
     }
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
@@ -314,6 +323,27 @@ fn load_program(
                 obj.programs[idx].name
             );
         }
+        let links: Vec<TailLink> = obj
+            .prog_array_inits
+            .iter()
+            .map(|init| {
+                let target = obj
+                    .programs
+                    .iter()
+                    .find(|p| p.name == init.program)
+                    .ok_or_else(|| format!("prog_array target '{}' not found", init.program))?;
+                Ok(TailLink {
+                    map_name: obj.maps[init.map_index].name.clone(),
+                    index: init.index,
+                    program_name: init.program.clone(),
+                    program: Program {
+                        insns: target.insns.clone(),
+                        maps: obj.maps.clone(),
+                        btf_ctx: target.btf_ctx.clone(),
+                    },
+                })
+            })
+            .collect::<Result<_, String>>()?;
         let mut programs = obj.programs;
         let chosen = programs.swap_remove(idx);
         let xdp = chosen.xdp;
@@ -325,6 +355,7 @@ fn load_program(
             },
             chosen.debug,
             xdp,
+            links,
         ))
     } else {
         let insns = insn::decode_program(&bytes)?;
@@ -336,6 +367,7 @@ fn load_program(
             },
             None,
             false,
+            Vec::new(),
         ))
     }
 }
@@ -429,8 +461,20 @@ fn verifier_config(o: &Opts, ctx_len: usize, xdp: bool) -> verifier::Config {
     }
 }
 
+fn link_tail_calls(vm: &mut Vm, links: &[TailLink], cfg: &verifier::Config) -> Result<(), String> {
+    for link in links {
+        vm.register_tail_call(
+            &link.map_name,
+            link.index,
+            link.program.clone(),
+            cfg.clone(),
+        )?;
+    }
+    Ok(())
+}
+
 /// `febpf record <prog> [--ctx ...] [--stop-at N] -o out.febpf`
-fn cmd_record(o: &Opts, prog: Program, xdp: bool) -> Result<ExitCode, String> {
+fn cmd_record(o: &Opts, prog: Program, xdp: bool, links: &[TailLink]) -> Result<ExitCode, String> {
     let out = o
         .out
         .as_deref()
@@ -455,10 +499,47 @@ fn cmd_record(o: &Opts, prog: Program, xdp: bool) -> Result<ExitCode, String> {
         } else {
             read_packet(o)?
         };
-        febpf::replay::Replay::record_xdp(&prog, packet, seed, o.stop_at, Vec::new())?
-    } else {
+        if links.is_empty() {
+            febpf::replay::Replay::record_xdp(&prog, packet, seed, o.stop_at, Vec::new())?
+        } else {
+            let replay_links = links
+                .iter()
+                .map(|link| febpf::replay::TailCallProgram {
+                    map_name: link.map_name.clone(),
+                    index: link.index,
+                    insns: link.program.insns.clone(),
+                })
+                .collect();
+            febpf::replay::Replay::record_xdp_tail_calls(
+                &prog,
+                replay_links,
+                packet,
+                seed,
+                o.stop_at,
+                Vec::new(),
+            )?
+        }
+    } else if links.is_empty() {
         let ctx = make_ctx(o)?;
         febpf::replay::Replay::record(&prog, ctx, seed, o.stop_at, Vec::new())?
+    } else {
+        let ctx = make_ctx(o)?;
+        let replay_links = links
+            .iter()
+            .map(|link| febpf::replay::TailCallProgram {
+                map_name: link.map_name.clone(),
+                index: link.index,
+                insns: link.program.insns.clone(),
+            })
+            .collect();
+        febpf::replay::Replay::record_tail_calls(
+            &prog,
+            replay_links,
+            ctx,
+            seed,
+            o.stop_at,
+            Vec::new(),
+        )?
     };
     let bytes = replay.to_bytes();
     std::fs::write(out, &bytes).map_err(|e| format!("cannot write {out}: {e}"))?;
@@ -623,8 +704,11 @@ fn cmd_equiv(o: &Opts) -> Result<ExitCode, String> {
         .file2
         .as_deref()
         .ok_or("equiv needs two programs: febpf equiv <a> <b>")?;
-    let (pa, _, _) = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
-    let (pb, _, _) = load_program(file_b, o.prog.as_deref(), o.target_btf.as_deref())?;
+    let (pa, _, _, ta) = load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
+    let (pb, _, _, tb) = load_program(file_b, o.prog.as_deref(), o.target_btf.as_deref())?;
+    if !ta.is_empty() || !tb.is_empty() {
+        return Err("equiv does not yet model tail-call program graphs".into());
+    }
     let opts = equiv_options(o)?;
     let verdict = equiv::check(&pa, &pb, &opts)?;
     match &verdict {
@@ -724,7 +808,7 @@ fn run() -> Result<ExitCode, String> {
     if o.cmd == "equiv" {
         return cmd_equiv(&o);
     }
-    let (prog, debug, elf_xdp) =
+    let (prog, debug, elf_xdp, tail_links) =
         load_program(&o.file, o.prog.as_deref(), o.target_btf.as_deref())?;
     if o.packet.is_some() && o.pcap.is_some() {
         return Err("--packet and --pcap are mutually exclusive".into());
@@ -733,6 +817,12 @@ fn run() -> Result<ExitCode, String> {
         return Err("--pcap is currently supported by run and record".into());
     }
     let xdp = elf_xdp || o.packet.is_some() || o.pcap.is_some();
+    if !tail_links.is_empty()
+        && o.no_verify
+        && matches!(o.cmd.as_str(), "run" | "profile" | "debug" | "bench")
+    {
+        return Err("tail-call bundles require verification".into());
+    }
     if xdp
         && !matches!(
             o.cmd.as_str(),
@@ -746,15 +836,21 @@ fn run() -> Result<ExitCode, String> {
         ));
     }
     if o.cmd == "record" {
-        return cmd_record(&o, prog, xdp);
+        return cmd_record(&o, prog, xdp, &tail_links);
     }
     if o.cmd == "optimize" {
+        if !tail_links.is_empty() {
+            return Err("optimize does not yet model tail-call program graphs".into());
+        }
         return cmd_optimize(&o, prog);
     }
     if o.cmd == "conftest" {
-        return conftest::conftest(&o, prog, xdp);
+        return conftest::conftest(&o, prog, xdp, &tail_links);
     }
     if o.cmd == "race" {
+        if !tail_links.is_empty() {
+            return Err("race does not yet model tail-call program graphs".into());
+        }
         return cmd_race(&o, prog);
     }
 
@@ -782,7 +878,15 @@ fn run() -> Result<ExitCode, String> {
         "verify" => {
             let ctx = make_ctx(&o)?;
             let mut vm = Vm::new(prog.clone())?;
-            match vm.verify(verifier_config(&o, ctx.len(), xdp)) {
+            let vcfg = verifier_config(&o, ctx.len(), xdp);
+            link_tail_calls(&mut vm, &tail_links, &vcfg)?;
+            for link in &tail_links {
+                println!(
+                    "static tail-call link '{}[{}]' -> '{}'",
+                    link.map_name, link.index, link.program_name
+                );
+            }
+            match vm.verify(vcfg) {
                 Ok(ok) => {
                     println!("verification PASSED");
                     print_verify_stats(&ok);
@@ -823,8 +927,16 @@ fn run() -> Result<ExitCode, String> {
                     m.name, m.kind, m.key_size, m.value_size, m.max_entries
                 );
             }
+            for link in &tail_links {
+                println!(
+                    "  tail-call link '{}[{}]' -> '{}'",
+                    link.map_name, link.index, link.program_name
+                );
+            }
             let mut vm = Vm::new(prog.clone())?;
-            match vm.verify(verifier_config(&o, ctx.len(), xdp)) {
+            let vcfg = verifier_config(&o, ctx.len(), xdp);
+            link_tail_calls(&mut vm, &tail_links, &vcfg)?;
+            match vm.verify(vcfg) {
                 Ok(ok) => {
                     println!("\n== verifier ==");
                     println!("  PASSED");
@@ -850,13 +962,18 @@ fn run() -> Result<ExitCode, String> {
             let mut ctx = make_ctx(&o)?;
             let mut vm = Vm::new(prog)?;
             vm.echo_printk = true;
+            if !tail_links.is_empty() && o.no_verify {
+                return Err("tail-call bundles require verification".into());
+            }
             if xdp && o.no_verify {
                 return Err("XDP execution currently requires verification".into());
             }
             if o.no_verify {
                 vm.insn_limit = 100_000_000;
             } else {
-                vm.verify(verifier_config(&o, ctx.len(), xdp)).map_err(|e| {
+                let vcfg = verifier_config(&o, ctx.len(), xdp);
+                link_tail_calls(&mut vm, &tail_links, &vcfg)?;
+                vm.verify(vcfg).map_err(|e| {
                     format!(
                         "verification failed: {e}\n{}(use --no-verify to run anyway)",
                         explain(vm.insns(), &e, &o)
@@ -891,7 +1008,9 @@ fn run() -> Result<ExitCode, String> {
             let mut vm = Vm::new(prog.clone())?;
             vm.echo_printk = true;
             if !o.no_verify {
-                vm.verify(verifier_config(&o, ctx.len(), xdp)).map_err(|e| {
+                let vcfg = verifier_config(&o, ctx.len(), xdp);
+                link_tail_calls(&mut vm, &tail_links, &vcfg)?;
+                vm.verify(vcfg).map_err(|e| {
                     format!("verification failed: {e}\n{}", explain(vm.insns(), &e, &o))
                 })?;
             } else {
@@ -918,7 +1037,9 @@ fn run() -> Result<ExitCode, String> {
                 vm.set_debug(di);
             }
             if !o.no_verify {
-                match vm.verify(verifier_config(&o, ctx.len(), xdp)) {
+                let vcfg = verifier_config(&o, ctx.len(), xdp);
+                link_tail_calls(&mut vm, &tail_links, &vcfg)?;
+                match vm.verify(vcfg) {
                     Ok(_) => println!("verifier: PASSED"),
                     Err(e) => {
                         println!("verifier: FAILED: {e} (debugging anyway)");
@@ -933,7 +1054,9 @@ fn run() -> Result<ExitCode, String> {
             let mut ctx = make_ctx(&o)?;
             let mut vm = Vm::new(prog)?;
             if !o.no_verify {
-                vm.verify(verifier_config(&o, ctx.len(), xdp)).map_err(|e| {
+                let vcfg = verifier_config(&o, ctx.len(), xdp);
+                link_tail_calls(&mut vm, &tail_links, &vcfg)?;
+                vm.verify(vcfg).map_err(|e| {
                     format!("verification failed: {e}\n{}", explain(vm.insns(), &e, &o))
                 })?;
             }
