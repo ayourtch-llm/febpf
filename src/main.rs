@@ -598,6 +598,7 @@ fn verifier_config(
         ctx_writable: !o.readonly_ctx,
         strict_alignment: o.strict_align,
         xdp: kind.is_xdp(),
+        skb: kind.is_skb(),
         legacy_packet: o.legacy_packet,
         ..Default::default()
     }
@@ -1041,11 +1042,19 @@ fn run() -> Result<ExitCode, String> {
         return Err("--pcap is currently supported by run and record".into());
     }
     let kind = if o.packet.is_some() || o.pcap.is_some() {
-        febpf::elf::ProgramKind::Xdp
+        if elf_kind.is_skb() {
+            elf_kind
+        } else {
+            febpf::elf::ProgramKind::Xdp
+        }
     } else {
         elf_kind
     };
     let xdp = kind.is_xdp();
+    let skb = kind.is_skb();
+    if skb && o.pcap.is_some() {
+        return Err("pcap execution for __sk_buff programs is not yet supported; use --packet".into());
+    }
     validate_legacy_options(&o)?;
     if !tail_links.is_empty()
         && o.no_verify
@@ -1067,6 +1076,9 @@ fn run() -> Result<ExitCode, String> {
         ));
     }
     if o.cmd == "record" {
+        if skb && o.packet.is_some() {
+            return Err("recording __sk_buff packet executions is not yet supported".into());
+        }
         return cmd_record(&o, prog, xdp, &tail_links);
     }
     if o.cmd == "optimize" {
@@ -1227,6 +1239,18 @@ fn run() -> Result<ExitCode, String> {
             let r0 = if xdp {
                 let mut packet = read_packet(&o)?;
                 vm.run_xdp(&mut packet).map_err(|e| e.to_string())?
+            } else if skb && o.packet.is_some() {
+                let mut packet = read_packet(&o)?;
+                if o.jit {
+                    #[cfg(feature = "jit")]
+                    {
+                        vm.run_skb_jit(&mut packet).map_err(|e| e.to_string())?
+                    }
+                    #[cfg(not(feature = "jit"))]
+                    unreachable!()
+                } else {
+                    vm.run_skb(&mut packet).map_err(|e| e.to_string())?
+                }
             } else {
                 run_maybe_jit(&mut vm, &mut ctx, o.jit).map_err(|e| e.to_string())?
             };
@@ -1251,6 +1275,9 @@ fn run() -> Result<ExitCode, String> {
             let r0 = if xdp {
                 let mut packet = read_packet(&o)?;
                 vm.run_xdp(&mut packet).map_err(|e| e.to_string())?
+            } else if skb && o.packet.is_some() {
+                let mut packet = read_packet(&o)?;
+                vm.run_skb(&mut packet).map_err(|e| e.to_string())?
             } else {
                 vm.run(&mut ctx).map_err(|e| e.to_string())?
             };
@@ -1266,6 +1293,9 @@ fn run() -> Result<ExitCode, String> {
             let mut vm = Vm::new(prog)?;
             if xdp && o.no_verify {
                 return Err("packet debugging requires verification; remove --no-verify".into());
+            }
+            if skb && o.packet.is_some() {
+                return Err("debugging __sk_buff packet executions is not yet supported".into());
             }
             if let Some(di) = debug {
                 vm.set_debug(di);
@@ -1497,11 +1527,14 @@ mod cli_tests {
     fn machine_program_records_use_section_kinds_without_splitting_names() {
         use febpf::elf::ProgramKind;
         assert_eq!(ProgramKind::from_section("socket").name(), "socket");
+        assert!(ProgramKind::from_section("socket").is_skb());
         assert_eq!(ProgramKind::from_section("socket/entry:name").name(), "socket");
         assert_eq!(ProgramKind::from_section("socket1").name(), "socket");
         assert_eq!(ProgramKind::from_section("classifier/ingress/main").name(), "tc");
+        assert!(ProgramKind::from_section("classifier/ingress/main").is_skb());
         assert_eq!(ProgramKind::from_section("tracepoint/socket").name(), "other");
         assert_eq!(ProgramKind::from_section("xdp").name(), "xdp");
+        assert!(!ProgramKind::from_section("xdp").is_skb());
         assert_eq!(machine_field("uprobe/lib:name").unwrap(), "uprobe/lib:name");
         assert!(machine_field("bad\tname").is_err());
         assert!(machine_field("bad\nname").is_err());

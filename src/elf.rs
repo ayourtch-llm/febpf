@@ -124,6 +124,21 @@ impl ProgramKind {
     pub fn is_xdp(self) -> bool {
         self == Self::Xdp
     }
+
+    pub fn is_skb(self) -> bool {
+        matches!(
+            self,
+            Self::SocketFilter
+                | Self::SchedClassifier
+                | Self::CgroupSkb
+                | Self::SkSkb
+                | Self::FlowDissector
+                | Self::LwtIn
+                | Self::LwtOut
+                | Self::LwtXmit
+                | Self::LwtSeg6Local
+        )
+    }
 }
 
 // BPF relocation types.

@@ -76,6 +76,82 @@ fn raw_buffer_adapter_uses_bounded_virtual_context_memory() {
 }
 
 #[test]
+fn skb_load_bytes_uses_explicit_owned_packet_adapter() {
+    assert_eq!(febpf::helpers::helper_id("skb_load_bytes"), Some(26));
+    let mut vm = Vm::new(program(
+        "*(u32 *)(r10 - 4) = 0\n\
+         r6 = r1\n\
+         r2 = *(u32 *)(r6 + 0)\n\
+         if r2 != 4 goto fail\n\
+         r1 = r6\n\
+         r2 = 1\n\
+         r3 = r10\n\
+         r3 += -4\n\
+         r4 = 3\n\
+         call skb_load_bytes\n\
+         if r0 != 0 goto fail\n\
+         r0 = *(u32 *)(r10 - 4)\n\
+         exit\n\
+         fail:\n\
+         r0 = -1\n\
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 192,
+        ctx_writable: false,
+        skb: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let mut packet = [0xaa, 0xbb, 0xcc, 0xdd];
+    assert_eq!(vm.run_skb(&mut packet).unwrap(), 0x00dd_ccbb);
+    assert_eq!(packet, [0xaa, 0xbb, 0xcc, 0xdd]);
+    #[cfg(feature = "jit")]
+    assert_eq!(vm.run_skb_jit(&mut packet).unwrap(), 0x00dd_ccbb);
+
+    let mut ordinary = Vm::new(program(
+        "r2 = 0\nr3 = r10\nr4 = 0\ncall skb_load_bytes\nexit",
+    ))
+    .unwrap();
+    let error = ordinary
+        .verify(Config::default())
+        .err()
+        .expect("skb helper without skb mode must reject")
+        .to_string();
+    assert!(error.contains("expected __sk_buff context pointer"), "{error}");
+}
+
+#[test]
+fn skb_load_bytes_reports_out_of_bounds_without_partial_write() {
+    let mut vm = Vm::new(program(
+        "*(u32 *)(r10 - 4) = 0x12345678\n\
+         r2 = 3\n\
+         r3 = r10\n\
+         r3 += -4\n\
+         r4 = 2\n\
+         call skb_load_bytes\n\
+         r1 = *(u32 *)(r10 - 4)\n\
+         if r1 != 0x12345678 goto changed\n\
+         exit\n\
+         changed:\n\
+         r0 = 1\n\
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 192,
+        ctx_writable: false,
+        skb: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut packet = [1, 2, 3, 4];
+    assert_eq!(vm.run_skb(&mut packet).unwrap(), (-14i64) as u64);
+}
+
+#[test]
 fn replace_program_is_transactional_on_construction_failure() {
     let mut vm = Vm::new(program(
         ".map state array 4 8 1\n\

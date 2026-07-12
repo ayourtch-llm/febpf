@@ -205,6 +205,8 @@ pub struct Vm {
     /// Set after verification with [`crate::verifier::Config::xdp`]; causes
     /// xdp_md data/data_end loads to synthesize full virtual addresses.
     xdp: bool,
+    /// Set after verification with the explicit `__sk_buff` model.
+    skb: bool,
     /// Configurable pointer-bearing metadata layout armed by verification.
     metadata_layout: Option<MetadataLayout>,
     legacy_packet: crate::verifier::LegacyPacketProfile,
@@ -303,6 +305,7 @@ impl Vm {
             kmem: Vec::new(),
             packet: Vec::new(),
             xdp: false,
+            skb: false,
             metadata_layout: None,
             legacy_packet: crate::verifier::LegacyPacketProfile::Disabled,
             legacy_packet_used: false,
@@ -529,11 +532,13 @@ impl Vm {
             cfg.btf_ctx = self.btf_ctx.clone();
         }
         let xdp = cfg.xdp;
+        let skb = cfg.skb;
         let metadata_layout = cfg.metadata_layout;
         let legacy_packet = cfg.legacy_packet;
         let ok =
             crate::verifier::verify(&self.insns, &self.map_defs, self.user_helpers.sigs(), cfg)?;
         self.xdp = xdp;
+        self.skb = skb;
         self.metadata_layout = metadata_layout;
         self.legacy_packet = legacy_packet;
         self.legacy_packet_used = self.insns.iter().any(is_legacy_packet_load);
@@ -561,6 +566,7 @@ impl Vm {
             cfg.btf_ctx = self.btf_ctx.clone();
         }
         let xdp = cfg.xdp;
+        let skb = cfg.skb;
         let metadata_layout = cfg.metadata_layout;
         let legacy_packet = cfg.legacy_packet;
         let ok = crate::verifier::verify(
@@ -577,6 +583,7 @@ impl Vm {
         })
         .map_err(VerifyWithPolicyError::Policy)?;
         self.xdp = xdp;
+        self.skb = skb;
         self.metadata_layout = metadata_layout;
         self.legacy_packet = legacy_packet;
         self.legacy_packet_used = self.insns.iter().any(is_legacy_packet_load);
@@ -773,6 +780,40 @@ impl Vm {
         let result = self.run_jit_with_packet(&mut ctx, LegacyPacketBacking::VmPacket);
         packet.copy_from_slice(&self.packet);
         result
+    }
+
+    /// Execute an skb-context program over VM-owned packet bytes. The method
+    /// constructs a zero-filled `struct __sk_buff` record with `len` set to
+    /// the packet length; no host skb or packet pointer is exposed.
+    pub fn run_skb(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
+        let mut ctx = self.prepare_skb(packet).map_err(|msg| EbpfError { pc: 0, msg })?;
+        let result = self.run_with_packet(&mut ctx, LegacyPacketBacking::VmPacket);
+        packet.copy_from_slice(&self.packet);
+        result
+    }
+
+    /// JIT counterpart of [`Vm::run_skb`].
+    #[cfg(feature = "jit")]
+    pub fn run_skb_jit(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
+        let mut ctx = self.prepare_skb(packet).map_err(|msg| EbpfError { pc: 0, msg })?;
+        let result = self.run_jit_with_packet(&mut ctx, LegacyPacketBacking::VmPacket);
+        packet.copy_from_slice(&self.packet);
+        result
+    }
+
+    /// Install packet bytes and return febpf's synthetic `struct __sk_buff`.
+    pub fn prepare_skb(&mut self, packet: &[u8]) -> Result<Vec<u8>, String> {
+        if !self.skb {
+            return Err("skb execution requires successful verification with Config::skb".into());
+        }
+        if packet.len() > u32::MAX as usize {
+            return Err("packet is too large for __sk_buff.len".into());
+        }
+        self.packet.clear();
+        self.packet.extend_from_slice(packet);
+        let mut ctx = vec![0u8; 192];
+        ctx[0..4].copy_from_slice(&(packet.len() as u32).to_le_bytes());
+        Ok(ctx)
     }
 
     /// Install packet bytes and return the synthetic `xdp_md` context used by
@@ -2239,6 +2280,21 @@ impl<'a> Machine<'a> {
                 let n = comm.len().min(size.saturating_sub(1));
                 buf[..n].copy_from_slice(&comm[..n]);
                 0
+            }
+            helpers::id::SKB_LOAD_BYTES => {
+                let start = args[1] as u32 as usize;
+                let len = args[3] as u32 as usize;
+                match start.checked_add(len) {
+                    Some(end)
+                        if end <= self.vm.packet.len()
+                            && self.legacy_packet_backing == LegacyPacketBacking::VmPacket =>
+                    {
+                        let data = self.vm.packet[start..end].to_vec();
+                        self.mem(args[2], len, true)?.copy_from_slice(&data);
+                        0
+                    }
+                    _ => (-14i64) as u64, // -EFAULT
+                }
             }
             helpers::id::GET_STACKID => {
                 // (ctx, map, flags). Deterministic model: the id is the FNV-1a

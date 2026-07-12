@@ -23,6 +23,7 @@ pub mod id {
     pub const GET_CURRENT_UID_GID: u32 = 15;
     pub const GET_CURRENT_COMM: u32 = 16;
     pub const PERF_EVENT_OUTPUT: u32 = 25;
+    pub const SKB_LOAD_BYTES: u32 = 26;
     pub const GET_STACKID: u32 = 27;
     pub const GET_CURRENT_TASK: u32 = 35;
     pub const CURRENT_TASK_UNDER_CGROUP: u32 = 37;
@@ -59,6 +60,8 @@ pub enum ArgKind {
     ConstMapPtr,
     /// The original program context pointer (`ARG_PTR_TO_CTX`).
     CtxPtr,
+    /// The original context pointer under the explicit `__sk_buff` model.
+    SkbCtxPtr,
     /// Readable memory of exactly the map's key size (map from arg 1).
     MapKey,
     /// Readable memory of exactly the map's value size (map from arg 1).
@@ -165,6 +168,11 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             name: "get_current_comm",
             // (buf, size); buf must be writable for `size` bytes.
             args: [MemWrite { size_arg: 1 }, Size, None, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::SKB_LOAD_BYTES => HelperSig {
+            name: "skb_load_bytes",
+            args: [SkbCtxPtr, Scalar, MemWrite { size_arg: 3 }, Size, None],
             ret: RetKind::Scalar,
         },
         id::GET_CURRENT_TASK => HelperSig {
@@ -333,6 +341,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::GET_CURRENT_PID_TGID,
         id::GET_CURRENT_UID_GID,
         id::GET_CURRENT_COMM,
+        id::SKB_LOAD_BYTES,
         id::GET_CURRENT_TASK,
         id::GET_STACKID,
         id::GET_STACK,

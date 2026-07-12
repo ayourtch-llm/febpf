@@ -69,6 +69,9 @@ pub struct Config {
     /// interface/queue metadata. Packet memory may only be accessed after a
     /// comparison against `data_end` proves the range safe.
     pub xdp: bool,
+    /// Treat the context as the safe scalar subset of `struct __sk_buff` and
+    /// allow skb-only helpers. Packet bytes are supplied by `Vm::run_skb`.
+    pub skb: bool,
     /// Treat exact 64-bit loads at caller-selected context offsets as packet
     /// start/end virtual pointers.
     pub metadata_layout: Option<crate::interp::MetadataLayout>,
@@ -86,6 +89,7 @@ impl Default for Config {
             max_states_per_pc: 4096,
             btf_ctx: None,
             xdp: false,
+            skb: false,
             metadata_layout: None,
             legacy_packet: LegacyPacketProfile::Disabled,
         }
@@ -2208,6 +2212,25 @@ impl<'a> Verifier<'a> {
                     }
                     return Ok(None);
                 }
+                if self.cfg.skb {
+                    if write {
+                        return Err(self.err(pc, "__sk_buff context is read-only"));
+                    }
+                    // Narrow standalone model used by the production socket
+                    // filters: len, pkt_type, ifindex, and cb[0..5]. Direct
+                    // data/data_end pointers are a separate networking batch.
+                    if size != 4
+                        || !matches!(disp, 0 | 4 | 40 | 48 | 52 | 56 | 60 | 64)
+                    {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "invalid __sk_buff context access at offset {disp} size {size}"
+                            ),
+                        ));
+                    }
+                    return Ok(None);
+                }
                 if let Some(layout) = self.cfg.metadata_layout {
                     let overlaps = |field: usize| {
                         let start = disp as i128;
@@ -2695,6 +2718,23 @@ impl<'a> Verifier<'a> {
                             pc,
                             format!(
                                 "helper {} arg{}: expected context pointer in r{reg}",
+                                sig.name,
+                                i + 1
+                            ),
+                        ));
+                    }
+                },
+                ArgKind::SkbCtxPtr => match val {
+                    RegState::Ptr(Ptr {
+                        kind: PtrKind::Ctx,
+                        off: 0,
+                        var,
+                    }) if self.cfg.skb && var.is_const() && var.umin == 0 => {}
+                    _ => {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {} arg{}: expected __sk_buff context pointer in r{reg}",
                                 sig.name,
                                 i + 1
                             ),
@@ -3890,14 +3930,24 @@ pub fn verify(
     user_sigs: &[(u32, HelperSig)],
     cfg: Config,
 ) -> Result<VerifyOk, VerifyError> {
-    if cfg.xdp && cfg.metadata_layout.is_some() {
+    if cfg.xdp && cfg.skb {
         return Err(VerifyError { pc: 0,
-            msg: "XDP and configurable metadata layouts are mutually exclusive".into(),
+            msg: "XDP and __sk_buff context models are mutually exclusive".into(),
+            trace: None });
+    }
+    if (cfg.xdp || cfg.skb) && cfg.metadata_layout.is_some() {
+        return Err(VerifyError { pc: 0,
+            msg: "packet context models and configurable metadata layouts are mutually exclusive".into(),
             trace: None });
     }
     if cfg.btf_ctx.is_some() && cfg.metadata_layout.is_some() {
         return Err(VerifyError { pc: 0,
             msg: "BTF and configurable metadata context models are mutually exclusive".into(),
+            trace: None });
+    }
+    if cfg.btf_ctx.is_some() && (cfg.xdp || cfg.skb) {
+        return Err(VerifyError { pc: 0,
+            msg: "BTF and packet context models are mutually exclusive".into(),
             trace: None });
     }
     if let Some(layout) = cfg.metadata_layout {
