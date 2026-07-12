@@ -2212,6 +2212,84 @@ fn array_of_maps_lookup_requires_null_check() {
     assert!(err.msg.contains("expected map pointer"), "{err}");
 }
 
+#[test]
+fn hash_of_maps_lookup_returns_typed_inner_map() {
+    let mut prog = program(
+        ".map inner array 4 8 1
+         .map outer hash_of_maps 8 4 2 inner
+         *(u64 *)(r10 - 8) = 7
+         r1 = map[outer]
+         r2 = r10
+         r2 += -8
+         call map_lookup_elem
+         if r0 == 0 goto miss
+         r1 = r0
+         *(u32 *)(r10 - 4) = 0
+         r2 = r10
+         r2 += -4
+         call map_lookup_elem
+         if r0 == 0 goto miss
+         r0 = *(u64 *)(r0 + 0)
+         exit
+       miss:
+         r0 = 0
+         exit",
+    );
+    prog.maps[0].init = 42u64.to_ne_bytes().to_vec();
+    let mut vm = Vm::new(prog).unwrap();
+    vm.update_inner_map(
+        1,
+        &7u64.to_ne_bytes(),
+        0,
+        febpf::maps::MapUpdateMode::NoExist,
+    )
+    .unwrap();
+    vm.verify(Config::default()).unwrap();
+    assert_eq!(vm.run(&mut []).unwrap(), 42);
+    assert_eq!(vm.maps[1].inner_map_by_key(&7u64.to_ne_bytes()), Some(0));
+    assert_eq!(
+        vm.update_inner_map(
+            1,
+            &7u64.to_ne_bytes(),
+            0,
+            febpf::maps::MapUpdateMode::NoExist,
+        ),
+        Err(-17)
+    );
+    vm.delete_inner_map(1, &7u64.to_ne_bytes()).unwrap();
+    assert_eq!(vm.maps[1].inner_map_by_key(&7u64.to_ne_bytes()), None);
+}
+
+#[test]
+fn map_in_map_userspace_update_rejects_incompatible_inner_map() {
+    let prog = program(
+        ".map template array 4 8 1
+         .map incompatible hash 4 8 1
+         .map outer hash_of_maps 8 4 2 template
+         r0 = 0
+         exit",
+    );
+    let mut vm = Vm::new(prog).unwrap();
+    assert_eq!(
+        vm.update_inner_map(
+            2,
+            &7u64.to_ne_bytes(),
+            1,
+            febpf::maps::MapUpdateMode::Any,
+        ),
+        Err(-22)
+    );
+    assert_eq!(
+        vm.update_inner_map(
+            2,
+            &7u64.to_ne_bytes(),
+            99,
+            febpf::maps::MapUpdateMode::Any,
+        ),
+        Err(-2)
+    );
+}
+
 fn copied_scalar_size_program(second_mask: u64) -> Program {
     program(&format!(
         ".map buf array 4 16296 1

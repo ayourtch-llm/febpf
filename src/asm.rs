@@ -360,6 +360,7 @@ pub fn assemble(source: &str) -> Result<Assembled, AsmError> {
                         "stack_trace" => MapKind::StackTrace,
                         "prog_array" => MapKind::ProgArray,
                         "array_of_maps" => MapKind::ArrayOfMaps,
+                        "hash_of_maps" => MapKind::HashOfMaps,
                         "devmap" => MapKind::DevMap,
                         "cpumap" => MapKind::CpuMap,
                         "devmap_hash" => MapKind::DevMapHash,
@@ -368,11 +369,11 @@ pub fn assemble(source: &str) -> Result<Assembled, AsmError> {
                     let key_size = p.number()? as u32;
                     let value_size = p.number()? as u32;
                     let max_entries = p.number()? as u32;
-                    let inner_map_idx = if kind == MapKind::ArrayOfMaps {
+                    let inner_map_idx = if kind.is_map_of_maps() {
                         let inner = p.expect_ident()?;
                         Some(
                             *map_ids.get(&inner).ok_or_else(|| {
-                                format!("array_of_maps '{name}' references unknown map '{inner}'")
+                                format!("map-in-map '{name}' references unknown map '{inner}'")
                             })?,
                         )
                     } else {

@@ -278,6 +278,24 @@ fn array_of_maps_kernel_differential_if_privileged() {
     assert_eq!(kernel, 42);
 }
 
+#[test]
+fn anonymous_hash_of_maps_template_loads_in_kernel_if_privileged() {
+    common::maybe_compile("hash_of_maps.c", "hash_of_maps.o", "-O2");
+    if !matches!(kbpf::has_privilege(), Ok(true)) {
+        eprintln!("skipped: no bpf privilege");
+        return;
+    }
+    let bytes = std::fs::read("tests/hash_of_maps.o").unwrap();
+    let obj = febpf::elf::load(&bytes).unwrap();
+    let entry = obj.programs.iter().find(|program| program.name == "socket").unwrap();
+    assert_eq!(obj.maps[1].max_entries, 0, "fixture must exercise a dynamic template capacity");
+
+    let mut log = String::new();
+    let kernel = kbpf::run_program(&entry.insns, &obj.maps, &[0u8; 8], Some(&mut log))
+        .unwrap_or_else(|e| panic!("kernel hash-of-maps load failed: {e}\n{log}"));
+    assert_eq!(kernel, 0);
+}
+
 /// Differential fuzz against the real kernel when privileged: interp, JIT and
 /// kernel must agree (low 32 bits) on every program the kernel accepts.
 #[test]

@@ -99,6 +99,50 @@ fn btf_maps_object() {
 }
 
 #[test]
+fn hash_of_maps_uses_anonymous_btf_inner_template() {
+    maybe_compile("hash_of_maps.c", "hash_of_maps.o");
+    let obj = load("tests/hash_of_maps.o");
+    assert_eq!(obj.maps.len(), 2);
+
+    let outer = &obj.maps[0];
+    assert_eq!(outer.name, "outputs");
+    assert_eq!(outer.kind, febpf::maps::MapKind::HashOfMaps);
+    assert_eq!((outer.key_size, outer.value_size, outer.max_entries), (8, 4, 8));
+    assert_eq!(outer.inner_map_idx, Some(1));
+
+    let template = &obj.maps[1];
+    assert_eq!(template.name, "outputs.inner");
+    assert_eq!(template.kind, febpf::maps::MapKind::PerfEventArray);
+    assert_eq!((template.key_size, template.value_size), (4, 4));
+
+    assert_eq!(run_prog(&obj, "socket", &mut [0u8; 8]), 0);
+}
+
+#[test]
+fn hash_of_maps_loads_four_byte_static_initializer() {
+    maybe_compile("hash_of_maps_init.c", "hash_of_maps_init.o");
+    let obj = load("tests/hash_of_maps_init.o");
+    assert_eq!(obj.maps.len(), 2);
+    let inner = obj.maps.iter().position(|map| map.name == "inner").unwrap();
+    let outer = obj.maps.iter().position(|map| map.name == "outer").unwrap();
+    assert_eq!(obj.maps[outer].kind, febpf::maps::MapKind::HashOfMaps);
+    assert_eq!(obj.maps[outer].inner_map_idx, Some(inner as u32));
+    assert_eq!(obj.maps[outer].map_in_map_values, [(1, inner as u32)]);
+    assert_eq!(run_prog(&obj, "socket", &mut [0u8; 8]), 1);
+}
+
+#[test]
+fn hash_of_maps_rejects_static_initializer_with_wide_key() {
+    maybe_compile("hash_of_maps_bad_init.c", "hash_of_maps_bad_init.o");
+    let bytes = std::fs::read("tests/hash_of_maps_bad_init.o").unwrap();
+    let error = match elf::load(&bytes) {
+        Ok(_) => panic!("wide-key static hash_of_maps initializer loaded"),
+        Err(error) => error,
+    };
+    assert!(error.contains("key_size is 8 instead of 4"), "{error}");
+}
+
+#[test]
 fn shared_section_entries_and_section_symbol_call_addends() {
     maybe_compile("multi_entry.c", "multi_entry.o");
     let obj = load("tests/multi_entry.o");

@@ -477,6 +477,7 @@ impl Replay {
                 MapKind::DevMap => 11,
                 MapKind::CpuMap => 12,
                 MapKind::DevMapHash => 13,
+                MapKind::HashOfMaps => 14,
             });
             p.extend_from_slice(&m.key_size.to_le_bytes());
             p.extend_from_slice(&m.value_size.to_le_bytes());
@@ -490,7 +491,7 @@ impl Replay {
             .maps
             .iter()
             .enumerate()
-            .filter(|(_, map)| map.kind == MapKind::ArrayOfMaps)
+            .filter(|(_, map)| map.kind.is_map_of_maps())
             .collect();
         if !nested.is_empty() {
             let mut p = Vec::new();
@@ -658,6 +659,7 @@ impl Replay {
                             11 => MapKind::DevMap,
                             12 => MapKind::CpuMap,
                             13 => MapKind::DevMapHash,
+                            14 => MapKind::HashOfMaps,
                             k => return Err(format!("unknown map kind {k}")),
                         };
                         let key_size = r.u32()?;
@@ -770,7 +772,7 @@ impl Replay {
             let map = maps
                 .get_mut(outer as usize)
                 .ok_or("MAP_IN_MAP references an unknown outer map")?;
-            if map.kind != MapKind::ArrayOfMaps || template == u32::MAX {
+            if !map.kind.is_map_of_maps() || template == u32::MAX {
                 return Err("invalid MAP_IN_MAP template".into());
             }
             map.inner_map_idx = Some(template);

@@ -14,7 +14,7 @@
 //! degrades to "kernel unavailable" so the rest of the crate still builds.
 
 use crate::insn::Insn;
-use crate::maps::{MapDef, MapKind};
+use crate::maps::{Map, MapDef, MapKind};
 
 /// Outcome of a `bpf(2)` operation: an fd/return value, or a raw `-errno`.
 pub type KResult<T> = Result<T, KError>;
@@ -250,6 +250,7 @@ mod imp {
             MapKind::Array => BPF_MAP_TYPE_ARRAY,
             MapKind::ProgArray => BPF_MAP_TYPE_PROG_ARRAY,
             MapKind::ArrayOfMaps => 12,
+            MapKind::HashOfMaps => 13,
             MapKind::Hash => BPF_MAP_TYPE_HASH,
             MapKind::PerCpuArray => BPF_MAP_TYPE_PERCPU_ARRAY,
             MapKind::PerCpuHash => BPF_MAP_TYPE_PERCPU_HASH,
@@ -468,6 +469,19 @@ fn load_program_type(
     xdp: bool,
     log: Option<&mut String>,
 ) -> KResult<KernelProgram> {
+    // Apply the same tolerant defaults used by the standalone VM before
+    // issuing BPF_MAP_CREATE. BTF templates commonly omit dynamic capacities
+    // (notably PERF_EVENT_ARRAY inside HASH_OF_MAPS); zero is not a valid
+    // kernel capacity.
+    let maps: Vec<MapDef> = maps
+        .iter()
+        .map(|def| {
+            Map::new(def.clone()).map(|map| map.def).map_err(|what| KError {
+                errno: 22,
+                what,
+            })
+        })
+        .collect::<KResult<_>>()?;
     // Create kernel maps and remember their fds by original map index.
     let mut pending: Vec<usize> = (0..maps.len()).collect();
     let mut created: Vec<Option<Fd>> = (0..maps.len()).map(|_| None).collect();
@@ -476,7 +490,7 @@ fn load_program_type(
         let mut next = Vec::new();
         for i in pending {
             let def = &maps[i];
-            if def.kind != MapKind::ArrayOfMaps
+            if !def.kind.is_map_of_maps()
                 && (def.inner_map_idx.is_some() || !def.map_in_map_values.is_empty())
             {
                 return Err(KError {
@@ -487,8 +501,8 @@ fn load_program_type(
                     ),
                 });
             }
-            let inner_fd = match (def.kind, def.inner_map_idx) {
-                (MapKind::ArrayOfMaps, Some(inner)) => {
+            let inner_fd = match (def.kind.is_map_of_maps(), def.inner_map_idx) {
+                (true, Some(inner)) => {
                     match created.get(inner as usize).and_then(Option::as_ref) {
                         Some(fd) => Some(fd.0),
                         None => {
@@ -497,13 +511,12 @@ fn load_program_type(
                         }
                     }
                 }
-                (MapKind::ArrayOfMaps, None) => None,
-                (_, _) => None,
+                (true, None) | (false, _) => None,
             };
-            if def.kind == MapKind::ArrayOfMaps && inner_fd.is_none() {
+            if def.kind.is_map_of_maps() && inner_fd.is_none() {
                 return Err(KError {
                     errno: 22,
-                    what: format!("array_of_maps '{}' has no inner-map template", def.name),
+                    what: format!("map-in-map '{}' has no inner-map template", def.name),
                 });
             }
             let fd = imp::map_create(def, inner_fd)?;

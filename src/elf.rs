@@ -160,6 +160,7 @@ const BPF_MAP_TYPE_STACK_TRACE: u32 = 7;
 const BPF_MAP_TYPE_CGROUP_ARRAY: u32 = 8;
 const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
 const BPF_MAP_TYPE_ARRAY_OF_MAPS: u32 = 12;
+const BPF_MAP_TYPE_HASH_OF_MAPS: u32 = 13;
 const BPF_MAP_TYPE_DEVMAP: u32 = 14;
 const BPF_MAP_TYPE_CPUMAP: u32 = 16;
 const BPF_MAP_TYPE_DEVMAP_HASH: u32 = 25;
@@ -1156,7 +1157,7 @@ struct MapIndex {
     kconfig: Vec<(String, usize, u32)>,
     /// (map index, section, map base, byte offset of flexible `values[]`).
     prog_arrays: Vec<(usize, u16, u64, u32)>,
-    /// Static initializer layout for `ARRAY_OF_MAPS.values[]`.
+    /// Static initializer layout for map-in-map `values[]`.
     map_arrays: Vec<(usize, u16, u64, u32)>,
 }
 
@@ -1328,18 +1329,26 @@ fn load_map_in_map_inits(
             let byte = offset - values_start;
             if !byte.is_multiple_of(8) {
                 return Err(format!(
-                    "array_of_maps relocation at {offset} is not slot-aligned"
+                    "map-in-map relocation at {offset} is not slot-aligned"
                 ));
             }
             let slot = (byte / 8) as u32;
+            if maps[outer].kind == crate::maps::MapKind::HashOfMaps
+                && maps[outer].key_size != 4
+            {
+                return Err(format!(
+                    "hash_of_maps '{}' has static values[] initializers but key_size is {} instead of 4",
+                    maps[outer].name, maps[outer].key_size
+                ));
+            }
             let sym = symbols
                 .get((info >> 32) as usize)
-                .ok_or("array_of_maps relocation references invalid symbol")?;
+                .ok_or("map-in-map relocation references invalid symbol")?;
             let inner = match index.resolve(sym) {
                 Some(MapRef::Obj(map)) => map as u32,
                 _ => {
                     return Err(format!(
-                        "array_of_maps '{}' slot {slot} targets non-map symbol '{}'",
+                        "map-in-map '{}' slot {slot} targets non-map symbol '{}'",
                         maps[outer].name, sym.name
                     ));
                 }
@@ -1350,7 +1359,7 @@ fn load_map_in_map_inits(
                 .any(|&(existing, _)| existing == slot)
             {
                 return Err(format!(
-                    "array_of_maps '{}' has duplicate initializer for slot {slot}",
+                    "map-in-map '{}' has duplicate initializer for slot {slot}",
                     maps[outer].name
                 ));
             }
@@ -1362,7 +1371,7 @@ fn load_map_in_map_inits(
                     ) =>
                 {
                     return Err(format!(
-                        "array_of_maps '{}' slot {slot} has an incompatible inner map '{}'",
+                        "map-in-map '{}' slot {slot} has an incompatible inner map '{}'",
                         maps[outer].name, maps[inner as usize].name
                     ));
                 }
@@ -1568,6 +1577,7 @@ fn map_kind(ty: u32) -> Result<MapKind, String> {
         BPF_MAP_TYPE_CGROUP_ARRAY => Ok(MapKind::CgroupArray),
         BPF_MAP_TYPE_LRU_HASH => Ok(MapKind::LruHash),
         BPF_MAP_TYPE_ARRAY_OF_MAPS => Ok(MapKind::ArrayOfMaps),
+        BPF_MAP_TYPE_HASH_OF_MAPS => Ok(MapKind::HashOfMaps),
         BPF_MAP_TYPE_DEVMAP => Ok(MapKind::DevMap),
         BPF_MAP_TYPE_CPUMAP => Ok(MapKind::CpuMap),
         BPF_MAP_TYPE_DEVMAP_HASH => Ok(MapKind::DevMapHash),
@@ -1575,7 +1585,7 @@ fn map_kind(ty: u32) -> Result<MapKind, String> {
         other => Err(format!(
             "unsupported map type {other} ({}); supported: hash/array/\
              perf_event_array/percpu_hash/percpu_array/stack_trace/cgroup_array/\
-             lru_hash/ringbuf/prog_array/array_of_maps/devmap/cpumap/devmap_hash",
+             lru_hash/ringbuf/prog_array/array_of_maps/hash_of_maps/devmap/cpumap/devmap_hash",
             map_type_name(other)
         )),
     }
@@ -1684,31 +1694,9 @@ mod btf_maps {
             btf.type_size(type_id)
         };
 
-        let secinfo = btf.datasec(".maps").ok_or("no .maps DATASEC in BTF")?;
-        let mut ordered: Vec<_> = secinfo.to_vec();
-        ordered.sort_by_key(|si| si.offset);
-
-        let mut maps = Vec::new();
-        let mut index = Vec::new();
-        let mut prog_arrays = Vec::new();
-        let mut map_arrays = Vec::new();
-        let mut map_struct_ids = Vec::new();
-        let mut values_target_ids = Vec::new();
-        // secinfo entries point at VARs. Prefer the ELF symbol value as the
-        // actual `.maps` byte offset: real loader fixtures may leave DATASEC
-        // offsets zero or otherwise non-distinct.
-        for si in &ordered {
-            let var = btf.ty(si.type_id)?;
-            let Kind::Var { type_id, .. } = var.kind else {
-                continue;
-            };
-            let map_name = btf.str_at(var.name_off).to_string();
-            let map_base = symbols
-                .iter()
-                .find(|sym| sym.shndx as usize == dotmaps_idx && sym.name == map_name)
-                .map(|sym| sym.value)
-                .unwrap_or(si.offset as u64);
-            let st_id = btf.resolve(type_id)?;
+        let parse_map_struct = |st_id: u32,
+                                map_name: &str|
+         -> Result<(MapDef, Option<u32>, Option<u32>), String> {
             let Kind::Struct { members, .. } = &btf.ty(st_id)?.kind else {
                 return Err(format!("map '{map_name}' is not a struct"));
             };
@@ -1743,15 +1731,15 @@ mod btf_maps {
             let kind = kind.ok_or_else(|| format!("map '{map_name}': missing type"))?;
             if matches!(
                 kind,
-                crate::maps::MapKind::ProgArray | crate::maps::MapKind::ArrayOfMaps
+                crate::maps::MapKind::ProgArray
+                    | crate::maps::MapKind::ArrayOfMaps
+                    | crate::maps::MapKind::HashOfMaps
             ) {
-                key_size.get_or_insert(4);
                 value_size.get_or_insert(4);
+                if kind != crate::maps::MapKind::HashOfMaps {
+                    key_size.get_or_insert(4);
+                }
             }
-            // Ringbufs have no key/value; libbpf omits those members entirely.
-            // Perf-event/cgroup/stack-trace maps also frequently omit key/value/
-            // max_entries (libbpf fills them from nr_cpus); default to 0 here and
-            // let `Map::new` apply sensible defaults. See docs/specs/map-types-2.md.
             let no_kv = matches!(
                 kind,
                 crate::maps::MapKind::RingBuf
@@ -1759,32 +1747,62 @@ mod btf_maps {
                     | crate::maps::MapKind::CgroupArray
                     | crate::maps::MapKind::StackTrace
             );
-            maps.push(MapDef {
-                name: map_name.clone(),
-                kind,
-                key_size: key_size
-                    .or(no_kv.then_some(0))
-                    .ok_or_else(|| format!("map '{map_name}': missing key size"))?,
-                value_size: value_size
-                    .or(no_kv.then_some(0))
-                    .ok_or_else(|| format!("map '{map_name}': missing value size"))?,
-                // A missing max_entries is legal in a BTF map def: libbpf
-                // leaves it 0 and the loader app sets it before load (e.g.
-                // bcc's cpudist calls bpf_map__set_max_entries). Default it
-                // rather than reject the object.
-                max_entries: max_entries
-                    .or(no_kv.then_some(0))
-                    .unwrap_or(DEFAULT_MAX_ENTRIES),
-                readonly: false,
-                init: Vec::new(),
-                inner_map_idx: None,
-                map_in_map_values: Vec::new(),
-            });
+            Ok((
+                MapDef {
+                    name: map_name.to_string(),
+                    kind,
+                    key_size: key_size
+                        .or(no_kv.then_some(0))
+                        .ok_or_else(|| format!("map '{map_name}': missing key size"))?,
+                    value_size: value_size
+                        .or(no_kv.then_some(0))
+                        .ok_or_else(|| format!("map '{map_name}': missing value size"))?,
+                    max_entries: max_entries
+                        .or(no_kv.then_some(0))
+                        .unwrap_or(DEFAULT_MAX_ENTRIES),
+                    readonly: false,
+                    init: Vec::new(),
+                    inner_map_idx: None,
+                    map_in_map_values: Vec::new(),
+                },
+                values_off,
+                values_target,
+            ))
+        };
+
+        let secinfo = btf.datasec(".maps").ok_or("no .maps DATASEC in BTF")?;
+        let mut ordered: Vec<_> = secinfo.to_vec();
+        ordered.sort_by_key(|si| si.offset);
+
+        let mut maps = Vec::new();
+        let mut index = Vec::new();
+        let mut prog_arrays = Vec::new();
+        let mut map_arrays = Vec::new();
+        let mut map_struct_ids = Vec::new();
+        let mut values_target_ids = Vec::new();
+        // secinfo entries point at VARs. Prefer the ELF symbol value as the
+        // actual `.maps` byte offset: real loader fixtures may leave DATASEC
+        // offsets zero or otherwise non-distinct.
+        for si in &ordered {
+            let var = btf.ty(si.type_id)?;
+            let Kind::Var { type_id, .. } = var.kind else {
+                continue;
+            };
+            let map_name = btf.str_at(var.name_off).to_string();
+            let map_base = symbols
+                .iter()
+                .find(|sym| sym.shndx as usize == dotmaps_idx && sym.name == map_name)
+                .map(|sym| sym.value)
+                .unwrap_or(si.offset as u64);
+            let st_id = btf.resolve(type_id)?;
+            let (def, values_off, values_target) = parse_map_struct(st_id, &map_name)?;
+            let kind = def.kind;
+            maps.push(def);
             if kind == crate::maps::MapKind::ProgArray {
                 if let Some(off) = values_off {
                     prog_arrays.push((maps.len() - 1, dotmaps_idx as u16, map_base, off));
                 }
-            } else if kind == crate::maps::MapKind::ArrayOfMaps {
+            } else if kind.is_map_of_maps() {
                 if let Some(off) = values_off {
                     map_arrays.push((maps.len() - 1, dotmaps_idx as u16, map_base, off));
                 }
@@ -1793,15 +1811,33 @@ mod btf_maps {
             values_target_ids.push(values_target);
             index.push((map_base, dotmaps_idx as u16, maps.len() - 1));
         }
-        for outer in 0..maps.len() {
-            if maps[outer].kind != crate::maps::MapKind::ArrayOfMaps {
+        let declared_maps = maps.len();
+        for outer in 0..declared_maps {
+            if !maps[outer].kind.is_map_of_maps() {
                 continue;
             }
             if let Some(target) = values_target_ids[outer] {
-                maps[outer].inner_map_idx = map_struct_ids
+                let declared = map_struct_ids
                     .iter()
                     .position(|&candidate| candidate == target)
                     .map(|map| map as u32);
+                maps[outer].inner_map_idx = if let Some(map) = declared {
+                    Some(map)
+                } else {
+                    let name = format!("{}.inner", maps[outer].name);
+                    let (template, _, nested_target) = parse_map_struct(target, &name)?;
+                    if template.kind.is_map_of_maps() || nested_target.is_some() {
+                        return Err(format!(
+                            "map '{}' has a nested map-in-map template",
+                            maps[outer].name
+                        ));
+                    }
+                    let idx = maps.len() as u32;
+                    maps.push(template);
+                    map_struct_ids.push(target);
+                    values_target_ids.push(None);
+                    Some(idx)
+                };
             }
         }
         // Map symbols may not be at DATASEC offsets in every toolchain; also
@@ -1864,6 +1900,7 @@ mod tests {
         assert!(map_kind(2).is_ok()); // ARRAY
         assert!(map_kind(3).is_ok()); // PROG_ARRAY
         assert!(map_kind(12).is_ok()); // ARRAY_OF_MAPS
+        assert!(map_kind(13).is_ok()); // HASH_OF_MAPS
         assert!(map_kind(27).is_ok()); // RINGBUF (now supported)
         assert!(map_kind(4).is_ok()); // PERF_EVENT_ARRAY (now supported)
         assert!(map_kind(8).is_ok()); // CGROUP_ARRAY (now supported)

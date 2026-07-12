@@ -566,8 +566,8 @@ pub enum PtrKind {
     MapValue { map: u32 },
     /// Result of map_lookup_elem before the null check.
     MapValueOrNull { map: u32, id: u32 },
-    /// Result of looking up an `ARRAY_OF_MAPS`; becomes a map pointer after a
-    /// null check. `map` is the verifier's inner-map template index.
+    /// Result of looking up a map-in-map; becomes a map pointer after a null
+    /// check. `map` is the verifier's inner-map template index.
     MapOrNull { map: u32, id: u32 },
     /// Writable ringbuf record of `size` bytes (from ringbuf_reserve, after the
     /// null check). `id` ties every copy together for consume-tracking.
@@ -3198,7 +3198,7 @@ impl<'a> Verifier<'a> {
                     ),
                 ));
             }
-            if def.kind == crate::maps::MapKind::ArrayOfMaps
+            if def.kind.is_map_of_maps()
                 && matches!(
                     hid,
                     crate::helpers::id::MAP_UPDATE_ELEM
@@ -3208,7 +3208,7 @@ impl<'a> Verifier<'a> {
                 return Err(self.err(
                     pc,
                     format!(
-                        "helper {} cannot modify array_of_maps '{}' from a BPF program",
+                        "helper {} cannot modify map-in-map '{}' from a BPF program",
                         sig.name, def.name
                     ),
                 ));
@@ -3275,11 +3275,11 @@ impl<'a> Verifier<'a> {
                     origins.insert(id, (pc, sig.name.to_string()));
                 }
                 let def = &self.maps[map as usize];
-                if def.kind == crate::maps::MapKind::ArrayOfMaps {
+                if def.kind.is_map_of_maps() {
                     let inner = def.inner_map_idx.ok_or_else(|| {
                         self.err(
                             pc,
-                            format!("array_of_maps '{}' has no inner-map template", def.name),
+                            format!("map-in-map '{}' has no inner-map template", def.name),
                         )
                     })?;
                     RegState::Ptr(Ptr::new(PtrKind::MapOrNull { map: inner, id }))

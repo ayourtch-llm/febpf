@@ -15,7 +15,7 @@
 #![allow(clippy::manual_checked_ops)]
 use crate::helpers::{self, MemBus, UserHelpers};
 use crate::insn::*;
-use crate::maps::{Map, MapDef, MapSnapshot, ValueRef};
+use crate::maps::{Map, MapDef, MapSnapshot, MapUpdateMode, ValueRef};
 use alloc::{
     format,
     string::{String, ToString},
@@ -231,28 +231,28 @@ impl Vm {
         regions.push(Region::KernelMem); // KMEM_HANDLE
         regions.push(Region::Packet); // PACKET_HANDLE
         for (outer, def) in prog.maps.iter().enumerate() {
-            if def.kind != crate::maps::MapKind::ArrayOfMaps {
+            if !def.kind.is_map_of_maps() {
                 continue;
             }
             let template = def.inner_map_idx.ok_or_else(|| {
-                format!("array_of_maps '{}' has no inner-map template", def.name)
+                format!("map-in-map '{}' has no inner-map template", def.name)
             })? as usize;
             let template_def = prog.maps.get(template).ok_or_else(|| {
                 format!(
-                    "array_of_maps '{}' references unknown template map {template}",
+                    "map-in-map '{}' references unknown template map {template}",
                     def.name
                 )
             })?;
-            if template == outer || template_def.kind == crate::maps::MapKind::ArrayOfMaps {
+            if template == outer || template_def.kind.is_map_of_maps() {
                 return Err(format!(
-                    "array_of_maps '{}' has invalid template '{}'",
+                    "map-in-map '{}' has invalid template '{}'",
                     def.name, template_def.name
                 ));
             }
             for &(_, inner) in &def.map_in_map_values {
                 let inner_def = prog.maps.get(inner as usize).ok_or_else(|| {
                     format!(
-                        "array_of_maps '{}' references unknown inner map {inner}",
+                        "map-in-map '{}' references unknown inner map {inner}",
                         def.name
                     )
                 })?;
@@ -262,7 +262,7 @@ impl Vm {
                     || inner_def.max_entries != template_def.max_entries
                 {
                     return Err(format!(
-                        "array_of_maps '{}' contains incompatible inner map '{}'",
+                        "map-in-map '{}' contains incompatible inner map '{}'",
                         def.name, inner_def.name
                     ));
                 }
@@ -451,6 +451,49 @@ impl Vm {
         });
         self.legacy_packet_used |= uses_legacy_packet;
         Ok(program_id)
+    }
+
+    /// Populate a map-in-map entry from userspace while preserving the inner
+    /// template invariant relied upon by the verifier.
+    pub fn update_inner_map(
+        &mut self,
+        outer: u32,
+        key: &[u8],
+        inner: u32,
+        mode: MapUpdateMode,
+    ) -> Result<(), i64> {
+        let outer_def = self.maps.get(outer as usize).ok_or(-2i64)?.def.clone();
+        let template = outer_def.inner_map_idx.ok_or(-22i64)?;
+        let template_def = &self.maps.get(template as usize).ok_or(-22i64)?.def;
+        let inner_def = &self.maps.get(inner as usize).ok_or(-2i64)?.def;
+        if template == outer
+            || template_def.kind.is_map_of_maps()
+            || inner_def.kind != template_def.kind
+            || inner_def.key_size != template_def.key_size
+            || inner_def.value_size != template_def.value_size
+            || inner_def.max_entries != template_def.max_entries
+        {
+            return Err(-22);
+        }
+        let outer_map = &mut self.maps[outer as usize];
+        match outer_def.kind {
+            crate::maps::MapKind::ArrayOfMaps => {
+                let index = u32::from_ne_bytes(key.try_into().map_err(|_| -22i64)?);
+                outer_map.set_inner_map(index, inner, mode)
+            }
+            crate::maps::MapKind::HashOfMaps => {
+                outer_map.set_inner_map_key(key, inner, mode)
+            }
+            _ => Err(-22),
+        }
+    }
+
+    /// Delete a userspace-populated `HASH_OF_MAPS` entry.
+    pub fn delete_inner_map(&mut self, outer: u32, key: &[u8]) -> Result<(), i64> {
+        self.maps
+            .get_mut(outer as usize)
+            .ok_or(-2i64)?
+            .delete_inner_map_key(key)
     }
 
     fn patch_wide(&mut self, pc: usize, value: u64) {
@@ -2172,12 +2215,20 @@ impl<'a> Machine<'a> {
             helpers::id::MAP_LOOKUP_ELEM => {
                 let m = self.map_from_ptr(args[0])?;
                 let key = self.read_bytes(args[1], self.vm.maps[m].def.key_size as usize)?;
-                if self.vm.maps[m].def.kind == crate::maps::MapKind::ArrayOfMaps {
-                    let index = u32::from_ne_bytes(
-                        key.try_into()
-                            .map_err(|_| self.err("array_of_maps key is not a u32"))?,
-                    );
-                    match self.vm.maps[m].inner_map_at(index) {
+                if self.vm.maps[m].def.kind.is_map_of_maps() {
+                    let inner = if self.vm.maps[m].def.kind
+                        == crate::maps::MapKind::ArrayOfMaps
+                    {
+                        let index = u32::from_ne_bytes(
+                            key.as_slice()
+                                .try_into()
+                                .map_err(|_| self.err("array_of_maps key is not a u32"))?,
+                        );
+                        self.vm.maps[m].inner_map_at(index)
+                    } else {
+                        self.vm.maps[m].inner_map_by_key(&key)
+                    };
+                    match inner {
                         Some(inner) => {
                             let handle = *self
                                 .vm

@@ -52,7 +52,7 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
   `trace_printk` capture, dataflow queries (`origin`/`when`/`who`), and C source
   lines and typed globals from BTF debug info.
 - **Maps & helpers**: array/hash/per-CPU/LRU/ring/perf/stack/program maps,
-  typed `ARRAY_OF_MAPS` nested lookup, and kernel-compatible helper ids
+  typed `ARRAY_OF_MAPS` and `HASH_OF_MAPS` nested lookup, and kernel-compatible helper ids
   (`map_lookup_elem`, `map_update_elem`, `map_delete_elem`,
   `ktime_get_ns`, `trace_printk`, `get_prandom_u32`, …), plus an API to
   register **custom helpers** with verifier-checked signatures.

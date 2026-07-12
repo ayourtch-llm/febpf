@@ -416,3 +416,21 @@ fn array_of_maps_round_trips_and_replays() {
     let (mut vm, ctx) = parsed.build_vm().unwrap();
     assert_eq!(run_capture(&mut vm, &ctx).0, Some(42));
 }
+
+#[test]
+fn hash_of_maps_definition_round_trips() {
+    let p = prog(
+        ".map inner array 4 8 1
+         .map outer hash_of_maps 8 4 2 inner
+         r0 = 0
+         exit",
+    );
+    let replay = Replay::record(&p, Vec::new(), DEFAULT_PRANDOM_SEED, None, Vec::new()).unwrap();
+    let parsed = Replay::from_bytes(&replay.to_bytes()).unwrap();
+    assert_eq!(parsed, replay);
+    assert_eq!(parsed.maps[1].kind, febpf::maps::MapKind::HashOfMaps);
+    assert_eq!(parsed.maps[1].inner_map_idx, Some(0));
+    assert!(parsed.maps[1].map_in_map_values.is_empty());
+    let (mut vm, ctx) = parsed.build_vm().unwrap();
+    assert_eq!(run_capture(&mut vm, &ctx).0, Some(0));
+}

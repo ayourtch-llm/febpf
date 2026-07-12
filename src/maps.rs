@@ -43,12 +43,23 @@ pub enum MapKind {
     ProgArray,
     /// Array whose values are references to compatible inner maps.
     ArrayOfMaps,
+    /// Hash whose values are references to compatible inner maps.
+    HashOfMaps,
     /// Device-indexed array used by `bpf_redirect_map`.
     DevMap,
     /// CPU-indexed array used by XDP CPU redirection.
     CpuMap,
     /// Hash variant of a device redirect map.
     DevMapHash,
+}
+
+/// Userspace update mode for a map-in-map entry, matching the kernel's
+/// `BPF_ANY`, `BPF_NOEXIST`, and `BPF_EXIST` flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapUpdateMode {
+    Any,
+    NoExist,
+    Exist,
 }
 
 impl MapKind {
@@ -81,6 +92,10 @@ impl MapKind {
             | MapKind::DevMapHash
         )
     }
+
+    pub(crate) fn is_map_of_maps(self) -> bool {
+        matches!(self, MapKind::ArrayOfMaps | MapKind::HashOfMaps)
+    }
 }
 
 impl core::fmt::Display for MapKind {
@@ -97,6 +112,7 @@ impl core::fmt::Display for MapKind {
             MapKind::StackTrace => "stack_trace",
             MapKind::ProgArray => "prog_array",
             MapKind::ArrayOfMaps => "array_of_maps",
+            MapKind::HashOfMaps => "hash_of_maps",
             MapKind::DevMap => "devmap",
             MapKind::CpuMap => "cpumap",
             MapKind::DevMapHash => "devmap_hash",
@@ -118,7 +134,7 @@ pub struct MapDef {
     /// Initial contents, copied into the front of the storage at creation
     /// (used for `.data`/`.rodata` global-data maps; rest is zero).
     pub init: Vec<u8>,
-    /// Map index used as the kernel inner-map template (`ARRAY_OF_MAPS` only).
+    /// Map index used as the kernel inner-map template (map-in-map kinds).
     pub inner_map_idx: Option<u32>,
     /// Static `(slot, map index)` values from BTF `.maps.values[]` relocations.
     pub map_in_map_values: Vec<(u32, u32)>,
@@ -210,6 +226,7 @@ enum Storage {
     PerfEvent { emitted: Vec<Vec<u8>> },
     ProgArray(Vec<Option<u32>>),
     MapArray(Vec<Option<u32>>),
+    MapHash { index: LookupMap<Vec<u8>, u32> },
 }
 
 /// A point-in-time copy of a map's contents *and* its VM region-handle
@@ -225,7 +242,7 @@ pub struct MapSnapshot {
 
 impl Map {
     pub fn new(mut def: MapDef) -> Result<Map, String> {
-        if def.kind != MapKind::ArrayOfMaps
+        if !def.kind.is_map_of_maps()
             && (def.inner_map_idx.is_some() || !def.map_in_map_values.is_empty())
         {
             return Err(format!(
@@ -270,7 +287,7 @@ impl Map {
                     def.max_entries = 1024;
                 }
             }
-            MapKind::ProgArray | MapKind::ArrayOfMaps => {
+            MapKind::ProgArray | MapKind::ArrayOfMaps | MapKind::HashOfMaps => {
                 if def.key_size == 0 {
                     def.key_size = 4;
                 }
@@ -290,6 +307,7 @@ impl Map {
                     | MapKind::PerfEventArray
                     | MapKind::ProgArray
                     | MapKind::ArrayOfMaps
+                    | MapKind::HashOfMaps
             )
         {
             return Err(format!("map '{}': zero value_size", def.name));
@@ -330,6 +348,28 @@ impl Map {
                 }
             }
             (Storage::MapArray(slots), Vec::new())
+        } else if def.kind == MapKind::HashOfMaps {
+            if def.key_size == 0
+                || def.value_size != 4
+                || !def.init.is_empty()
+                || def.inner_map_idx.is_none()
+                || (def.key_size != 4 && !def.map_in_map_values.is_empty())
+            {
+                return Err(format!(
+                    "hash_of_maps '{}' requires a nonzero key size, value_size=4, an inner-map template, no byte initializer, and 4-byte keys for static values[] initializers",
+                    def.name
+                ));
+            }
+            let mut index = LookupMap::new();
+            for &(key, map) in &def.map_in_map_values {
+                if index.insert(key.to_ne_bytes().to_vec(), map).is_some() {
+                    return Err(format!(
+                        "hash_of_maps '{}' has duplicate key {key}",
+                        def.name
+                    ));
+                }
+            }
+            (Storage::MapHash { index }, Vec::new())
         } else if def.kind.is_arraylike() {
             if def.key_size != 4 {
                 return Err(format!("array map '{}' requires key_size=4", def.name));
@@ -410,7 +450,8 @@ impl Map {
             Storage::RingBuf { .. }
             | Storage::PerfEvent { .. }
             | Storage::ProgArray(_)
-            | Storage::MapArray(_) => None,
+            | Storage::MapArray(_)
+            | Storage::MapHash { .. } => None,
         }
     }
 
@@ -466,6 +507,7 @@ impl Map {
                 | MapKind::PerfEventArray
                 | MapKind::ProgArray
                 | MapKind::ArrayOfMaps
+                | MapKind::HashOfMaps
         ) {
             return Err(-22); // EINVAL: no key/value update path
         }
@@ -545,7 +587,8 @@ impl Map {
             Storage::RingBuf { .. }
             | Storage::PerfEvent { .. }
             | Storage::ProgArray(_)
-            | Storage::MapArray(_) => {
+            | Storage::MapArray(_)
+            | Storage::MapHash { .. } => {
                 unreachable!()
             }
         }
@@ -568,10 +611,19 @@ impl Map {
         }
     }
 
-    pub fn set_inner_map(&mut self, index: u32, map: u32) -> Result<(), i64> {
+    pub(crate) fn set_inner_map(
+        &mut self,
+        index: u32,
+        map: u32,
+        mode: MapUpdateMode,
+    ) -> Result<(), i64> {
         match &mut self.storage {
             Storage::MapArray(slots) => {
-                *slots.get_mut(index as usize).ok_or(-7i64)? = Some(map);
+                let slot = slots.get_mut(index as usize).ok_or(-7i64)?;
+                match mode {
+                    MapUpdateMode::NoExist => return Err(-17), // EEXIST: array keys exist
+                    MapUpdateMode::Exist | MapUpdateMode::Any => *slot = Some(map),
+                }
                 Ok(())
             }
             _ => Err(-22),
@@ -582,6 +634,50 @@ impl Map {
         match &self.storage {
             Storage::MapArray(slots) => slots.get(index as usize).copied().flatten(),
             _ => None,
+        }
+    }
+
+    pub(crate) fn set_inner_map_key(
+        &mut self,
+        key: &[u8],
+        map: u32,
+        mode: MapUpdateMode,
+    ) -> Result<(), i64> {
+        if key.len() != self.def.key_size as usize {
+            return Err(-22);
+        }
+        match &mut self.storage {
+            Storage::MapHash { index } => {
+                let exists = index.contains_key(key);
+                if (mode == MapUpdateMode::NoExist && exists)
+                    || (mode == MapUpdateMode::Exist && !exists)
+                {
+                    return Err(if exists { -17 } else { -2 });
+                }
+                if !exists && index.len() >= self.def.max_entries as usize {
+                    return Err(-7);
+                }
+                index.insert(key.to_vec(), map);
+                Ok(())
+            }
+            _ => Err(-22),
+        }
+    }
+
+    pub fn inner_map_by_key(&self, key: &[u8]) -> Option<u32> {
+        match &self.storage {
+            Storage::MapHash { index } => index.get(key).copied(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn delete_inner_map_key(&mut self, key: &[u8]) -> Result<(), i64> {
+        if key.len() != self.def.key_size as usize {
+            return Err(-22);
+        }
+        match &mut self.storage {
+            Storage::MapHash { index } => index.remove(key).map(|_| ()).ok_or(-2),
+            _ => Err(-22),
         }
     }
 
@@ -614,7 +710,8 @@ impl Map {
             Storage::RingBuf { .. }
             | Storage::PerfEvent { .. }
             | Storage::ProgArray(_)
-            | Storage::MapArray(_) => Err(-22),
+            | Storage::MapArray(_)
+            | Storage::MapHash { .. } => Err(-22),
             Storage::Hash { index, free, .. } => match index.remove(key) {
                 Some(i) => {
                     free.push(i);
@@ -792,6 +889,10 @@ impl Map {
                         )
                     })
                 })
+                .collect(),
+            Storage::MapHash { index } => index
+                .iter()
+                .map(|(key, &map)| (key.clone(), map.to_ne_bytes().to_vec()))
                 .collect(),
             Storage::RingBuf { .. } | Storage::PerfEvent { .. } | Storage::ProgArray(_) => Vec::new(),
         }
