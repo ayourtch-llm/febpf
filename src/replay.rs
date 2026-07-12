@@ -15,7 +15,7 @@
 use crate::insn::{self, Insn};
 use crate::interp::{Program, Vm};
 use crate::maps::{MapDef, MapKind};
-use crate::verifier::LegacyPacketProfile;
+use crate::verifier::{LegacyPacketProfile, UninitStackPolicy};
 use alloc::{
     format,
     string::{String, ToString},
@@ -41,6 +41,7 @@ const TAG_PACKET: u8 = 0x09;
 const TAG_TAIL_CALLS: u8 = 0x0a;
 const TAG_MAP_IN_MAP: u8 = 0x0b;
 const TAG_LEGACY_PACKET: u8 = 0x0c;
+const TAG_UNINIT_STACK: u8 = 0x0d;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TailCallProgram {
@@ -92,6 +93,9 @@ pub struct Replay {
     /// Deprecated packet-load semantics used for this invocation. Disabled
     /// replays omit the additive LEGACY_PACKET section byte-for-byte.
     pub legacy_packet: LegacyPacketProfile,
+    /// Verifier provenance for privileged uninitialized-stack reads. Strict
+    /// files omit the additive section for backward-compatible encoding.
+    pub uninit_stack: UninitStackPolicy,
     pub seed: u64,
     /// Optional "stop at instruction count N" cursor for the debugger.
     pub stop_at: Option<u64>,
@@ -128,6 +132,7 @@ impl Replay {
             ctx,
             packet: None,
             legacy_packet: LegacyPacketProfile::Disabled,
+            uninit_stack: UninitStackPolicy::Strict,
             seed,
             stop_at,
             preload,
@@ -167,6 +172,7 @@ impl Replay {
             ctx: vec![0u8; 24],
             packet: Some(packet),
             legacy_packet: LegacyPacketProfile::Disabled,
+            uninit_stack: UninitStackPolicy::Strict,
             seed,
             stop_at,
             preload,
@@ -212,6 +218,7 @@ impl Replay {
             ctx,
             packet: None,
             legacy_packet: LegacyPacketProfile::Disabled,
+            uninit_stack: UninitStackPolicy::Strict,
             seed,
             stop_at,
             preload,
@@ -263,6 +270,7 @@ impl Replay {
             ctx: vec![0u8; 24],
             packet: Some(packet),
             legacy_packet: LegacyPacketProfile::Disabled,
+            uninit_stack: UninitStackPolicy::Strict,
             seed,
             stop_at,
             preload,
@@ -288,6 +296,7 @@ impl Replay {
         vm.verify(crate::verifier::Config {
             ctx_size: packet.len(),
             legacy_packet: profile,
+            uninit_stack: UninitStackPolicy::Strict,
             ..Default::default()
         })
         .map_err(|e| format!("legacy packet verification failed: {e}"))?;
@@ -305,6 +314,7 @@ impl Replay {
             ctx: packet,
             packet: None,
             legacy_packet: profile,
+            uninit_stack: UninitStackPolicy::Strict,
             seed,
             stop_at,
             preload,
@@ -350,6 +360,7 @@ impl Replay {
             ctx: vec![0u8; 24],
             packet: Some(packet),
             legacy_packet: profile,
+            uninit_stack: UninitStackPolicy::Strict,
             seed,
             stop_at,
             preload,
@@ -425,16 +436,21 @@ impl Replay {
                 ctx_writable: false,
                 xdp: true,
                 legacy_packet: self.legacy_packet,
+                uninit_stack: self.uninit_stack,
                 ..Default::default()
             }
         } else if self.legacy_packet != LegacyPacketProfile::Disabled {
             crate::verifier::Config {
                 ctx_size: self.ctx.len(),
                 legacy_packet: self.legacy_packet,
+                uninit_stack: self.uninit_stack,
                 ..Default::default()
             }
         } else {
-            crate::verifier::Config::default()
+            crate::verifier::Config {
+                uninit_stack: self.uninit_stack,
+                ..Default::default()
+            }
         }
     }
 
@@ -524,6 +540,9 @@ impl Replay {
             };
             section(&mut out, TAG_LEGACY_PACKET, &[profile]);
         }
+        if self.uninit_stack == UninitStackPolicy::Allow {
+            section(&mut out, TAG_UNINIT_STACK, &[1]);
+        }
 
         // SEED
         section(&mut out, TAG_SEED, &self.seed.to_le_bytes());
@@ -605,6 +624,7 @@ impl Replay {
         let mut tail_calls = Vec::new();
         let mut map_in_map = Vec::new();
         let mut legacy_packet = LegacyPacketProfile::Disabled;
+        let mut uninit_stack = UninitStackPolicy::Strict;
 
         let mut pos = 10usize;
         while pos < bytes.len() {
@@ -763,6 +783,16 @@ impl Replay {
                         return Err("LEGACY_PACKET section has trailing bytes".into());
                     }
                 }
+                TAG_UNINIT_STACK => {
+                    let mut r = Reader::new(payload);
+                    uninit_stack = match r.u8()? {
+                        1 => UninitStackPolicy::Allow,
+                        policy => return Err(format!("unknown uninitialized-stack policy {policy}")),
+                    };
+                    if !r.rest().is_empty() {
+                        return Err("UNINIT_STACK section has trailing bytes".into());
+                    }
+                }
                 _ => {} // unknown section: skip (forward compatibility)
             }
         }
@@ -785,6 +815,7 @@ impl Replay {
             ctx: ctx.ok_or("replay file missing CTX section")?,
             packet,
             legacy_packet,
+            uninit_stack,
             seed: seed.ok_or("replay file missing SEED section")?,
             stop_at,
             preload,

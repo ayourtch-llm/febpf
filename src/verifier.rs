@@ -46,6 +46,19 @@ pub enum LegacyPacketProfile {
     Rbpf041,
 }
 
+/// Verification policy for reads from stack bytes that have not been written
+/// on every path. Linux permits these reads for privileged programs; febpf's
+/// runtime stack is zero-backed, while the verifier treats loaded values as
+/// unknown scalars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UninitStackPolicy {
+    /// Reject direct and helper reads unless every byte is initialized.
+    #[default]
+    Strict,
+    /// Match Linux's privileged `allow_uninit_stack` behavior.
+    Allow,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Size of the memory region r1 points to on entry (0 = no context).
@@ -77,6 +90,9 @@ pub struct Config {
     pub metadata_layout: Option<crate::interp::MetadataLayout>,
     /// Explicit semantics for deprecated legacy packet loads.
     pub legacy_packet: LegacyPacketProfile,
+    /// Whether privileged Linux-style reads of uninitialized stack bytes are
+    /// accepted. Strict rejection remains the default.
+    pub uninit_stack: UninitStackPolicy,
 }
 
 impl Default for Config {
@@ -92,6 +108,7 @@ impl Default for Config {
             skb: false,
             metadata_layout: None,
             legacy_packet: LegacyPacketProfile::Disabled,
+            uninit_stack: UninitStackPolicy::Strict,
         }
     }
 }
@@ -2747,6 +2764,9 @@ impl<'a> Verifier<'a> {
                 SlotState::Spill(v) => return Ok(v),
                 SlotState::Bytes(0xff) => return Ok(RegState::Scalar(Scalar::unknown())),
                 SlotState::Bytes(_) => {
+                    if self.cfg.uninit_stack == UninitStackPolicy::Allow {
+                        return Ok(RegState::Scalar(Scalar::unknown()));
+                    }
                     return Err(self.err(
                         pc,
                         format!("read of partially uninitialized stack at off {off}"),
@@ -2758,6 +2778,9 @@ impl<'a> Verifier<'a> {
             let slot = b / 8;
             let bit = 1u8 << (b % 8);
             if stack[slot].init_mask() & bit == 0 {
+                if self.cfg.uninit_stack == UninitStackPolicy::Allow {
+                    continue;
+                }
                 return Err(self.err(
                     pc,
                     format!("read of uninitialized stack byte at off {}", b as i64 - STACK_SIZE as i64),
@@ -2806,6 +2829,9 @@ impl<'a> Verifier<'a> {
                 for b in base..base + len as usize {
                     let slot = state.frames[frame].stack[b / 8];
                     if slot.init_mask() & (1u8 << (b % 8)) == 0 {
+                        if self.cfg.uninit_stack == UninitStackPolicy::Allow {
+                            continue;
+                        }
                         return Err(self.err(
                             pc,
                             format!(

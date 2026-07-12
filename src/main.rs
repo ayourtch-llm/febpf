@@ -48,6 +48,7 @@ options:
   --jit                compile to native code (run/bench; x86-64 Linux, aarch64 macOS/Linux)
   --strict-align       verifier: require aligned memory accesses
   --readonly-ctx       verifier: forbid stores to the context
+  --allow-uninit-stack verifier: privileged Linux parity; unread stack is zero-backed
   --iters <n>          bench/fuzz: iterations (default 1000)
   --seed <n>           fuzz: PRNG seed (random if omitted; printed on failure)
   --kernel             conftest/fuzz/vfuzz: also diff against the real kernel (root)
@@ -90,6 +91,7 @@ struct Opts {
     no_explain: bool,
     strict_align: bool,
     readonly_ctx: bool,
+    allow_uninit_stack: bool,
     iters: u64,
     jit: bool,
     prog: Option<String>,
@@ -127,6 +129,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Opts, Strin
         no_explain: false,
         strict_align: false,
         readonly_ctx: false,
+        allow_uninit_stack: false,
         iters: 1000,
         jit: false,
         prog: None,
@@ -244,6 +247,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Opts, Strin
             }
             "--strict-align" => o.strict_align = true,
             "--readonly-ctx" => o.readonly_ctx = true,
+            "--allow-uninit-stack" => o.allow_uninit_stack = true,
             f if !f.starts_with('-') && o.file.is_empty() => o.file = f.to_string(),
             f if !f.starts_with('-') && o.file2.is_none() => o.file2 = Some(f.to_string()),
             other => return Err(format!("unknown option '{other}'")),
@@ -600,6 +604,11 @@ fn verifier_config(
         xdp: kind.is_xdp(),
         skb: kind.is_skb(),
         legacy_packet: o.legacy_packet,
+        uninit_stack: if o.allow_uninit_stack {
+            verifier::UninitStackPolicy::Allow
+        } else {
+            verifier::UninitStackPolicy::Strict
+        },
         ..Default::default()
     }
 }
@@ -642,7 +651,7 @@ fn cmd_record(o: &Opts, prog: Program, xdp: bool, links: &[TailLink]) -> Result<
         .as_deref()
         .ok_or("record needs an output file: -o <out.febpf>")?;
     let seed = febpf::interp::DEFAULT_PRANDOM_SEED;
-    let replay = if o.legacy_packet != verifier::LegacyPacketProfile::Disabled {
+    let mut replay = if o.legacy_packet != verifier::LegacyPacketProfile::Disabled {
         if !links.is_empty() {
             return Err(
                 "recording legacy packet loads with tail-call bundles is not yet supported".into(),
@@ -735,6 +744,11 @@ fn cmd_record(o: &Opts, prog: Program, xdp: bool, links: &[TailLink]) -> Result<
             o.stop_at,
             Vec::new(),
         )?
+    };
+    replay.uninit_stack = if o.allow_uninit_stack {
+        verifier::UninitStackPolicy::Allow
+    } else {
+        verifier::UninitStackPolicy::Strict
     };
     let bytes = replay.to_bytes();
     std::fs::write(out, &bytes).map_err(|e| format!("cannot write {out}: {e}"))?;
@@ -1438,6 +1452,19 @@ mod cli_tests {
         ])
         .unwrap();
         assert_eq!(rbpf.legacy_packet, verifier::LegacyPacketProfile::Rbpf041);
+    }
+
+    #[test]
+    fn privileged_uninitialized_stack_policy_is_explicit() {
+        let strict = parse(&["verify", "program.s"]).unwrap();
+        assert!(!strict.allow_uninit_stack);
+        let privileged = parse(&[
+            "verify",
+            "--allow-uninit-stack",
+            "program.s",
+        ])
+        .unwrap();
+        assert!(privileged.allow_uninit_stack);
     }
 
     #[test]

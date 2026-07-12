@@ -122,6 +122,7 @@ EMPTY_PACKET="$TMP/empty-packet"
 # inheriting a global default silently.
 map_args_for_object() {
     MAP_MAX_ENTRIES=""
+    ALLOW_UNINIT_STACK=0
     case "$1" in
         inspektor-gadget__audit_seccomp.o|\
         inspektor-gadget__profile_cpu.o|\
@@ -130,6 +131,13 @@ map_args_for_object() {
         inspektor-gadget__trace_malloc.o|\
         inspektor-gadget__trace_open.o)
             MAP_MAX_ENTRIES="ig_build_id=1024"
+            ;;
+    esac
+    case "$1" in
+        inspektor-gadget__snapshot_file.o|\
+        inspektor-gadget__top_blockio.o|\
+        inspektor-gadget__trace_lsm.o)
+            ALLOW_UNINIT_STACK=1
             ;;
     esac
 }
@@ -181,6 +189,11 @@ needs_linux_legacy_packet() {
         '^verification FAILED: at insn [0-9]+: legacy packet profile disabled for opcode 0x[0-9a-fA-F]{2}$'
 }
 
+needs_privileged_uninit_stack() {
+    printf '%s\n' "$1" | grep -Eq \
+        '^verification FAILED: at insn [0-9]+: (helper reads uninitialized stack byte|read of (partially )?uninitialized stack)'
+}
+
 total=0
 objects_loaded=0
 objects_ok=0
@@ -219,12 +232,26 @@ for obj in "${OBJS[@]}"; do
                         --legacy-packet linux --packet "$EMPTY_PACKET" 2>&1)
                 fi
                 classify "$out"
+                if [ "$ALLOW_UNINIT_STACK" -eq 1 ] && needs_privileged_uninit_stack "$out"; then
+                    privileged_out=$(run_febpf verify "$obj" --prog "$program_name" \
+                        --allow-uninit-stack 2>&1)
+                    classify "$privileged_out"
+                    if [ "$bucket" = OK ]; then
+                        bucket="OK-PRIVILEGED-UNINIT"
+                    fi
+                fi
                 echo "$bucket" >> "$BUCKETS"
                 printf '%s\t%s::%s\n' "$bucket" "$name" "$program_name" >> "$DETAIL"
-                if [ "$bucket" != OK ]; then
-                    object_ok=0
-                    [ "$object_bucket" = OK ] && object_bucket="$bucket"
-                fi
+                case "$bucket" in
+                    OK) ;;
+                    OK-PRIVILEGED-UNINIT)
+                        [ "$object_bucket" = OK ] && object_bucket="$bucket"
+                        ;;
+                    *)
+                        object_ok=0
+                        object_bucket="$bucket"
+                        ;;
+                esac
                 ;;
             link)
                 object_links=$((object_links + 1))
@@ -250,10 +277,12 @@ done
 
 # --- Aggregate ------------------------------------------------------------
 n_ok=$(grep -c '^OK$' "$BUCKETS" || true)
+n_privileged=$(grep -c '^OK-PRIVILEGED-UNINIT$' "$BUCKETS" || true)
+n_verified=$((n_ok + n_privileged))
 n_load_fail=$(grep -c '^LOAD-FAIL:' "$BUCKETS" || true)
 n_verify_reject=$(grep -c '^VERIFY-REJECT:' "$BUCKETS" || true)
 # "loaded" = reached the verifier (OK or any VERIFY-REJECT).
-n_loaded=$((n_ok + n_verify_reject))
+n_loaded=$((n_verified + n_verify_reject))
 n_graphs=$(wc -l < "$GRAPHS" | tr -d ' ')
 n_links=$(wc -l < "$LINKS" | tr -d ' ')
 
@@ -275,7 +304,9 @@ pct() { # pct <num> <den>
     echo "objects fully compatible  : $objects_ok  ($(pct "$objects_ok" "$total")%)"
     echo "entry programs scanned    : $entry_total"
     echo "entries loaded            : $n_loaded  ($(pct "$n_loaded" "$entry_total")%)"
-    echo "entries verified OK       : $n_ok  ($(pct "$n_ok" "$entry_total")%)"
+    echo "entries verified OK       : $n_verified  ($(pct "$n_verified" "$entry_total")%)"
+    echo "  strict                  : $n_ok  ($(pct "$n_ok" "$entry_total")%)"
+    echo "  privileged uninit-stack : $n_privileged  ($(pct "$n_privileged" "$entry_total")%)"
     echo "entry load failures       : $n_load_fail  ($(pct "$n_load_fail" "$entry_total")%)"
     echo "entry verify rejections   : $n_verify_reject  ($(pct "$n_verify_reject" "$entry_total")%)"
     echo "static tail-call graphs   : $n_graphs  ($(pct "$n_graphs" "$total")%)"

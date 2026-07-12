@@ -247,6 +247,7 @@ pub struct Session {
     packet: Option<Vec<u8>>,
     /// Legacy packet-load semantics and therefore the stepping input adapter.
     legacy_packet: verifier::LegacyPacketProfile,
+    uninit_stack: verifier::UninitStackPolicy,
 }
 
 /// Load a replay file's bytes into a debugger [`Session`], positioned at its
@@ -291,6 +292,7 @@ impl Session {
             preload: Vec::new(),
             packet: None,
             legacy_packet: verifier::LegacyPacketProfile::Disabled,
+            uninit_stack: verifier::UninitStackPolicy::Strict,
         })
     }
 
@@ -309,6 +311,7 @@ impl Session {
             preload: r.preload,
             packet: r.packet,
             legacy_packet: r.legacy_packet,
+            uninit_stack: r.uninit_stack,
         })
     }
 
@@ -327,6 +330,7 @@ impl Session {
                 ctx_writable: false,
                 xdp: true,
                 legacy_packet: self.legacy_packet,
+                uninit_stack: self.uninit_stack,
                 ..Default::default()
             })
             .map_err(|e| format!("replayed XDP program no longer verifies: {e}"))?;
@@ -336,6 +340,7 @@ impl Session {
                 vm.verify(crate::verifier::Config {
                     ctx_size: self.ctx_template.len(),
                     legacy_packet: self.legacy_packet,
+                    uninit_stack: self.uninit_stack,
                     ..Default::default()
                 })
                 .map_err(|e| format!("replayed legacy program no longer verifies: {e}"))?;

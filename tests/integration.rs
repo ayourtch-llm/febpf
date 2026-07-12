@@ -2067,6 +2067,99 @@ fn reject_uninit_stack_read() {
 }
 
 #[test]
+fn privileged_policy_allows_zero_backed_direct_stack_reads() {
+    let source = "
+        *(u32 *)(r10 - 8) = 0x11223344
+        r0 = *(u64 *)(r10 - 8)
+        exit";
+    let mut strict = Vm::new(program(source)).unwrap();
+    assert!(strict.verify(Config::default()).is_err());
+
+    let mut privileged = Vm::new(program(source)).unwrap();
+    privileged
+        .verify(Config {
+            uninit_stack: febpf::verifier::UninitStackPolicy::Allow,
+            ..Config::default()
+        })
+        .unwrap();
+    assert_eq!(privileged.run(&mut []).unwrap(), 0x11223344);
+}
+
+#[test]
+fn privileged_policy_allows_zero_backed_helper_input_but_not_uninit_registers() {
+    let source = "
+        .map values hash 4 8 1
+        *(u32 *)(r10 - 12) = 7
+        *(u32 *)(r10 - 8) = 0x55667788
+        r1 = map[values]
+        r2 = r10
+        r2 += -12
+        r3 = r10
+        r3 += -8
+        r4 = 0
+        call map_update_elem
+        r1 = map[values]
+        r2 = r10
+        r2 += -12
+        call map_lookup_elem
+        if r0 == 0 goto miss
+        r0 = *(u64 *)(r0 + 0)
+        exit
+      miss:
+        r0 = 0
+        exit";
+    let mut strict = Vm::new(program(source)).unwrap();
+    let error = match strict.verify(Config::default()) {
+        Ok(_) => panic!("strict policy accepted partially initialized helper input"),
+        Err(error) => error,
+    };
+    assert!(error.msg.contains("helper reads uninitialized stack"), "{error}");
+
+    let cfg = Config {
+        uninit_stack: febpf::verifier::UninitStackPolicy::Allow,
+        ..Config::default()
+    };
+    let mut privileged = Vm::new(program(source)).unwrap();
+    privileged.verify(cfg.clone()).unwrap();
+    assert_eq!(privileged.run(&mut []).unwrap(), 0x55667788);
+
+    let mut bad_register = Vm::new(program("r0 = r2\nexit")).unwrap();
+    assert!(bad_register.verify(cfg).is_err());
+}
+
+#[test]
+fn privileged_policy_zeroes_reused_local_call_frames() {
+    let source = "
+        call write_byte
+        call read_byte
+        exit
+      write_byte:
+        *(u8 *)(r10 - 1) = 0xaa
+        r0 = 0
+        exit
+      read_byte:
+        r0 = *(u8 *)(r10 - 1)
+        exit";
+    let mut vm = Vm::new(program(source)).unwrap();
+    vm.verify(Config {
+        uninit_stack: febpf::verifier::UninitStackPolicy::Allow,
+        ..Config::default()
+    })
+    .unwrap();
+    assert_eq!(vm.run(&mut []).unwrap(), 0);
+    #[cfg(feature = "jit")]
+    {
+        let mut vm = Vm::new(program(source)).unwrap();
+        vm.verify(Config {
+            uninit_stack: febpf::verifier::UninitStackPolicy::Allow,
+            ..Config::default()
+        })
+        .unwrap();
+        assert_eq!(vm.run_jit(&mut []).unwrap(), 0);
+    }
+}
+
+#[test]
 fn reject_unchecked_map_value() {
     let e = verify_err(
         "

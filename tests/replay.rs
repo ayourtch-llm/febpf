@@ -434,3 +434,29 @@ fn hash_of_maps_definition_round_trips() {
     let (mut vm, ctx) = parsed.build_vm().unwrap();
     assert_eq!(run_capture(&mut vm, &ctx).0, Some(0));
 }
+
+#[test]
+fn privileged_uninitialized_stack_policy_round_trips_additively() {
+    let p = prog(
+        "*(u32 *)(r10 - 8) = 0x11223344
+         r0 = *(u64 *)(r10 - 8)
+         exit",
+    );
+    let strict = Replay::record(&p, Vec::new(), DEFAULT_PRANDOM_SEED, None, Vec::new()).unwrap();
+    assert_eq!(
+        Replay::from_bytes(&strict.to_bytes()).unwrap().uninit_stack,
+        febpf::verifier::UninitStackPolicy::Strict
+    );
+
+    let mut privileged = strict;
+    privileged.uninit_stack = febpf::verifier::UninitStackPolicy::Allow;
+    let parsed = Replay::from_bytes(&privileged.to_bytes()).unwrap();
+    assert_eq!(parsed, privileged);
+    let (mut vm, ctx) = parsed.build_vm().unwrap();
+    vm.verify(febpf::verifier::Config {
+        uninit_stack: parsed.uninit_stack,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(run_capture(&mut vm, &ctx).0, Some(0x11223344));
+}

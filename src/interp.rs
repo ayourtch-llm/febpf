@@ -2023,6 +2023,12 @@ impl<'a> Machine<'a> {
                                 ret_pc: self.pc + 1,
                                 regs6_9,
                             });
+                            // Each verifier frame starts with invalid stack
+                            // slots. The backing bytes are deterministic
+                            // zeroes, so a later callee reusing this depth must
+                            // not observe an earlier callee's stale bytes.
+                            let depth = self.frames.len();
+                            self.vm.stack[depth * STACK_SIZE..(depth + 1) * STACK_SIZE].fill(0);
                             self.regs[REG_FP as usize] =
                                 mkaddr(STACK0_HANDLE + self.frames.len() as u32, STACK_SIZE as u32);
                             self.jump(ins.imm as i64)?;
