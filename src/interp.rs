@@ -856,6 +856,12 @@ impl Vm {
         self.packet.extend_from_slice(packet);
         let mut ctx = vec![0u8; 192];
         ctx[0..4].copy_from_slice(&(packet.len() as u32).to_le_bytes());
+        // For Ethernet packet input, synthesize skb->protocol from the outer
+        // EtherType exactly as the little-endian eBPF host observes __be16.
+        if packet.len() >= 14 {
+            let protocol = u16::from_le_bytes([packet[12], packet[13]]) as u32;
+            ctx[16..20].copy_from_slice(&protocol.to_le_bytes());
+        }
         Ok(ctx)
     }
 

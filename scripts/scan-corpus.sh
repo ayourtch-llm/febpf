@@ -157,7 +157,11 @@ run_febpf() {
 
 classify() {
     classified_output="$1"
-    if printf '%s' "$classified_output" | grep -q "verification PASSED"; then
+    classified_program="${2:-}"
+    if [ -n "$classified_program" ] && printf '%s' "$classified_output" | \
+        grep -Fq "warning: $classified_program: no function '"; then
+        bucket="ENVIRONMENT:missing-attach-target"
+    elif printf '%s' "$classified_output" | grep -q "verification PASSED"; then
         bucket="OK"
     elif line=$(printf '%s\n' "$classified_output" | grep -m1 "unsupported map type"); then
         mt=$(printf '%s' "$line" | sed -n 's/.*unsupported map type [0-9]* (\([A-Za-z0-9_]*\)).*/\1/p')
@@ -231,11 +235,11 @@ for obj in "${OBJS[@]}"; do
                     out=$(run_febpf verify "$obj" --prog "$program_name" \
                         --legacy-packet linux --packet "$EMPTY_PACKET" 2>&1)
                 fi
-                classify "$out"
+                classify "$out" "$program_name"
                 if [ "$ALLOW_UNINIT_STACK" -eq 1 ] && needs_privileged_uninit_stack "$out"; then
                     privileged_out=$(run_febpf verify "$obj" --prog "$program_name" \
                         --allow-uninit-stack 2>&1)
-                    classify "$privileged_out"
+                    classify "$privileged_out" "$program_name"
                     if [ "$bucket" = OK ]; then
                         bucket="OK-PRIVILEGED-UNINIT"
                     fi
@@ -281,8 +285,10 @@ n_privileged=$(grep -c '^OK-PRIVILEGED-UNINIT$' "$BUCKETS" || true)
 n_verified=$((n_ok + n_privileged))
 n_load_fail=$(grep -c '^LOAD-FAIL:' "$BUCKETS" || true)
 n_verify_reject=$(grep -c '^VERIFY-REJECT:' "$BUCKETS" || true)
-# "loaded" = reached the verifier (OK or any VERIFY-REJECT).
-n_loaded=$((n_verified + n_verify_reject))
+n_environment=$(grep -c '^ENVIRONMENT:' "$BUCKETS" || true)
+# "loaded" = object/entry construction reached verification, including
+# explicit attach-environment gaps that prevent a kernel-equivalent verdict.
+n_loaded=$((n_verified + n_verify_reject + n_environment))
 n_graphs=$(wc -l < "$GRAPHS" | tr -d ' ')
 n_links=$(wc -l < "$LINKS" | tr -d ' ')
 
@@ -309,6 +315,7 @@ pct() { # pct <num> <den>
     echo "  privileged uninit-stack : $n_privileged  ($(pct "$n_privileged" "$entry_total")%)"
     echo "entry load failures       : $n_load_fail  ($(pct "$n_load_fail" "$entry_total")%)"
     echo "entry verify rejections   : $n_verify_reject  ($(pct "$n_verify_reject" "$entry_total")%)"
+    echo "entry environment gaps    : $n_environment  ($(pct "$n_environment" "$entry_total")%)"
     echo "static tail-call graphs   : $n_graphs  ($(pct "$n_graphs" "$total")%)"
     echo "static tail-call links    : $n_links"
     echo ""

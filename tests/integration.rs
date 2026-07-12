@@ -299,6 +299,48 @@ fn skb_load_bytes_reports_out_of_bounds_without_partial_write() {
 }
 
 #[test]
+fn skb_protocol_and_direct_packet_fields_match_ethernet_input() {
+    let source = "
+        r2 = *(u32 *)(r1 + 16)
+        if w2 != 8 goto miss
+        r2 = *(u32 *)(r1 + 76)
+        r3 = *(u32 *)(r1 + 80)
+        r4 = r2
+        r4 += 14
+        if r4 > r3 goto miss
+        r0 = *(u8 *)(r2 + 0)
+        exit
+      miss:
+        r0 = 0
+        exit";
+    let config = Config {
+        ctx_size: 192,
+        ctx_writable: false,
+        skb: true,
+        ..Default::default()
+    };
+    let packet = [
+        0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x00,
+    ];
+    let mut vm = Vm::new(program(source)).unwrap();
+    vm.verify(config.clone()).unwrap();
+    let mut frame = packet;
+    assert_eq!(vm.run_skb(&mut frame).unwrap(), 0xaa);
+    let mut non_ipv4 = packet;
+    non_ipv4[12..14].copy_from_slice(&[0x86, 0xdd]);
+    assert_eq!(vm.run_skb(&mut non_ipv4).unwrap(), 0);
+    let mut short = [0xaau8; 13];
+    assert_eq!(vm.run_skb(&mut short).unwrap(), 0);
+    #[cfg(feature = "jit")]
+    {
+        let mut vm = Vm::new(program(source)).unwrap();
+        vm.verify(config).unwrap();
+        let mut frame = packet;
+        assert_eq!(vm.run_skb_jit(&mut frame).unwrap(), 0xaa);
+    }
+}
+
+#[test]
 fn skb_pull_data_invalidates_old_packet_pointers_and_allows_reload() {
     assert_eq!(febpf::helpers::helper_id("skb_pull_data"), Some(39));
     let stale = "r6 = r1

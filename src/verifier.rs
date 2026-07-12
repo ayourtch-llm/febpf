@@ -2376,7 +2376,7 @@ impl<'a> Verifier<'a> {
                     // filters: len, pkt_type, ifindex, and cb[0..5]. Direct
                     // data/data_end pointers are a separate networking batch.
                     if size != 4
-                        || !matches!(disp, 0 | 4 | 40 | 48 | 52 | 56 | 60 | 64 | 76 | 80)
+                        || !matches!(disp, 0 | 4 | 16 | 40 | 48 | 52 | 56 | 60 | 64 | 76 | 80)
                     {
                         return Err(self.err(
                             pc,

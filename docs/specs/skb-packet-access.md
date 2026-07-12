@@ -13,7 +13,8 @@ with XDP, BTF-typed, and configurable metadata context models.
 
 The current verifier exposes the production-corpus scalar subset of
 `struct __sk_buff` as exact read-only 32-bit fields: `len` at offset 0,
-`pkt_type` at 4, `ifindex` at 40, and `cb[0..5]` at offsets 48 through 64.
+`pkt_type` at 4, `protocol` at 16, `ifindex` at 40, and `cb[0..5]` at offsets
+48 through 64.
 Modified context pointers, other widths/offsets, and context writes reject.
 Exact 32-bit loads of `data` and `data_end` at offsets 76 and 80 yield the
 same bounded VM packet-pointer classes as XDP. Direct access therefore needs a
@@ -21,7 +22,9 @@ fresh end comparison proving the accessed prefix.
 
 `Vm::run_skb` and `Vm::run_skb_jit` copy caller packet bytes into the existing
 bounds-checked VM packet region and construct a zero-filled 192-byte context.
-`len` is the packet length; the other modeled metadata fields default to zero.
+`len` is the packet length. For an Ethernet-sized packet, `protocol` is derived
+from its outer EtherType in the host representation of the kernel's `__be16`;
+the other modeled metadata fields default to zero.
 No host skb or host packet address enters a guest register. Ordinary `Vm::run`
 does not guess that an arbitrary context has packet backing.
 
