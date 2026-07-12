@@ -3028,6 +3028,147 @@ fn jmp32_signed_refinement_keeps_sign_range() {
 }
 
 #[test]
+fn jmp32_refines_unknown_u64_low_half_through_mask_and_mov32() {
+    // The guard constrains only low32(r1). A 64-bit mask removes the unknown
+    // upper half, after which the verifier can use the non-power-of-two bound.
+    let mut vm = Vm::new(program(
+        "r1 = *(u64 *)(r1 + 0)
+         if w1 > 499 goto out
+         r1 &= 511
+         if r1 > 499 goto bad
+        out:
+         r0 = 0
+         exit
+        bad:
+         r0 = r2
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 8,
+        ..Default::default()
+    })
+    .expect("JMP32 fallthrough bound should survive a low mask");
+
+    // Taken refinement is consumed by an ALU32 move, which zero-extends.
+    let mut vm = Vm::new(program(
+        "r1 = *(u64 *)(r1 + 0)
+         if w1 < 8192 goto small
+         r0 = 0
+         exit
+        small:
+         w2 = w1
+         if r2 >= 8192 goto bad
+         r0 = 0
+         exit
+        bad:
+         r0 = r3
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 8,
+        ..Default::default()
+    })
+    .expect("JMP32 taken bound should feed an ALU32 move");
+
+    // Signed refinement of an unknown-u64 source remains available to a
+    // later signed JMP32 comparison.
+    let mut vm = Vm::new(program(
+        "r1 = *(u64 *)(r1 + 0)
+         if w1 s< 100 goto small
+         r0 = 0
+         exit
+        small:
+         if w1 s>= 100 goto bad
+         r0 = 0
+         exit
+        bad:
+         r0 = r2
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 8,
+        ..Default::default()
+    })
+    .expect("signed JMP32 bounds should remain in the s32 domain");
+}
+
+#[test]
+fn jmp32_low_half_refinement_propagates_to_equal_copies_and_spills() {
+    let mut vm = Vm::new(program(
+        "r1 = *(u64 *)(r1 + 0)
+         r2 = r1
+         *(u64 *)(r10 - 8) = r1
+         if w2 > 499 goto out
+         r3 = *(u64 *)(r10 - 8)
+         r3 &= 511
+         if r3 > 499 goto bad
+        out:
+         r0 = 0
+         exit
+        bad:
+         r0 = r4
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 8,
+        ..Default::default()
+    })
+    .expect("scalar ids should carry low-half facts to copies and aligned spills");
+}
+
+#[test]
+fn jmp32_refinement_never_constrains_unknown_upper_half() {
+    let e = verify_err_ctx(
+        "r1 = *(u64 *)(r1 + 0)
+         if w1 > 499 goto out
+         if r1 > 499 goto bad
+        out:
+         r0 = 0
+         exit
+        bad:
+         r0 = r2
+         exit",
+        8,
+    );
+    assert!(e.contains("uninitialized"), "upper half was unsoundly bounded: {e}");
+
+    // Equality of low halves says nothing about equality of full registers.
+    let e = verify_err_ctx(
+        "r1 = *(u64 *)(r1 + 0)
+         r2 = 0x1_00000000 ll
+         if w1 != w2 goto out
+         if r1 != r2 goto bad
+        out:
+         r0 = 0
+         exit
+        bad:
+         r0 = r3
+         exit",
+        8,
+    );
+    assert!(e.contains("uninitialized"), "JMP32 equality leaked to u64: {e}");
+
+    // Signed low-half refinement cannot be consumed as an unsigned bound.
+    let e = verify_err_ctx(
+        "r1 = *(u64 *)(r1 + 0)
+         if w1 s>= 100 goto out
+         if w1 > 99 goto bad
+        out:
+         r0 = 0
+         exit
+        bad:
+         r0 = r2
+         exit",
+        8,
+    );
+    assert!(e.contains("uninitialized"), "signed bound leaked to unsigned: {e}");
+}
+
+#[test]
 fn alu32_signed_div_mod_fold_as_i32() {
     // 1 s/ -1 in 32 bits is -1 (0xffffffff); the unsound fold computed
     // 1 / 4294967295 = 0, so the verifier believed `w0 == -1` impossible

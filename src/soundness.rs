@@ -279,6 +279,10 @@ fn contains_s(s: &Scalar, v: u64) -> bool {
         && v <= s.umax
         && s.smin <= (v as i64)
         && (v as i64) <= s.smax
+        && s.umin32 <= v as u32
+        && (v as u32) <= s.umax32
+        && s.smin32 <= v as u32 as i32
+        && (v as u32 as i32) <= s.smax32
 }
 
 #[derive(Clone)]
@@ -294,8 +298,9 @@ struct AState {
 /// states over the window (every window tnum x every u-range), each with the
 /// signed bounds both untightened (i64 full range: what `sync` derives) and
 /// exact (the tightest consistent signed range). With `full_signed`, every
-/// consistent `(smin, smax)` pair over the window is enumerated as well, so
-/// the state space is complete over the window.
+/// consistent `(smin, smax)` pair over the window is enumerated as well. The
+/// dedicated 32-bit fields start unconstrained here; independently tight
+/// subregister states are covered by [`pool_mixed32`].
 fn window_candidates(w: u32, base: u64, full_signed: bool) -> (Vec<u64>, Vec<Scalar>) {
     let n = 1u64 << w;
     assert!(base.checked_add(n - 1).is_some(), "window wraps u64");
@@ -335,6 +340,10 @@ fn window_candidates(w: u32, base: u64, full_signed: bool) -> (Vec<u64>, Vec<Sca
                     umax: hi,
                     smin,
                     smax,
+                    umin32: 0,
+                    umax32: u32::MAX,
+                    smin32: i32::MIN,
+                    smax32: i32::MAX,
                 };
                 // signed bounds untightened: sync derives them
                 out.push(mk(i64::MIN, i64::MAX));
@@ -401,6 +410,69 @@ fn pool32(w: u32) -> Vec<AState> {
     p.extend(window_states(w, (1u64 << 31) - (1u64 << (w - 1)), false));
     p.extend(window_states(w, (1u64 << 32) - (1u64 << (w - 1)), false));
     p
+}
+
+/// States with several unrelated upper halves but a tight low-32 interval.
+/// This is the shape produced by a JMP32 refinement of a u64 load and cannot
+/// be represented by a single contiguous 64-bit range alone.
+fn pool_mixed32(w: u32) -> Vec<AState> {
+    let n = 1u64 << w;
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for base in [0u64, (1u64 << 31) - n / 2, (1u64 << 32) - n] {
+        let lows: Vec<u32> = (0..n).map(|v| (base + v) as u32).collect();
+        for i in 0..lows.len() {
+            for j in i..lows.len() {
+                let mut g = Vec::new();
+                for hi in [0u64, 1, u32::MAX as u64] {
+                    for &lo in &lows[i..=j] {
+                        g.push((hi << 32) | lo as u64);
+                    }
+                }
+                let mut s = Scalar::unknown();
+                s.umin = *g.iter().min().unwrap();
+                s.umax = *g.iter().max().unwrap();
+                s.umin32 = lows[i];
+                s.umax32 = lows[j];
+                let slo = lows[i] as i32;
+                let shi = lows[j] as i32;
+                if slo <= shi {
+                    s.smin32 = slo;
+                    s.smax32 = shi;
+                }
+                assert!(g.iter().all(|&v| contains_s(&s, v)));
+                if !s.sync() {
+                    continue;
+                }
+                for &v in &g {
+                    assert!(
+                        contains_s(&s, v),
+                        "mixed sync removed {v:#x} from {s:?}"
+                    );
+                }
+                let mut s2 = s;
+                assert!(s2.sync(), "second mixed sync contradicted {s:?}");
+                assert_eq!(s, s2, "mixed sync not idempotent");
+                if !g.is_empty()
+                    && seen.insert((
+                        s.tnum.value,
+                        s.tnum.mask,
+                        s.umin,
+                        s.umax,
+                        s.smin,
+                        s.smax,
+                        s.umin32,
+                        s.umax32,
+                        s.smin32,
+                        s.smax32,
+                    ))
+                {
+                    out.push(AState { s, g });
+                }
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -730,13 +802,57 @@ fn jmp_signed_full_state_space_w3() {
     }
 }
 
+#[test]
+fn jmp_mixed_upper_halves_w3() {
+    let p = pool_mixed32(3);
+    for op in [
+        jmp::JEQ,
+        jmp::JNE,
+        jmp::JGT,
+        jmp::JGE,
+        jmp::JLT,
+        jmp::JLE,
+        jmp::JSGT,
+        jmp::JSGE,
+        jmp::JSLT,
+        jmp::JSLE,
+        jmp::JSET,
+    ] {
+        check_branch_op(op, true, &p);
+        check_branch_op(op, false, &p);
+    }
+}
+
+#[test]
+fn alu_low32_local_ops_mixed_upper_halves_w3() {
+    let p = pool_mixed32(3);
+    for op in [alu::ADD, alu::SUB, alu::MUL, alu::AND, alu::OR, alu::XOR] {
+        check_alu_op(op, false, false, &p);
+        check_alu_op(op, true, false, &p);
+    }
+}
+
+#[test]
+fn alu_nonlocal_ops_mixed_upper_halves_w3() {
+    let p = pool_mixed32(3);
+    for op in [alu::DIV, alu::MOD, alu::LSH, alu::RSH, alu::ARSH] {
+        check_alu_op(op, false, false, &p);
+        check_alu_op(op, true, false, &p);
+    }
+    for op in [alu::DIV, alu::MOD] {
+        check_alu_op(op, false, true, &p);
+        check_alu_op(op, true, true, &p);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unary transfers: truncation, sign-extension, endianness
 // ---------------------------------------------------------------------------
 
 #[test]
 fn truncate32_sound() {
-    for a in pool32(4).iter().chain(pool64(4).iter()) {
+    let mixed = pool_mixed32(3);
+    for a in pool32(4).iter().chain(pool64(4).iter()).chain(&mixed) {
         let r = a.s.truncate32();
         assert!(wf(r.tnum));
         for &x in &a.g {
@@ -756,7 +872,8 @@ fn movsx_sound() {
             _ => x as u32 as i32 as i64 as u64,
         }
     };
-    for a in pool64(4).iter().chain(pool32(4).iter()) {
+    let mixed = pool_mixed32(3);
+    for a in pool64(4).iter().chain(pool32(4).iter()).chain(&mixed) {
         for bits in [8u16, 16, 32] {
             let r = scalar_movsx(a.s, bits);
             assert!(wf(r.tnum));
@@ -779,7 +896,8 @@ fn movsx_sound() {
 
 #[test]
 fn endian_sound() {
-    for a in pool64(4).iter().chain(pool32(4).iter()) {
+    let mixed = pool_mixed32(3);
+    for a in pool64(4).iter().chain(pool32(4).iter()).chain(&mixed) {
         for width in [16i32, 32, 64] {
             for is_swap in [false, true] {
                 let mut r = scalar_endian(is_swap, width, a.s);
@@ -876,7 +994,7 @@ fn sync_preserves_gamma_and_is_idempotent() {
 /// pruning is unsound without this.
 #[test]
 fn scalar_subset_sound() {
-    for pool in [pool64(4), pool32(4)] {
+    for pool in [pool64(4), pool32(4), pool_mixed32(3)] {
         for a in &pool {
             for b in &pool {
                 if a.s.is_subset_of(&b.s) {
@@ -897,7 +1015,7 @@ fn scalar_subset_sound() {
 /// join is an upper bound: γ(a) ∪ γ(b) ⊆ γ(a ⊔ b).
 #[test]
 fn scalar_join_sound() {
-    for pool in [pool64(3), pool32(3)] {
+    for pool in [pool64(3), pool32(3), pool_mixed32(3)] {
         for a in &pool {
             for b in &pool {
                 let j = a.s.join(&b.s);

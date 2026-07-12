@@ -227,6 +227,12 @@ pub struct Scalar {
     pub umax: u64,
     pub smin: i64,
     pub smax: i64,
+    /// Bounds on the low 32 bits, interpreted as an unsigned value.
+    pub umin32: u32,
+    pub umax32: u32,
+    /// Bounds on the low 32 bits, interpreted as a signed value.
+    pub smin32: i32,
+    pub smax32: i32,
 }
 
 impl Scalar {
@@ -237,6 +243,10 @@ impl Scalar {
             umax: u64::MAX,
             smin: i64::MIN,
             smax: i64::MAX,
+            umin32: 0,
+            umax32: u32::MAX,
+            smin32: i32::MIN,
+            smax32: i32::MAX,
         }
     }
     pub fn constant(v: u64) -> Scalar {
@@ -246,6 +256,10 @@ impl Scalar {
             umax: v,
             smin: v as i64,
             smax: v as i64,
+            umin32: v as u32,
+            umax32: v as u32,
+            smin32: v as u32 as i32,
+            smax32: v as u32 as i32,
         }
     }
     pub fn is_const(&self) -> bool {
@@ -284,7 +298,51 @@ impl Scalar {
             self.tnum = self.tnum.intersect(Tnum::range(self.umin, self.umax));
             self.umin = self.umin.max(self.tnum.umin());
             self.umax = self.umax.min(self.tnum.umax());
-            if self.umin > self.umax || self.smin > self.smax {
+
+            // Dedicated low-32 bounds are necessary for JMP32 facts when
+            // the register's high half is unknown. Mirror the 64-bit
+            // reconciliation above in the subregister domain.
+            let sub = self.tnum.subreg();
+            self.umin32 = self.umin32.max(sub.umin() as u32);
+            self.umax32 = self.umax32.min(sub.umax() as u32);
+            if (self.umin32 as i32) <= (self.umax32 as i32) {
+                self.smin32 = self.smin32.max(self.umin32 as i32);
+                self.smax32 = self.smax32.min(self.umax32 as i32);
+            }
+            if self.smin32 >= 0 || self.smax32 < 0 {
+                self.umin32 = self.umin32.max(self.smin32 as u32);
+                self.umax32 = self.umax32.min(self.smax32 as u32);
+            }
+
+            // A 64-bit interval wholly inside one 2^32 bucket has a
+            // monotone low-half projection. The zero bucket additionally
+            // makes the 64- and 32-bit unsigned bounds equivalent.
+            if self.umin >> 32 == self.umax >> 32 {
+                self.umin32 = self.umin32.max(self.umin as u32);
+                self.umax32 = self.umax32.min(self.umax as u32);
+            }
+            if self.umax <= u32::MAX as u64 {
+                self.umin = self.umin.max(self.umin32 as u64);
+                self.umax = self.umax.min(self.umax32 as u64);
+            }
+
+            // Constrain only the subregister bits in the shared tnum. Upper
+            // bits remain unknown in the intersecting operand, so a JMP32
+            // refinement can never directly constrain them.
+            let low_range = Tnum::range(self.umin32 as u64, self.umax32 as u64);
+            self.tnum = self.tnum.intersect(Tnum {
+                value: low_range.value,
+                mask: low_range.mask | 0xffff_ffff_0000_0000,
+            });
+            let sub = self.tnum.subreg();
+            self.umin32 = self.umin32.max(sub.umin() as u32);
+            self.umax32 = self.umax32.min(sub.umax() as u32);
+
+            if self.umin > self.umax
+                || self.smin > self.smax
+                || self.umin32 > self.umax32
+                || self.smin32 > self.smax32
+            {
                 return false;
             }
             if *self == before {
@@ -300,6 +358,10 @@ impl Scalar {
             umax: t.umax(),
             smin: i64::MIN,
             smax: i64::MAX,
+            umin32: 0,
+            umax32: u32::MAX,
+            smin32: i32::MIN,
+            smax32: i32::MAX,
         };
         s.sync();
         s
@@ -307,16 +369,20 @@ impl Scalar {
 
     /// Zero-extended 32-bit view. Result ranges lie within [0, u32::MAX].
     pub(crate) fn truncate32(&self) -> Scalar {
-        if self.umax <= u32::MAX as u64 {
-            let mut s = *self;
-            s.tnum = s.tnum.cast(4);
-            s.smin = s.umin as i64;
-            s.smax = s.umax as i64;
-            s.sync();
-            s
-        } else {
-            Scalar::from_tnum(self.tnum.cast(4))
-        }
+        let mut s = Scalar {
+            tnum: self.tnum.cast(4),
+            umin: self.umin32 as u64,
+            umax: self.umax32 as u64,
+            smin: self.umin32 as i64,
+            smax: self.umax32 as i64,
+            umin32: self.umin32,
+            umax32: self.umax32,
+            smin32: self.smin32,
+            smax32: self.smax32,
+        };
+        let consistent = s.sync();
+        debug_assert!(consistent, "truncate32 of a consistent scalar must be consistent");
+        s
     }
 
     /// The signed-32 view of a scalar already truncated to 32 bits
@@ -326,9 +392,9 @@ impl Scalar {
     /// The kernel keeps dedicated 32-bit bounds (`s32_min_value` /
     /// `s32_max_value`, kernel/bpf/verifier.c) that JMP32 signed decisions
     /// and refinement use directly (`is_branch32_taken`, `reg_set_min_max`).
-    /// febpf tracks only 64-bit bounds, so the s32 view is derived on
-    /// demand: exact when the 32-bit range does not cross the i32 sign
-    /// boundary, conservative (`[i32::MIN, i32::MAX]`) when it does.
+    /// The comparison view sign-extends the dedicated low-32 bounds on
+    /// demand so the existing 64-bit comparison/refinement machinery can be
+    /// reused without confusing signed and zero-extended interpretations.
     fn sext32_view(&self) -> Scalar {
         let t = self.tnum.cast(4);
         let tnum = if t.mask & 0x8000_0000 != 0 {
@@ -346,25 +412,27 @@ impl Scalar {
         } else {
             t
         };
-        let (umin, umax, smin, smax) = if self.umax <= i32::MAX as u64 {
+        let (umin, umax) = if self.smin32 >= 0 {
             // non-negative as i32: sign-extension is the identity
-            (self.umin, self.umax, self.umin as i64, self.umax as i64)
-        } else if self.umin >= 1 << 31 {
+            (self.smin32 as u64, self.smax32 as u64)
+        } else if self.smax32 < 0 {
             // negative as i32: sign-extension is monotone on [2^31, 2^32)
-            let lo = self.umin as u32 as i32 as i64;
-            let hi = self.umax as u32 as i32 as i64;
-            (lo as u64, hi as u64, lo, hi)
+            (self.smin32 as i64 as u64, self.smax32 as i64 as u64)
         } else {
             // range crosses the i32 sign boundary: only the sign-extended
             // magnitude is known
-            (0, u64::MAX, i32::MIN as i64, i32::MAX as i64)
+            (0, u64::MAX)
         };
         let mut r = Scalar {
             tnum,
             umin,
             umax,
-            smin,
-            smax,
+            smin: self.smin32 as i64,
+            smax: self.smax32 as i64,
+            umin32: self.umin32,
+            umax32: self.umax32,
+            smin32: self.smin32,
+            smax32: self.smax32,
         };
         if !r.sync() {
             // cannot happen for a consistent truncated input; never return
@@ -375,9 +443,28 @@ impl Scalar {
                 umax: u64::MAX,
                 smin: i32::MIN as i64,
                 smax: i32::MAX as i64,
+                umin32: self.umin32,
+                umax32: self.umax32,
+                smin32: self.smin32,
+                smax32: self.smax32,
             };
         }
         r
+    }
+
+    /// Intersect this full-width value with a zero-extended view of its low
+    /// 32 bits. The upper half is preserved: JMP32 says nothing about it.
+    fn merge_low32(&mut self, view: &Scalar) -> bool {
+        self.umin32 = self.umin32.max(view.umin32);
+        self.umax32 = self.umax32.min(view.umax32);
+        self.smin32 = self.smin32.max(view.smin32);
+        self.smax32 = self.smax32.min(view.smax32);
+        let low = view.tnum.subreg();
+        self.tnum = self.tnum.intersect(Tnum {
+            value: low.value,
+            mask: low.mask | 0xffff_ffff_0000_0000,
+        });
+        self.sync()
     }
 
     pub fn is_subset_of(&self, o: &Scalar) -> bool {
@@ -385,6 +472,10 @@ impl Scalar {
             && self.umax <= o.umax
             && self.smin >= o.smin
             && self.smax <= o.smax
+            && self.umin32 >= o.umin32
+            && self.umax32 <= o.umax32
+            && self.smin32 >= o.smin32
+            && self.smax32 <= o.smax32
             && self.tnum.is_subset_of(&o.tnum)
     }
 
@@ -398,6 +489,10 @@ impl Scalar {
             umax: self.umax.max(o.umax),
             smin: self.smin.min(o.smin),
             smax: self.smax.max(o.smax),
+            umin32: self.umin32.min(o.umin32),
+            umax32: self.umax32.max(o.umax32),
+            smin32: self.smin32.min(o.smin32),
+            smax32: self.smax32.max(o.smax32),
         };
         // `sync` only tightens; a union of two valid scalars stays non-empty.
         // Guard defensively: if reconciliation somehow contradicts, widen to
@@ -428,6 +523,20 @@ impl core::fmt::Display for Scalar {
                 write!(f, " ")?;
             }
             write!(f, "s=[{},{}]", self.smin, self.smax)?;
+            first = false;
+        }
+        if self.umin32 != 0 || self.umax32 != u32::MAX {
+            if !first {
+                write!(f, " ")?;
+            }
+            write!(f, "u32=[{},{}]", self.umin32, self.umax32)?;
+            first = false;
+        }
+        if self.smin32 != i32::MIN || self.smax32 != i32::MAX {
+            if !first {
+                write!(f, " ")?;
+            }
+            write!(f, "s32=[{},{}]", self.smin32, self.smax32)?;
             first = false;
         }
         if self.tnum != Tnum::unknown() {
@@ -1025,6 +1134,19 @@ pub(crate) fn alu_scalar(
         alu::LSH | alu::RSH | alu::ARSH => scalar_shift(op, is32, a, b)?,
         _ => return Err(format!("unhandled ALU op {op:#x}")),
     };
+    if !is32 && matches!(op, alu::ADD | alu::SUB | alu::MUL | alu::AND | alu::OR | alu::XOR) {
+        // These operations are local to each bit position modulo 2^32:
+        // low32(op64(a, b)) == op32(low32(a), low32(b)). Preserve dedicated
+        // subregister bounds even when the full-width result's high half is
+        // unknown. Shifts/division/modulo/endian conversion do not have this
+        // property and intentionally derive their sub-bounds from tnum only.
+        let low = alu_scalar(op, true, signed_off, a, b)?;
+        r.umin32 = low.umin32;
+        r.umax32 = low.umax32;
+        r.smin32 = low.smin32;
+        r.smax32 = low.smax32;
+        r.sync();
+    }
     if is32 {
         // zero-extend the 32-bit result
         r.tnum = r.tnum.cast(4);
@@ -1256,8 +1378,6 @@ pub(crate) enum CondOutcome {
 /// harness), so the truncation/refinement composition is tested as deployed.
 pub(crate) fn analyze_cond_jmp(op: u8, is32: bool, sa: Scalar, sb: Scalar) -> CondOutcome {
     let signed_op = matches!(op, jmp::JSGT | jmp::JSGE | jmp::JSLT | jmp::JSLE);
-    // 32-bit compares refine only when values fit in 32 bits
-    let refinable = !is32 || (sa.umax <= u32::MAX as u64 && sb.umax <= u32::MAX as u64);
     let (ca, cb) = if is32 {
         let (ta, tb) = (sa.truncate32(), sb.truncate32());
         if signed_op {
@@ -1279,21 +1399,36 @@ pub(crate) fn analyze_cond_jmp(op: u8, is32: bool, sa: Scalar, sb: Scalar) -> Co
     }
 
     let mut out: [Option<(Scalar, Scalar)>; 2] = [Some((sa, sb)), Some((sa, sb))];
-    if refinable {
-        for (slot, taken) in [(0usize, false), (1usize, true)] {
-            let (mut ra, mut rb) = (ca, cb);
-            if refine(op, taken, &mut ra, &mut rb) {
-                // refinement of a 32-bit signed compare happened in the
-                // sign-extended domain; map back to the zero-extended values
-                // the register holds
-                if is32 && signed_op {
-                    ra = ra.truncate32();
-                    rb = rb.truncate32();
-                }
-                out[slot] = Some((ra, rb));
-            } else {
-                out[slot] = None; // contradictory: path is dead
+    for (slot, taken) in [(0usize, false), (1usize, true)] {
+        let (mut ra, mut rb) = (ca, cb);
+        if !refine(op, taken, &mut ra, &mut rb) {
+            out[slot] = None; // contradictory: path is dead
+            continue;
+        }
+        if is32 {
+            // Signed refinement happens in the sign-extended comparison
+            // domain. Convert it back to a zero-extended low-half view, then
+            // merge that view into the original full-width values without
+            // constraining their upper halves.
+            if signed_op {
+                // `refine` tightened the sign-extended view's 64-bit signed
+                // bounds. Project those back into the dedicated s32 family
+                // before zero-extending the view for merge_low32.
+                ra.smin32 = ra.smin32.max(ra.smin as i32);
+                ra.smax32 = ra.smax32.min(ra.smax as i32);
+                rb.smin32 = rb.smin32.max(rb.smin as i32);
+                rb.smax32 = rb.smax32.min(rb.smax as i32);
+                ra = ra.truncate32();
+                rb = rb.truncate32();
             }
+            let (mut fa, mut fb) = (sa, sb);
+            out[slot] = if fa.merge_low32(&ra) && fb.merge_low32(&rb) {
+                Some((fa, fb))
+            } else {
+                None
+            };
+        } else {
+            out[slot] = Some((ra, rb));
         }
     }
     CondOutcome::Both(out)
@@ -2092,6 +2227,10 @@ impl<'a> Verifier<'a> {
             umax: a.umax.min(b.umax),
             smin: a.smin.max(b.smin),
             smax: a.smax.min(b.smax),
+            umin32: a.umin32.max(b.umin32),
+            umax32: a.umax32.min(b.umax32),
+            smin32: a.smin32.max(b.smin32),
+            smax32: a.smax32.min(b.smax32),
         };
         value.sync().then_some(value)
     }
