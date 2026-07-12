@@ -5,13 +5,18 @@ diving in; it's the context that isn't obvious from the code._
 
 ## ACTIVE RESUME CHECKPOINT (2026-07-12, read this first)
 
-Embedding-parity Waves 1-3 and their behavioral evidence are complete through
-`7e919d3`. At that code tip, `main` is 29 commits ahead of `origin/main`; this
-docs/handoff batch makes it 30 ahead when committed.
+Embedding parity and the legacy-opcode/Cranelift closure are complete through
+`b30a42a`. Commit the current documentation checkpoint separately.
 
 Completed linear batches:
 
 ```
+b30a42a replay: preserve legacy packet profiles
+01ae4c0 docs: record rbpf legacy behavior
+72b9d93 tests: differential legacy packet behavior
+fc37249 packet: support legacy ABS and IND loads
+ac4137d docs: specify legacy packet and backend parity
+83f3687 docs: plan strict superset closure
 7e919d3 api: add configurable packet metadata
 beb9eeb portability: add no_std alloc core
 190f186 verifier: add embedding policy hooks
@@ -41,13 +46,22 @@ Current capability checkpoint:
   `thumbv7em-none-eabihf` no-std target are configured.
 - The pinned production corpus remains 62/62 loaded and verified, with no
   measured map/helper/load/verifier blockers.
+- Deprecated packet loads are explicit profiles, disabled by default: Linux
+  B/H/W semantics and rbpf 0.4.1 B/H/W/DW compatibility are implemented across
+  assembler/disassembler, verifier, interpreter, hybrid JIT, CLI, replay, and
+  native/browser debugging. Replay stores only an address-free profile tag and
+  packet bytes.
+- The pinned rbpf Cranelift audit is complete. Its x86-64 Linux suite measured
+  134 passed and 2 ignored. It is an alternative backend, not an observed
+  febpf capability gap; additional host reach is unknown, and the audited
+  backend has atomics, tail-call, and local-call gaps.
 
 Validation at this tip:
 
-- Default JIT: `cargo test --all-targets` — **357 passed + 4 ignored**.
+- Default JIT: `cargo test --all-targets` — **382 passed + 4 ignored**.
 - `std` interpreter-only:
   `cargo test --all-targets --no-default-features --features std` —
-  **342 passed + 4 ignored**.
+  **365 passed + 4 ignored**.
 - Strict clippy is green with
   `cargo clippy --all-targets -- -D warnings` and
   `cargo clippy --all-targets --no-default-features --features std -- -D warnings`.
@@ -64,9 +78,11 @@ Honest remaining differences and follow-ups:
   a real use case justifies their lifetime API.
 - Replay files do not serialize external regions. Any future support must
   capture explicit bytes or report unavailable input, never host addresses.
-- Legacy `ld_abs`/`ld_ind`, a full opcode/backend differential, and the exact
-  significance of rbpf's optional Cranelift backend remain open before any
-  strict global-superset claim.
+- The legacy live-kernel socket-filter differential is present but skips on
+  this host because BPF privileges are unavailable. Run it on a privileged
+  Linux host when kernel evidence is required.
+- Universal native-target dominance is not claimed: rbpf Cranelift reach
+  beyond its measured x86-64 Linux suite remains unknown.
 - Arbitrary custom-only verifier replacement is intentionally not presented
   as verification. Callers may apply their own callback before deliberately
   running unverified; runtime virtual-memory checks still apply.
@@ -905,8 +921,8 @@ kernel-frontier checks when changing this logic.
 5. **Verifier depth** — dynptr, spin locks, bpf_loop/iterators, broader linked
    scalar relationships. Expression identity is implemented; `vfuzz --kernel`
    (keep at 0 FEBPF-LAX) remains the conformance check.
-6. **ELF/kfunc/legacy gaps** — `R_BPF_64_ABS*`, static multi-object linking,
-   kfuncs, and legacy `ld_abs`/`ld_ind`; add when real workloads demand them.
+6. **ELF/kfunc gaps** — `R_BPF_64_ABS*`, static multi-object linking, and
+   kfuncs; add when real workloads demand them.
 
 ## Working style the user likes
 - They're hands-on and technical (wrote the "fun challenge" framing, asked for

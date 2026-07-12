@@ -274,13 +274,13 @@ including time-travel `rstep`.
 - **ELF/BTF/CO-RE loading**: `docs/specs/elf-loading.md` and
   `docs/specs/core-relocations.md`.
 - **Known gaps**: kfuncs, dynptrs, spin locks, `bpf_loop`/iterators,
-  `R_BPF_64_ABS*` relocations, static multi-object linking, legacy
-  `ld_abs`/`ld_ind`, and a riscv64 JIT backend. XDP execution currently uses
+  `R_BPF_64_ABS*` relocations, static multi-object linking, and a riscv64 JIT
+  backend. XDP execution currently uses
   the interpreter; `--jit` rejects it explicitly.
 
 ## Tests
 
-The current suite has **368 passing tests** with default features and **352**
+The current suite has **382 passing tests** with default features and **365**
 with the std interpreter-only profile, plus four intentionally ignored
 exhaustive soundness sweeps in each configuration. Coverage includes ISA semantics,
 verifier acceptance and rejection, abstract-operator soundness, maps/helpers,

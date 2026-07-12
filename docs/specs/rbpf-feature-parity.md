@@ -22,12 +22,13 @@ The comparison has two different axes that must not be collapsed:
    ranges and permits a callback to replace verification entirely; febpf
    intentionally does neither through its verified API.
 
-Therefore **febpf must not yet claim to be a strict global feature superset of
+Therefore **febpf must not claim to be a strict global public-API superset of
 rbpf 0.4.1**. It can accurately claim substantially broader Linux eBPF
 semantics, safety analysis, object support, developer tooling, and a portable
-typed embedding surface. The remaining differences are live host-memory
-aliasing, optional backend/legacy-opcode coverage, and exact unsafe API shape,
-not missing ordinary embedding workflows.
+typed embedding surface. Legacy opcode behavior and the optional Cranelift
+backend have now been measured and closed as capability questions. The
+remaining differences are live host-memory aliasing and exact unsafe API
+shape, not missing ordinary embedding workflows.
 
 ## Evidence baseline
 
@@ -43,8 +44,8 @@ Docs.rs records 0.4.1 as published on 2026-02-06. The crate has default
 dependencies; its presence is recorded here, but backend coverage and safety
 are not inferred merely from dependency metadata.
 
-febpf evidence is the source and specs in this repository through commit
-`7e919d3`. In particular, see `tests/embedding.rs`,
+febpf evidence is the source and specs in this repository through the legacy
+packet/replay closure on 2026-07-12. In particular, see `tests/embedding.rs`,
 `tests/external_regions.rs`, `tests/verification_policy.rs`,
 `tests/metadata.rs`, the public APIs in `src/builder.rs` and `src/interp.rs`,
 and the default, standard-library interpreter-only, true-`no_std`, Windows,
@@ -65,10 +66,10 @@ and wasm CI configurations.
 | BTF and CO-RE | Full BTF graph, source info, typed contexts, and 13 CO-RE relocation kinds | No public built-in BTF/CO-RE surface found | febpf broader |
 | XDP packet model | Kernel-style `xdp_md` data/data_end verification, deterministic raw-packet/pcap execution, replay, and kernel differential; interpreter only | General raw-packet and metadata-buffer execution; not a kernel XDP verifier/model | Different abstraction; febpf broader for XDP semantics |
 | Native JIT platforms | x86-64 Linux and AArch64 Linux/macOS | README documents a hand-written x86-64 JIT on non-Windows `std` builds | febpf has broader documented native architecture coverage |
-| Optional Cranelift backend | None | Optional `cranelift` feature exists in 0.4.1 | rbpf-only option; exact platform/opcode coverage not claimed by this audit |
+| Optional Cranelift backend | No Cranelift dependency; safe hybrid native backend on the claimed JIT targets | Pinned suite measured 134 passed, 2 ignored on x86-64 Linux; atomics/tail calls/local calls have backend gaps | Alternative implementation strategy, not an observed febpf capability gap; additional host reach is unknown |
 | Debug/analysis tools | CFG/analyze/profile, source debugger, reverse execution, dataflow queries, replay, race exploration, equivalence, optimizer, kernel conformance fuzzing | Assembler and disassembler; no comparable public integrated toolset found | febpf broader |
-| ISA edge coverage | Modern JMP32, atomics, signed div/mod, sign-extending moves, subprograms, and long jumps are covered by tests | Public opcode surface is broad but README says a small number remain unimplemented | Do not claim strict ISA inclusion without a differential opcode audit |
-| Legacy `ld_abs`/`ld_ind` | Not implemented | Public opcode inventory includes these forms, but this audit did not independently test execution | Explicit febpf gap; another reason not to claim strict ISA superset |
+| ISA edge coverage | Modern JMP32, atomics, signed div/mod, sign-extending moves, subprograms, long jumps, and explicit legacy packet profiles are covered by tests | Public opcode surface is broad; pinned interpreter/Cranelift legacy vectors were measured | febpf covers the identified opcode gap; universal behavior across every raw encoding remains broader than this audit |
+| Legacy `ld_abs`/`ld_ind` | Explicit Linux B/H/W and rbpf-compatible B/H/W/DW profiles across tools, verifier, interpreter, hybrid JIT, CLI, replay, and debugger | All eight ABS/IND width forms measured as little-endian; checked interpreter reports OOB errors | Covered without conflating rbpf's extension with Linux semantics |
 
 ## Portable embedding matrix
 

@@ -1,6 +1,6 @@
 # Strict-superset closure: legacy packet ISA and backend audit
 
-STATUS: active, 2026-07-12. This plan closes the two technical axes left open
+STATUS: complete, 2026-07-12. This plan closed the two technical axes left open
 by `rbpf-feature-parity.md`: deprecated `LD_ABS`/`LD_IND` packet instructions
 and rbpf 0.4.1's optional Cranelift execution backend.
 
@@ -111,3 +111,23 @@ Update `rbpf-feature-parity.md` and the active handoff with:
 Before committing the final claim, run default JIT and std interpreter-only
 tests/clippy, true no-std check/clippy, relevant wasm/Windows cross-checks,
 legacy kernel/rbpf differentials, and `git diff --check`.
+
+## Result
+
+- Steps 1-3 are implemented in `legacy-packet-loads.md`: explicit Linux and
+  rbpf 0.4.1 profiles cover all eight measured rbpf forms while keeping the
+  standardized Linux B/H/W, byte order, register effects, and OOB exit
+  semantics distinct. The live-kernel differential is privilege-gated and
+  skipped cleanly on hosts without `BPF_PROG_TEST_RUN` authority.
+- Steps 4-5 are recorded in `rbpf-backend-parity.md`. The pinned Cranelift
+  suite passed 134 tests with two ignored on x86-64 Linux. Cranelift adds no
+  observed guest behavior or claimed target that requires a febpf dependency;
+  its additional host reach remains unmeasured, while its backend omits
+  atomics, tail calls, and correct local-call handling.
+- Replay v1 remains backward compatible through an additive, address-free
+  legacy-profile section. Native CLI and browser debugger replay select the
+  recorded packet adapter.
+- The final qualification is no longer legacy ISA or Cranelift. A strict
+  global public-API superset claim remains inappropriate because rbpf exposes
+  unsafe live host-memory aliases and total verifier replacement, which febpf
+  deliberately does not reproduce in its verified API.
