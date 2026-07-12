@@ -15,7 +15,9 @@ The current verifier exposes the production-corpus scalar subset of
 `struct __sk_buff` as exact read-only 32-bit fields: `len` at offset 0,
 `pkt_type` at 4, `ifindex` at 40, and `cb[0..5]` at offsets 48 through 64.
 Modified context pointers, other widths/offsets, and context writes reject.
-In particular, `data`/`data_end` do not yet become direct packet pointers.
+Exact 32-bit loads of `data` and `data_end` at offsets 76 and 80 yield the
+same bounded VM packet-pointer classes as XDP. Direct access therefore needs a
+fresh end comparison proving the accessed prefix.
 
 `Vm::run_skb` and `Vm::run_skb_jit` copy caller packet bytes into the existing
 bounds-checked VM packet region and construct a zero-filled 192-byte context.
@@ -41,6 +43,20 @@ zero. A missing packet backing, arithmetic overflow, or out-of-range interval
 returns `-EFAULT` without partially changing the destination. Interpreter and
 hybrid JIT use the same helper dispatcher and packet region.
 
+## `skb_pull_data`
+
+`skb_pull_data` (#39) requires the original skb context and a scalar u32
+length. The VM-owned packet is already linear and writable, so zero or an
+available length succeeds without changing bytes; a requested length beyond
+the packet returns `-ENOMEM`.
+
+The verifier nevertheless follows the kernel relocation rule: every packet
+and data-end pointer derived before the call, including register aliases and
+aligned spills, is invalidated regardless of the runtime result. Programs
+must reload `data` and `data_end` from the preserved context and repeat their
+bounds check. This keeps the standalone optimization from weakening the
+portable verifier contract.
+
 ## Acceptance
 
 - Inspektor Gadget `advise_networkpolicy` and libbpf-bootstrap `sockfilter`
@@ -49,3 +65,6 @@ hybrid JIT use the same helper dispatcher and packet region.
 - Tests cover exact packet copies, synthesized `len`, generic-context
   rejection, atomic out-of-range failure, and interpreter/JIT agreement.
 - The full corpus contains no remaining helper #26 blocker.
+- Both Gadget tcpdump entries advance beyond helper #39 and remain classified
+  by their target/environment CO-RE relocation outcome; #39 is absent from the
+  helper histogram.

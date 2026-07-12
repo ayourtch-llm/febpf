@@ -1901,10 +1901,12 @@ impl<'a> Machine<'a> {
                 // febpf virtual addresses are 64-bit region handles. Once the
                 // verifier has typed this as XDP, synthesize those full
                 // addresses at the load boundary.
-                let xdp_ptr = if self.vm.xdp && size == 4 && addr >> 32 == CTX_HANDLE as u64 {
-                    match addr as u32 {
-                        0 => Some(mkaddr(PACKET_HANDLE, 0)),
-                        4 => Some(mkaddr(PACKET_HANDLE, self.vm.packet.len() as u32)),
+                let packet_ptr = if size == 4 && addr >> 32 == CTX_HANDLE as u64 {
+                    match (self.vm.xdp, self.vm.skb, addr as u32) {
+                        (true, _, 0) | (_, true, 76) => Some(mkaddr(PACKET_HANDLE, 0)),
+                        (true, _, 4) | (_, true, 80) => {
+                            Some(mkaddr(PACKET_HANDLE, self.vm.packet.len() as u32))
+                        }
                         _ => None,
                     }
                 } else {
@@ -1914,7 +1916,7 @@ impl<'a> Machine<'a> {
                 // kernel's BPF_PROBE_MEM: an unresolvable address reads as
                 // zero instead of faulting (e.g. chasing a pointer loaded
                 // from zeroed kernel memory, i.e. NULL).
-                let v = if let Some(ptr) = xdp_ptr {
+                let v = if let Some(ptr) = packet_ptr {
                     ptr
                 } else {
                     match self.load(addr, size) {
@@ -2353,6 +2355,16 @@ impl<'a> Machine<'a> {
                         0
                     }
                     _ => (-14i64) as u64, // -EFAULT
+                }
+            }
+            helpers::id::SKB_PULL_DATA => {
+                let len = args[1] as u32 as usize;
+                if self.legacy_packet_backing != LegacyPacketBacking::VmPacket {
+                    (-14i64) as u64 // no skb packet backing
+                } else if len == 0 || len <= self.vm.packet.len() {
+                    0 // the VM-owned packet is already linear and writable
+                } else {
+                    (-12i64) as u64 // -ENOMEM, matching skb_ensure_writable
                 }
             }
             helpers::id::GET_STACKID => {

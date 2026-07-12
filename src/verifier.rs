@@ -2220,7 +2220,7 @@ impl<'a> Verifier<'a> {
                     // filters: len, pkt_type, ifindex, and cb[0..5]. Direct
                     // data/data_end pointers are a separate networking batch.
                     if size != 4
-                        || !matches!(disp, 0 | 4 | 40 | 48 | 52 | 56 | 60 | 64)
+                        || !matches!(disp, 0 | 4 | 40 | 48 | 52 | 56 | 60 | 64 | 76 | 80)
                     {
                         return Err(self.err(
                             pc,
@@ -2482,6 +2482,13 @@ impl<'a> Verifier<'a> {
                         4 => Ok(RegState::Ptr(Ptr::new(PtrKind::PacketEnd))),
                         12 | 16 | 20 => Ok(RegState::Scalar(Scalar::unknown())),
                         _ => unreachable!("validated XDP ctx offset"),
+                    };
+                }
+                if self.cfg.skb && size == 4 {
+                    return match disp {
+                        76 => Ok(RegState::Ptr(Ptr::new(PtrKind::Packet { range: 0 }))),
+                        80 => Ok(RegState::Ptr(Ptr::new(PtrKind::PacketEnd))),
+                        _ => Ok(RegState::Scalar(Scalar::unknown())),
                     };
                 }
                 if let Some(layout) = self.cfg.metadata_layout {
@@ -2988,6 +2995,9 @@ impl<'a> Verifier<'a> {
         if let Some(id) = consume_id {
             Self::mark_consumed(state, id);
         }
+        if hid == crate::helpers::id::SKB_PULL_DATA {
+            Self::invalidate_packet_ptrs(state);
+        }
 
         // Frozen (.rodata) maps cannot be mutated through helpers.
         if let Some(map) = map_arg {
@@ -3271,6 +3281,34 @@ impl<'a> Verifier<'a> {
             for s in frame.stack.iter_mut() {
                 if let SlotState::Spill(r) = s {
                     fix(r);
+                }
+            }
+        }
+    }
+
+    /// Helpers such as `skb_pull_data` may relocate the packet buffer. The
+    /// kernel invalidates every earlier data/data_end pointer regardless of
+    /// the helper's runtime result; model that by degrading all aliases and
+    /// aligned spills to unknown scalars. Fresh ctx loads mint new pointers.
+    fn invalidate_packet_ptrs(state: &mut VState) {
+        for frame in &mut state.frames {
+            let invalidate = |r: &mut RegState| {
+                if matches!(
+                    r,
+                    RegState::Ptr(Ptr {
+                        kind: PtrKind::Packet { .. } | PtrKind::PacketEnd,
+                        ..
+                    })
+                ) {
+                    *r = RegState::Scalar(Scalar::unknown());
+                }
+            };
+            for r in &mut frame.regs {
+                invalidate(r);
+            }
+            for slot in &mut frame.stack {
+                if let SlotState::Spill(r) = slot {
+                    invalidate(r);
                 }
             }
         }

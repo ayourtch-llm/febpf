@@ -299,6 +299,81 @@ fn skb_load_bytes_reports_out_of_bounds_without_partial_write() {
 }
 
 #[test]
+fn skb_pull_data_invalidates_old_packet_pointers_and_allows_reload() {
+    assert_eq!(febpf::helpers::helper_id("skb_pull_data"), Some(39));
+    let stale = "r6 = r1
+        r7 = *(u32 *)(r1 + 76)
+        r8 = *(u32 *)(r1 + 80)
+        r2 = r7
+        r2 += 1
+        if r2 > r8 goto short
+        r1 = r6
+        r2 = 0
+        call skb_pull_data
+        r0 = *(u8 *)(r7 + 0)
+        exit
+      short:
+        r0 = 0
+        exit";
+    let mut stale_vm = Vm::new(program(stale)).unwrap();
+    let error = stale_vm
+        .verify(Config {
+            ctx_size: 192,
+            ctx_writable: false,
+            skb: true,
+            ..Default::default()
+        })
+        .err()
+        .expect("old packet pointer must be invalidated")
+        .to_string();
+    assert!(error.contains("loads need a pointer"), "{error}");
+
+    let mut vm = Vm::new(program(
+        "r6 = r1\n\
+         r2 = 0\n\
+         call skb_pull_data\n\
+         if r0 != 0 goto short\n\
+         r7 = *(u32 *)(r6 + 76)\n\
+         r8 = *(u32 *)(r6 + 80)\n\
+         r2 = r7\n\
+         r2 += 1\n\
+         if r2 > r8 goto short\n\
+         r0 = *(u8 *)(r7 + 0)\n\
+         exit\n\
+         short:\n\
+         r0 = 0\n\
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 192,
+        ctx_writable: false,
+        skb: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut packet = [0xab];
+    assert_eq!(vm.run_skb(&mut packet).unwrap(), 0xab);
+    #[cfg(feature = "jit")]
+    assert_eq!(vm.run_skb_jit(&mut packet).unwrap(), 0xab);
+}
+
+#[test]
+fn skb_pull_data_reports_unavailable_length_without_mutation() {
+    let mut vm = Vm::new(program("r2 = 5\ncall skb_pull_data\nexit")).unwrap();
+    vm.verify(Config {
+        ctx_size: 192,
+        ctx_writable: false,
+        skb: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut packet = [1, 2, 3, 4];
+    assert_eq!(vm.run_skb(&mut packet).unwrap(), (-12i64) as u64);
+    assert_eq!(packet, [1, 2, 3, 4]);
+}
+
+#[test]
 fn replace_program_is_transactional_on_construction_failure() {
     let mut vm = Vm::new(program(
         ".map state array 4 8 1\n\

@@ -28,6 +28,7 @@ pub mod id {
     pub const GET_STACKID: u32 = 27;
     pub const GET_CURRENT_TASK: u32 = 35;
     pub const CURRENT_TASK_UNDER_CGROUP: u32 = 37;
+    pub const SKB_PULL_DATA: u32 = 39;
     pub const PROBE_READ_STR: u32 = 45;
     pub const GET_SOCKET_COOKIE: u32 = 46;
     pub const REDIRECT_MAP: u32 = 51;
@@ -271,6 +272,11 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [ConstMapPtr, Scalar, None, None, None],
             ret: RetKind::Scalar,
         },
+        id::SKB_PULL_DATA => HelperSig {
+            name: "skb_pull_data",
+            args: [SkbCtxPtr, Scalar, None, None, None],
+            ret: RetKind::Scalar,
+        },
         id::PERF_EVENT_OUTPUT => HelperSig {
             name: "perf_event_output",
             // (ctx, map, flags, data, size); data is a readable region of `size`
@@ -383,6 +389,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::KTIME_GET_BOOT_NS,
         id::SEQ_WRITE,
         id::CURRENT_TASK_UNDER_CGROUP,
+        id::SKB_PULL_DATA,
         id::PERF_EVENT_OUTPUT,
         id::GET_FUNC_IP,
         id::XDP_LOAD_BYTES,
