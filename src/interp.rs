@@ -50,6 +50,37 @@ impl Clock {
     }
 }
 
+fn csum_add(a: u32, b: u32) -> u32 {
+    let (sum, carry) = a.overflowing_add(b);
+    sum.wrapping_add(u32::from(carry))
+}
+
+fn csum_partial(data: &[u8], seed: u32) -> u32 {
+    let mut sum = seed;
+    for word in data.chunks_exact(2) {
+        sum = csum_add(sum, u16::from_ne_bytes([word[0], word[1]]) as u32);
+    }
+    sum
+}
+
+fn csum_fold_to_16(sum: u32) -> u16 {
+    let sum = (sum & 0xffff).wrapping_add(sum >> 16);
+    ((sum & 0xffff).wrapping_add(sum >> 16)) as u16
+}
+
+fn csum_diff(from: &[u8], to: &[u8], seed: u32) -> u16 {
+    let sum = if !from.is_empty() && !to.is_empty() {
+        csum_add(csum_partial(to, seed), !csum_partial(from, 0))
+    } else if !to.is_empty() {
+        csum_partial(to, seed)
+    } else if !from.is_empty() {
+        !csum_partial(from, !seed)
+    } else {
+        seed
+    };
+    csum_fold_to_16(sum)
+}
+
 #[derive(Debug)]
 pub struct EbpfError {
     pub pc: usize,
@@ -2289,6 +2320,49 @@ impl<'a> Machine<'a> {
             helpers::id::KTIME_GET_BOOT_NS => {
                 self.logical_boot_ns = self.logical_boot_ns.saturating_add(1);
                 self.logical_boot_ns
+            }
+            // Deterministic coarse monotonic clock. Advancing by one
+            // millisecond preserves the helper's deliberately low resolution
+            // and uses snapshotted logical time rather than a host clock.
+            helpers::id::KTIME_GET_COARSE_NS => {
+                self.logical_boot_ns = self.logical_boot_ns.saturating_add(1_000_000);
+                self.logical_boot_ns
+            }
+            helpers::id::FIB_LOOKUP => {
+                let len = args[2] as usize;
+                // Validate both halves of MEM_RDWR at runtime even for
+                // unchecked execution. A standalone VM has no host route
+                // table, so report the kernel's deterministic NOT_FWDED
+                // outcome without inventing interface or neighbour state.
+                let _ = self.read_bytes(args[1], len)?;
+                let _ = self.mem(args[1], len, true)?;
+                4 // BPF_FIB_LKUP_RET_NOT_FWDED
+            }
+            helpers::id::SPIN_LOCK | helpers::id::SPIN_UNLOCK => {
+                // Standalone execution has one invocation. Validate the
+                // actual writable lock word even without prior verification;
+                // ordering/pairing is enforced statically by the verifier.
+                let _ = self.mem(args[0], 4, true)?;
+                0
+            }
+            helpers::id::CSUM_DIFF => {
+                let from_len = args[1] as usize;
+                let to_len = args[3] as usize;
+                if !from_len.is_multiple_of(4) || !to_len.is_multiple_of(4) {
+                    (-22i64) as u64 // -EINVAL
+                } else {
+                    let from = if from_len == 0 {
+                        Vec::new()
+                    } else {
+                        self.read_bytes(args[0], from_len)?
+                    };
+                    let to = if to_len == 0 {
+                        Vec::new()
+                    } else {
+                        self.read_bytes(args[2], to_len)?
+                    };
+                    csum_diff(&from, &to, args[4] as u32) as u64
+                }
             }
             helpers::id::SEQ_WRITE => {
                 let data = self.read_bytes(args[1], args[2] as usize)?;

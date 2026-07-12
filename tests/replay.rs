@@ -436,6 +436,20 @@ fn hash_of_maps_definition_round_trips() {
 }
 
 #[test]
+fn btf_spin_lock_metadata_round_trips_additively() {
+    let mut p = prog(
+        ".map locks array 4 8 1
+         r0 = 0
+         exit",
+    );
+    p.maps[0].spin_lock_off = Some(0);
+    let replay = Replay::record(&p, Vec::new(), DEFAULT_PRANDOM_SEED, None, Vec::new()).unwrap();
+    let parsed = Replay::from_bytes(&replay.to_bytes()).unwrap();
+    assert_eq!(parsed, replay);
+    assert_eq!(parsed.maps[0].spin_lock_off, Some(0));
+}
+
+#[test]
 fn privileged_uninitialized_stack_policy_round_trips_additively() {
     let p = prog(
         "*(u32 *)(r10 - 8) = 0x11223344

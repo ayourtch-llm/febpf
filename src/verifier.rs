@@ -774,6 +774,9 @@ impl Frame {
 #[derive(Debug, Clone, PartialEq)]
 struct VState {
     frames: Vec<Frame>,
+    /// Exact map/value offset locked on this path. Kernel BPF permits only one
+    /// held spin lock and requires the same field at unlock.
+    held_lock: Option<(u32, i64)>,
 }
 
 /// States remembered at one prune point, with a miss-streak backoff so that
@@ -799,7 +802,7 @@ impl VState {
     }
 
     fn subsumed_by(&self, old: &VState) -> bool {
-        if self.frames.len() != old.frames.len() {
+        if self.frames.len() != old.frames.len() || self.held_lock != old.held_lock {
             return false;
         }
         for (nf, of) in self.frames.iter().zip(&old.frames) {
@@ -1687,6 +1690,7 @@ impl<'a> Verifier<'a> {
         frame.regs[REG_FP as usize] = RegState::Ptr(Ptr::new(PtrKind::Stack { frame: 0 }));
         VState {
             frames: vec![frame],
+            held_lock: None,
         }
     }
 
@@ -2466,6 +2470,24 @@ impl<'a> Verifier<'a> {
             }
             PtrKind::MapValue { map } => {
                 let def = &self.maps[map as usize];
+                if let Some(lock_off) = def.spin_lock_off {
+                    let lo = p.off.saturating_add(disp).saturating_add(p.var.smin);
+                    let hi = i64::try_from(p.var.umax)
+                        .ok()
+                        .and_then(|var| p.off.checked_add(disp)?.checked_add(var))
+                        .and_then(|start| start.checked_add(size as i64));
+                    let lock_lo = i64::from(lock_off);
+                    let lock_hi = lock_lo + 4;
+                    if hi.is_none_or(|hi| lo < lock_hi && lock_lo < hi) {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "direct access overlaps spin-lock field in map '{}'",
+                                def.name
+                            ),
+                        ));
+                    }
+                }
                 if write && def.readonly {
                     return Err(self.err(
                         pc,
@@ -2866,6 +2888,12 @@ impl<'a> Verifier<'a> {
         let sig = self
             .sig_for(hid)
             .ok_or_else(|| self.err(pc, format!("call to unknown helper #{hid}")))?;
+        if state.held_lock.is_some() && hid != crate::helpers::id::SPIN_UNLOCK {
+            return Err(self.err(
+                pc,
+                format!("helper {} called while holding a spin lock", sig.name),
+            ));
+        }
         if hid == crate::helpers::id::REDIRECT && !(self.cfg.xdp || self.cfg.skb) {
             return Err(self.err(
                 pc,
@@ -2873,9 +2901,27 @@ impl<'a> Verifier<'a> {
             ));
         }
         let args: Vec<RegState> = (1..=5).map(|r| state.cur().regs[r]).collect();
+        if hid == crate::helpers::id::CSUM_DIFF {
+            for index in [1usize, 3] {
+                match args[index] {
+                    RegState::Scalar(size) if size.is_const() && size.umin % 4 == 0 => {}
+                    _ => {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {} arg{} must be a constant multiple of 4",
+                                sig.name,
+                                index + 1
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
         let mut map_arg: Option<u32> = None;
         // Ringbuf record id to mark consumed after this call (submit/discard).
         let mut consume_id: Option<u32> = None;
+        let mut spin_lock_arg: Option<(u32, i64)> = None;
 
         for (i, kind) in sig.args.iter().enumerate() {
             let reg = i as u8 + 1;
@@ -3014,6 +3060,59 @@ impl<'a> Verifier<'a> {
                         ));
                     }
                 }
+                ArgKind::SpinLock => {
+                    let RegState::Ptr(p) = val else {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {} arg{}: expected a map-value spin-lock pointer in r{reg}",
+                                sig.name,
+                                i + 1
+                            ),
+                        ));
+                    };
+                    let PtrKind::MapValue { map } = p.kind else {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {} arg{}: expected a map-value spin-lock pointer in r{reg}",
+                                sig.name,
+                                i + 1
+                            ),
+                        ));
+                    };
+                    if !matches!(
+                        self.maps[map as usize].kind,
+                        crate::maps::MapKind::Array | crate::maps::MapKind::Hash
+                    ) {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {} requires an array or hash map, got '{}'",
+                                sig.name, self.maps[map as usize].name
+                            ),
+                        ));
+                    }
+                    if !p.var.is_const() || p.var.umin != 0 {
+                        return Err(self.err(pc, "spin-lock pointer has a variable offset"));
+                    }
+                    let expected = self.maps[map as usize].spin_lock_off;
+                    if expected != u32::try_from(p.off).ok() {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {} requires the BTF-declared spin lock in map '{}' at offset {}, got {}",
+                                sig.name,
+                                self.maps[map as usize].name,
+                                expected
+                                    .map(|off| off.to_string())
+                                    .unwrap_or_else(|| "<none>".into()),
+                                p.off
+                            ),
+                        ));
+                    }
+                    spin_lock_arg = Some((map, p.off));
+                }
                 ArgKind::ConstMapPtr => match val {
                     RegState::Ptr(Ptr {
                         kind: PtrKind::Map { map },
@@ -3138,6 +3237,44 @@ impl<'a> Verifier<'a> {
                     };
                     self.check_helper_mem(state, pc, &p, sz.umax, write)?;
                 }
+                ArgKind::MemReadWrite { size_arg } => {
+                    let sz = match args[*size_arg as usize] {
+                        RegState::Scalar(s) => s,
+                        _ => {
+                            return Err(self.err(
+                                pc,
+                                format!(
+                                    "helper {}: size argument r{} must be a scalar",
+                                    sig.name,
+                                    size_arg + 1
+                                ),
+                            ));
+                        }
+                    };
+                    if sz.umax > 1 << 20 {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {}: size in r{} unbounded (umax={})",
+                                sig.name,
+                                size_arg + 1,
+                                sz.umax
+                            ),
+                        ));
+                    }
+                    let RegState::Ptr(p) = val else {
+                        return Err(self.err(
+                            pc,
+                            format!(
+                                "helper {} arg{}: expected pointer to memory in r{reg}",
+                                sig.name,
+                                i + 1
+                            ),
+                        ));
+                    };
+                    self.check_helper_mem(state, pc, &p, sz.umax, false)?;
+                    self.check_helper_mem(state, pc, &p, sz.umax, true)?;
+                }
                 ArgKind::RingbufReserved => {
                     let p = match val {
                         RegState::Ptr(p) => p,
@@ -3195,6 +3332,21 @@ impl<'a> Verifier<'a> {
                     }
                     consume_id = Some(id);
                 }
+            }
+        }
+
+        if hid == crate::helpers::id::SPIN_LOCK {
+            let lock = spin_lock_arg.expect("spin_lock signature has SpinLock arg");
+            if state.held_lock.is_some() {
+                return Err(self.err(pc, "cannot take a second spin lock"));
+            }
+            state.held_lock = Some(lock);
+        } else if hid == crate::helpers::id::SPIN_UNLOCK {
+            let lock = spin_lock_arg.expect("spin_unlock signature has SpinLock arg");
+            match state.held_lock {
+                Some(held) if held == lock => state.held_lock = None,
+                Some(_) => return Err(self.err(pc, "spin_unlock does not match the held lock")),
+                None => return Err(self.err(pc, "spin_unlock called without a held lock")),
             }
         }
 
@@ -3556,6 +3708,12 @@ impl<'a> Verifier<'a> {
     fn step(&mut self, pc: usize, mut state: VState) -> Result<StepOutcome, VerifyError> {
         let ins = self.insns[pc];
         let cls = ins.class();
+        if state.held_lock.is_some()
+            && cls == class::LD
+            && matches!(ins.mem_mode(), mode::ABS | mode::IND)
+        {
+            return Err(self.err(pc, "legacy packet load while holding a spin lock"));
+        }
         match cls {
             class::ALU | class::ALU64 => {
                 self.step_alu(pc, &mut state, ins)?;
@@ -3993,6 +4151,9 @@ impl<'a> Verifier<'a> {
                 Ok(StepOutcome::Next(vec![(t, state)]))
             }
             jmp::EXIT => {
+                if state.held_lock.is_some() {
+                    return Err(self.err(pc, "program or subprogram exits while holding a spin lock"));
+                }
                 let r0 = state.cur().regs[0];
                 let r0_scalar_id = state.cur().scalar_ids[0];
                 if state.frames.len() > 1 {
@@ -4042,6 +4203,9 @@ impl<'a> Verifier<'a> {
             }
             jmp::CALL => {
                 if ins.src == call_kind::LOCAL {
+                    if state.held_lock.is_some() {
+                        return Err(self.err(pc, "local call while holding a spin lock"));
+                    }
                     if state.frames.len() >= MAX_CALL_FRAMES {
                         return Err(self.err(
                             pc,

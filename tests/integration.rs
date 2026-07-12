@@ -50,6 +50,43 @@ fn xdp_config() -> Config {
 }
 
 #[test]
+fn fib_lookup_requires_initialized_writable_input_and_has_no_route_standalone() {
+    assert_eq!(febpf::helpers::helper_id("fib_lookup"), Some(69));
+    let initialized = "
+        r6 = r1
+        r2 = r10
+        r2 += -64
+        r0 = 0
+        *(u64 *)(r10 - 64) = r0
+        *(u64 *)(r10 - 56) = r0
+        *(u64 *)(r10 - 48) = r0
+        *(u64 *)(r10 - 40) = r0
+        *(u64 *)(r10 - 32) = r0
+        *(u64 *)(r10 - 24) = r0
+        *(u64 *)(r10 - 16) = r0
+        *(u64 *)(r10 - 8) = r0
+        r1 = r6
+        r3 = 64
+        r4 = 0
+        call fib_lookup
+        exit";
+    let mut vm = Vm::new(program(initialized)).unwrap();
+    vm.verify(xdp_config()).unwrap();
+    let mut packet = [0u8; 1];
+    assert_eq!(vm.run_xdp(&mut packet).unwrap(), 4);
+    #[cfg(feature = "jit")]
+    assert_eq!(vm.run_xdp_jit(&mut packet).unwrap(), 4);
+
+    let uninitialized = initialized.replace("*(u64 *)(r10 - 64) = r0\n", "");
+    let mut vm = Vm::new(program(&uninitialized)).unwrap();
+    let error = match vm.verify(xdp_config()) {
+        Ok(_) => panic!("uninitialized read-write buffer verified"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("uninitialized stack"), "{error}");
+}
+
+#[test]
 fn xdp_byte_helpers_copy_owned_packet_and_mark_load_destination_initialized() {
     assert_eq!(febpf::helpers::helper_id("xdp_load_bytes"), Some(189));
     assert_eq!(febpf::helpers::helper_id("xdp_store_bytes"), Some(190));
@@ -1761,6 +1798,122 @@ fn ktime_get_boot_ns_is_deterministic_logical_time() {
     }
 }
 
+#[test]
+fn ktime_get_coarse_ns_is_deterministic_millisecond_time() {
+    assert_eq!(febpf::helpers::helper_id("ktime_get_coarse_ns"), Some(160));
+    assert_eq!(febpf::helpers::helper_name(160), "ktime_get_coarse_ns");
+    let src = "
+        call ktime_get_coarse_ns
+        r6 = r0
+        call ktime_get_coarse_ns
+        r0 -= r6
+        exit";
+    assert_eq!(run_src(src), 1_000_000);
+    #[cfg(feature = "jit")]
+    {
+        let mut vm = Vm::new(program(src)).unwrap();
+        vm.verify(Config::default()).unwrap();
+        assert_eq!(vm.run_jit(&mut []).unwrap(), 1_000_000);
+    }
+}
+
+#[test]
+fn csum_diff_has_kernel_buffer_rules_and_incremental_checksum_semantics() {
+    assert_eq!(febpf::helpers::helper_id("csum_diff"), Some(28));
+    let src = "
+        *(u32 *)(r10 - 8) = 0x01020304
+        *(u32 *)(r10 - 4) = 0x05060708
+        r1 = r10
+        r1 += -8
+        r2 = 4
+        r3 = r10
+        r3 += -4
+        r4 = 4
+        r5 = 0
+        call csum_diff
+        exit";
+    assert_eq!(run_src(src), 0x0808);
+    #[cfg(feature = "jit")]
+    {
+        let mut vm = Vm::new(program(src)).unwrap();
+        vm.verify(Config::default()).unwrap();
+        assert_eq!(vm.run_jit(&mut []).unwrap(), 0x0808);
+    }
+
+    let bad_size = src.replace("r2 = 4", "r2 = 2");
+    assert!(verify_err(&bad_size).contains("constant multiple of 4"));
+    let uninit = src.replace("*(u32 *)(r10 - 8) = 0x01020304\n", "");
+    assert!(verify_err(&uninit).contains("uninitialized stack"));
+}
+
+#[test]
+fn spin_helpers_require_exact_btf_map_field_and_balanced_pairing() {
+    assert_eq!(febpf::helpers::helper_id("spin_lock"), Some(93));
+    assert_eq!(febpf::helpers::helper_id("spin_unlock"), Some(94));
+    let body = "
+        .map locks array 4 8 1
+        *(u32 *)(r10 - 4) = 0
+        r1 = map[locks]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        if r0 == 0 goto miss
+        r6 = r0
+        r1 = r6
+        call spin_lock
+        *(u32 *)(r6 + 4) = 7
+        r1 = r6
+        call spin_unlock
+        r0 = *(u32 *)(r6 + 4)
+        exit
+    miss:
+        r0 = 0
+        exit";
+    let mut prog = program(body);
+    prog.maps[0].spin_lock_off = Some(0);
+    let mut standalone_map = febpf::maps::Map::new(prog.maps[0].clone()).unwrap();
+    standalone_map
+        .update(&0u32.to_ne_bytes(), &[1, 2, 3, 4, 7, 0, 0, 0])
+        .unwrap();
+    let value = standalone_map.lookup(&0u32.to_ne_bytes()).unwrap();
+    assert_eq!(standalone_map.value(value), &[0, 0, 0, 0, 7, 0, 0, 0]);
+
+    let mut invalid = prog.clone();
+    invalid.maps[0].spin_lock_off = Some(8);
+    assert!(Vm::new(invalid).is_err());
+
+    let mut vm = Vm::new(prog.clone()).unwrap();
+    vm.verify(Config::default()).unwrap();
+    assert_eq!(vm.run(&mut []).unwrap(), 7);
+    #[cfg(feature = "jit")]
+    assert_eq!(vm.run_jit(&mut []).unwrap(), 7);
+
+    let mut missing_btf = prog.clone();
+    missing_btf.maps[0].spin_lock_off = None;
+    let mut vm = Vm::new(missing_btf).unwrap();
+    assert!(vm.verify(Config::default()).is_err());
+
+    let direct_lock_access = body.replace("*(u32 *)(r6 + 4) = 7", "*(u32 *)(r6 + 0) = 7");
+    let mut prog = program(&direct_lock_access);
+    prog.maps[0].spin_lock_off = Some(0);
+    let mut vm = Vm::new(prog).unwrap();
+    let error = match vm.verify(Config::default()) {
+        Ok(_) => panic!("direct spin-lock access verified"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("overlaps spin-lock field"), "{error}");
+
+    let unbalanced = body.replace("r1 = r6\n        call spin_unlock\n", "");
+    let mut prog = program(&unbalanced);
+    prog.maps[0].spin_lock_off = Some(0);
+    let mut vm = Vm::new(prog).unwrap();
+    let error = match vm.verify(Config::default()) {
+        Ok(_) => panic!("unbalanced spin lock verified"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("holding a spin lock"), "{error}");
+}
+
 /// The caller must null-check a returned map_value_or_null before deref —
 /// the pointer's typing survives the frame pop.
 #[test]
@@ -2288,6 +2441,7 @@ fn prog_array_slots_store_program_identities() {
         init: Vec::new(),
         inner_map_idx: None,
         map_in_map_values: Vec::new(),
+        spin_lock_off: None,
     })
     .unwrap();
     assert_eq!(map.program_at(0), None);

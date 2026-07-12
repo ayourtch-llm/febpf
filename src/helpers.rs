@@ -26,6 +26,7 @@ pub mod id {
     pub const PERF_EVENT_OUTPUT: u32 = 25;
     pub const SKB_LOAD_BYTES: u32 = 26;
     pub const GET_STACKID: u32 = 27;
+    pub const CSUM_DIFF: u32 = 28;
     pub const GET_CURRENT_TASK: u32 = 35;
     pub const CURRENT_TASK_UNDER_CGROUP: u32 = 37;
     pub const SKB_PULL_DATA: u32 = 39;
@@ -33,6 +34,9 @@ pub mod id {
     pub const GET_SOCKET_COOKIE: u32 = 46;
     pub const REDIRECT_MAP: u32 = 51;
     pub const GET_STACK: u32 = 67;
+    pub const FIB_LOOKUP: u32 = 69;
+    pub const SPIN_LOCK: u32 = 93;
+    pub const SPIN_UNLOCK: u32 = 94;
     pub const PROBE_READ_USER: u32 = 112;
     pub const PROBE_READ_KERNEL: u32 = 113;
     pub const PROBE_READ_USER_STR: u32 = 114;
@@ -48,6 +52,7 @@ pub mod id {
     pub const SKC_TO_TCP_TIMEWAIT_SOCK: u32 = 138;
     pub const SKC_TO_TCP_REQUEST_SOCK: u32 = 139;
     pub const GET_TASK_STACK: u32 = 141;
+    pub const KTIME_GET_COARSE_NS: u32 = 160;
     pub const GET_FUNC_IP: u32 = 173;
     pub const TRACE_VPRINTK: u32 = 177;
     pub const XDP_LOAD_BYTES: u32 = 189;
@@ -83,12 +88,17 @@ pub enum ArgKind {
     MemReadOrNull { size_arg: u8 },
     /// Writable memory whose length is given by the argument at `size_arg`.
     MemWrite { size_arg: u8 },
+    /// Initialized, writable memory whose length is given by another argument.
+    /// Kernel helpers with `MEM_RDWR` consume and may update the same buffer.
+    MemReadWrite { size_arg: u8 },
     /// A scalar used as a memory size; the paired memory argument constrains
     /// its upper bound. Zero is accepted for kernel `*_SIZE_OR_ZERO` forms.
     Size,
     /// An unmodified pointer to the exact named struct/union in target BTF.
     /// This models helpers whose kernel prototype uses `ARG_PTR_TO_BTF_ID`.
     BtfPtr { type_name: &'static str },
+    /// Exact BTF-declared `struct bpf_spin_lock` field in a map value.
+    SpinLock,
     /// Anything, including uninitialized (kernel ARG_ANYTHING for varargs).
     Any,
     /// A pointer to a ringbuf-reserved record (from `ringbuf_reserve`, after a
@@ -203,11 +213,43 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [Any, ConstMapPtr, Scalar, None, None],
             ret: RetKind::Scalar,
         },
+        id::CSUM_DIFF => HelperSig {
+            name: "csum_diff",
+            args: [
+                MemReadOrNull { size_arg: 1 },
+                Size,
+                MemReadOrNull { size_arg: 3 },
+                Size,
+                Scalar,
+            ],
+            ret: RetKind::Scalar,
+        },
         id::GET_STACK => HelperSig {
             name: "get_stack",
             // (ctx, buf, size, flags); buf must be writable for `size` bytes.
             // ctx/flags accepted loosely like get_stackid. No map involved.
             args: [Any, MemWrite { size_arg: 2 }, Size, Scalar, None],
+            ret: RetKind::Scalar,
+        },
+        id::FIB_LOOKUP => HelperSig {
+            name: "fib_lookup",
+            args: [
+                XdpCtxPtr,
+                MemReadWrite { size_arg: 2 },
+                Size,
+                Scalar,
+                None,
+            ],
+            ret: RetKind::Scalar,
+        },
+        id::SPIN_LOCK => HelperSig {
+            name: "spin_lock",
+            args: [SpinLock, None, None, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::SPIN_UNLOCK => HelperSig {
+            name: "spin_unlock",
+            args: [SpinLock, None, None, None, None],
             ret: RetKind::Scalar,
         },
         // probe_read family: (dst, size, unsafe_ptr). The source is
@@ -369,6 +411,11 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             ],
             ret: RetKind::Scalar,
         },
+        id::KTIME_GET_COARSE_NS => HelperSig {
+            name: "ktime_get_coarse_ns",
+            args: [None, None, None, None, None],
+            ret: RetKind::Scalar,
+        },
         _ => return Option::None,
     };
     Some(sig)
@@ -398,7 +445,11 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::SKB_LOAD_BYTES,
         id::GET_CURRENT_TASK,
         id::GET_STACKID,
+        id::CSUM_DIFF,
         id::GET_STACK,
+        id::FIB_LOOKUP,
+        id::SPIN_LOCK,
+        id::SPIN_UNLOCK,
         id::PROBE_READ,
         id::PROBE_READ_STR,
         id::GET_SOCKET_COOKIE,
@@ -425,6 +476,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::SKC_TO_TCP_TIMEWAIT_SOCK,
         id::SKC_TO_TCP_REQUEST_SOCK,
         id::GET_TASK_STACK,
+        id::KTIME_GET_COARSE_NS,
     ].into_iter().find(|&hid| builtin_sig(hid).unwrap().name == name)
 }
 

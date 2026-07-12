@@ -208,3 +208,37 @@ fi
 
     fs::remove_dir_all(temp).unwrap();
 }
+
+#[test]
+fn scanner_classifies_missing_kfunc_as_an_environment_gap() {
+    let temp = temp_dir("corpus-missing-kfunc");
+    let mock = temp.join("febpf-mock");
+    let object = temp.join("xdp-tools__xdp_flowtable.o");
+    let target = temp.join("target.btf");
+    let report = temp.join("report.txt");
+    fs::write(&object, b"mock object").unwrap();
+    fs::write(&target, b"mock BTF").unwrap();
+    fs::write(
+        &mock,
+        "#!/usr/bin/env bash\nprintf \"error: missing kfunc 'bpf_xdp_flow_lookup' in target BTF\\n\" >&2\nexit 1\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&mock).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&mock, permissions).unwrap();
+
+    let output = Command::new("bash")
+        .arg("scripts/scan-corpus.sh")
+        .arg(&object)
+        .env("NO_BUILD", "1")
+        .env("FEBPF", &mock)
+        .env("TARGET_BTF", &target)
+        .env("CORPUS_REPORT", &report)
+        .output()
+        .expect("run corpus scanner");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let report = fs::read_to_string(report).unwrap();
+    assert!(report.contains("ENVIRONMENT:missing-kfunc"), "{report}");
+    assert!(!report.contains("LOAD-FAIL:relocation"), "{report}");
+    fs::remove_dir_all(temp).unwrap();
+}

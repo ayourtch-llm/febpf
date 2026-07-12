@@ -95,6 +95,32 @@ fn kernel_roundtrip_if_privileged() {
     assert_eq!(retval, 42, "kernel retval mismatch");
 }
 
+#[test]
+fn csum_diff_matches_kernel_if_privileged() {
+    if !matches!(kbpf::has_privilege(), Ok(true)) {
+        eprintln!("skipped: no bpf privilege");
+        return;
+    }
+    let assembled = asm::assemble(
+        "*(u32 *)(r10 - 8) = 0x01020304
+         *(u32 *)(r10 - 4) = 0x05060708
+         r1 = r10
+         r1 += -8
+         r2 = 4
+         r3 = r10
+         r3 += -4
+         r4 = 4
+         r5 = 0
+         call csum_diff
+         exit",
+    )
+    .unwrap();
+    let mut log = String::new();
+    let kernel = kbpf::run_program(&assembled.insns, &[], &[], Some(&mut log))
+        .unwrap_or_else(|error| panic!("kernel csum_diff failed: {error}\n{log}"));
+    assert_eq!(kernel, 0x0808);
+}
+
 /// The febpf half of the XDP differential remains an ordinary verifier-backed
 /// execution and is always tested, even on hosts without kernel BPF access.
 #[test]

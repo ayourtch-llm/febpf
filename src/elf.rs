@@ -404,6 +404,16 @@ pub fn load_with_target_btf_and_attach_targets(
 ) -> Result<Object, String> {
     let (r, sections) = parse_elf(bytes)?;
     let bytes = r.buf;
+    let target = target_btf
+        .map(|blob| {
+            let le = match blob.first_chunk::<2>() {
+                Some(&[0x9f, 0xeb]) => true,
+                Some(&[0xeb, 0x9f]) => false,
+                _ => return Err("target BTF: bad magic".into()),
+            };
+            Btf::parse(le, blob).map(std::sync::Arc::new)
+        })
+        .transpose()?;
 
     // symbol table + its string table
     let symtab_idx = sections
@@ -502,6 +512,7 @@ pub fn load_with_target_btf_and_attach_targets(
                 &text_insns,
                 &symbols,
                 &map_by_symval,
+                target.as_deref(),
             )?;
             let kind = ProgramKind::from_section(&sec.name);
             programs.push((
@@ -536,6 +547,7 @@ pub fn load_with_target_btf_and_attach_targets(
                 &text_insns,
                 &symbols,
                 &map_by_symval,
+                target.as_deref(),
             )?;
             programs.push((
                 LoadedProgram {
@@ -559,14 +571,7 @@ pub fn load_with_target_btf_and_attach_targets(
     }
 
     let resolved_attach_targets = resolve_attach_targets(&programs, target_btf, attach_targets)?;
-    if let Some(target) = target_btf {
-        // A raw BTF blob declares its own byte order via the magic.
-        let target_le = match target.first_chunk::<2>() {
-            Some(&[0x9f, 0xeb]) => true,
-            Some(&[0xeb, 0x9f]) => false,
-            _ => return Err("target BTF: bad magic".into()),
-        };
-        let target = std::sync::Arc::new(Btf::parse(target_le, target)?);
+    if let Some(target) = target {
         apply_core_relocations(r.le, bytes, &sections, &mut programs, &target)?;
         // BTF-typed program types (tp_btf/fentry/...): resolve the ctx's
         // argument typing from the section name, like the kernel does at
@@ -1001,6 +1006,7 @@ fn build_program(
     text_insns: &[Insn],
     symbols: &[Symbol],
     map_by_symval: &MapIndex,
+    target_btf: Option<&Btf>,
 ) -> Result<(Vec<Insn>, Option<usize>), String> {
     let raw = section_bytes(bytes, sections, idx)?;
     let entry_raw = raw
@@ -1038,6 +1044,7 @@ fn build_program(
         text_idx,
         0,
         text_base,
+        target_btf,
         &mut insns,
     )?;
     // Relocations for the appended `.text` (code at offset `text_base`).
@@ -1054,6 +1061,7 @@ fn build_program(
                 text_idx,
                 base,
                 text_base,
+                target_btf,
                 &mut insns,
             )?;
         }
@@ -1138,6 +1146,7 @@ fn apply_relocations(
     text_idx: Option<usize>,
     code_base: usize,
     text_base: Option<usize>,
+    target_btf: Option<&Btf>,
     insns: &mut [Insn],
 ) -> Result<(), String> {
     let Some(rel) = sections
@@ -1198,6 +1207,25 @@ fn apply_relocations(
                 }
             }
             R_BPF_64_32 => {
+                if sym.shndx == 0 {
+                    let target = target_btf.ok_or_else(|| {
+                        format!("kfunc '{}' requires target BTF", sym.name)
+                    })?;
+                    let btf_id = target
+                        .ids_by_name(&sym.name)
+                        .iter()
+                        .copied()
+                        .find(|&id| {
+                            matches!(
+                                target.ty(id).map(|ty| &ty.kind),
+                                Ok(crate::btf::Kind::Func { linkage, .. }) if *linkage != 2
+                            )
+                        })
+                        .ok_or_else(|| format!("missing kfunc '{}' in target BTF", sym.name))?;
+                    insns[insn_idx].src = insn::call_kind::KFUNC;
+                    insns[insn_idx].imm = btf_id as i32;
+                    continue;
+                }
                 // SHT_REL carries the addend in the call's immediate. In BPF
                 // call-displacement units, target = S/8 + A + 1. A SECTION
                 // symbol has S=0 and relies entirely on A; an ordinary FUNC
@@ -1542,6 +1570,7 @@ fn load_data_maps(
             init,
             inner_map_idx: None,
             map_in_map_values: Vec::new(),
+            spin_lock_off: None,
         });
     }
     Ok(())
@@ -1604,6 +1633,7 @@ fn load_kconfig_map(
         init,
         inner_map_idx: None,
         map_in_map_values: Vec::new(),
+        spin_lock_off: None,
     });
     for (name, off) in externs {
         index.kconfig.push((name, map_idx, off));
@@ -1659,6 +1689,7 @@ fn load_legacy_maps(
             init: Vec::new(),
             inner_map_idx: None,
             map_in_map_values: Vec::new(),
+            spin_lock_off: None,
         });
         index.push((sym.value, sym.shndx, i));
     }
@@ -1796,11 +1827,11 @@ mod btf_maps {
                 _ => Err("expected pointer-to-array __uint encoding".into()),
             }
         };
-        let ptr_pointee_size = |id: u32| -> Result<u32, String> {
+        let ptr_pointee = |id: u32| -> Result<u32, String> {
             let Kind::Ptr { type_id } = btf.ty(btf.resolve(id)?)?.kind else {
                 return Err("expected pointer-encoded __type member".into());
             };
-            btf.type_size(type_id)
+            btf.resolve(type_id)
         };
 
         let parse_map_struct = |st_id: u32,
@@ -1811,6 +1842,7 @@ mod btf_maps {
             };
             let (mut kind, mut key_size, mut value_size, mut max_entries) =
                 (None, None, None, None);
+            let mut value_type = None;
             let mut values_off = None;
             let mut values_target = None;
             for m in members {
@@ -1820,8 +1852,12 @@ mod btf_maps {
                     "map_flags" => {}
                     "key_size" => key_size = Some(ptr_array_nelems(m.type_id)?),
                     "value_size" => value_size = Some(ptr_array_nelems(m.type_id)?),
-                    "key" => key_size = Some(ptr_pointee_size(m.type_id)?),
-                    "value" => value_size = Some(ptr_pointee_size(m.type_id)?),
+                    "key" => key_size = Some(btf.type_size(ptr_pointee(m.type_id)?)?),
+                    "value" => {
+                        let id = ptr_pointee(m.type_id)?;
+                        value_size = Some(btf.type_size(id)?);
+                        value_type = Some(id);
+                    }
                     "values" => {
                         values_off = Some(m.bit_offset / 8);
                         if let Kind::Array { elem_type, .. } =
@@ -1856,6 +1892,20 @@ mod btf_maps {
                     | crate::maps::MapKind::CgroupArray
                     | crate::maps::MapKind::StackTrace
             );
+            let spin_lock_off = value_type.and_then(|id| {
+                let Kind::Struct { members, .. } = &btf.ty(id).ok()?.kind else {
+                    return None;
+                };
+                let locks = members
+                    .iter()
+                    .filter(|member| btf.type_name(member.type_id) == "bpf_spin_lock")
+                    .collect::<Vec<_>>();
+                if locks.len() == 1 && locks[0].bit_offset % 32 == 0 {
+                    Some(locks[0].bit_offset / 8)
+                } else {
+                    None
+                }
+            });
             Ok((
                 MapDef {
                     name: map_name.to_string(),
@@ -1873,6 +1923,7 @@ mod btf_maps {
                     init: Vec::new(),
                     inner_map_idx: None,
                     map_in_map_values: Vec::new(),
+                    spin_lock_off,
                 },
                 values_off,
                 values_target,

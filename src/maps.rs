@@ -24,6 +24,22 @@ pub const NR_CPUS: u32 = 4;
 /// `value_size` (kernel's `PERF_MAX_STACK_DEPTH`).
 pub const PERF_MAX_STACK_DEPTH: u32 = 127;
 
+fn copy_map_value(dst: &mut [u8], src: &[u8], spin_lock_off: Option<u32>, existing: bool) {
+    let saved_lock = spin_lock_off.and_then(|off| {
+        let off = off as usize;
+        existing.then(|| <[u8; 4]>::try_from(&dst[off..off + 4]).unwrap())
+    });
+    dst.copy_from_slice(src);
+    if let Some(off) = spin_lock_off {
+        let off = off as usize;
+        if let Some(saved) = saved_lock {
+            dst[off..off + 4].copy_from_slice(&saved);
+        } else {
+            dst[off..off + 4].fill(0);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapKind {
     Array,
@@ -138,6 +154,9 @@ pub struct MapDef {
     pub inner_map_idx: Option<u32>,
     /// Static `(slot, map index)` values from BTF `.maps.values[]` relocations.
     pub map_in_map_values: Vec<(u32, u32)>,
+    /// Byte offset of a direct `struct bpf_spin_lock` member in the BTF map
+    /// value, when declared. Spin helpers accept only this exact field.
+    pub spin_lock_off: Option<u32>,
 }
 
 /// Override a map capacity by exact name before map instantiation.
@@ -311,6 +330,17 @@ impl Map {
             )
         {
             return Err(format!("map '{}': zero value_size", def.name));
+        }
+        if let Some(off) = def.spin_lock_off {
+            if !matches!(def.kind, MapKind::Array | MapKind::Hash)
+                || off % 4 != 0
+                || off.checked_add(4).is_none_or(|end| end > def.value_size)
+            {
+                return Err(format!(
+                    "map '{}': invalid BTF spin-lock offset {off} for {} value size {}",
+                    def.name, def.kind, def.value_size
+                ));
+            }
         }
         let per_cpu = def.kind.per_cpu() as usize;
         let (storage, handles) = if def.kind == MapKind::ProgArray {
@@ -516,6 +546,7 @@ impl Map {
         }
         let per_cpu = self.per_cpu();
         let vs = self.def.value_size as usize;
+        let spin_lock_off = self.def.spin_lock_off;
         match &mut self.storage {
             Storage::Array(data) => {
                 let idx = u32::from_ne_bytes(key.try_into().map_err(|_| -22i64)?);
@@ -524,7 +555,12 @@ impl Map {
                 }
                 // CPU 0's cell.
                 let cell = idx as usize * per_cpu;
-                data[cell * vs..cell * vs + vs].copy_from_slice(value);
+                copy_map_value(
+                    &mut data[cell * vs..cell * vs + vs],
+                    value,
+                    spin_lock_off,
+                    true,
+                );
                 Ok(ValueRef::ArrayElem(cell as u32))
             }
             Storage::Hash {
@@ -535,7 +571,7 @@ impl Map {
                 tick,
             } => {
                 if let Some(&i) = index.get(key) {
-                    slab[i as usize][..vs].copy_from_slice(value);
+                    copy_map_value(&mut slab[i as usize][..vs], value, spin_lock_off, true);
                     *tick += 1;
                     last_used[i as usize] = *tick;
                     return Ok(ValueRef::Slab(i));
@@ -550,7 +586,12 @@ impl Map {
                             .map(|(k, &i)| (k.clone(), i));
                         if let Some((vk, i)) = victim {
                             index.remove(&vk);
-                            slab[i as usize][..vs].copy_from_slice(value);
+                            copy_map_value(
+                                &mut slab[i as usize][..vs],
+                                value,
+                                spin_lock_off,
+                                false,
+                            );
                             // Zero the other CPUs' copies for a fresh entry.
                             for c in 1..per_cpu {
                                 slab[i as usize][c * vs..c * vs + vs].fill(0);
@@ -566,14 +607,14 @@ impl Map {
                 }
                 let i = if let Some(i) = free.pop() {
                     let e = &mut slab[i as usize];
-                    e[..vs].copy_from_slice(value);
+                    copy_map_value(&mut e[..vs], value, spin_lock_off, false);
                     for c in 1..per_cpu {
                         e[c * vs..c * vs + vs].fill(0);
                     }
                     i
                 } else {
                     let mut e = vec![0u8; per_cpu * vs].into_boxed_slice();
-                    e[..vs].copy_from_slice(value);
+                    copy_map_value(&mut e[..vs], value, spin_lock_off, false);
                     slab.push(e);
                     self.region_handles.push(0);
                     last_used.push(0);

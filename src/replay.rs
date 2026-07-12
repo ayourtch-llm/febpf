@@ -42,6 +42,7 @@ const TAG_TAIL_CALLS: u8 = 0x0a;
 const TAG_MAP_IN_MAP: u8 = 0x0b;
 const TAG_LEGACY_PACKET: u8 = 0x0c;
 const TAG_UNINIT_STACK: u8 = 0x0d;
+const TAG_MAP_SPIN_LOCKS: u8 = 0x0e;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TailCallProgram {
@@ -523,6 +524,21 @@ impl Replay {
             }
             section(&mut out, TAG_MAP_IN_MAP, &p);
         }
+        let spin_locks: Vec<_> = self
+            .maps
+            .iter()
+            .enumerate()
+            .filter_map(|(map, def)| def.spin_lock_off.map(|off| (map as u32, off)))
+            .collect();
+        if !spin_locks.is_empty() {
+            let mut p = Vec::new();
+            p.extend_from_slice(&(spin_locks.len() as u32).to_le_bytes());
+            for (map, off) in spin_locks {
+                p.extend_from_slice(&map.to_le_bytes());
+                p.extend_from_slice(&off.to_le_bytes());
+            }
+            section(&mut out, TAG_MAP_SPIN_LOCKS, &p);
+        }
 
         // CTX (raw bytes, length is the section length)
         section(&mut out, TAG_CTX, &self.ctx);
@@ -697,6 +713,7 @@ impl Replay {
                             init,
                             inner_map_idx: None,
                             map_in_map_values: Vec::new(),
+                            spin_lock_off: None,
                         });
                     }
                     maps = Some(v);
@@ -791,6 +808,25 @@ impl Replay {
                     };
                     if !r.rest().is_empty() {
                         return Err("UNINIT_STACK section has trailing bytes".into());
+                    }
+                }
+                TAG_MAP_SPIN_LOCKS => {
+                    let mut r = Reader::new(payload);
+                    let n = r.u32()? as usize;
+                    for _ in 0..n {
+                        let map = r.u32()? as usize;
+                        let off = r.u32()?;
+                        let maps = maps.as_mut().ok_or("MAP_SPIN_LOCKS precedes MAPS")?;
+                        let def = maps
+                            .get_mut(map)
+                            .ok_or("MAP_SPIN_LOCKS references an unknown map")?;
+                        if off.checked_add(4).is_none_or(|end| end > def.value_size) {
+                            return Err("MAP_SPIN_LOCKS offset is outside map value".into());
+                        }
+                        def.spin_lock_off = Some(off);
+                    }
+                    if !r.rest().is_empty() {
+                        return Err("MAP_SPIN_LOCKS section has trailing bytes".into());
                     }
                 }
                 _ => {} // unknown section: skip (forward compatibility)

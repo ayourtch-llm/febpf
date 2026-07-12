@@ -63,6 +63,7 @@ N     payload        (payload_len bytes; parsed per-tag below)
 | 0x0b | MAP_IN_MAP | no    | `u32 outer_count`, then per outer map: `u32 outer_index`, `u32 template_index`, `u32 value_count`, followed by `(u32 slot, u32 inner_index)` pairs |
 | 0x0c | LEGACY_PACKET | no | one `u8 profile` (`1` = Linux, `2` = Rbpf041); selects deprecated packet-load verification and execution semantics, and never contains a guest or host address |
 | 0x0d | UNINIT_STACK | no | one `u8 policy` (`1` = explicit privileged allowance); absence means strict verification |
+| 0x0e | MAP_SPIN_LOCKS | no | `u32 count`, then `(u32 map_index, u32 value_offset)` pairs preserving BTF-declared top-level `struct bpf_spin_lock` fields |
 
 Round-trip is exact: `from_bytes(to_bytes(r)) == r` for every field.
 
@@ -89,6 +90,10 @@ an address-free replay representation.
 An absent UNINIT_STACK section likewise preserves strict verification and the
 canonical bytes of older v1 files. Unknown policies and trailing payload bytes
 are rejected.
+
+An absent MAP_SPIN_LOCKS section means no map has BTF spin-lock metadata, which
+preserves older v1 files. Entries must reference an existing map and a complete
+four-byte field within its value.
 
 ## Determinism contract
 

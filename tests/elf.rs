@@ -601,3 +601,44 @@ fn application_attach_target_validation_is_strict() {
     )
     .contains("overlapping"));
 }
+
+#[test]
+fn btf_map_records_exact_spin_lock_field_offset() {
+    maybe_compile("spin_lock.c", "spin_lock.o");
+    let object = load("tests/spin_lock.o");
+    let map = object.maps.iter().find(|map| map.name == "locks").unwrap();
+    assert_eq!(map.value_size, 8);
+    assert_eq!(map.spin_lock_off, Some(4));
+}
+
+#[test]
+fn undefined_kfunc_relocations_resolve_only_against_real_target_btf() {
+    maybe_compile("kfunc.c", "kfunc.o");
+    maybe_compile("kfunc_target.c", "kfunc_target.o");
+    let object = std::fs::read("tests/kfunc.o").unwrap();
+    let target_object = std::fs::read("tests/kfunc_target.o").unwrap();
+    let target = elf::read_section(&target_object, ".BTF").unwrap().unwrap().0;
+
+    let no_target = elf::load(&object).err().expect("kfunc needs target BTF");
+    assert!(no_target.contains("requires target BTF"), "{no_target}");
+
+    // An extern declaration in object BTF is not a definition supplied by a
+    // kernel. Use an unrelated target fixture to exercise the missing case.
+    let own_btf = elf::read_section(&object, ".BTF").unwrap().unwrap().0;
+    assert!(elf::load_with_target_btf(&object, Some(&own_btf)).is_err());
+    let unrelated = std::fs::read("tests/spin_lock.o").unwrap();
+    let unrelated = elf::read_section(&unrelated, ".BTF").unwrap().unwrap().0;
+    let missing = elf::load_with_target_btf(&object, Some(&unrelated))
+        .err()
+        .expect("missing target kfunc");
+    assert!(missing.contains("missing kfunc 'kernel_function'"), "{missing}");
+
+    let loaded = elf::load_with_target_btf(&object, Some(&target)).unwrap();
+    let call = loaded.programs[0]
+        .insns
+        .iter()
+        .find(|insn| insn.op() == febpf::insn::jmp::CALL)
+        .unwrap();
+    assert_eq!(call.src, febpf::insn::call_kind::KFUNC);
+    assert!(call.imm > 0);
+}

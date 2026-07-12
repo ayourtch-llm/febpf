@@ -400,6 +400,7 @@ pub fn assemble(source: &str) -> Result<Assembled, AsmError> {
                         init: Vec::new(),
                         inner_map_idx,
                         map_in_map_values: Vec::new(),
+                        spin_lock_off: None,
                     });
                     Ok(())
                 }

@@ -196,6 +196,8 @@ classify() {
     if [ -n "$classified_program" ] && printf '%s' "$classified_output" | \
         grep -Fq "warning: $classified_program: no function '"; then
         bucket="ENVIRONMENT:missing-attach-target"
+    elif printf '%s' "$classified_output" | grep -Fq "missing kfunc '"; then
+        bucket="ENVIRONMENT:missing-kfunc"
     elif printf '%s' "$classified_output" | grep -q "verification PASSED"; then
         bucket="OK"
     elif line=$(printf '%s\n' "$classified_output" | grep -m1 "unsupported map type"); then
