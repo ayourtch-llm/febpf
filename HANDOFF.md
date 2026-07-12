@@ -3,10 +3,10 @@
 _A note from past-me to future-me (or whoever picks this up). Read this before
 diving in; it's the context that isn't obvious from the code._
 
-## ACTIVE RESUME CHECKPOINT (2026-07-12 22:27 UTC, read this first)
+## ACTIVE RESUME CHECKPOINT (2026-07-12 22:40 UTC, read this first)
 
 The production-corpus moonshot is active. The portable CI closure remains
-fully green at `932060e`; local development has advanced through `84b1970`.
+fully green at `932060e`; implementation has advanced through `feedac1`.
 Do not resume from older 62/62 object-level or 600/785 entry-level claims:
 measurement is per ELF entry function and preserves static graph grouping.
 
@@ -20,6 +20,7 @@ commit before widening scope.
 Completed and committed since the prior refresh:
 
 ```
+feedac1 verifier: add privileged stack policy
 84b1970 maps: support hash-of-maps templates
 d7c1bb7 verifier: track 32-bit conditional bounds
 188e641 tracing: add deterministic pid namespace helper
@@ -37,21 +38,31 @@ Current measured corpus:
 - 114 pinned object families and 787 enumerable entry programs: BCC/libbpf-tools,
   libbpf-bootstrap, xdp-tools, Cilium fixture, and 39/39 production Inspektor
   Gadget v0.54.0 sources.
-- Latest stable full scan: **104/114 fully compatible families** and **628/787
-  verified entries (79.8%)**. All 787 entries load and all 114 families
-  instantiate; Gadget `traceloop` contributes the two newly enumerable entries.
+- Latest stable full scan: **107/114 compatible families** and **777/787
+  verified entries (98.7%)** under explicit per-object policy. The strict
+  baseline remains **104/114 families and 628/787 entries (79.8%)**; exactly
+  three audited Gadget families / 149 entries are separately reported as
+  `OK-PRIVILEGED-UNINIT`. All 787 entries load and all 114 families instantiate.
 - The unsupported-map and unknown-helper histograms are now empty. Remaining
-  buckets are five `VERIFY-REJECT:other` families / 152 entries and five
+  buckets are two `VERIFY-REJECT:other` families / three entries and five
   poisoned-CO-RE families / seven entries.
 - The Gadget lane remains reproducible at manifest digest
   `cc4b5fdff7392995183181692f328dbb063356d8004bd88b5fdb96b9847bb62d`.
-- Default tests: **432 passed + 4 ignored**. Std interpreter-only: **414 passed
+- Default tests: **437 passed + 4 ignored**. Std interpreter-only: **419 passed
   + 4 ignored**. Both strict Clippy profiles and true thumb no-std check/Clippy
   are green. The last full GitHub portable matrix remains run `29207495214`;
   no new remote CI run has been claimed for the post-checkpoint commits.
 
 Important correctness and breadth now landed:
 
+- `UninitStackPolicy` is strict by default and has one explicit privileged
+  `Allow` mode matching Linux `allow_uninit_stack` for direct and helper stack
+  reads. The CLI never infers it from uid or `--kernel`. VM stack holes are
+  deterministic zeroes, including reused local-call frames; verifier loads
+  remain unknown scalars. Replay v1 preserves the policy additively. The
+  scanner retries only exact diagnostics for `snapshot_file`, `top_blockio`,
+  and `trace_lsm`, labeling their 149 entries separately instead of hiding
+  them as ordinary strict success.
 - `HASH_OF_MAPS` preserves arbitrary hash key widths and typed nullable inner
   lookups across verifier, interpreter/JIT, replay, assembler, and kernel map
   creation. BTF-only anonymous inner templates are materialized explicitly;
@@ -86,9 +97,9 @@ Important correctness and breadth now landed:
 
 Immediate resume order:
 
-1. Design the explicit privileged uninitialized-stack verification policy for
-   `snapshot_file`, `top_blockio`, and generated `trace_lsm` hooks. Strict must
-   remain the default; differential-test bytes before changing corpus policy.
+1. Inspect the last three ordinary verifier rejections: BCC `fsslower`'s two
+   entries and libbpf-bootstrap `tc`'s one entry. Keep this separate from the
+   privileged policy and rank distinct-family correctness first.
 2. Keep application-supplied/missing CO-RE targets (Gadget DNS/SNI/tcpdump,
    tcpdrop/tcpretrans, missing fentry targets/socket BTF) classified as
    environment/configuration artifacts, not reasons to loosen verification.
@@ -114,10 +125,9 @@ Privileged-kernel oracle result that changes the earlier audit:
   initialized stack bytes passed to `map_update_elem`/`ringbuf_output`.
   febpf's 148 rejections are therefore false negatives, not source defects.
 - Primary kernel verifier source explains the policy: `env->allow_uninit_stack`
-  accepts `STACK_INVALID` reads for privileged programs. Do **not** globally
-  weaken febpf. Design an explicit verifier/CLI privilege policy (strict by
-  default) and remember febpf zeroes VM stack memory, then differential-test
-  semantic bytes and unchecked execution before applying it to the corpus.
+  accepts `STACK_INVALID` reads for privileged programs. febpf now mirrors it
+  only through the explicit strict-default policy described above; runtime
+  zero backing and frame reuse are regression-tested.
 - Full `trace_lsm` kernel load eventually stopped at disabled hook
   `bpf_lsm_vm_enough_memory` before instruction verification; that one stop is
   an attach-environment artifact and does not invalidate the representative
