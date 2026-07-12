@@ -102,6 +102,42 @@ impl std::fmt::Display for VerifyError {
 }
 impl std::error::Error for VerifyError {}
 
+/// Immutable input supplied to an application verification policy after the
+/// core memory-safety verifier has accepted a program.
+pub struct PolicyView<'a> {
+    pub insns: &'a [Insn],
+    pub maps: &'a [MapDef],
+    pub evidence: &'a VerifyOk,
+}
+
+/// Failure from [`crate::interp::Vm::verify_with_policy`]. Core verifier
+/// failures and application policy rejections remain distinguishable.
+#[derive(Debug)]
+pub enum VerifyWithPolicyError {
+    Core(VerifyError),
+    Policy(String),
+}
+
+impl std::fmt::Display for VerifyWithPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerifyWithPolicyError::Core(error) => write!(f, "core verification failed: {error}"),
+            VerifyWithPolicyError::Policy(message) => {
+                write!(f, "verification policy rejected program: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VerifyWithPolicyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            VerifyWithPolicyError::Core(error) => Some(error),
+            VerifyWithPolicyError::Policy(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Stats {
     /// Abstract instructions processed.

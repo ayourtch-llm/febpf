@@ -484,6 +484,44 @@ impl Vm {
         Ok(ok)
     }
 
+    /// Run core verification, then apply an embedding-specific policy.
+    ///
+    /// `policy` is called only after febpf's structural and memory-safety
+    /// verifier succeeds. The VM is armed with verifier-derived XDP and probe
+    /// state only if both stages accept the program. Use [`Vm::verify`] when
+    /// no application policy is needed.
+    pub fn verify_with_policy<F>(
+        &mut self,
+        mut cfg: crate::verifier::Config,
+        policy: F,
+    ) -> Result<crate::verifier::VerifyOk, crate::verifier::VerifyWithPolicyError>
+    where
+        F: FnOnce(&crate::verifier::PolicyView<'_>) -> Result<(), String>,
+    {
+        use crate::verifier::VerifyWithPolicyError;
+
+        if cfg.btf_ctx.is_none() {
+            cfg.btf_ctx = self.btf_ctx.clone();
+        }
+        let xdp = cfg.xdp;
+        let ok = crate::verifier::verify(
+            &self.insns,
+            &self.map_defs,
+            self.user_helpers.sigs(),
+            cfg,
+        )
+        .map_err(VerifyWithPolicyError::Core)?;
+        policy(&crate::verifier::PolicyView {
+            insns: &self.insns,
+            maps: &self.map_defs,
+            evidence: &ok,
+        })
+        .map_err(VerifyWithPolicyError::Policy)?;
+        self.xdp = xdp;
+        self.probe_mem = ok.probe_mem.clone();
+        Ok(ok)
+    }
+
     /// Attach BTF typing of the ctx (set by the ELF loader for
     /// `tp_btf`/`fentry`-style programs). Pointer ctx slots are prefilled
     /// with kernel-memory addresses on each run, and [`Vm::verify`] verifies
