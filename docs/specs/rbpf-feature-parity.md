@@ -13,17 +13,17 @@ The comparison has two different axes that must not be collapsed:
    graphs and tail calls, direct clang ELF/BTF/BTF.ext/CO-RE loading, safe
    interpreter and hybrid-JIT runtime faults, and debugging, replay,
    conformance, race, equivalence, and optimization tools.
-2. **Portable embedding API.** rbpf exposes useful capabilities febpf does not:
-   four explicit input models, a replaceable verifier callback, arbitrary
-   allowed host-memory ranges, runtime program replacement, a fluent Rust
-   instruction builder, a `no_std` interpreter/assembler build, and a Windows
-   interpreter build.
+2. **Embedding conveniences and portability.** febpf already exposes a broad,
+   safety-oriented embedding API. rbpf additionally provides four named input
+   wrappers, a replaceable verifier callback, arbitrary allowed host-memory
+   ranges, runtime program replacement, a fluent Rust instruction builder, a
+   `no_std` interpreter/assembler build, and a Windows interpreter build.
 
-Therefore **febpf must not claim to be a strict global feature superset of
+Therefore **febpf must not yet claim to be a strict global feature superset of
 rbpf 0.4.1**. It can accurately claim substantially broader Linux eBPF
-semantics, safety analysis, object support, and developer tooling. Closing the
-embedding gaps may be worthwhile, but cosmetic API parity is not ahead of
-corpus-measured production blockers.
+semantics, safety analysis, object support, developer tooling, and an existing
+typed embedding surface. The remaining gaps are pointed conveniences and
+portability targets, tracked in `embedding-parity-roadmap.md`.
 
 ## Evidence baseline
 
@@ -68,13 +68,13 @@ configuration test suites.
 
 | Capability | febpf | rbpf 0.4.1 | Assessment |
 |---|---|---|---|
-| Input models | Generic mutable context bytes via `Vm::run`; kernel-style synthesized XDP context via `run_xdp`; an empty context covers no-data programs | Separate raw-packet, caller metadata-buffer, fixed synthesized metadata-buffer, and no-data VM types | rbpf exposes the clearer and more flexible embedding surface |
-| Raw packet pointer in `r1` | Deliberately absent: guest pointers are virtual handles, and XDP uses synthesized context fields | `EbpfVmRaw` directly places packet data in the first register | rbpf-only semantics; adding it naively would violate febpf's safety model |
+| Input models | Generic mutable context bytes via `Vm::run` already cover raw-buffer, caller-metadata, and empty/no-data execution; `run_xdp` synthesizes kernel-style XDP context and packet regions | Separate raw-packet, caller metadata-buffer, fixed synthesized metadata-buffer, and no-data VM types | Both cover the core modes; rbpf names them as distinct wrapper types, while febpf uses one safer virtual-region API |
+| Raw packet pointer in `r1` | `Vm::run(&mut packet)` places a bounded virtual pointer to those bytes in `r1`, preserving program-visible direct-buffer semantics without exposing a host address | `EbpfVmRaw` places the host packet address in the first register | Capability present in both; febpf has the stronger runtime safety model |
 | Arbitrary metadata layout | Caller may supply bytes, but embedded host pointers are not imported as guest regions; XDP synthesis uses its defined layout | Caller-controlled metadata or fixed buffer with configurable data/data_end offsets | rbpf broader |
 | Replaceable verifier | Verification policy is configurable, and callers may skip verification, but cannot replace it with an arbitrary callback | `set_verifier` installs a function and immediately rechecks a loaded program | rbpf broader/pluggable |
 | Allowed host-memory ranges | No public registration of host addresses; memory must become a VM-owned typed region | `register_allowed_memory` appends arbitrary address ranges for interpreter access | rbpf broader as an escape hatch; febpf's restriction is intentional safety architecture |
 | Runtime program replacement | Construct a new `Vm`; tail-call bundle targets can be linked, but the entry program has no `set_program` API | `set_program` replaces and reverifies code on an existing VM | rbpf broader |
-| Instruction construction | Public `Insn` plus textual assembler | Textual assembler plus fluent `insn_builder::BpfCode` API | rbpf broader ergonomically |
+| Instruction construction | Public `Insn` encoding/decoding plus textual assembler | Textual assembler plus fluent `insn_builder::BpfCode` API | febpf lacks only the fluent convenience layer |
 | Custom helper ABI | Boxed `UserHelper` with verifier-visible argument/return signatures and checked `MemBus` access | Plain five-`u64` function pointer registered at any `u32` id | Both extensible; febpf adds type/safety integration, rbpf is simpler |
 | `no_std` | No; febpf uses `std`. `--no-default-features` disables JIT, not the standard library | Default `std` can be disabled; interpreter and reduced-diagnostic assembler remain, normal JIT does not | rbpf broader |
 | Windows | No supported Windows execution target documented | README documents interpreter support on Windows and excludes JIT there | rbpf broader |
@@ -87,9 +87,10 @@ Safe wording for project documentation:
 
 > Compared with rbpf 0.4.1, febpf provides substantially broader Linux eBPF
 > verification, maps/helpers, object loading, safe JIT fault handling, and
-> analysis/debugging tooling. rbpf retains a broader portable embedding API,
-> including `no_std` and Windows interpreter support, multiple input models,
-> verifier replacement, and allowed host-memory ranges.
+> analysis/debugging tooling, together with a typed embedding API. rbpf retains
+> several additional portability and host-integration conveniences, including
+> `no_std` and Windows interpreter support, verifier replacement, and allowed
+> host-memory ranges.
 
 Avoid:
 
