@@ -2331,6 +2331,15 @@ impl<'a> Machine<'a> {
                 buf[..n].copy_from_slice(&comm[..n]);
                 0
             }
+            helpers::id::REDIRECT => {
+                if self.vm.xdp {
+                    if args[1] == 0 { 4 } else { 0 } // XDP_REDIRECT / XDP_ABORTED
+                } else if self.vm.skb {
+                    if args[1] & !1 == 0 { 7 } else { 2 } // TC_ACT_REDIRECT / SHOT
+                } else {
+                    0
+                }
+            }
             helpers::id::SKB_LOAD_BYTES => {
                 let start = args[1] as u32 as usize;
                 let len = args[3] as u32 as usize;

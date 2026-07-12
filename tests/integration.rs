@@ -1266,6 +1266,50 @@ fn redirect_map_requires_redirect_kind_and_returns_deterministic_verdict() {
     assert!(error.contains("requires a devmap"), "{error}");
 }
 
+#[test]
+fn redirect_helper_uses_program_kind_verdicts() {
+    assert_eq!(febpf::helpers::helper_id("redirect"), Some(23));
+
+    let xdp = |flags: u64| {
+        let mut vm = Vm::new(program(&format!(
+            "r1 = 7\nr2 = {flags}\ncall redirect\nexit"
+        )))
+        .unwrap();
+        vm.verify(xdp_config()).unwrap();
+        let mut packet = [0u8; 1];
+        vm.run_xdp(&mut packet).unwrap()
+    };
+    assert_eq!(xdp(0), 4);
+    assert_eq!(xdp(1), 0);
+
+    let skb = |flags: u64| {
+        let mut vm = Vm::new(program(&format!(
+            "r1 = 7\nr2 = {flags}\ncall redirect\nexit"
+        )))
+        .unwrap();
+        vm.verify(Config {
+            ctx_size: 192,
+            ctx_writable: false,
+            skb: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut packet = [0u8; 1];
+        vm.run_skb(&mut packet).unwrap()
+    };
+    assert_eq!(skb(0), 7);
+    assert_eq!(skb(1), 7);
+    assert_eq!(skb(2), 2);
+
+    let mut generic = Vm::new(program("r1 = 7\nr2 = 0\ncall redirect\nexit")).unwrap();
+    let error = generic
+        .verify(Config::default())
+        .err()
+        .expect("redirect under generic context must reject")
+        .to_string();
+    assert!(error.contains("requires an XDP or __sk_buff"), "{error}");
+}
+
 // --------------------------------------------------------- stack_trace
 
 /// get_stackid returns a deterministic 31-bit id and stores the captured

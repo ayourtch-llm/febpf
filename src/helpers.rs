@@ -22,6 +22,7 @@ pub mod id {
     pub const GET_CURRENT_PID_TGID: u32 = 14;
     pub const GET_CURRENT_UID_GID: u32 = 15;
     pub const GET_CURRENT_COMM: u32 = 16;
+    pub const REDIRECT: u32 = 23;
     pub const PERF_EVENT_OUTPUT: u32 = 25;
     pub const SKB_LOAD_BYTES: u32 = 26;
     pub const GET_STACKID: u32 = 27;
@@ -173,6 +174,11 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             name: "get_current_comm",
             // (buf, size); buf must be writable for `size` bytes.
             args: [MemWrite { size_arg: 1 }, Size, None, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::REDIRECT => HelperSig {
+            name: "redirect",
+            args: [Scalar, Scalar, None, None, None],
             ret: RetKind::Scalar,
         },
         id::SKB_LOAD_BYTES => HelperSig {
@@ -361,6 +367,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::GET_CURRENT_PID_TGID,
         id::GET_CURRENT_UID_GID,
         id::GET_CURRENT_COMM,
+        id::REDIRECT,
         id::SKB_LOAD_BYTES,
         id::GET_CURRENT_TASK,
         id::GET_STACKID,

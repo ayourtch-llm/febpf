@@ -81,6 +81,11 @@ contents but not its extent, so existing `data_end` range proofs remain valid.
 Interpreter and hybrid JIT share this helper implementation, and packet writes
 are copied back through the ordinary `run_xdp` contract.
 
+`redirect` (#23) accepts scalar interface-index and flags arguments under the
+explicit XDP model. Zero flags produce the `XDP_REDIRECT` verdict; unsupported
+nonzero flags produce `XDP_ABORTED`. Standalone execution records the verdict
+only and does not pretend to transmit the packet.
+
 This slice covers verifier semantics, deterministic interpreter execution,
 automatic ELF program-type selection, raw packet-file CLI runs, a
 pcap-in/verdict-out harness, selected-packet `.febpf` replay/debugging, and

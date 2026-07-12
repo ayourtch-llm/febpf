@@ -2694,6 +2694,12 @@ impl<'a> Verifier<'a> {
         let sig = self
             .sig_for(hid)
             .ok_or_else(|| self.err(pc, format!("call to unknown helper #{hid}")))?;
+        if hid == crate::helpers::id::REDIRECT && !(self.cfg.xdp || self.cfg.skb) {
+            return Err(self.err(
+                pc,
+                "helper redirect requires an XDP or __sk_buff context model",
+            ));
+        }
         let args: Vec<RegState> = (1..=5).map(|r| state.cur().regs[r]).collect();
         let mut map_arg: Option<u32> = None;
         // Ringbuf record id to mark consumed after this call (submit/discard).

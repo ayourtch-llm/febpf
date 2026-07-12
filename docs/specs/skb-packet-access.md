@@ -23,6 +23,11 @@ bounds-checked VM packet region and construct a zero-filled 192-byte context.
 No host skb or host packet address enters a guest register. Ordinary `Vm::run`
 does not guess that an arbitrary context has packet backing.
 
+`redirect` (#23) is also selected by the explicit skb model. Flags may be zero
+or `BPF_F_INGRESS`; those cases return `TC_ACT_REDIRECT`. Other flag bits
+return `TC_ACT_SHOT`. The standalone VM reports only this action and does not
+invent a network device or transmission side effect.
+
 ## `skb_load_bytes`
 
 The helper prototype is `(struct __sk_buff *skb, u32 offset, void *to,
