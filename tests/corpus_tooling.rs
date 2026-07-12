@@ -33,6 +33,32 @@ fn programs_lists_elf_entries_and_static_links_in_loader_order() {
 }
 
 #[test]
+fn programs_lists_each_global_entry_in_a_shared_section() {
+    let output = Command::new(env!("CARGO_BIN_EXE_febpf"))
+        .args(["programs", "tests/multi_entry.o"])
+        .output()
+        .expect("run febpf programs");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "program\t0\txdp\tfirst_entry\nprogram\t1\txdp\tsecond_entry\n"
+    );
+
+    for name in ["first_entry", "second_entry"] {
+        let verify = Command::new(env!("CARGO_BIN_EXE_febpf"))
+            .args(["verify", "tests/multi_entry.o", "--prog", name])
+            .output()
+            .expect("select shared-section entry");
+        assert!(
+            verify.status.success(),
+            "{}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        assert!(String::from_utf8_lossy(&verify.stdout).contains("verification PASSED"));
+    }
+}
+
+#[test]
 fn scanner_counts_a_non_default_rejection_and_preserves_section_names() {
     let temp = temp_dir("corpus-scan");
     let mock = temp.join("febpf-mock");
@@ -86,7 +112,11 @@ esac
         .env("CORPUS_REPORT", &report)
         .output()
         .expect("run corpus scanner");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let report = fs::read_to_string(report).unwrap();
     assert!(report.contains("objects/families scanned  : 1"), "{report}");

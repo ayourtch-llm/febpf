@@ -68,6 +68,79 @@ fn btf_maps_object() {
 }
 
 #[test]
+fn shared_section_entries_and_section_symbol_call_addends() {
+    maybe_compile("multi_entry.c", "multi_entry.o");
+    let obj = load("tests/multi_entry.o");
+    assert_eq!(
+        obj.programs
+            .iter()
+            .map(|program| program.name.as_str())
+            .collect::<Vec<_>>(),
+        ["first_entry", "second_entry"]
+    );
+
+    // The second relocation is against the .text SECTION symbol with encoded
+    // addend 2 and must select add_seven rather than silently selecting
+    // add_one. Load-time subprogram DCE then removes the uncalled callee and
+    // remaps both surviving calls to the same compact displacement.
+    assert_eq!(obj.programs[0].insns[1].imm, 1);
+    assert_eq!(obj.programs[1].insns[1].imm, 1);
+    assert!(obj.programs[0].insns.iter().any(|insn| insn.imm == 1));
+    assert!(obj.programs[1].insns.iter().any(|insn| insn.imm == 7));
+    let mut ctx = [0u8; 8];
+    ctx[..4].copy_from_slice(&11u32.to_le_bytes());
+    assert_eq!(run_prog(&obj, "first_entry", &mut ctx), 12);
+    assert_eq!(run_prog(&obj, "second_entry", &mut ctx), 18);
+}
+
+#[test]
+fn cached_production_shared_entries_and_call_addend() {
+    let xdp_path = "corpus/obj/xdp-tools__xdp_basic.o";
+    let bio_path = "corpus/obj/bcc__biolatency.o";
+    let (Ok(xdp_bytes), Ok(bio_bytes)) = (std::fs::read(xdp_path), std::fs::read(bio_path)) else {
+        eprintln!("skipping: cached production corpus objects are absent");
+        return;
+    };
+
+    let xdp = elf::load(&xdp_bytes).unwrap();
+    let xdp_names: Vec<&str> = xdp
+        .programs
+        .iter()
+        .map(|program| program.name.as_str())
+        .collect();
+    for expected in [
+        "xdp_basic_prog",
+        "xdp_read_data_prog",
+        "xdp_read_data_load_bytes_prog",
+        "xdp_swap_macs_prog",
+        "xdp_swap_macs_load_bytes_prog",
+        "xdp_parse_prog",
+        "xdp_parse_load_bytes_prog",
+    ] {
+        assert!(
+            xdp_names.contains(&expected),
+            "missing xdp entry {expected}"
+        );
+    }
+    assert!(!xdp_names.contains(&"xdp"));
+
+    let bio = elf::load(&bio_bytes).unwrap();
+    let complete = bio
+        .programs
+        .iter()
+        .find(|program| program.name == "raw_tp/block_rq_complete")
+        .unwrap();
+    // The section-symbol addend selects handle_block_rq_complete. DCE removes
+    // the two preceding uncalled .text functions and compacts this callee to
+    // pc 4; the debug function boundary proves which body survived.
+    assert_eq!(complete.insns[1].imm, 2);
+    assert_eq!(
+        complete.debug.as_ref().unwrap().func_at(4).unwrap().name,
+        "handle_block_rq_complete"
+    );
+}
+
+#[test]
 fn static_prog_array_initializers_link_programs() {
     maybe_compile("tail_call.c", "tail_call.o");
     let obj = load("tests/tail_call.o");

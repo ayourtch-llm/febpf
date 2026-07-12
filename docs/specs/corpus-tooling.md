@@ -21,6 +21,57 @@ source headers are included from the pinned checkout's `headers/` directory;
 the fetch script also supplies the host multiarch include directory required by
 the distro's `asm/types.h` include and advertises the pinned libbpf helper API.
 
+The Inspektor Gadget lane pins v0.54.0 at the immutable commit
+`0c733324b97dbbbe8d85b64ae93622a86fe7bf45`. Its explicit
+`gadgets/*/program.bpf.c` selection contains exactly 39 top-level production
+gadgets; nested `gadgets/ci/` fixtures and `testdata/` are excluded. All 39
+sources compile directly with clang and the checkout's
+`include/gadget/amd64` and `include` trees, without Go, Docker, `ig`, or the
+upstream builder image. Their object names use the gadget directory
+(`inspektor-gadget__trace_exec.o`, for example), since every source basename
+is `program.bpf.c`.
+
+The repository is Apache-2.0 overall, while the selected BPF sources retain
+their more specific SPDX declarations: 24 GPL-2.0, 10
+`(LGPL-2.1 OR BSD-2-Clause)`, three GPL-2.0 with the Linux syscall note, one
+BSD-2-Clause, and one Apache-2.0. Corpus downloads and compiled objects remain
+git-ignored; users redistributing them must preserve and evaluate the upstream
+license terms rather than treating febpf's repository license as a substitute.
+
+The first combined scan exposed two loader/enumerator defects that were fixed
+before recording the baseline below:
+
+1. `R_BPF_64_32` calls against a `.text` section symbol can lose their
+   relocation addend. BCC `biolatency`'s `raw_tp/block_rq_complete` has an
+   addend/encoded call target of `0x147`; mislinking it to the first subprogram
+   can reject that entry and can also let a sibling entry verify the wrong
+   body.
+2. Multiple global `STT_FUNC` entry symbols sharing one executable section are
+   currently collapsed into one loader entry. The xdp-tools `xdp_basic`
+   object, for example, has several functions in `SEC("xdp")`, so the program
+   count is a known undercount.
+
+After those fixes, the authoritative combined scan observed 114 object
+families and 785 entry programs. 113 families enumerate, 71 are fully
+compatible, and 486/785 entries verify (61.9%); 42 entries fail during loading
+and 257 reach the verifier but reject. Helper #125 `ktime_get_boot_ns` is the
+largest blocker by both families and entries (14 first-blocked families / 210
+entries), though one 147-hook LSM family amplifies the entry count. The next
+groups are other verifier/context failures (11 families / 19 entries), other
+load failures (six / 42), helper #51 `redirect_map` (three / 13), helper #26
+`skb_load_bytes` (three / three), helper #189 `xdp_load_bytes` (four entries),
+helpers #39 `skb_pull_data` and #177 `trace_vprintk` (two entries each), and one
+`HASH_OF_MAPS` load blocker. Family count, entry count, and graph shape remain
+separate signals; no single large generated hook family is treated as hundreds
+of independent production workloads.
+
+The old `libbpf-bootstrap v1.4` clone ref did not exist upstream and therefore
+never populated a fresh cache. This revision pins the repository directly at
+`fac4e8ddf011aead8e14962bf8db74542331264b`; 13 of its current example objects
+compile on this host (two target-specific examples do not). This accounts for
+the increase from 62 previously cached families to 114 combined families once
+the 39 Gadget objects are added.
+
 A previous full cached scan built/scanned 57 objects: all 57 loaded and all 57
 verified (100%), with no unsupported map types/helpers, load failures, or
 verifier rejections. The final rejection, BCC `ksnoop`, was resolved with
@@ -29,11 +80,11 @@ memory-bounds check. The host kernel rejects a minimal version of the same
 safe relation, so this 100% figure measures febpf coverage rather than kernel
 verdict parity.
 
-The expanded scan after adding `xdp-tools` and implementing its measured
-redirect-map blockers built/scanned 62 objects: all 62 loaded and all 62
-verified (100%). It includes five XDP networking objects and reports one
-static tail-call graph; no unsupported map types, unknown helpers, load
-failures, or verifier rejections remain in this pinned cache.
+The earlier default-entry-only scan after adding `xdp-tools` and implementing
+its measured redirect-map blockers built/scanned 62 objects: each object's
+first selected entry loaded and verified. That historical 62/62 result is not
+an all-entry claim; the enumeration audit above supersedes that measurement
+method.
 
 ## Why
 
@@ -56,7 +107,7 @@ two scripts are. `corpus/` is git-ignored.
 
 ## Prerequisites
 
-- `git`, `clang` (tested with clang 21), `bpftool`, and a readable
+- `git`, `clang` (tested with clang 21), `sha256sum`, `bpftool`, and a readable
   `/sys/kernel/btf/vmlinux` for `scan-corpus.sh`'s `--target-btf`.
 - Network access for `fetch-corpus.sh` (unless `--offline`).
 - Shell scripts are exempt from febpf's zero-dependency rule; they may use
@@ -67,14 +118,19 @@ two scripts are. `corpus/` is git-ignored.
 `fetch-corpus.sh` is deliberately polite so it can be re-run without hammering
 anyone:
 
-- **Shallow, single-branch, pinned.** Every repo is cloned with
-  `git clone --depth 1 --single-branch --branch <PIN>` where `<PIN>` is a
-  tag or commit recorded in the `REPOS` array at the top of the script.
+- **Shallow and pinned.** Tags are cloned with
+  `git clone --depth 1 --single-branch --branch <tag>`. Exact commit pins use a
+  one-commit `git fetch --depth 1` followed by a detached checkout. Every
+  resolved `HEAD` must equal the separately recorded immutable commit.
   Pinning makes the corpus reproducible; shallow keeps it small.
 - **One repo at a time,** with a configurable `SLEEP` (default 2s) between
   network operations. Never parallel, never a firehose.
 - **Cache + skip.** Everything lands in `corpus/cache/<repo>`. If a repo is
-  already present it is *not* re-downloaded. Delete the cache dir to refresh.
+  already present it is *not* re-downloaded. Before reuse, its exact `HEAD` is
+  compared with the immutable expected commit recorded beside the clone ref.
+  A non-git cache or mismatch is a hard error with the expected/found commits
+  and a request to remove that one cache directory; the script never silently
+  scans a moving or locally switched checkout.
 - **Offline mode.** `--offline` builds only from whatever is already in
   `corpus/cache/` and never touches the network. If a needed repo is missing
   it is skipped with a logged warning rather than failing the run.
@@ -91,6 +147,7 @@ corpus/
     bcc/                 libbpf-tools/*.bpf.c
     cilium-ebpf/         testdata/btf_map_init.c (ELF loader fixture)
     xdp-tools/           xdp-bench/*.bpf.c (XDP networking lane)
+    inspektor-gadget/    gadgets/*/program.bpf.c (39 production gadgets)
   include/
     vmlinux.h            generated locally: bpftool btf dump file
                          /sys/kernel/btf/vmlinux format c
@@ -100,6 +157,8 @@ corpus/
     <repo>__<name>.o     one compiled object per discovered *.bpf.c
   build.log              per-file clang stdout/stderr; compile failures logged
                          here and skipped, never aborting the whole run
+  inspektor-gadget-manifest.sha256
+                         pin/toolchain plus stable source and object SHA-256s
 ```
 
 Each `*.bpf.c` is compiled with:
@@ -115,17 +174,26 @@ macros, per-repo private headers, kfunc decls, etc.). They are logged to
 `corpus/build.log` and skipped. The script prints a summary: N repos
 processed, M `*.bpf.c` discovered, K objects built, and where they are.
 
+The Inspektor Gadget lane is stricter: the pinned glob must resolve to exactly
+39 sources. Before rebuilding, only `inspektor-gadget__*.o` is removed, so a
+stale object cannot survive a renamed/deleted gadget and no other lane is
+touched. The timestamp-free manifest records the exact commit, first clang
+version line, 39 source hashes, and 39 object hashes. On this host two complete
+offline rebuilds produced the identical manifest SHA-256
+`cc4b5fdff7392995183181692f328dbb063356d8004bd88b5fdb96b9847bb62d`.
+
 ### Extending the repo list
 
 Add a line to the `REPOS` array at the top of `scripts/fetch-corpus.sh`:
 
 ```
-# name|relative-github-path|pinned-tag-or-commit|glob-of-bpf-sources
+# name|relative-github-path|clone-ref|expected-commit|glob-of-bpf-sources
 REPOS="
-libbpf-bootstrap|libbpf/libbpf-bootstrap|<tag>|examples/c/*.bpf.c
-bcc|iovisor/bcc|<tag>|libbpf-tools/*.bpf.c
-cilium-ebpf|cilium/ebpf|<tag>|testdata/btf_map_init.c
-xdp-tools|xdp-project/xdp-tools|v1.6.3|xdp-bench/*.bpf.c
+libbpf-bootstrap|libbpf/libbpf-bootstrap|<ref>|<40-hex-commit>|examples/c/*.bpf.c
+bcc|iovisor/bcc|<tag>|<40-hex-commit>|libbpf-tools/*.bpf.c
+cilium-ebpf|cilium/ebpf|<tag>|<40-hex-commit>|testdata/btf_map_init.c
+xdp-tools|xdp-project/xdp-tools|v1.6.3|8fbad9f0af621a22aa87ff2520b3735915b1f0fd|xdp-bench/*.bpf.c
+inspektor-gadget|inspektor-gadget/inspektor-gadget|v0.54.0|0c733324b97dbbbe8d85b64ae93622a86fe7bf45|gadgets/*/program.bpf.c
 "
 ```
 
@@ -144,8 +212,10 @@ febpf programs <object> [--target-btf <path>]
 ```
 
 `programs` is a stable, machine-readable interface. It writes one
-tab-delimited record per line, in the executable-section order preserved by
-the ELF loader:
+tab-delimited record per line, in executable-section order. A section with a
+single entry keeps its section name; a section containing multiple global
+entry `STT_FUNC` symbols contributes one record per function, ordered by byte
+offset and then symbol-table order and named by the function symbol:
 
 ```
 program<TAB><zero-based-index><TAB><kind><TAB><section-name>

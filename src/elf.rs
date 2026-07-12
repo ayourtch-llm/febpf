@@ -42,6 +42,9 @@ const R_BPF_64_64: u32 = 1;
 const R_BPF_64_ABS64: u32 = 2;
 const R_BPF_64_32: u32 = 10;
 
+const STB_GLOBAL: u8 = 1;
+const STT_FUNC: u8 = 2;
+
 // BPF map types we support.
 const BPF_MAP_TYPE_HASH: u32 = 1;
 const BPF_MAP_TYPE_ARRAY: u32 = 2;
@@ -158,10 +161,17 @@ struct Section {
 #[derive(Clone)]
 struct Symbol {
     name: String,
+    info: u8,
     value: u64,
     shndx: u16,
     #[allow(dead_code)]
     size: u64,
+}
+
+impl Symbol {
+    fn is_global_func(&self) -> bool {
+        self.info >> 4 == STB_GLOBAL && self.info & 0x0f == STT_FUNC
+    }
 }
 
 struct Relocation {
@@ -297,40 +307,87 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
         .map(|(i, _)| i)
         .collect();
 
-    // (program, its ELF section name, where `.text` was stitched in — needed
-    // to map per-section CO-RE relocations onto the flat instruction stream)
-    let mut programs: Vec<(LoadedProgram, String, Option<usize>)> = Vec::new();
+    // (program, its ELF section name, byte range within that section, where
+    // `.text` was stitched in). The range is non-zero when multiple global
+    // entry functions share one SEC() section.
+    let mut programs: Vec<(LoadedProgram, String, usize, usize, Option<usize>)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for idx in &entry_sections {
         let sec = &sections[*idx];
-        let (insns, text_base) = build_program(
-            &r,
-            bytes,
-            &sections,
-            *idx,
-            text_idx,
-            &text_insns,
-            &symbols,
-            &map_by_symval,
-        )?;
-        programs.push((
-            LoadedProgram {
-                name: sec.name.clone(),
-                insns,
-                xdp: is_xdp_section(&sec.name),
-                debug: None,
-                btf_ctx: None,
-            },
-            sec.name.clone(),
-            text_base,
-        ));
+        let mut symbols_in_section: Vec<(usize, &Symbol)> = symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, sym)| sym.shndx as usize == *idx && sym.is_global_func())
+            .collect();
+        symbols_in_section.sort_by_key(|(sym_idx, sym)| (sym.value, *sym_idx));
+        let entries: Vec<(String, u64, u64)> = if symbols_in_section.len() > 1 {
+            symbols_in_section
+                .into_iter()
+                .map(|(_, sym)| (sym.name.clone(), sym.value, sym.size))
+                .collect()
+        } else {
+            vec![(sec.name.clone(), 0, sec.size as u64)]
+        };
+        for (entry_name, entry_value, entry_size) in entries {
+            let start = usize::try_from(entry_value)
+                .map_err(|_| format!("entry '{entry_name}' offset does not fit usize"))?;
+            let size = usize::try_from(entry_size)
+                .map_err(|_| format!("entry '{entry_name}' size does not fit usize"))?;
+            let end = start
+                .checked_add(size)
+                .ok_or_else(|| format!("entry '{entry_name}' range overflows"))?;
+            if start % insn::INSN_SIZE != 0
+                || size == 0
+                || size % insn::INSN_SIZE != 0
+                || end > sec.size
+            {
+                return Err(format!(
+                    "entry '{}' has invalid range {start}..{end} in section '{}' (size {})",
+                    entry_name, sec.name, sec.size
+                ));
+            }
+            let (insns, text_base) = build_program(
+                &r,
+                bytes,
+                &sections,
+                *idx,
+                start,
+                end,
+                text_idx,
+                &text_insns,
+                &symbols,
+                &map_by_symval,
+            )?;
+            programs.push((
+                LoadedProgram {
+                    name: entry_name,
+                    insns,
+                    xdp: is_xdp_section(&sec.name),
+                    debug: None,
+                    btf_ctx: None,
+                },
+                sec.name.clone(),
+                start,
+                end,
+                text_base,
+            ));
+        }
     }
 
     // If there are no SEC()-annotated entry programs, expose `.text` itself.
     if programs.is_empty() {
         if let Some(ti) = text_idx {
             let (insns, text_base) = build_program(
-                &r, bytes, &sections, ti, text_idx, &text_insns, &symbols, &map_by_symval,
+                &r,
+                bytes,
+                &sections,
+                ti,
+                0,
+                sections[ti].size,
+                text_idx,
+                &text_insns,
+                &symbols,
+                &map_by_symval,
             )?;
             programs.push((
                 LoadedProgram {
@@ -341,6 +398,8 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
                     btf_ctx: None,
                 },
                 ".text".into(),
+                0,
+                sections[ti].size,
                 text_base,
             ));
         }
@@ -366,7 +425,7 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
         // some kernel versions) — such a program keeps the untyped flat-ctx
         // model, with a warning, and would only fail on a real kernel when
         // actually loaded against that target.
-        for (prog, sec_name, _) in programs.iter_mut() {
+        for (prog, sec_name, _, _, _) in programs.iter_mut() {
             match crate::btf::resolve_ctx_args(&target, sec_name) {
                 Ok(Some(args)) => {
                     prog.btf_ctx = Some(crate::btf::BtfCtx {
@@ -384,8 +443,10 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
     }
 
     // Surface source-level debug info (line/func/globals) for each program.
-    for (prog, sec_name, text_base) in programs.iter_mut() {
-        prog.debug = build_debug_info(r.le, bytes, &sections, sec_name, *text_base, &maps)?;
+    for (prog, sec_name, sec_start, sec_end, text_base) in programs.iter_mut() {
+        prog.debug = build_debug_info(
+            r.le, bytes, &sections, sec_name, *sec_start, *sec_end, *text_base, &maps,
+        )?;
     }
 
     // libbpf-style load-time dead-code elimination driven by frozen `.rodata`
@@ -395,7 +456,7 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
     // does the equivalent before handing a program to the kernel, so objects
     // compiled with the `const volatile` config idiom rely on it to pass the
     // verifier's unreachable-instruction check.
-    for (prog, _, _) in programs.iter_mut() {
+    for (prog, _, _, _, _) in programs.iter_mut() {
         if let Some(res) = crate::dce::eliminate_rodata_dead_code(&prog.insns, &maps) {
             if let Some(d) = prog.debug.as_mut() {
                 d.remap_insns(&res.pc_map);
@@ -405,7 +466,7 @@ pub fn load_with_target_btf(bytes: &[u8], target_btf: Option<&[u8]>) -> Result<O
     }
 
     Ok(Object {
-        programs: programs.into_iter().map(|(p, _, _)| p).collect(),
+        programs: programs.into_iter().map(|(p, _, _, _, _)| p).collect(),
         maps,
         prog_array_inits,
         warnings,
@@ -454,7 +515,7 @@ fn apply_core_relocations(
     le: bool,
     bytes: &[u8],
     sections: &[Section],
-    programs: &mut [(LoadedProgram, String, Option<usize>)],
+    programs: &mut [(LoadedProgram, String, usize, usize, Option<usize>)],
     target: &Btf,
 ) -> Result<(), String> {
     let Some(btf_idx) = sections.iter().position(|s| s.name == ".BTF" && s.size > 0) else {
@@ -474,24 +535,28 @@ fn apply_core_relocations(
 
     let index = crate::relo::CandidateIndex::new(target);
 
-    for (prog, sec_name, text_base) in programs.iter_mut() {
+    for (prog, sec_name, sec_start, sec_end, text_base) in programs.iter_mut() {
         for ext_sec in &ext.core_relos {
             let relo_sec = local.str_at(ext_sec.sec_name_off);
             // Where does this section's code live inside this program?
-            let code_base = if relo_sec == sec_name {
-                0
+            let (code_base, source_start, source_end) = if relo_sec == sec_name {
+                (0, *sec_start, *sec_end)
             } else if relo_sec == ".text" {
                 match text_base {
-                    Some(base) => *base,
+                    Some(base) => (*base, 0, usize::MAX),
                     None => continue, // program didn't stitch .text in
                 }
             } else {
                 continue; // relocations for some other program's section
             };
             for relo in &ext_sec.recs {
+                let source_off = relo.insn_off as usize;
+                if source_off < source_start || source_off >= source_end {
+                    continue;
+                }
                 let res = crate::relo::calc_relo(&local, relo, target, &index)
                     .map_err(|e| format!("{}+{}: {e}", relo_sec, relo.insn_off))?;
-                let idx = code_base + relo.insn_off as usize / insn::INSN_SIZE;
+                let idx = code_base + (source_off - source_start) / insn::INSN_SIZE;
                 patch_core_insn(&mut prog.insns, idx, &res).map_err(|e| {
                     format!(
                         "{}+{}: CO-RE {}: {e}",
@@ -512,11 +577,14 @@ fn apply_core_relocations(
 /// section and translated to flat instruction indices exactly as CO-RE
 /// relocations are (see `docs/specs/source-debug.md`). Returns `None` when the
 /// object carries no usable debug info.
+#[allow(clippy::too_many_arguments)]
 fn build_debug_info(
     le: bool,
     bytes: &[u8],
     sections: &[Section],
     sec_name: &str,
+    sec_start: usize,
+    sec_end: usize,
     text_base: Option<usize>,
     maps: &[MapDef],
 ) -> Result<Option<DebugInfo>, String> {
@@ -528,14 +596,18 @@ fn build_debug_info(
     // Flat instruction index of a per-section byte offset, or None if the
     // record belongs to a section not part of this program.
     let flat_idx = |rec_sec: &str, insn_off: u32| -> Option<usize> {
-        let base = if rec_sec == sec_name {
-            0
+        let source_off = insn_off as usize;
+        let (base, source_start) = if rec_sec == sec_name {
+            if source_off < sec_start || source_off >= sec_end {
+                return None;
+            }
+            (0, sec_start)
         } else if rec_sec == ".text" {
-            text_base?
+            (text_base?, 0)
         } else {
             return None;
         };
-        Some(base + insn_off as usize / insn::INSN_SIZE)
+        Some(base + (source_off - source_start) / insn::INSN_SIZE)
     };
 
     let mut lines = Vec::new();
@@ -693,17 +765,24 @@ fn build_program(
     bytes: &[u8],
     sections: &[Section],
     idx: usize,
+    entry_start: usize,
+    entry_end: usize,
     text_idx: Option<usize>,
     text_insns: &[Insn],
     symbols: &[Symbol],
     map_by_symval: &MapIndex,
 ) -> Result<(Vec<Insn>, Option<usize>), String> {
     let raw = section_bytes(bytes, sections, idx)?;
-    let mut insns = insn::decode_program(raw)?;
+    let entry_raw = raw
+        .get(entry_start..entry_end)
+        .ok_or("entry function range is outside its section")?;
+    let mut insns = insn::decode_program(entry_raw)?;
 
     // Does this section call into `.text`? If so, append it once.
     let calls_text = match text_idx {
-        Some(ti) => section_reloc_targets_section(r, sections, idx, symbols, ti)?,
+        Some(ti) => {
+            section_reloc_targets_section(r, sections, idx, entry_start, entry_end, symbols, ti)?
+        }
         None => false,
     };
     let is_text_itself = Some(idx) == text_idx;
@@ -718,12 +797,34 @@ fn build_program(
     };
 
     // Relocations for the entry section (code at offset 0).
-    apply_relocations(r, sections, idx, symbols, map_by_symval, text_idx, 0, text_base, &mut insns)?;
+    apply_relocations(
+        r,
+        sections,
+        idx,
+        entry_start,
+        entry_end,
+        symbols,
+        map_by_symval,
+        text_idx,
+        0,
+        text_base,
+        &mut insns,
+    )?;
     // Relocations for the appended `.text` (code at offset `text_base`).
     if let (Some(ti), Some(base)) = (text_idx, text_base) {
         if !is_text_itself {
             apply_relocations(
-                r, sections, ti, symbols, map_by_symval, text_idx, base, text_base, &mut insns,
+                r,
+                sections,
+                ti,
+                0,
+                sections[ti].size,
+                symbols,
+                map_by_symval,
+                text_idx,
+                base,
+                text_base,
+                &mut insns,
             )?;
         }
     }
@@ -736,6 +837,8 @@ fn section_reloc_targets_section(
     r: &Reader,
     sections: &[Section],
     sec_idx: usize,
+    source_start: usize,
+    source_end: usize,
     symbols: &[Symbol],
     wanted: usize,
 ) -> Result<bool, String> {
@@ -748,6 +851,10 @@ fn section_reloc_targets_section(
     let entsize = if rel.entsize == 0 { 16 } else { rel.entsize };
     for i in 0..rel.size / entsize {
         let base = rel.offset + i * entsize;
+        let offset = r.u64(base)? as usize;
+        if offset < source_start || offset >= source_end {
+            continue;
+        }
         let sym_idx = (r.u64(base + 8)? >> 32) as usize;
         if let Some(sym) = symbols.get(sym_idx) {
             if sym.shndx as usize == wanted {
@@ -776,6 +883,7 @@ fn parse_symbols(
         let name_off = r.u32(base)? as usize;
         syms.push(Symbol {
             name: cstr(symstr, name_off),
+            info: *r.buf.get(base + 4).ok_or("truncated symbol info")?,
             shndx: r.u16(base + 6)?,
             value: r.u64(base + 8)?,
             size: r.u64(base + 16)?,
@@ -793,6 +901,8 @@ fn apply_relocations(
     r: &Reader,
     sections: &[Section],
     target_idx: usize,
+    source_start: usize,
+    source_end: usize,
     symbols: &[Symbol],
     map_by_symval: &MapIndex,
     text_idx: Option<usize>,
@@ -818,7 +928,11 @@ fn apply_relocations(
         let sym = symbols
             .get(reloc.sym as usize)
             .ok_or("relocation references invalid symbol")?;
-        let insn_idx = code_base + reloc.offset as usize / insn::INSN_SIZE;
+        let reloc_offset = reloc.offset as usize;
+        if reloc_offset < source_start || reloc_offset >= source_end {
+            continue;
+        }
+        let insn_idx = code_base + (reloc_offset - source_start) / insn::INSN_SIZE;
         if insn_idx >= insns.len() {
             return Err(format!("relocation offset {} out of range", reloc.offset));
         }
@@ -854,15 +968,37 @@ fn apply_relocations(
                 }
             }
             R_BPF_64_32 => {
-                // bpf-to-bpf call. The callee symbol lives in `.text` (or in
-                // this same section); its value is a byte offset there.
-                let callee_off = sym.value as usize / insn::INSN_SIZE;
+                // SHT_REL carries the addend in the call's immediate. In BPF
+                // call-displacement units, target = S/8 + A + 1. A SECTION
+                // symbol has S=0 and relies entirely on A; an ordinary FUNC
+                // symbol normally has A=-1 and relies on S.
+                let callee_off = i64::try_from(sym.value / insn::INSN_SIZE as u64)
+                    .map_err(|_| "call target does not fit i64")?
+                    .checked_add(i64::from(insns[insn_idx].imm))
+                    .and_then(|v| v.checked_add(1))
+                    .ok_or("call relocation target overflows")?;
+                let callee_off = usize::try_from(callee_off).map_err(|_| {
+                    format!("call relocation for '{}' has negative target", sym.name)
+                })?;
                 let target = if Some(sym.shndx as usize) == text_idx {
                     let tb = text_base.ok_or("call into .text but .text not stitched in")?;
                     tb + callee_off
+                } else if sym.shndx as usize == target_idx {
+                    let callee_byte = callee_off
+                        .checked_mul(insn::INSN_SIZE)
+                        .ok_or("call target byte offset overflows")?;
+                    if callee_byte < source_start || callee_byte >= source_end {
+                        return Err(format!(
+                            "call target '{}' at byte {callee_byte} is outside entry slice {source_start}..{source_end}",
+                            sym.name
+                        ));
+                    }
+                    code_base + (callee_byte - source_start) / insn::INSN_SIZE
                 } else {
-                    // same-section call
-                    code_base + callee_off
+                    return Err(format!(
+                        "call relocation for '{}' targets unsupported section {}",
+                        sym.name, sym.shndx
+                    ));
                 };
                 let disp = target as i64 - insn_idx as i64 - 1;
                 insns[insn_idx].imm = disp as i32;
@@ -1023,7 +1159,19 @@ fn load_prog_array_inits(
             out.push(ProgArrayInit {
                 map_index: map,
                 index: slot,
-                program: sec.name.clone(),
+                program: if sym.is_global_func()
+                    && symbols
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.shndx == sym.shndx && candidate.is_global_func()
+                        })
+                        .count()
+                        > 1
+                {
+                    sym.name.clone()
+                } else {
+                    sec.name.clone()
+                },
             });
         }
     }

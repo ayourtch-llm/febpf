@@ -9,7 +9,7 @@ needs: programs, maps, and the two relocation kinds clang emits for them.
 | Feature | Detail |
 |---------|--------|
 | ELF64 | `ELFCLASS64`, both endians (`e_ident[EI_DATA]`); rejects non-`ET_REL`, non-`EM_BPF` (247) |
-| Programs | every executable `SHT_PROGBITS` section (`SHF_EXECINSTR`) becomes a named program; `.text` is stitched in as subprograms |
+| Programs | executable `SHT_PROGBITS` sections (`SHF_EXECINSTR`) become named programs; a section containing multiple global `STT_FUNC` entries is exposed once per function; `.text` is stitched in as subprograms |
 | `R_BPF_64_64` | map references in `ld_imm64` — resolved to a map index (`src=MAP_ID`) |
 | `R_BPF_64_32` | bpf-to-bpf calls, incl. cross-section into `.text` (retargeted, see below) |
 | Legacy maps | `struct bpf_map_def` array in a `maps` section, one symbol per map |
@@ -18,7 +18,13 @@ needs: programs, maps, and the two relocation kinds clang emits for them.
 | Global data | `.data`/`.data.*`, `.bss`/`.bss.*`, `.rodata*` (incl. `.rodata.str1.1`, `.rodata.cst16`) as single-entry array maps |
 
 Multiple `SEC()` programs in one object are all exposed; the CLI selects with
-`--prog <name>` (section name, e.g. `socket`, `xdp`; `.text` → `text`).
+`--prog <name>`. A section with one entry retains its section name (e.g.
+`socket`, `xdp`; `.text` → `text`) for backward compatibility. When clang
+places multiple global entry `STT_FUNC` symbols in one executable section,
+each function is sliced at its symbol value/size and exposed by its symbol
+name, in byte-offset then symbol-table order. The slice retains the containing
+section's program type, CO-RE/BTF context classification, relocations and
+debug records. Calls into `.text` still stitch that section after the slice.
 
 ## `.text` stitching (cross-section bpf-to-bpf calls)
 
@@ -36,6 +42,14 @@ instruction stream per program, the loader:
 Intra-`.text` calls are PC-relative and unchanged by the shift, so a single
 append handles transitive calls. Recursion and multi-level calls work; the
 only bound is the runtime's 8-frame call depth.
+
+`SHT_REL` has no explicit addend. For `R_BPF_64_32`, clang stores the addend
+in the call instruction's immediate using call-displacement units. The callee
+instruction offset within its defining section is therefore
+`symbol.value / 8 + immediate + 1`. This matters for relocations against a
+section symbol: `symbol.value` is zero and the immediate selects the actual
+subprogram. For ordinary `STT_FUNC` relocations clang normally leaves `-1` in
+the immediate, so the same formula selects `symbol.value / 8`.
 
 ## BTF `.maps` parsing (minimal)
 
