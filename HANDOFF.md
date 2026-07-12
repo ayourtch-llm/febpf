@@ -14,8 +14,8 @@ load-bearing constraint. Don't add any without a very good reason and the
 user's OK (raw Linux syscalls via `asm!` are used instead of libc — see the
 JIT's `sys` module).
 
-Everything works today: the full default-feature suite is **303 green + 4
-intentional heavy soundness sweeps ignored**; `--no-default-features` is **292
+Everything works today: the full default-feature suite is **304 green + 4
+intentional heavy soundness sweeps ignored**; `--no-default-features` is **293
 green + the same 4 ignored** (2026-07-11, after the XDP work below).
 `cargo clippy --all-targets -- -D warnings` is clean in both configs. **Keep
 BOTH configs green** — the JIT is now behind `default = ["jit"]`, so always
@@ -169,10 +169,10 @@ that work was done on an arm64 Mac).
   a warning gate nobody can turn on is worthless.
 - **CI checks the fixtures survive** (`git diff --diff-filter=D -- tests/`) —
   the regression that destroyed them in session 5 would now fail the build.
-  Note Linux CI *regenerates* the `.o` files (its clang can target BPF, so the
-  `maybe_compile` path actually runs) while macOS skips them, so only deletions
-  are an error on Linux; on macOS nothing may change at all. Both paths get
-  covered, which is why the matrix is worth having.
+  Note Linux CI *explicitly regenerates* the `.o` files with
+  `FEBPF_REGENERATE_FIXTURES=1` (its clang can target BPF) while macOS consumes
+  them read-only, so only deletions are an error on Linux; on macOS nothing may
+  change at all. Both paths get covered, which is why the matrix is worth having.
 - No benchmark *gate* — CI runners are far too noisy for timing assertions, so
   `bench` runs informationally only.
 
@@ -265,8 +265,9 @@ on Linux, and both would have bitten anyone who ran the suite on a Mac):
    `cargo test`, which then cascaded into ~30 failures that looked
    environmental. It now probes `--print-targets` for real BPF support and
    builds via a temp file that is renamed into place only on success, so a
-   failing clang can never damage a fixture. (All four copies of the helper —
-   `tests/{elf,btf,btfctx,sourcedebug}.rs` — had it.)
+   failing clang can never damage a fixture. Follow-up: ordinary tests no
+   longer invoke it at all. The four copies were consolidated in
+   `tests/common/mod.rs`, gated by `FEBPF_REGENERATE_FIXTURES=1`.
 2. **`kbpf::has_privilege()` returned `Err` on any non-Linux host.** The stub
    `probe()` reports ENOSYS, and only EPERM/EACCES were mapped to `Ok(false)`
    — so the probe violated the "never panics, always a definite answer"
@@ -495,10 +496,11 @@ buggy program replays identically under the debugger. Keep it that way.
 - `clang` (21.x) and `bpftool` **are installed**. `llvm-objdump` may not be on
   PATH (user installed it but it didn't show up last I checked — verify with
   `which llvm-objdump`).
-- ELF tests (`tests/elf.rs`) recompile `examples/c/*.c` → `tests/*.o` when
-  clang is present, else use the committed `.o` fixtures. If you change the C,
-  regenerate: `clang -O2 -g -target bpf -c examples/c/X.c -o tests/X.o` (use
-  `-O0` for `subprog.c` so the cross-`.text` call isn't inlined away).
+- ELF tests consume committed `.o` fixtures and never rewrite them by default.
+  If you change the C, regenerate with
+  `FEBPF_REGENERATE_FIXTURES=1 cargo test` using a BPF-capable clang. The shared
+  helper preserves `-O0` for `subprog.c` so the cross-`.text` call is not
+  inlined away.
 - `Date.now()`/randomness are fine here (this is a normal shell, not a workflow
   sandbox). The scratchpad dir is session-specific — use whatever the current
   session's system prompt says.
@@ -521,11 +523,10 @@ buggy program replays identically under the debugger. Keep it that way.
   merge` once silently ran inside the agent's worktree ("Already up to date")
   instead of main. Always `cd /home/ayourtch/rust/febpf` first or check
   `git worktree list` output paths.
-- `tests/*.o` fixtures: clang `-g` embeds the compilation directory, so
-  fixtures regenerated inside a worktree differ byte-wise from main-checkout
-  builds. Commit fixture `.o` files ONLY from the main checkout; worktree `.o`
-  churn in `git status` is expected noise (tell agents not to commit
-  regenerated pre-existing fixtures).
+- `tests/*.o` fixtures: clang `-g` embeds the compilation directory, so an
+  explicit regeneration inside a worktree differs byte-wise from a main-checkout
+  build. Commit fixture `.o` files ONLY from the main checkout; ordinary tests
+  are read-only and should produce no fixture churn.
 - After merging an agent branch: run both test configs + clippy FROM MAIN,
   `cargo build --release` (the corpus scan uses the release binary), rescan,
   then `git worktree remove --force <path>` + delete the branch.
@@ -544,12 +545,13 @@ cargo build --release
 ./target/release/febpf bench examples/sum_loop.s --iters 50000 --jit   # ~11 GIPS
 cargo test --release -- --ignored soundness     # optional heavy verifier sweep
 ```
-Latest host result after `2ec0fef`: default **303 passed / 4 ignored**;
-no-default-features **292 passed / 4 ignored**; both strict clippy invocations
-clean. The full tests may regenerate tracked `tests/*.o` fixtures with the
-host clang. Those are toolchain-byte differences, not intended edits: inspect
-and restore only the known regenerated fixtures before committing. Never
-delete or blindly rewrite user changes.
+Latest host result after the XDP kernel-differential + read-only fixture work:
+default **304 passed / 4 ignored**; no-default-features **293 passed / 4
+ignored**; both strict clippy invocations
+clean. Ordinary tests do not regenerate tracked `tests/*.o`; any fixture diff
+without `FEBPF_REGENERATE_FIXTURES=1` is now a regression. Explicitly generated
+objects can still differ by clang version and compilation path. Never delete or
+blindly rewrite user changes.
 The **differential tests are the safety net**: `tests/jit.rs` and the
 `jit_matches_interpreter_on_objects` test in `tests/elf.rs` run programs under
 both interpreter and JIT and require identical results. If you touch codegen,

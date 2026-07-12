@@ -4,47 +4,12 @@
 //! its own `.BTF`, so no running kernel is needed.
 //! See docs/specs/btf-ctx-pointers.md.
 
+mod common;
+
 use febpf::btf::{resolve_ctx_args, Btf, BtfCtx, CtxSlot};
 use febpf::verifier::Config;
 use febpf::{asm, Program, Vm};
-use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Recompile the fixture when a BPF-capable clang is available (mirrors
-/// tests/elf.rs). Apple clang has no BPF backend — running it would fail and
-/// destroy the committed fixture, so probe first and build via a temp file.
-fn maybe_compile() {
-    let bpf_capable = Command::new("clang")
-        .arg("--print-targets")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("bpf"))
-        .unwrap_or(false);
-    if !bpf_capable {
-        return;
-    }
-    if !Path::new("examples/c/btfctx.c").exists() {
-        return;
-    }
-    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
-    let tmp = format!(
-        "tests/.btfctx.o.{}.{}.tmp",
-        std::process::id(),
-        TEMP_ID.fetch_add(1, Ordering::Relaxed)
-    );
-    let status = Command::new("clang")
-        .args(["-O2", "-g", "-target", "bpf", "-c", "examples/c/btfctx.c", "-o"])
-        .arg(&tmp)
-        .status();
-    let ok = status.map(|s| s.success()).unwrap_or(false);
-    if ok {
-        std::fs::rename(&tmp, "tests/btfctx.o").expect("install fixture");
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    assert!(ok, "clang failed to compile btfctx.c");
-}
 
 fn fixture_bytes() -> Vec<u8> {
     // Compile at most once per test process — tests run in parallel, and a
@@ -52,7 +17,7 @@ fn fixture_bytes() -> Vec<u8> {
     static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     BYTES
         .get_or_init(|| {
-            maybe_compile();
+            common::maybe_compile("btfctx.c", "btfctx.o", "-O2");
             std::fs::read("tests/btfctx.o").expect("tests/btfctx.o fixture")
         })
         .clone()

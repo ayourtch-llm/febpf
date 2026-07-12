@@ -5,10 +5,10 @@
 //! tests live in `src/btf.rs`; this file checks the parser at vmlinux scale
 //! (~150k types) against an independent implementation.
 
+mod common;
+
 use febpf::btf::{relo_kind, Btf, BtfExt, Kind};
-use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 const VMLINUX: &str = "/sys/kernel/btf/vmlinux";
 
@@ -113,41 +113,8 @@ fn vmlinux_matches_bpftool() {
     }
 }
 
-/// Recompile a fixture when a BPF-capable clang is available (mirrors
-/// tests/elf.rs). Apple clang has no BPF backend — running it would fail and
-/// destroy the committed fixture, so probe first and build via a temp file.
 fn maybe_compile(src: &str, out: &str) {
-    let bpf_capable = Command::new("clang")
-        .arg("--print-targets")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("bpf"))
-        .unwrap_or(false);
-    if !bpf_capable {
-        return;
-    }
-    let src_path = format!("examples/c/{src}");
-    if !Path::new(&src_path).exists() {
-        return;
-    }
-    // Tests run concurrently, so a fixed temp name would let one invocation
-    // rename another's output before it installs its own fixture.
-    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
-    let tmp = format!(
-        "tests/.{out}.{}.{}.tmp",
-        std::process::id(),
-        TEMP_ID.fetch_add(1, Ordering::Relaxed)
-    );
-    let status = Command::new("clang")
-        .args(["-O2", "-g", "-target", "bpf", "-c", &src_path, "-o"])
-        .arg(&tmp)
-        .status();
-    let ok = status.map(|s| s.success()).unwrap_or(false);
-    if ok {
-        std::fs::rename(&tmp, format!("tests/{out}")).expect("install fixture");
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    assert!(ok, "clang failed to compile {src}");
+    common::maybe_compile(src, out, "-O2");
 }
 
 #[test]

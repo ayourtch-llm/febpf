@@ -1,58 +1,18 @@
 //! Tests for the ELF object loader, using real `clang -target bpf` output.
 //!
 //! The `.o` fixtures under `tests/` were produced by clang from the sources in
-//! `examples/c/`. When clang is available the fixtures are regenerated first so
-//! the tests always track the current toolchain; otherwise the committed
-//! fixtures are used as-is.
+//! `examples/c/`. Normal tests consume the committed fixtures without writing
+//! them; set `FEBPF_REGENERATE_FIXTURES=1` to rebuild explicitly.
+
+mod common;
 
 use febpf::verifier::Config;
 use febpf::{elf, Program, Vm};
-use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// True when the local clang can actually emit BPF objects. Finding `clang` is
-/// not enough: Apple clang ships no BPF backend, and running it anyway fails
-/// *after* it has already truncated the output — which would destroy the
-/// committed fixture.
-pub fn clang_targets_bpf() -> bool {
-    Command::new("clang")
-        .arg("--print-targets")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("bpf"))
-        .unwrap_or(false)
-}
 
 fn maybe_compile(src: &str, out: &str) {
-    if !clang_targets_bpf() {
-        return; // no BPF-capable clang; use the committed fixture
-    }
-    let src_path = format!("examples/c/{src}");
-    if !Path::new(&src_path).exists() {
-        return;
-    }
     let opt = if src == "subprog.c" { "-O0" } else { "-O2" };
-    // Build to a temp path and install on success, so a clang that fails
-    // partway can never leave the committed fixture damaged.
-    // Tests and integration-test binaries may compile the same fixture at
-    // once, so every invocation needs its own staging path.
-    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
-    let tmp = format!(
-        "tests/.{out}.{}.{}.tmp",
-        std::process::id(),
-        TEMP_ID.fetch_add(1, Ordering::Relaxed)
-    );
-    let status = Command::new("clang")
-        .args([opt, "-g", "-target", "bpf", "-c", &src_path, "-o"])
-        .arg(&tmp)
-        .status();
-    let ok = status.map(|s| s.success()).unwrap_or(false);
-    if ok {
-        std::fs::rename(&tmp, format!("tests/{out}")).expect("install fixture");
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    assert!(ok, "clang failed to compile {src}");
+    common::maybe_compile(src, out, opt);
 }
 
 fn load(path: &str) -> elf::Object {

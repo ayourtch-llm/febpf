@@ -216,4 +216,6 @@ byte swaps, atomics), verifier accept/reject cases, map round-trips,
 bpf-to-bpf calls, custom helpers, assembler/disassembler round-tripping,
 **JIT-vs-interpreter differential** tests, and **ELF loading** against real
 clang output (legacy `maps`, BTF `.maps`, cross-`.text` calls). The ELF
-tests recompile the `examples/c/*.c` fixtures when clang is present.
+tests consume committed `tests/*.o` fixtures without modifying them. To
+explicitly rebuild fixtures with a BPF-capable clang, run
+`FEBPF_REGENERATE_FIXTURES=1 cargo test`.

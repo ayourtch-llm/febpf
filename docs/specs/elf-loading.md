@@ -160,7 +160,9 @@ relocation algorithm in `src/relo.rs` — see `docs/specs/core-relocations.md`.
 
 ## Fixtures & testing
 
-`examples/c/*.c` are compiled to `tests/*.o` fixtures. `tests/elf.rs`
-regenerates them with clang when available (otherwise uses the committed
-`.o`), then asserts the loaded maps/programs and runs each under both the
+`examples/c/*.c` are compiled to committed `tests/*.o` fixtures. Ordinary
+tests are read-only and consume those objects as-is. Explicitly run
+`FEBPF_REGENERATE_FIXTURES=1 cargo test` with a BPF-capable clang to rebuild
+them; regeneration stages to unique temporary files and installs only complete
+objects. The tests assert the loaded maps/programs and run each under both the
 interpreter and the JIT, requiring identical results.

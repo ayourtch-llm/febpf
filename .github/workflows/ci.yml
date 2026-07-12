@@ -42,11 +42,9 @@ jobs:
           rustup default stable
           rustc -vV
 
-      # The ELF/BTF/debuginfo tests rebuild their .o fixtures from examples/c
-      # when — and only when — clang can actually target BPF. Linux clang can,
-      # so these runners exercise the real compile path; Apple clang has no BPF
-      # backend, so on macOS the tests fall back to the committed fixtures
-      # (see maybe_compile in tests/). Both paths are worth covering.
+      # Fixture regeneration is explicit: ordinary cargo test is read-only.
+      # Linux opts in for the first test pass to exercise the real clang path;
+      # Apple clang has no BPF backend, so macOS consumes committed fixtures.
       - name: Install clang (BPF-capable)
         if: runner.os == 'Linux'
         run: |
@@ -61,6 +59,8 @@ jobs:
       # wasm build depends on the crate compiling without it.
       - name: Test (jit)
         run: cargo test
+        env:
+          FEBPF_REGENERATE_FIXTURES: ${{ runner.os == 'Linux' && '1' || '0' }}
 
       - name: Test (no jit)
         run: cargo test --no-default-features
@@ -88,19 +88,14 @@ jobs:
           cargo run --release -- bench examples/sum_loop.s --iters 20000
           cargo run --release -- bench examples/sum_loop.s --iters 20000 --jit
 
-      # Fixtures are committed binaries, and a test run must never DELETE one.
-      # It did once: clang was invoked without checking it could target BPF, so
-      # on a toolchain without the BPF backend it failed *after* truncating the
-      # output, silently destroying 10 committed .o files on every `cargo test`.
+      # Fixtures are committed binaries. Linux deliberately regenerated them
+      # above, so byte differences are expected there; deletion never is.
       #
-      # Regenerating them is fine and expected on Linux (CI's clang differs
-      # from whoever last committed them), so only deletions are an error there.
-      # On macOS the compile is skipped entirely, so nothing may change at all.
       - name: Fixtures not destroyed
         if: runner.os == 'Linux'
         run: git diff --exit-code --diff-filter=D -- 'tests/*.o'
 
-      - name: Fixtures untouched (no BPF-capable clang)
+      - name: Fixtures untouched (regeneration disabled)
         if: runner.os == 'macOS'
         run: git diff --exit-code -- 'tests/*.o'
 
