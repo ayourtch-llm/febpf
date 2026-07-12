@@ -5,7 +5,7 @@ diving in; it's the context that isn't obvious from the code._
 
 ## ACTIVE RESUME CHECKPOINT (2026-07-12 20:05 UTC, read this first)
 
-The production-corpus moonshot is active. The tree is clean through `2fcc237`;
+The production-corpus moonshot is active. The tree is clean through `26ec5bc`;
 the iterator helper batch is `f1f8ff0` on top of the user's `39366b8` refresh
 checkpoint.
 Do not resume from the older 62/62 object-level claim: measurement is now per
@@ -18,6 +18,7 @@ time and commit before widening scope.
 Completed and committed in this wave:
 
 ```
+26ec5bc corpus: support macOS system bash
 2fcc237 ci: isolate fixtures and preserve arm registers
 f1f8ff0 helpers: complete iterator output layer
 e811bb8 verifier: type kernel iterator contexts
@@ -88,9 +89,12 @@ no-JIT pass consumed them; CI now checks for fixture deletion and restores the
 committed objects between passes. On aarch64, deferred rbpf-profile packet
 loads reloaded stale in-memory r1-r5 values without first spilling the live
 callee-saved registers; the classifier now spills r1-r6 before the trampoline.
-The classifier regression, exact regeneration/restore/no-JIT sequence, default
-Clippy, and aarch64 cross-check are green locally. The next pushed CI run is
-still required as the native aarch64 execution oracle.
+The next run proved x86-64 and aarch64 Linux fully green. Its remaining macOS
+failure was Bash 3.2 treating empty array expansion as unbound under `set -u`;
+the scanner now uses positional parameters for optional arguments and also
+replaces unavailable `mapfile` in the default object-discovery path. The
+absent-BTF and ordinary scanner tests are green locally; the next pushed run
+remains the macOS oracle.
 
 Privileged-kernel oracle result that changes the earlier audit:
 
