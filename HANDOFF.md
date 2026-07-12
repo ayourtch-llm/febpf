@@ -5,108 +5,76 @@ diving in; it's the context that isn't obvious from the code._
 
 ## ACTIVE RESUME CHECKPOINT (2026-07-12, read this first)
 
-Refresh experiment note: recurring job `cron-1` was deleted after tttt wrapped
-its payload as `[CRON cron-1]: /clear` instead of executing the slash command.
-No cleanup job remains active.
+Embedding-parity Waves 1-3 and their behavioral evidence are complete through
+`7e919d3`. At that code tip, `main` is 29 commits ahead of `origin/main`; this
+docs/handoff batch makes it 30 ahead when committed.
 
-Context refresh completed on 2026-07-12. The xdp-tools v1.6.3 audit, expanded
-scan, and measured redirect-map blocker batch are complete and committed.
+Completed linear batches:
 
-The user asked to expand the real-world eBPF corpus iteratively, implement the
-highest-impact measured blockers, and independently compare febpf with
-qmonnet/rbpf so febpf can honestly claim a strict feature superset where
-possible. **Do not copy any rbpf code.** Use its public documentation and
-behavior only as an inventory/reference. The user also asked for a short pause
-between corpus loops so they can interject.
+```
+7e919d3 api: add configurable packet metadata
+beb9eeb portability: add no_std alloc core
+190f186 verifier: add embedding policy hooks
+a90688b vm: add safe owned external regions
+19a2b46 tests: cover public embedding behavior
+4bc990b api: add embedding execution adapters
+ffdbee3 api: add typed instruction builder
+2a39d7d ci: cover Windows interpreter builds
+e60b901 docs: plan embedding parity work
+d4f7224 docs: audit rbpf feature parity
+```
 
-Current workspace state:
+Current capability checkpoint:
 
-- Branch `main` is 20 commits ahead of `origin/main` after the README,
-  redirect-map, and rbpf-audit batches were committed.
-- `README.md` was committed as `f4b8cae`. It now
-  documents current BTF/CO-RE/XDP/replay/race/equiv/optimizer functionality,
-  fixes the `Program { btf_ctx: None }` example, expands the CLI list, updates
-  the test counts, and labels fences correctly. `rustdoc --test README.md ...`
-  passed (1 passed, the intentionally partial helper snippet ignored), and
-  `git diff --check` passed. Preserve this work.
-- Before that edit, both suites passed on this exact checkout: default **328
-  passed + 4 ignored**, and `--no-default-features` **314 passed + 4 ignored**.
-- The current ignored cache has `bcc` v0.31.0, `cilium-ebpf` v0.21.0, pinned
-  `libbpf` headers, and `xdp-tools` v1.6.3. `libbpf-bootstrap` is unexpectedly
-  absent in this checkout despite the historical note; do not treat any old
-  object as proof that its source cache exists. The offline fetch rebuilt 56
-  BCC objects, one Cilium fixture, and five xdp-tools objects (62 total).
-  The prior 57/57 baseline was measured before this lane; the expanded scan is
-  complete at 62/62.
-- The xdp-tools tag was verified remotely: annotated tag object `63a210f...`
-  peels to the shallow checkout's commit `8fbad9f...`. The selected glob is
-  `xdp-bench/*.bpf.c`; all five files compiled successfully using the added
-  `headers/` include root, host multiarch `asm/` include, and
-  `HAVE_LIBBPF_BPF_PROGRAM__TYPE` define.
-- The xdp-tools lane, redirect-map implementation, tests, specs, and this
-  handoff are committed together in the commit following `f4b8cae`.
-- Resume progress: `cargo build --release` and the expanded scan completed.
-  Before the redirect-map batch, the 62-object corpus was 59/62 loaded and
-  verified; the three failures were exactly one each of `DEVMAP`, `CPUMAP`,
-  and `DEVMAP_HASH`. After implementing them, the unchanged corpus is **62/62
-  loaded and 62/62 verified (100%)**, with one static tail-call graph and no
-  map/helper/load/verifier blockers. The report is in the ignored
-  `corpus/coverage-report.txt`.
-- The measured blocker batch is documented in `docs/specs/map-types-3.md` and
-  covers distinct ELF/UAPI map kinds, generic array/hash-backed VM behavior,
-  assembler keywords, raw kernel map creation constants, replay v1 kind codes,
-  and integration/replay tests. Targeted tests pass.
-- Final validation for this batch is green: default tests **330 passed + 4
-  ignored**, `--no-default-features` **316 passed + 4 ignored**, clippy with
-  `-D warnings` passes in both configurations, and `git diff --check` passes.
-- The user is happy for the resumed session to explore `docs/ideas.md` and
-  sneak in one or two small, non-critical items if the corpus loop leaves
-  bandwidth. Keep that optional work after the scan/blocker checkpoint and
-  avoid expanding it into a new product direction.
+- Explicit no-data/raw/caller-metadata/XDP input adapters, configurable
+  caller/fixed packet metadata, transactional program replacement, and the
+  typed fluent instruction builder are complete.
+- Owned RO/RW external regions use opaque virtual guest addresses, have typed
+  verifier helper returns, retain runtime bounds/permission checks when
+  unverified, participate in snapshots, and agree across interpreter/JIT.
+- `verify_with_policy` runs application policy only after core verification
+  and keeps `Core` versus `Policy` rejection distinct.
+- `std` and `jit` are separate features. `--no-default-features` is the true
+  `no_std + alloc` core; portable interpreter-only builds use
+  `--no-default-features --features std`.
+- Native Windows interpreter CI, wasm `std` interpreter checks, and a true
+  `thumbv7em-none-eabihf` no-std target are configured.
+- The pinned production corpus remains 62/62 loaded and verified, with no
+  measured map/helper/load/verifier blockers.
 
-The active plan is:
+Validation at this tip:
 
-1. The rbpf feature-parity audit is complete in
-   `docs/specs/rbpf-feature-parity.md`; preserve its qualified claim language.
-2. If bandwidth remains, choose one small, non-critical item from
-   `docs/ideas.md`; keep the corpus-driven production loop as the main thrust.
-3. Keep both feature configurations and clippy `-D warnings` green and commit
-   coherent batches.
+- Default JIT: `cargo test --all-targets` — **357 passed + 4 ignored**.
+- `std` interpreter-only:
+  `cargo test --all-targets --no-default-features --features std` —
+  **342 passed + 4 ignored**.
+- Strict clippy is green with
+  `cargo clippy --all-targets -- -D warnings` and
+  `cargo clippy --all-targets --no-default-features --features std -- -D warnings`.
+- True no-std checks are green:
+  `cargo check --lib --target thumbv7em-none-eabihf --no-default-features` and
+  `cargo clippy --lib --target thumbv7em-none-eabihf --no-default-features -- -D warnings`.
+- CI also builds/clippies wasm with `--no-default-features --features std` and
+  builds/tests/clippies the same interpreter-only configuration on Windows.
 
-The first new lane is `xdp-project/xdp-tools` pinned at release **v1.6.3**
-(latest observed on 2026-07-12), because it adds a production networking/XDP
-axis missing from the tracing-heavy BCC lane. The audit selected only
-`xdp-bench/*.bpf.c`, not the whole repository. Follow the gentle-fetch
-contract in `docs/specs/corpus-tooling.md`: shallow, single branch, pinned,
-sequential, cached. Other candidates considered were Tracee and Inspektor
-Gadget; xdp-tools looked more self-contained and focused.
+Honest remaining differences and follow-ups:
 
-rbpf audit complete (public docs for rbpf 0.4.1, published 2026-02-06):
+- Owned external regions do not provide rbpf-style live, zero-copy aliases to
+  arbitrary host memory. Borrowed execution-scoped regions are deferred until
+  a real use case justifies their lifetime API.
+- Replay files do not serialize external regions. Any future support must
+  capture explicit bytes or report unavailable input, never host addresses.
+- Legacy `ld_abs`/`ld_ind`, a full opcode/backend differential, and the exact
+  significance of rbpf's optional Cranelift backend remain open before any
+  strict global-superset claim.
+- Arbitrary custom-only verifier replacement is intentionally not presented
+  as verification. Callers may apply their own callback before deliberately
+  running unverified; runtime virtual-memory checks still apply.
 
-- Reference: https://github.com/qmonnet/rbpf and
-  https://docs.rs/rbpf/latest/rbpf/
-- febpf is already materially ahead in kernel-style verification, bounded-loop
-  handling, safe JIT runtime faults, maps/helpers, tail calls, modern ISA,
-  ELF/BTF/BTF.ext/CO-RE, x86-64 + AArch64 JITs, debugger/replay/race/equiv/
-  optimizer tooling, and direct clang object support.
-- rbpf surfaces that prevent a blanket superset claim:
-  superset claim: four VM input modes (raw packet, caller metadata buffer,
-  fixed synthesized metadata buffer, no-data), replaceable verifier callback,
-  arbitrary allowed-memory ranges, a fluent Rust instruction-builder API,
-  `no_std` interpreter/assembler support, Windows interpreter support, and
-  runtime program replacement. rbpf also documents x86-64 JIT only, unsafe JIT
-  memory accesses, a simple non-kernel verifier, few built-in helpers, no
-  built-in maps, and no tail calls. Version 0.4.1 has an optional `cranelift`
-  feature; the audit records its existence without inferring backend coverage
-  or safety from dependency metadata.
-- `docs/specs/rbpf-feature-parity.md` distinguishes Linux eBPF
-  semantics/tooling from portable embedding APIs and concludes that febpf is
-  materially broader on the former axis but is not a strict global superset.
-  Do not implement cosmetic API parity ahead of measured corpus blockers.
-
-Immediate resume action: pause for user direction or take one small optional
-item from `docs/ideas.md`. The corpus cache is green at 62/62 and does not need
-another scan unless the implementation changes.
+Immediate resume action after this docs-only commit: pause for user direction.
+Preserve the qualified claim language in `docs/specs/rbpf-feature-parity.md`.
+Historical sections below predate the `std`/`jit` split; use the feature
+commands in this active checkpoint rather than their old command examples.
 
 ## What this is
 

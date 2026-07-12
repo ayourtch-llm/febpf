@@ -13,17 +13,21 @@ The comparison has two different axes that must not be collapsed:
    graphs and tail calls, direct clang ELF/BTF/BTF.ext/CO-RE loading, safe
    interpreter and hybrid-JIT runtime faults, and debugging, replay,
    conformance, race, equivalence, and optimization tools.
-2. **Embedding conveniences and portability.** febpf already exposes a broad,
-   safety-oriented embedding API. rbpf additionally provides four named input
-   wrappers, a replaceable verifier callback, arbitrary allowed host-memory
-   ranges, runtime program replacement, a fluent Rust instruction builder, a
-   `no_std` interpreter/assembler build, and a Windows interpreter build.
+2. **Embedding conveniences and portability.** febpf now covers rbpf's useful
+   public embedding behaviors: named input adapters, configurable metadata,
+   transactional program replacement, a fluent builder, post-core policy
+   hooks, owned external regions, `no_std + alloc`, and Windows interpreter
+   builds. It preserves these behaviors without putting host addresses in
+   guest registers. rbpf still exposes live aliases to arbitrary host-memory
+   ranges and permits a callback to replace verification entirely; febpf
+   intentionally does neither through its verified API.
 
 Therefore **febpf must not yet claim to be a strict global feature superset of
 rbpf 0.4.1**. It can accurately claim substantially broader Linux eBPF
-semantics, safety analysis, object support, developer tooling, and an existing
-typed embedding surface. The remaining gaps are pointed conveniences and
-portability targets, tracked in `embedding-parity-roadmap.md`.
+semantics, safety analysis, object support, developer tooling, and a portable
+typed embedding surface. The remaining differences are live host-memory
+aliasing, optional backend/legacy-opcode coverage, and exact unsafe API shape,
+not missing ordinary embedding workflows.
 
 ## Evidence baseline
 
@@ -39,10 +43,12 @@ Docs.rs records 0.4.1 as published on 2026-02-06. The crate has default
 dependencies; its presence is recorded here, but backend coverage and safety
 are not inferred merely from dependency metadata.
 
-febpf evidence is the source and specs in this repository at commit
-`48f253c` and later. In particular, see `README.md`, `docs/specs/`, the public
-API in `src/interp.rs`, platform gates in `src/jit/mod.rs`, and the two
-configuration test suites.
+febpf evidence is the source and specs in this repository through commit
+`7e919d3`. In particular, see `tests/embedding.rs`,
+`tests/external_regions.rs`, `tests/verification_policy.rs`,
+`tests/metadata.rs`, the public APIs in `src/builder.rs` and `src/interp.rs`,
+and the default, standard-library interpreter-only, true-`no_std`, Windows,
+and wasm CI configurations.
 
 ## Linux semantics and tooling matrix
 
@@ -68,16 +74,16 @@ configuration test suites.
 
 | Capability | febpf | rbpf 0.4.1 | Assessment |
 |---|---|---|---|
-| Input models | Generic mutable context bytes via `Vm::run` already cover raw-buffer, caller-metadata, and empty/no-data execution; `run_xdp` synthesizes kernel-style XDP context and packet regions | Separate raw-packet, caller metadata-buffer, fixed synthesized metadata-buffer, and no-data VM types | Both cover the core modes; rbpf names them as distinct wrapper types, while febpf uses one safer virtual-region API |
-| Raw packet pointer in `r1` | `Vm::run(&mut packet)` places a bounded virtual pointer to those bytes in `r1`, preserving program-visible direct-buffer semantics without exposing a host address | `EbpfVmRaw` places the host packet address in the first register | Capability present in both; febpf has the stronger runtime safety model |
-| Arbitrary metadata layout | Caller may supply bytes, but embedded host pointers are not imported as guest regions; XDP synthesis uses its defined layout | Caller-controlled metadata or fixed buffer with configurable data/data_end offsets | rbpf broader |
-| Replaceable verifier | Verification policy is configurable, and callers may skip verification, but cannot replace it with an arbitrary callback | `set_verifier` installs a function and immediately rechecks a loaded program | rbpf broader/pluggable |
-| Allowed host-memory ranges | No public registration of host addresses; memory must become a VM-owned typed region | `register_allowed_memory` appends arbitrary address ranges for interpreter access | rbpf broader as an escape hatch; febpf's restriction is intentional safety architecture |
-| Runtime program replacement | Construct a new `Vm`; tail-call bundle targets can be linked, but the entry program has no `set_program` API | `set_program` replaces and reverifies code on an existing VM | rbpf broader |
-| Instruction construction | Public `Insn` encoding/decoding plus textual assembler | Textual assembler plus fluent `insn_builder::BpfCode` API | febpf lacks only the fluent convenience layer |
+| Input models | `run_no_data`, `run_raw`, ordinary `run`, `run_xdp`, `run_metadata`, and fixed-metadata adapters cover empty, raw, caller-metadata, kernel XDP, and synthesized-metadata execution | Separate raw-packet, caller metadata-buffer, fixed synthesized metadata-buffer, and no-data VM types | Behavioral parity; febpf uses one VM and explicit safe adapters rather than wrapper VM types |
+| Raw packet pointer in `r1` | `Vm::run_raw` places a bounded virtual pointer to mutable packet bytes in `r1`, preserving direct-buffer semantics without exposing a host address | `EbpfVmRaw` places the host packet address in the first register | Behavioral parity; febpf has the stronger runtime safety model |
+| Arbitrary metadata layout | `MetadataLayout` configures data/data_end offsets; caller or fixed buffers receive opaque virtual packet bounds, with interpreter/JIT execution and runtime validation | Caller-controlled metadata or fixed buffer with configurable data/data_end offsets | Behavioral parity; febpf never imports host pointers and additionally verifies the layout |
+| Replaceable verifier | `verify_with_policy` runs application policy over instructions, maps, and `VerifyOk` only after core safety verification; callers may separately choose unchecked execution | `set_verifier` installs a function and immediately rechecks a loaded program | Practical policy-hook parity with stronger safety; arbitrary acceptance of core-invalid programs remains an intentional rbpf-only escape hatch |
+| Allowed host-memory ranges | `register_owned_region` provides opaque bounded RO/RW guest regions, typed helper returns, snapshots, and checked interpreter/JIT access even when unverified | `register_allowed_memory` appends arbitrary live host-address ranges for interpreter access | Owned copy-in/inspection behavior is covered and safer; rbpf alone provides zero-copy live host aliasing, intentionally deferred |
+| Runtime program replacement | `replace_program` transactionally rebuilds program-derived state, resets maps/tails/debug/verifier/JIT state, and preserves embedding configuration/helpers; verification is then explicit | `set_program` replaces and reverifies code on an existing VM | Behavioral parity; febpf has the clearer failure/state contract |
+| Instruction construction | Public `Insn`, textual assembler, and fluent typed `builder::Builder` covering representative ALU32/64, memory, jumps, calls, `lddw`, and exit | Textual assembler plus fluent `insn_builder::BpfCode` API | Parity for the audited construction convenience; exact method-for-method identity is not claimed |
 | Custom helper ABI | Boxed `UserHelper` with verifier-visible argument/return signatures and checked `MemBus` access | Plain five-`u64` function pointer registered at any `u32` id | Both extensible; febpf adds type/safety integration, rbpf is simpler |
-| `no_std` | No; febpf uses `std`. `--no-default-features` disables JIT, not the standard library | Default `std` can be disabled; interpreter and reduced-diagnostic assembler remain, normal JIT does not | rbpf broader |
-| Windows | No supported Windows execution target documented | README documents interpreter support on Windows and excludes JIT there | rbpf broader |
+| `no_std` | Default `std`/`jit` features are separable; `--no-default-features` builds the VM, verifier, maps/helpers, builder, and reduced-diagnostic assembler with `core + alloc`, checked on `thumbv7em-none-eabihf` | Default `std` can be disabled; interpreter and reduced-diagnostic assembler remain, normal JIT does not | Behavioral parity; febpf retains zero dependencies |
+| Windows | Native Windows CI checks default compatibility and runs the interpreter/library/CLI tests and strict clippy with `std` but no JIT | README documents interpreter support on Windows and excludes JIT there | Interpreter-platform parity |
 | Browser/WASM | Hand-written wasm ABI and self-contained playground; interpreter build is tested | No comparable public browser integration found; `no_std` alone is not treated as proof of WASM behavior | febpf broader |
 | Dependency profile | Zero Cargo dependencies by design | Uses byteorder, combine, hashbrown, log; libc is optional with `std`; Cranelift dependencies are optional | Different tradeoff; febpf smaller, rbpf enables `no_std` despite dependencies |
 
@@ -87,10 +93,11 @@ Safe wording for project documentation:
 
 > Compared with rbpf 0.4.1, febpf provides substantially broader Linux eBPF
 > verification, maps/helpers, object loading, safe JIT fault handling, and
-> analysis/debugging tooling, together with a typed embedding API. rbpf retains
-> several additional portability and host-integration conveniences, including
-> `no_std` and Windows interpreter support, verifier replacement, and allowed
-> host-memory ranges.
+> analysis/debugging tooling, together with a portable typed embedding API
+> covering rbpf's useful execution, construction, replacement, metadata, and
+> policy workflows. rbpf retains unsafe escape hatches for replacing the
+> verifier and live-aliasing arbitrary host addresses; febpf deliberately uses
+> mandatory core verification for verified runs and owned virtual regions.
 
 Avoid:
 
@@ -102,16 +109,11 @@ unproven at the opcode-behavior level.
 ## Follow-up policy
 
 Do not weaken the virtual-address model to imitate `EbpfVmRaw` or arbitrary
-host-memory ranges. If embedding parity becomes a real user need, preserve the
-safety invariant by registering owned/borrowed slices as bounded VM regions
-and exposing opaque guest handles. The most plausible low-risk additions are:
+host-memory ranges. Owned regions cover deterministic copy-in/inspection and
+snapshot behavior. Execution-scoped borrowed regions may be added later if a
+real zero-copy user requires live host aliasing, but their lifetimes must not
+outlive the run and replay must never serialize host addresses.
 
-1. a convenience no-data constructor or runner;
-2. a safe configurable metadata-layout adapter backed by VM regions;
-3. a fluent instruction builder over febpf's existing `Insn` constructors;
-4. entry-program replacement that rebuilds verifier/JIT/debug state
-   transactionally.
-
-`no_std` and Windows are architectural projects, not opportunistic parity
-patches. Implement any of these only when an embedding user or measured corpus
-requires it.
+Likewise, a caller can apply its own callback before deliberately running
+without `Vm::verify`; no verifier-shaped custom-only API is needed. Such a
+path must never arm XDP/probe evidence or masquerade as core verification.

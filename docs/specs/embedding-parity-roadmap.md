@@ -1,22 +1,40 @@
 # Embedding parity roadmap
 
-STATUS: active roadmap, agreed 2026-07-12. This closes the useful embedding
-and portability gaps identified by the rbpf 0.4.1 audit without weakening
-febpf's virtual-address safety model or zero-dependency constraint.
+STATUS: Waves 1-3 complete and Wave 4 evidence current as of 2026-07-12
+(through `7e919d3`). The useful behavioral embedding and portability gaps in
+the rbpf 0.4.1 audit are closed without weakening febpf's virtual-address
+safety model or zero-dependency constraint. Borrowed zero-copy aliases and
+external-region replay-file support are deferred follow-ups, not requirements
+for the behavioral-parity claim.
 
 ## Goal
 
-febpf already has a substantial embedding API: `Program`, `Vm`, configurable
-verification, caller-provided context memory, XDP packet execution, maps,
-typed custom helpers, interpreter/JIT execution, stepping, debugging, replay,
-and analysis are public library surfaces. The remaining work is targeted API
-ergonomics, host integration, and portability—not creation of an embedding
-API from scratch.
+febpf exposes `Program`, `Vm`, configurable core verification, application
+policy hooks, caller-provided and synthesized inputs, maps, typed helpers,
+interpreter/JIT execution, stepping, debugging, replay, and analysis. The
+completed work adds the remaining useful ergonomics, host integration, and
+portability behavior identified from rbpf's public API.
 
-The desired end state is behavioral coverage of rbpf's useful public
-embedding capabilities with stronger memory safety. This alone does not prove
-a strict global feature superset; legacy opcode behavior and optional backend
-coverage remain separate audit axes.
+Behavioral embedding parity does not prove a strict global feature superset.
+Legacy opcode behavior and optional backend coverage remain separate audit
+axes.
+
+## Completion record
+
+- **Wave 1 complete:** fluent typed builder, named input adapters,
+  transactional program replacement, and native Windows interpreter CI.
+- **Wave 2 complete:** owned RO/RW virtual regions with verifier-typed helper
+  returns and snapshots; core-first application policy hooks with distinct
+  core/policy errors; configurable caller/fixed metadata layouts backed by
+  opaque packet-region addresses. Borrowed live aliases are intentionally
+  deferred.
+- **Wave 3 complete:** separate `std` and `jit` features; VM/verifier/maps/
+  helpers/builder/reduced assembler on `no_std + alloc`; true no-std target,
+  standard-library interpreter-only, default JIT, wasm, and Windows checks.
+- **Wave 4 current:** public behavioral tests cover adapters, builder,
+  replacement success/failure, owned regions and unchecked faults, policy
+  ordering/rejection, metadata layouts, snapshots, and interpreter/JIT
+  agreement where applicable.
 
 ## Non-negotiable invariants
 
@@ -26,133 +44,120 @@ coverage remain separate audit axes.
 2. The normal verification path always runs febpf's structural and memory-
    safety verifier. Application policy hooks add constraints; they do not
    silently replace the safety proof.
-3. Any explicitly unchecked/custom-only path is named as such and retains
-   runtime virtual-memory checks.
-4. Program replacement is transactional: on any construction or verification
-   failure, the original VM remains usable and bit-for-bit equivalent in
-   program-derived state.
-5. The crate remains zero-dependency. `no_std` work may use `core` and `alloc`,
-   not new Cargo dependencies.
-6. Both current configurations remain green throughout:
-   `cargo test --all-targets` and
-   `cargo test --all-targets --no-default-features`, plus strict clippy for
-   each.
+3. Deliberately unverified execution retains runtime virtual-memory checks and
+   never masquerades as core verification or arms verifier-derived XDP/probe
+   state.
+4. Program replacement is transactional: construction failure leaves the
+   original VM usable and unchanged in program-derived state.
+5. The crate remains zero-dependency. The portable core uses only `core` and
+   `alloc`.
+6. All supported configurations remain green: default JIT
+   (`cargo test --all-targets`), standard-library interpreter-only
+   (`cargo test --all-targets --no-default-features --features std`), and the
+   true no-std library target (`cargo check --lib --target
+   thumbv7em-none-eabihf --no-default-features`), with strict clippy for each.
 
-## Wave 1 — embedding ergonomics and Windows baseline
+## Wave 1 — embedding ergonomics and Windows baseline (complete)
 
 ### Typed instruction builder
 
-Add a public fluent/typed builder over `Insn`, alongside rather than instead
-of the textual assembler. It should:
-
-- cover representative ALU32/64, moves, loads/stores, jumps, calls, `lddw`,
-  and exit;
-- reject invalid registers and immediate/displacement values at construction;
-- emit ordinary `Vec<Insn>` accepted by `Program`, encoding, verification,
-  interpreter, and JIT paths;
-- prove behavior with execution tests, not only struct-field assertions.
+`builder::Builder` is a fluent typed layer over `Insn`, alongside the textual
+assembler. It covers representative ALU32/64, moves, loads/stores, jumps,
+calls, `lddw`, and exit; validates registers; and emits ordinary `Vec<Insn>`
+accepted by encoding, verification, interpreter, and JIT paths. Tests cover
+both exact encodings and execution.
 
 ### Input conveniences
 
-Name the input modes already expressible through `Vm::run`:
-
-- no-data execution (empty context);
-- raw mutable bytes, where `r1` points to the bounded virtual context region;
-- ordinary caller metadata bytes;
-- kernel-style XDP metadata plus packet via `run_xdp`.
-
-Prefer small adapters or an `ExecutionInput` abstraction over four duplicated
-VM implementations. Configurable pointer-bearing metadata layouts belong to
-Wave 2 because they require multiple safe regions.
+One VM exposes explicit adapters for no-data, raw mutable bytes, ordinary
+caller metadata, kernel-style XDP metadata/packet execution, and configurable
+caller or fixed metadata layouts. The adapters reuse the virtual-region
+runtime rather than duplicating VM implementations.
 
 ### Transactional program replacement
 
-Add an entry-program replacement operation with an explicit state contract.
-The first version should preserve host configuration and registered helper
-implementations, rebuild all program-derived state, reset maps/tail programs/
-debug/verifier/JIT state, and install the new program only after complete
-construction succeeds. Compatible map-state preservation can be a later,
-explicit option; it must never happen heuristically.
+`Vm::replace_program` preserves embedding configuration and registered helper
+implementations while rebuilding program-derived state and resetting maps,
+tail programs, debug, verifier, and JIT state. A construction failure leaves
+the old executable and live state untouched. Re-verification is explicit.
 
 ### Windows interpreter baseline
 
-Make the interpreter/library configuration compile and run on Windows while
-cleanly stubbing Linux kernel integration and native JIT support. Add CI that
-at minimum cross-checks an MSVC target; run interpreter tests natively when a
-Windows runner is available. JIT support is not part of this milestone.
+Windows CI checks default-feature compatibility and natively builds, tests,
+and runs strict clippy for `std` interpreter-only mode. Native Windows JIT is
+outside this milestone.
 
-## Wave 2 — safe host integration and verifier policy
+## Wave 2 — safe host integration and verifier policy (complete)
 
 ### External regions
 
-Replace rbpf-style arbitrary allowed host-address ranges with safe virtual
-regions:
+Owned external regions return opaque guest bases and enforce bounds and RO/RW
+permissions through ordinary region resolution, including unverified runs.
+Typed helpers can return verifier-understood external pointers. Snapshots
+capture owned bytes, program replacement resets them, and interpreter/JIT
+behavior agrees.
 
-- registration returns an opaque guest base address;
-- every access is bounds- and mutability-checked by normal region resolution;
-- helper signatures can return a typed nullable/non-null external-region
-  pointer understood by the verifier;
-- owned regions come first; execution-scoped borrowed regions follow with
-  lifetimes that cannot outlive the run;
-- snapshots and replay either capture owned bytes or explicitly identify an
-  unavailable external input—never serialize host addresses.
-
-Behavioral acceptance includes valid reads/writes, boundary failures,
-read-only enforcement, helper-returned pointers, JIT/interpreter agreement,
-snapshot restoration, and clean failure under `--no-verify`.
+Execution-scoped borrowed regions are deferred until a measured zero-copy
+need justifies their lifetime API. Replay-file support for external regions is
+also deferred. Neither follow-up may serialize or expose host addresses.
 
 ### Verification policy hooks
 
-Add application-specific policy after the core verifier succeeds. The hook
-receives the program and/or `VerifyOk` evidence and may reject with an
-application error. If custom-only verification is needed, expose it as an
-explicitly unsafe or conspicuously unchecked mode; ordinary `verify` must
-never lose febpf's proof silently.
+`Vm::verify_with_policy` invokes application policy only after the core
+verifier succeeds. The policy can inspect instructions, map definitions, and
+`VerifyOk` evidence; core and policy failures remain distinct. The VM receives
+verifier-derived runtime state only after both stages accept.
 
-## Wave 3 — `no_std + alloc`
+A verifier-shaped custom-only API is unnecessary: callers can run their own
+callback before deliberately executing without `Vm::verify`, while runtime
+virtual-memory checks remain active. Such execution does not constitute core
+verification.
 
-Introduce a default `std` feature distinct from `jit`, then split the crate:
+### Configurable metadata
 
-- core VM, verifier, instruction encoding, maps, helpers, and a reduced-
-  diagnostic assembler use `core`/`alloc`;
-- CLI, filesystem, wall clocks, kernel conformance, native JIT allocation,
-  and OS integrations require `std`;
-- deterministic collection replacements preserve replay behavior;
-- `--no-default-features` becomes the `no_std + alloc` core, while a separate
-  `std` without `jit` configuration retains today's portable interpreter.
+`MetadataLayout` safely places opaque packet start/end addresses at configured
+offsets in caller-owned or fixed metadata buffers. Verification types those
+loads as packet pointers; runtime validates layout, packet base, region
+permissions, and bounds. Tests cover malformed layouts, unchecked failures,
+replacement behavior, and interpreter/JIT execution.
 
-Required checks include a true no-std target, `std` interpreter-only, and the
-default JIT build. This is an architectural batch and should follow the API
-work so public boundaries are stable before modules are feature-gated.
+## Wave 3 — `no_std + alloc` (complete)
 
-## Wave 4 — behavioral parity evidence
+The default `std` feature is distinct from `jit`. Core VM, verifier,
+instruction encoding, maps, helpers, builder, and a reduced-diagnostic
+assembler use `core + alloc`. CLI, filesystem, wall-clock/error integration,
+kernel conformance, and native JIT require `std` as appropriate.
 
-Build tests from rbpf's public documentation and documented behavior only; do
-not copy implementation code. Cover:
+`--no-default-features` is the true `no_std + alloc` core. Standard-library
+interpreter-only builds use `--no-default-features --features std`; default
+builds retain JIT. CI checks a real no-std target as well as wasm and Windows.
 
-- no-data, raw buffer, caller metadata, and synthesized metadata modes;
+## Wave 4 — behavioral parity evidence (current)
+
+Tests were derived from rbpf's public documentation and documented behavior
+only; no implementation code was copied. Evidence covers:
+
+- no-data, raw buffer, caller metadata, fixed metadata, and synthesized XDP;
 - program replacement success/failure and state rules;
-- policy-hook rejection and explicit unchecked behavior;
-- external-region reads, writes, and invalid accesses;
-- instruction-builder output and execution;
-- Windows interpreter and `no_std + alloc` builds.
+- policy acceptance, rejection, core short-circuit, and unchecked runtime
+  memory safety;
+- external-region reads/writes, permissions, invalid accesses, snapshots, and
+  interpreter/JIT agreement;
+- instruction-builder encoding and execution;
+- Windows interpreter, wasm, true `no_std + alloc`, standard-library
+  interpreter-only, and default JIT builds.
 
-Update `docs/specs/rbpf-feature-parity.md` after each wave. Claim embedding
-parity only when every row has behavioral evidence. A global strict-superset
-claim additionally requires resolving or explicitly scoping legacy
-`ld_abs`/`ld_ind` and completing an opcode/backend differential audit.
+The embedding matrix may claim behavioral parity with stronger memory safety.
+A global strict-superset claim still requires resolving or explicitly scoping
+legacy `ld_abs`/`ld_ind` and completing an opcode/backend differential audit,
+including the significance of rbpf's optional Cranelift feature.
 
-## Commit boundaries
+## Completed commit boundaries
 
-Keep the work reviewable and bisectable:
-
-1. docs: record embedding parity roadmap and correct the existing audit;
-2. api: add typed instruction builder;
-3. api: add input adapters and transactional replacement;
-4. portability: support the Windows interpreter build;
-5. vm/verifier: add safe external regions and policy hooks;
-6. portability: split the `no_std + alloc` core;
-7. tests/docs: finish behavioral parity evidence and claim update.
-
-Every implementation commit carries its own behavioral tests and passes both
-then-supported feature configurations before merge.
+1. `e60b901` — record the roadmap and correct the audit;
+2. `ffdbee3` — typed instruction builder;
+3. `4bc990b` and `19a2b46` — input/replacement APIs and public behavior;
+4. `2a39d7d` — Windows interpreter CI;
+5. `a90688b` and `190f186` — owned regions and policy hooks;
+6. `beb9eeb` — `no_std + alloc` core split;
+7. `7e919d3` — configurable metadata and remaining behavioral evidence.
