@@ -61,6 +61,7 @@ N     payload        (payload_len bytes; parsed per-tag below)
 | 0x09 | PACKET  | no       | original XDP packet bytes; presence selects XDP verification/execution and makes CTX the synthetic 24-byte `xdp_md` image |
 | 0x0a | TAIL_CALLS | no    | `u32 count`, then per static link: `str(map_name)`, `u32 slot`, `u32 insn_count`, encoded target instructions |
 | 0x0b | MAP_IN_MAP | no    | `u32 outer_count`, then per outer map: `u32 outer_index`, `u32 template_index`, `u32 value_count`, followed by `(u32 slot, u32 inner_index)` pairs |
+| 0x0c | LEGACY_PACKET | no | one `u8 profile` (`1` = Linux, `2` = Rbpf041); selects deprecated packet-load verification and execution semantics, and never contains a guest or host address |
 
 Round-trip is exact: `from_bytes(to_bytes(r)) == r` for every field.
 
@@ -76,6 +77,13 @@ Unknown section tags are skipped (forward compatibility). A `.o`/random file is
 rejected cleanly by the magic check. Element counts (maps, preload entries) are
 **never** used to pre-allocate — vectors grow as each bounds-checked element is
 read — so a corrupted count fails fast instead of attempting a huge allocation.
+
+An absent LEGACY_PACKET section preserves the pre-extension v1 behavior and
+serialization exactly. Unknown profile values and trailing bytes in its payload
+are corrupt-file errors. With PACKET, legacy reads use the recorded XDP packet;
+without PACKET, CTX is both context and raw packet. Configurable-metadata legacy
+replays are rejected until owned external regions and their selected bases have
+an address-free replay representation.
 
 ## Determinism contract
 

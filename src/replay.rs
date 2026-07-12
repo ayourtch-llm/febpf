@@ -15,6 +15,7 @@
 use crate::insn::{self, Insn};
 use crate::interp::{Program, Vm};
 use crate::maps::{MapDef, MapKind};
+use crate::verifier::LegacyPacketProfile;
 use alloc::{
     format,
     string::{String, ToString},
@@ -39,6 +40,7 @@ const TAG_OUTCOME: u8 = 0x08;
 const TAG_PACKET: u8 = 0x09;
 const TAG_TAIL_CALLS: u8 = 0x0a;
 const TAG_MAP_IN_MAP: u8 = 0x0b;
+const TAG_LEGACY_PACKET: u8 = 0x0c;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TailCallProgram {
@@ -68,6 +70,13 @@ pub enum Outcome {
     Error(String),
 }
 
+fn outcome(result: Result<u64, crate::interp::EbpfError>) -> Outcome {
+    match result {
+        Ok(r0) => Outcome::Exit(r0),
+        Err(error) => Outcome::Error(error.to_string()),
+    }
+}
+
 /// A decoded replay file. Round-trips exactly through
 /// [`Replay::to_bytes`]/[`Replay::from_bytes`].
 #[derive(Clone, Debug, PartialEq)]
@@ -80,6 +89,9 @@ pub struct Replay {
     /// XDP packet input. When present, `ctx` is the synthetic xdp_md image and
     /// replay verifies/executes under packet data/data_end rules.
     pub packet: Option<Vec<u8>>,
+    /// Deprecated packet-load semantics used for this invocation. Disabled
+    /// replays omit the additive LEGACY_PACKET section byte-for-byte.
+    pub legacy_packet: LegacyPacketProfile,
     pub seed: u64,
     /// Optional "stop at instruction count N" cursor for the debugger.
     pub stop_at: Option<u64>,
@@ -115,6 +127,7 @@ impl Replay {
             maps: prog.maps.clone(),
             ctx,
             packet: None,
+            legacy_packet: LegacyPacketProfile::Disabled,
             seed,
             stop_at,
             preload,
@@ -153,6 +166,7 @@ impl Replay {
             maps: prog.maps.clone(),
             ctx: vec![0u8; 24],
             packet: Some(packet),
+            legacy_packet: LegacyPacketProfile::Disabled,
             seed,
             stop_at,
             preload,
@@ -197,6 +211,7 @@ impl Replay {
             maps: prog.maps.clone(),
             ctx,
             packet: None,
+            legacy_packet: LegacyPacketProfile::Disabled,
             seed,
             stop_at,
             preload,
@@ -247,11 +262,99 @@ impl Replay {
             maps: prog.maps.clone(),
             ctx: vec![0u8; 24],
             packet: Some(packet),
+            legacy_packet: LegacyPacketProfile::Disabled,
             seed,
             stop_at,
             preload,
             outcome: Some(outcome),
             tail_calls,
+        })
+    }
+
+    /// Record a raw-buffer invocation using an explicit legacy packet-load
+    /// profile. The recorded CTX bytes are also the packet backing.
+    pub fn record_legacy_raw(
+        prog: &Program,
+        packet: Vec<u8>,
+        profile: LegacyPacketProfile,
+        seed: u64,
+        stop_at: Option<u64>,
+        preload: Vec<MapPreload>,
+    ) -> Result<Replay, String> {
+        if profile == LegacyPacketProfile::Disabled {
+            return Err("legacy replay requires Linux or Rbpf041 profile".into());
+        }
+        let mut vm = Vm::new(prog.clone())?;
+        vm.verify(crate::verifier::Config {
+            ctx_size: packet.len(),
+            legacy_packet: profile,
+            ..Default::default()
+        })
+        .map_err(|e| format!("legacy packet verification failed: {e}"))?;
+        if !vm.uses_legacy_packet() {
+            return Err("legacy replay program contains no legacy packet loads".into());
+        }
+        vm.set_prandom_seed(seed);
+        apply_preload(&mut vm, &preload)?;
+        let mut run_packet = packet.clone();
+        let outcome = outcome(vm.run_raw(&mut run_packet));
+        Ok(Replay {
+            febpf_version: febpf_version(),
+            insns: prog.insns.clone(),
+            maps: prog.maps.clone(),
+            ctx: packet,
+            packet: None,
+            legacy_packet: profile,
+            seed,
+            stop_at,
+            preload,
+            outcome: Some(outcome),
+            tail_calls: Vec::new(),
+        })
+    }
+
+    /// Record an XDP-backed invocation using an explicit legacy packet-load
+    /// profile. PACKET remains the only serialized packet data; no virtual or
+    /// host addresses enter the replay file.
+    pub fn record_legacy_xdp(
+        prog: &Program,
+        packet: Vec<u8>,
+        profile: LegacyPacketProfile,
+        seed: u64,
+        stop_at: Option<u64>,
+        preload: Vec<MapPreload>,
+    ) -> Result<Replay, String> {
+        if profile == LegacyPacketProfile::Disabled {
+            return Err("legacy replay requires Linux or Rbpf041 profile".into());
+        }
+        let mut vm = Vm::new(prog.clone())?;
+        vm.verify(crate::verifier::Config {
+            ctx_size: 24,
+            ctx_writable: false,
+            xdp: true,
+            legacy_packet: profile,
+            ..Default::default()
+        })
+        .map_err(|e| format!("legacy XDP verification failed: {e}"))?;
+        if !vm.uses_legacy_packet() {
+            return Err("legacy replay program contains no legacy packet loads".into());
+        }
+        vm.set_prandom_seed(seed);
+        apply_preload(&mut vm, &preload)?;
+        let mut run_packet = packet.clone();
+        let outcome = outcome(vm.run_xdp(&mut run_packet));
+        Ok(Replay {
+            febpf_version: febpf_version(),
+            insns: prog.insns.clone(),
+            maps: prog.maps.clone(),
+            ctx: vec![0u8; 24],
+            packet: Some(packet),
+            legacy_packet: profile,
+            seed,
+            stop_at,
+            preload,
+            outcome: Some(outcome),
+            tail_calls: Vec::new(),
         })
     }
 
@@ -268,20 +371,14 @@ impl Replay {
     /// to run or drop into the debugger. `ctx` is the (mutable) working copy.
     pub fn build_vm(&self) -> Result<(Vm, Vec<u8>), String> {
         let mut vm = Vm::new(self.program())?;
-        if !self.tail_calls.is_empty() && self.packet.is_none() {
-            vm.verify(crate::verifier::Config::default())
+        let config = self.verifier_config();
+        if !self.tail_calls.is_empty()
+            || self.packet.is_some()
+            || self.legacy_packet != LegacyPacketProfile::Disabled
+        {
+            vm.verify(config.clone())
                 .map_err(|e| format!("replayed entry no longer verifies: {e}"))?;
         }
-        let link_cfg = if self.packet.is_some() {
-            crate::verifier::Config {
-                ctx_size: 24,
-                ctx_writable: false,
-                xdp: true,
-                ..Default::default()
-            }
-        } else {
-            crate::verifier::Config::default()
-        };
         for link in &self.tail_calls {
             vm.register_tail_call(
                 &link.map_name,
@@ -291,24 +388,54 @@ impl Replay {
                     maps: self.maps.clone(),
                     btf_ctx: None,
                 },
-                link_cfg.clone(),
+                config.clone(),
             )?;
         }
         vm.set_prandom_seed(self.seed);
         apply_preload(&mut vm, &self.preload)?;
         let ctx = if let Some(packet) = &self.packet {
-            vm.verify(crate::verifier::Config {
-                ctx_size: 24,
-                ctx_writable: false,
-                xdp: true,
-                ..Default::default()
-            })
-            .map_err(|e| format!("replayed XDP program no longer verifies: {e}"))?;
             vm.prepare_xdp(packet)?
         } else {
             self.ctx.clone()
         };
         Ok((vm, ctx))
+    }
+
+    /// Execute a VM returned by [`Replay::build_vm`] with the recorded input
+    /// adapter, including the packet backing required by legacy loads.
+    pub fn run(&self, vm: &mut Vm, ctx: &mut [u8]) -> Result<u64, crate::interp::EbpfError> {
+        match (self.legacy_packet, self.packet.is_some()) {
+            (LegacyPacketProfile::Disabled, _) => vm.run(ctx),
+            (_, false) => vm.run_raw(ctx),
+            (_, true) => {
+                let mut machine = vm.machine_prepared_xdp(ctx)?;
+                loop {
+                    if let Some(result) = machine.step()? {
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+    }
+
+    fn verifier_config(&self) -> crate::verifier::Config {
+        if self.packet.is_some() {
+            crate::verifier::Config {
+                ctx_size: 24,
+                ctx_writable: false,
+                xdp: true,
+                legacy_packet: self.legacy_packet,
+                ..Default::default()
+            }
+        } else if self.legacy_packet != LegacyPacketProfile::Disabled {
+            crate::verifier::Config {
+                ctx_size: self.ctx.len(),
+                legacy_packet: self.legacy_packet,
+                ..Default::default()
+            }
+        } else {
+            crate::verifier::Config::default()
+        }
     }
 
     // -- serialization ------------------------------------------------------
@@ -386,6 +513,15 @@ impl Replay {
         // PACKET marks an XDP replay and carries the original packet input.
         if let Some(packet) = &self.packet {
             section(&mut out, TAG_PACKET, packet);
+        }
+
+        if self.legacy_packet != LegacyPacketProfile::Disabled {
+            let profile = match self.legacy_packet {
+                LegacyPacketProfile::Linux => 1,
+                LegacyPacketProfile::Rbpf041 => 2,
+                LegacyPacketProfile::Disabled => unreachable!(),
+            };
+            section(&mut out, TAG_LEGACY_PACKET, &[profile]);
         }
 
         // SEED
@@ -467,6 +603,7 @@ impl Replay {
         let mut packet = None;
         let mut tail_calls = Vec::new();
         let mut map_in_map = Vec::new();
+        let mut legacy_packet = LegacyPacketProfile::Disabled;
 
         let mut pos = 10usize;
         while pos < bytes.len() {
@@ -613,6 +750,17 @@ impl Replay {
                         map_in_map.push((outer, template, values));
                     }
                 }
+                TAG_LEGACY_PACKET => {
+                    let mut r = Reader::new(payload);
+                    legacy_packet = match r.u8()? {
+                        1 => LegacyPacketProfile::Linux,
+                        2 => LegacyPacketProfile::Rbpf041,
+                        profile => return Err(format!("unknown legacy packet profile {profile}")),
+                    };
+                    if !r.rest().is_empty() {
+                        return Err("LEGACY_PACKET section has trailing bytes".into());
+                    }
+                }
                 _ => {} // unknown section: skip (forward compatibility)
             }
         }
@@ -634,6 +782,7 @@ impl Replay {
             maps,
             ctx: ctx.ok_or("replay file missing CTX section")?,
             packet,
+            legacy_packet,
             seed: seed.ok_or("replay file missing SEED section")?,
             stop_at,
             preload,

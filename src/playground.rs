@@ -245,6 +245,8 @@ pub struct Session {
     preload: Vec<crate::replay::MapPreload>,
     /// XDP packet input for replay sessions.
     packet: Option<Vec<u8>>,
+    /// Legacy packet-load semantics and therefore the stepping input adapter.
+    legacy_packet: verifier::LegacyPacketProfile,
 }
 
 /// Load a replay file's bytes into a debugger [`Session`], positioned at its
@@ -288,6 +290,7 @@ impl Session {
             seed: None,
             preload: Vec::new(),
             packet: None,
+            legacy_packet: verifier::LegacyPacketProfile::Disabled,
         })
     }
 
@@ -305,6 +308,7 @@ impl Session {
             seed: Some(r.seed),
             preload: r.preload,
             packet: r.packet,
+            legacy_packet: r.legacy_packet,
         })
     }
 
@@ -322,14 +326,29 @@ impl Session {
                 ctx_size: 24,
                 ctx_writable: false,
                 xdp: true,
+                legacy_packet: self.legacy_packet,
                 ..Default::default()
             })
             .map_err(|e| format!("replayed XDP program no longer verifies: {e}"))?;
             vm.prepare_xdp(packet)?
         } else {
+            if self.legacy_packet != verifier::LegacyPacketProfile::Disabled {
+                vm.verify(crate::verifier::Config {
+                    ctx_size: self.ctx_template.len(),
+                    legacy_packet: self.legacy_packet,
+                    ..Default::default()
+                })
+                .map_err(|e| format!("replayed legacy program no longer verifies: {e}"))?;
+            }
             self.ctx_template.clone()
         };
-        let mut m = vm.machine(&mut ctx);
+        let mut m = match (self.legacy_packet, self.packet.is_some()) {
+            (verifier::LegacyPacketProfile::Disabled, _) => vm.machine(&mut ctx),
+            (_, false) => vm.machine_raw(&mut ctx).map_err(|e| e.to_string())?,
+            (_, true) => vm
+                .machine_prepared_xdp(&mut ctx)
+                .map_err(|e| e.to_string())?,
+        };
         let mut status = Status::Running;
         while m.insn_count < self.steps {
             match m.step() {

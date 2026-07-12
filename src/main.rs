@@ -38,6 +38,8 @@ options:
   --ctx <hex|@file>    context memory contents (hex string or file)
   --packet <file>      run an XDP program over raw packet bytes from file
   --pcap <file>        run an XDP program over every packet in classic pcap
+  --legacy-packet <profile>
+                       enable deprecated packet loads: linux or rbpf-0.4.1
   --packet-index <n>   record packet N from --pcap (1-based, default 1)
   --ctx-size <n>       context size in bytes (default 4096, or data length)
   --no-verify          run without verifying first (still memory-safe)
@@ -78,6 +80,7 @@ struct Opts {
     packet: Option<String>,
     pcap: Option<String>,
     packet_index: usize,
+    legacy_packet: verifier::LegacyPacketProfile,
     ctx_size: Option<usize>,
     no_verify: bool,
     no_explain: bool,
@@ -98,7 +101,10 @@ struct Opts {
 }
 
 fn parse_args() -> Result<Opts, String> {
-    let mut args = std::env::args().skip(1);
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Opts, String> {
     let cmd = args.next().ok_or("missing command")?;
     let mut o = Opts {
         cmd,
@@ -110,6 +116,7 @@ fn parse_args() -> Result<Opts, String> {
         packet: None,
         pcap: None,
         packet_index: 1,
+        legacy_packet: verifier::LegacyPacketProfile::Disabled,
         ctx_size: None,
         no_verify: false,
         no_explain: false,
@@ -142,6 +149,18 @@ fn parse_args() -> Result<Opts, String> {
                     .map_err(|e| format!("bad --packet-index: {e}"))?;
                 if o.packet_index == 0 {
                     return Err("--packet-index is 1-based and must be nonzero".into());
+                }
+            }
+            "--legacy-packet" => {
+                o.legacy_packet = match args.next().as_deref() {
+                    Some("linux") => verifier::LegacyPacketProfile::Linux,
+                    Some("rbpf-0.4.1") => verifier::LegacyPacketProfile::Rbpf041,
+                    Some(value) => {
+                        return Err(format!(
+                            "bad --legacy-packet profile '{value}': expected linux or rbpf-0.4.1"
+                        ))
+                    }
+                    None => return Err("--legacy-packet needs a value: linux or rbpf-0.4.1".into()),
                 }
             }
             "--ctx-size" => {
@@ -457,8 +476,28 @@ fn verifier_config(o: &Opts, ctx_len: usize, xdp: bool) -> verifier::Config {
         ctx_writable: !o.readonly_ctx,
         strict_alignment: o.strict_align,
         xdp,
+        legacy_packet: o.legacy_packet,
         ..Default::default()
     }
+}
+
+fn validate_legacy_options(o: &Opts) -> Result<(), String> {
+    if o.legacy_packet == verifier::LegacyPacketProfile::Disabled {
+        return Ok(());
+    }
+    if !matches!(o.cmd.as_str(), "verify" | "analyze" | "run" | "profile" | "debug" | "record") {
+        return Err(format!(
+            "--legacy-packet is not supported by {}; use verify, analyze, run, profile, debug, or record",
+            o.cmd
+        ));
+    }
+    if o.packet.is_none() && o.pcap.is_none() {
+        return Err(
+            "--legacy-packet requires packet input: use --packet <raw-packet-file> (or --pcap with run/record)"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn link_tail_calls(vm: &mut Vm, links: &[TailLink], cfg: &verifier::Config) -> Result<(), String> {
@@ -480,7 +519,40 @@ fn cmd_record(o: &Opts, prog: Program, xdp: bool, links: &[TailLink]) -> Result<
         .as_deref()
         .ok_or("record needs an output file: -o <out.febpf>")?;
     let seed = febpf::interp::DEFAULT_PRANDOM_SEED;
-    let replay = if xdp {
+    let replay = if o.legacy_packet != verifier::LegacyPacketProfile::Disabled {
+        if !links.is_empty() {
+            return Err(
+                "recording legacy packet loads with tail-call bundles is not yet supported".into(),
+            );
+        }
+        let packet = if let Some(path) = &o.pcap {
+            let bytes =
+                std::fs::read(path).map_err(|e| format!("cannot read pcap {path}: {e}"))?;
+            let capture = febpf::pcap::parse(&bytes)?;
+            capture
+                .packets
+                .get(o.packet_index - 1)
+                .ok_or_else(|| {
+                    format!(
+                        "pcap has {} packet(s); cannot select --packet-index {}",
+                        capture.packets.len(),
+                        o.packet_index
+                    )
+                })?
+                .data
+                .to_vec()
+        } else {
+            read_packet(o)?
+        };
+        febpf::replay::Replay::record_legacy_xdp(
+            &prog,
+            packet,
+            o.legacy_packet,
+            seed,
+            o.stop_at,
+            Vec::new(),
+        )?
+    } else if xdp {
         let packet = if let Some(path) = &o.pcap {
             let bytes = std::fs::read(path).map_err(|e| format!("cannot read pcap {path}: {e}"))?;
             let capture = febpf::pcap::parse(&bytes)?;
@@ -583,7 +655,7 @@ fn cmd_replay(o: &Opts) -> Result<ExitCode, String> {
     if o.run {
         // Reproduce r0 and apply the determinism guard.
         vm.insn_limit = 100_000_000;
-        let reproduced = vm.run(&mut ctx);
+        let reproduced = replay.run(&mut vm, &mut ctx);
         let repro = match &reproduced {
             Ok(r0) => febpf::replay::Outcome::Exit(*r0),
             Err(e) => febpf::replay::Outcome::Error(e.to_string()),
@@ -601,7 +673,12 @@ fn cmd_replay(o: &Opts) -> Result<ExitCode, String> {
         start_at: replay.stop_at,
         ..Default::default()
     };
-    debug::repl(&mut vm, &mut ctx, opts).map_err(|e| e.to_string())?;
+    match (replay.legacy_packet, replay.packet.is_some()) {
+        (febpf::verifier::LegacyPacketProfile::Disabled, _) => debug::repl(&mut vm, &mut ctx, opts),
+        (_, false) => debug::repl_raw(&mut vm, &mut ctx, opts),
+        (_, true) => debug::repl_prepared_xdp(&mut vm, &mut ctx, opts),
+    }
+    .map_err(|e| e.to_string())?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -817,6 +894,7 @@ fn run() -> Result<ExitCode, String> {
         return Err("--pcap is currently supported by run and record".into());
     }
     let xdp = elf_xdp || o.packet.is_some() || o.pcap.is_some();
+    validate_legacy_options(&o)?;
     if !tail_links.is_empty()
         && o.no_verify
         && matches!(o.cmd.as_str(), "run" | "profile" | "debug" | "bench")
@@ -826,7 +904,8 @@ fn run() -> Result<ExitCode, String> {
     if xdp
         && !matches!(
             o.cmd.as_str(),
-            "asm" | "disasm" | "verify" | "analyze" | "dot" | "run" | "profile" | "record"
+            "asm" | "disasm" | "verify" | "analyze" | "dot" | "run" | "profile" | "debug"
+                | "record"
                 | "conftest"
         )
     {
@@ -1033,6 +1112,9 @@ fn run() -> Result<ExitCode, String> {
         "debug" => {
             let mut ctx = make_ctx(&o)?;
             let mut vm = Vm::new(prog)?;
+            if xdp && o.no_verify {
+                return Err("packet debugging requires verification; remove --no-verify".into());
+            }
             if let Some(di) = debug {
                 vm.set_debug(di);
             }
@@ -1041,14 +1123,27 @@ fn run() -> Result<ExitCode, String> {
                 link_tail_calls(&mut vm, &tail_links, &vcfg)?;
                 match vm.verify(vcfg) {
                     Ok(_) => println!("verifier: PASSED"),
+                    Err(e) if xdp => {
+                        return Err(format!(
+                            "verification failed: {e}\n{}",
+                            explain(vm.insns(), &e, &o)
+                        ));
+                    }
                     Err(e) => {
                         println!("verifier: FAILED: {e} (debugging anyway)");
                         print!("{}", explain(vm.insns(), &e, &o));
                     }
                 }
             }
-            debug::repl(&mut vm, &mut ctx, debug::DebuggerOpts::default())
-                .map_err(|e| e.to_string())?;
+            if xdp {
+                let packet = read_packet(&o)?;
+                ctx = vm.prepare_xdp(&packet)?;
+                debug::repl_prepared_xdp(&mut vm, &mut ctx, debug::DebuggerOpts::default())
+                    .map_err(|e| e.to_string())?;
+            } else {
+                debug::repl(&mut vm, &mut ctx, debug::DebuggerOpts::default())
+                    .map_err(|e| e.to_string())?;
+            }
         }
         "bench" => {
             let mut ctx = make_ctx(&o)?;
@@ -1121,5 +1216,83 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn parse(words: &[&str]) -> Result<Opts, String> {
+        parse_args_from(words.iter().map(|word| (*word).to_string()))
+    }
+
+    #[test]
+    fn parses_both_legacy_packet_profiles_without_changing_the_default() {
+        let default = parse(&["verify", "program.s"]).unwrap();
+        assert_eq!(
+            default.legacy_packet,
+            verifier::LegacyPacketProfile::Disabled
+        );
+
+        let linux = parse(&[
+            "run",
+            "--legacy-packet",
+            "linux",
+            "--packet",
+            "frame.bin",
+            "program.s",
+        ])
+        .unwrap();
+        assert_eq!(linux.legacy_packet, verifier::LegacyPacketProfile::Linux);
+
+        let rbpf = parse(&[
+            "verify",
+            "--legacy-packet",
+            "rbpf-0.4.1",
+            "--packet",
+            "frame.bin",
+            "program.s",
+        ])
+        .unwrap();
+        assert_eq!(rbpf.legacy_packet, verifier::LegacyPacketProfile::Rbpf041);
+    }
+
+    #[test]
+    fn rejects_unknown_or_missing_legacy_packet_profile() {
+        let error = match parse(&["verify", "--legacy-packet", "rbpf", "program.s"]) {
+            Ok(_) => panic!("unknown profile parsed"),
+            Err(error) => error,
+        };
+        assert!(error.contains("expected linux or rbpf-0.4.1"), "{error}");
+
+        let error = match parse(&["verify", "program.s", "--legacy-packet"]) {
+            Ok(_) => panic!("missing profile parsed"),
+            Err(error) => error,
+        };
+        assert!(error.contains("needs a value"), "{error}");
+    }
+
+    #[test]
+    fn legacy_packet_requires_explicit_input_and_a_supported_command() {
+        let missing_packet = parse(&[
+            "verify",
+            "--legacy-packet",
+            "linux",
+            "program.s",
+        ]).unwrap();
+        let error = validate_legacy_options(&missing_packet).unwrap_err();
+        assert!(error.contains("requires packet input"), "{error}");
+
+        let unsupported = parse(&[
+            "bench",
+            "--legacy-packet",
+            "linux",
+            "--packet",
+            "frame.bin",
+            "program.s",
+        ]).unwrap();
+        let error = validate_legacy_options(&unsupported).unwrap_err();
+        assert!(error.contains("not supported by bench"), "{error}");
     }
 }

@@ -7,6 +7,7 @@
 use febpf::interp::DEFAULT_PRANDOM_SEED;
 use febpf::maps::Map;
 use febpf::replay::{MapPreload, Outcome, Replay, TailCallProgram};
+use febpf::verifier::LegacyPacketProfile;
 use febpf::{asm, Program, Vm};
 
 fn prog(src: &str) -> Program {
@@ -149,6 +150,89 @@ fn xdp_packet_round_trips_and_replays() {
     assert_eq!(parsed, rec);
     let (mut vm, mut ctx) = parsed.build_vm().unwrap();
     assert_eq!(vm.run(&mut ctx).unwrap(), 0x1234);
+}
+
+#[test]
+fn legacy_profiles_round_trip_and_reproduce_their_distinct_outcomes() {
+    let linux = Replay::record_legacy_raw(
+        &prog("r6 = r1\nldabsw 1\nr0 = 99\nexit"),
+        vec![1, 2],
+        LegacyPacketProfile::Linux,
+        DEFAULT_PRANDOM_SEED,
+        Some(2),
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(linux.outcome, Some(Outcome::Exit(0)));
+    let linux = Replay::from_bytes(&linux.to_bytes()).unwrap();
+    assert_eq!(linux.legacy_packet, LegacyPacketProfile::Linux);
+    let (mut vm, mut ctx) = linux.build_vm().unwrap();
+    assert_eq!(linux.run(&mut vm, &mut ctx).unwrap(), 0);
+
+    let rbpf = Replay::record_legacy_raw(
+        &prog("ldabsdw 1\nexit"),
+        vec![1, 2],
+        LegacyPacketProfile::Rbpf041,
+        DEFAULT_PRANDOM_SEED,
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(matches!(rbpf.outcome, Some(Outcome::Error(ref msg)) if msg.contains("out of bounds")));
+    let rbpf = Replay::from_bytes(&rbpf.to_bytes()).unwrap();
+    assert_eq!(rbpf.legacy_packet, LegacyPacketProfile::Rbpf041);
+    let (mut vm, mut ctx) = rbpf.build_vm().unwrap();
+    assert!(rbpf
+        .run(&mut vm, &mut ctx)
+        .unwrap_err()
+        .to_string()
+        .contains("out of bounds"));
+}
+
+#[test]
+fn legacy_profile_corruption_is_rejected_and_old_files_stay_canonical() {
+    let ordinary = Replay::record(
+        &prog("r0 = 1\nexit"),
+        Vec::new(),
+        DEFAULT_PRANDOM_SEED,
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+    let ordinary_bytes = ordinary.to_bytes();
+    let parsed = Replay::from_bytes(&ordinary_bytes).unwrap();
+    assert_eq!(parsed.legacy_packet, LegacyPacketProfile::Disabled);
+    assert_eq!(parsed.to_bytes(), ordinary_bytes);
+
+    let mut corrupt = ordinary_bytes;
+    corrupt.extend_from_slice(&[0x0c, 1, 0, 0, 0, 99]);
+    let error = Replay::from_bytes(&corrupt).unwrap_err();
+    assert!(error.contains("unknown legacy packet profile 99"), "{error}");
+}
+
+#[test]
+fn legacy_xdp_replay_debugger_steps_against_recorded_packet() {
+    let replay = Replay::record_legacy_xdp(
+        &prog("r6 = r1\nldabsb 1\nexit"),
+        vec![0x11, 0xab],
+        LegacyPacketProfile::Linux,
+        DEFAULT_PRANDOM_SEED,
+        Some(2),
+        Vec::new(),
+    )
+    .unwrap();
+    let replay = Replay::from_bytes(&replay.to_bytes()).unwrap();
+    let (mut vm, mut ctx) = replay.build_vm().unwrap();
+    let opts = febpf::debug::DebuggerOpts::default();
+    let mut session = febpf::debug::DebugSession::new_prepared_xdp(&mut vm, &mut ctx, &opts)
+        .unwrap();
+    assert_eq!(session.machine().step().unwrap(), None);
+    assert_eq!(session.machine().step().unwrap(), None);
+    assert_eq!(session.machine().regs[0], 0xab);
+
+    let mut browser_session = febpf::playground::replay_session(&replay.to_bytes()).unwrap();
+    let registers = browser_session.command("regs");
+    assert!(registers.contains("r0 = 0x00000000000000ab"), "{registers}");
 }
 
 #[test]

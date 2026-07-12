@@ -248,6 +248,32 @@ impl<'a> DebugSession<'a> {
     pub fn new(vm: &'a mut Vm, ctx: &'a mut [u8], opts: &DebuggerOpts) -> Self {
         vm.echo_printk = opts.echo_printk;
         let m = vm.machine(ctx);
+        Self::from_machine(m, opts)
+    }
+
+    /// Start a debugger whose context is also a legacy raw-packet backing.
+    pub fn new_raw(
+        vm: &'a mut Vm,
+        ctx: &'a mut [u8],
+        opts: &DebuggerOpts,
+    ) -> Result<Self, crate::interp::EbpfError> {
+        vm.echo_printk = opts.echo_printk;
+        let m = vm.machine_raw(ctx)?;
+        Ok(Self::from_machine(m, opts))
+    }
+
+    /// Start a debugger over a packet installed by [`Vm::prepare_xdp`].
+    pub fn new_prepared_xdp(
+        vm: &'a mut Vm,
+        ctx: &'a mut [u8],
+        opts: &DebuggerOpts,
+    ) -> Result<Self, crate::interp::EbpfError> {
+        vm.echo_printk = opts.echo_printk;
+        let m = vm.machine_prepared_xdp(ctx)?;
+        Ok(Self::from_machine(m, opts))
+    }
+
+    fn from_machine(m: Machine<'a>, opts: &DebuggerOpts) -> Self {
         let base = m.snapshot();
         DebugSession {
             m,
@@ -1289,7 +1315,28 @@ impl<'a> DebugSession<'a> {
 /// Run an interactive debugging session for `vm` with context `ctx`.
 /// Returns the program's r0 if it ran to completion.
 pub fn repl(vm: &mut Vm, ctx: &mut [u8], opts: DebuggerOpts) -> io::Result<Option<u64>> {
-    let mut session = DebugSession::new(vm, ctx, &opts);
+    let session = DebugSession::new(vm, ctx, &opts);
+    repl_session(session, opts)
+}
+
+/// Run the debugger with CTX also bound as a legacy raw packet.
+pub fn repl_raw(vm: &mut Vm, ctx: &mut [u8], opts: DebuggerOpts) -> io::Result<Option<u64>> {
+    let session = DebugSession::new_raw(vm, ctx, &opts).map_err(io::Error::other)?;
+    repl_session(session, opts)
+}
+
+/// Run the debugger with the packet previously installed by
+/// [`Vm::prepare_xdp`] as the legacy packet backing.
+pub fn repl_prepared_xdp(
+    vm: &mut Vm,
+    ctx: &mut [u8],
+    opts: DebuggerOpts,
+) -> io::Result<Option<u64>> {
+    let session = DebugSession::new_prepared_xdp(vm, ctx, &opts).map_err(io::Error::other)?;
+    repl_session(session, opts)
+}
+
+fn repl_session(mut session: DebugSession<'_>, opts: DebuggerOpts) -> io::Result<Option<u64>> {
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     let mut out = io::stdout();

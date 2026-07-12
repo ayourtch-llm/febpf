@@ -788,6 +788,35 @@ impl Vm {
         Machine::new(self, ctx)
     }
 
+    /// Create a single-stepping execution whose context is also the legacy
+    /// packet input. This is the debugger/replay counterpart of
+    /// [`Vm::run_raw`].
+    pub fn machine_raw<'a>(
+        &'a mut self,
+        buffer: &'a mut [u8],
+    ) -> Result<Machine<'a>, EbpfError> {
+        self.require_packet_backing(LegacyPacketBacking::Context)?;
+        Ok(Machine::new_with_packet(
+            self,
+            buffer,
+            LegacyPacketBacking::Context,
+        ))
+    }
+
+    /// Create a single-stepping XDP execution after [`Vm::prepare_xdp`].
+    /// Legacy packet loads read the VM's prepared packet region.
+    pub fn machine_prepared_xdp<'a>(
+        &'a mut self,
+        ctx: &'a mut [u8],
+    ) -> Result<Machine<'a>, EbpfError> {
+        self.require_packet_backing(LegacyPacketBacking::VmPacket)?;
+        Ok(Machine::new_with_packet(
+            self,
+            ctx,
+            LegacyPacketBacking::VmPacket,
+        ))
+    }
+
     /// Compile the program to native code (idempotent). Requires a supported
     /// host architecture; see [`crate::jit`].
     #[cfg(feature = "jit")]
