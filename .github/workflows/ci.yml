@@ -62,6 +62,15 @@ jobs:
         env:
           FEBPF_REGENERATE_FIXTURES: ${{ runner.os == 'Linux' && '1' || '0' }}
 
+      # The regeneration pass proves that this runner's clang path works, but
+      # its objects contain toolchain-specific BTF/debug layouts. Do not let
+      # those replacements become inputs to the independent no-JIT pass.
+      - name: Restore regenerated fixtures
+        if: runner.os == 'Linux'
+        run: |
+          git diff --exit-code --diff-filter=D -- 'tests/*.o'
+          git restore --source=HEAD -- 'tests/*.o'
+
       - name: Test (no jit)
         run: cargo test --no-default-features --features std
 
@@ -87,13 +96,6 @@ jobs:
         run: |
           cargo run --release -- bench examples/sum_loop.s --iters 20000
           cargo run --release -- bench examples/sum_loop.s --iters 20000 --jit
-
-      # Fixtures are committed binaries. Linux deliberately regenerated them
-      # above, so byte differences are expected there; deletion never is.
-      #
-      - name: Fixtures not destroyed
-        if: runner.os == 'Linux'
-        run: git diff --exit-code --diff-filter=D -- 'tests/*.o'
 
       - name: Fixtures untouched (regeneration disabled)
         if: runner.os == 'macOS'

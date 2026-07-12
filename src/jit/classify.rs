@@ -150,9 +150,14 @@ pub fn deferred_regs(ins: Insn) -> DeferredRegs {
         // `lddw` takes its value from the instruction stream.
         class::LD if ins.is_wide() => DeferredRegs::flow(0, bit(dst)),
         // Legacy packet loads read r6 implicitly and, for IND, the encoded
-        // source register. They write r0 and clobber r1-r5.
+        // source register. Linux semantics clobber r1-r5, while rbpf041 must
+        // preserve them. The profile is runtime state, not encoded in the
+        // instruction, so spill r1-r5 before reloading the interpreter's
+        // profile-dependent result. This matters on aarch64, where those
+        // physical registers otherwise survive the trampoline while regs[]
+        // still contains their stale entry values.
         class::LD => {
-            let mut spill = bit(6);
+            let mut spill = 0x7e; // r1-r6
             if ins.mem_mode() == mode::IND {
                 spill |= bit(src);
             }
@@ -298,5 +303,29 @@ pub fn lower(ins: Insn) -> Lowering {
             }
         }
         _ => Lowering::Deferred, // ld/ldx/st/stx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_load_preservation_reaches_the_deferred_register_file() {
+        let abs = Insn {
+            opcode: class::LD | mode::ABS | size::B,
+            dst: 0,
+            src: 0,
+            off: 0,
+            imm: 0,
+        };
+        assert_eq!(deferred_regs(abs), DeferredRegs::flow(0x7e, 0x3f));
+
+        let ind = Insn {
+            opcode: class::LD | mode::IND | size::W,
+            src: 8,
+            ..abs
+        };
+        assert_eq!(deferred_regs(ind), DeferredRegs::flow(0x17e, 0x3f));
     }
 }
