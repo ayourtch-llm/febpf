@@ -36,10 +36,16 @@ TARGET_BTF="${TARGET_BTF:-/sys/kernel/btf/vmlinux}"
 # Collect the object list: explicit args, else corpus/obj/*.o.
 if [ "$#" -gt 0 ]; then
     OBJS=("$@")
+    OBJ_COUNT=$#
 else
-    mapfile -t OBJS < <(find "$CORPUS/obj" -maxdepth 1 -type f -name '*.o' -print 2>/dev/null | sort)
+    OBJS=()
+    OBJ_COUNT=0
+    while IFS= read -r obj; do
+        OBJS[$OBJ_COUNT]="$obj"
+        OBJ_COUNT=$((OBJ_COUNT + 1))
+    done < <(find "$CORPUS/obj" -maxdepth 1 -type f -name '*.o' -print 2>/dev/null | sort)
 fi
-if [ "${#OBJS[@]}" -eq 0 ]; then
+if [ "$OBJ_COUNT" -eq 0 ]; then
     echo "no objects to scan (pass paths, or run scripts/fetch-corpus.sh first)" >&2
     exit 1
 fi
@@ -52,8 +58,12 @@ if [ "${NO_BUILD:-0}" != 1 ] && [ ! -x "$FEBPF" ]; then
 fi
 [ -x "$FEBPF" ] || { echo "febpf binary not found at $FEBPF" >&2; exit 1; }
 
-BTF_ARGS=()
-[ -r "$TARGET_BTF" ] && BTF_ARGS=(--target-btf "$TARGET_BTF")
+HAVE_TARGET_BTF=0
+BTF_DISPLAY="<none>"
+if [ -r "$TARGET_BTF" ]; then
+    HAVE_TARGET_BTF=1
+    BTF_DISPLAY="--target-btf $TARGET_BTF"
+fi
 
 mkdir -p "$CORPUS"
 
@@ -111,7 +121,7 @@ EMPTY_PACKET="$TMP/empty-packet"
 # Keep this list exact: a new explicit-zero object must be audited rather than
 # inheriting a global default silently.
 map_args_for_object() {
-    MAP_ARGS=()
+    MAP_MAX_ENTRIES=""
     case "$1" in
         inspektor-gadget__audit_seccomp.o|\
         inspektor-gadget__profile_cpu.o|\
@@ -119,9 +129,22 @@ map_args_for_object() {
         inspektor-gadget__trace_capabilities.o|\
         inspektor-gadget__trace_malloc.o|\
         inspektor-gadget__trace_open.o)
-            MAP_ARGS=(--map-max-entries ig_build_id=1024)
+            MAP_MAX_ENTRIES="ig_build_id=1024"
             ;;
     esac
+}
+
+# Append optional loader configuration through positional parameters rather
+# than empty arrays. Bash 3.2 (the system shell on macOS) treats an empty
+# "${array[@]}" expansion as unbound under `set -u`.
+run_febpf() {
+    if [ "$HAVE_TARGET_BTF" -eq 1 ]; then
+        set -- "$@" --target-btf "$TARGET_BTF"
+    fi
+    if [ -n "$MAP_MAX_ENTRIES" ]; then
+        set -- "$@" --map-max-entries "$MAP_MAX_ENTRIES"
+    fi
+    "$FEBPF" "$@"
 }
 
 classify() {
@@ -169,7 +192,7 @@ for obj in "${OBJS[@]}"; do
     map_args_for_object "$name"
     listing="$TMP/programs.$total"
     listing_err="$TMP/programs.$total.err"
-    if ! "$FEBPF" programs "$obj" "${BTF_ARGS[@]}" "${MAP_ARGS[@]}" >"$listing" 2>"$listing_err"; then
+    if ! run_febpf programs "$obj" >"$listing" 2>"$listing_err"; then
         out="$(<"$listing_err")"
         classify "$out"
         echo "$bucket" >> "$OBJECT_BUCKETS"
@@ -190,11 +213,9 @@ for obj in "${OBJS[@]}"; do
                 entry_total=$((entry_total + 1))
                 kind="$field3"
                 program_name="$field4"
-                out=$("$FEBPF" verify "$obj" --prog "$program_name" \
-                    "${BTF_ARGS[@]}" "${MAP_ARGS[@]}" 2>&1)
+                out=$(run_febpf verify "$obj" --prog "$program_name" 2>&1)
                 if [ "$kind" = socket ] && needs_linux_legacy_packet "$out"; then
-                    out=$("$FEBPF" verify "$obj" --prog "$program_name" \
-                        "${BTF_ARGS[@]}" "${MAP_ARGS[@]}" \
+                    out=$(run_febpf verify "$obj" --prog "$program_name" \
                         --legacy-packet linux --packet "$EMPTY_PACKET" 2>&1)
                 fi
                 classify "$out"
@@ -246,7 +267,7 @@ pct() { # pct <num> <den>
     echo "======================================================================"
     echo " febpf corpus coverage report"
     echo " generated: $(date -u '+%Y-%m-%d %H:%M:%SZ')   febpf: $FEBPF"
-    echo " target BTF: ${BTF_ARGS[*]:-<none>}"
+    echo " target BTF: $BTF_DISPLAY"
     echo "======================================================================"
     echo ""
     echo "objects/families scanned  : $total"
