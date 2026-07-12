@@ -23,7 +23,17 @@ run `cargo test` AND
 `cargo test --no-default-features` (and clippy in both) before calling
 anything done.
 
-## LATEST (2026-07-11): verifier soundness + the XDP packet workbench foundation
+## LATEST (2026-07-12): the current pinned real-world corpus is 57/57
+
+**START HERE.** The immediate goal is real-world breadth: support the eBPF code
+people actually run before spending time on esoterica. The current gentle,
+pinned corpus is **57/57 loaded and 57/57 verified**, including a static
+tail-call graph and `ARRAY_OF_MAPS`. That is 100% of this corpus, **not a claim
+that febpf supports 100% of all eBPF in the wild**. The next useful move is to
+widen the pinned corpus with another representative production project or
+feature lane, scan it, and implement the highest-impact measured blocker. Keep
+program graphs visible as graphs in the report rather than flattening them
+into misleading object counts.
 
 **DONE (2026-07-12): real-world program graphs / tail calls.**
 `docs/specs/tail-calls.md` is the contract. The userspace-populated path is
@@ -72,13 +82,29 @@ This is the current tip and the context a fresh agent is most likely to need.
 The work is committed linearly on `main`:
 
 ```
-2ec0fef xdp: replay selected packets in time-travel debugger
-a4b83d2 xdp: run classic pcap captures with verdicts
-86fac0b xdp: recognize ELF programs and run packet files
-a4b7857 xdp: verify and execute bounded packet access
-426ea87 verifier: fix 3 soundness bugs found by new exhaustive operator harness
-25414e7 verifier: extract analyze_cond_jmp + pub(crate) transfer-function hooks
+2b4f739 verifier: track scalar expression identities
+a63e66e maps: support static array-of-maps
+8e8978e tests: cover tail-call graphs in JIT
+5271ebd docs: record kernel tail-call validation
+3f35b5a tailcall: load static ELF program graphs
+b32fe13 tailcall: add verified program bundles
+261e156 tests: make fixture regeneration explicit
+3061e49 xdp: differential test-run against kernel
 ```
+
+To choose the next production-coverage batch, first build the binary the scan
+actually uses, then rescan the existing cache:
+
+```
+cargo build --release
+./scripts/fetch-corpus.sh --offline
+NO_BUILD=1 FEBPF=target/release/febpf ./scripts/scan-corpus.sh
+```
+
+When widening the corpus, pin tags/commits, keep fetching shallow and gentle,
+and document the new lane and its blockers in `docs/specs/corpus-tooling.md`.
+Do not add a dependency to solve corpus tooling or core-engine work without the
+user's explicit OK.
 
 The old Claude worktree `.claude/worktrees/agent-aee527c2832b79ec3` was
 successfully rescued: its two commits were rebased onto `main`, validated, and
@@ -544,6 +570,14 @@ buggy program replays identically under the debugger. Keep it that way.
   `FEBPF_REGENERATE_FIXTURES=1 cargo test` using a BPF-capable clang. The shared
   helper preserves `-O0` for `subprog.c` so the cross-`.text` call is not
   inlined away.
+- Do not run a repository-wide `cargo fmt` on this host: the installed
+  rustfmt/toolchain combination reformats unrelated files. Format only files
+  intentionally touched and inspect the diff.
+- Root conformance was run through the user's TTTT `pty-3`. If that shell is
+  still available, its root PATH does not include Cargo; use
+  `CARGO_HOME=/home/ayourtch/.cargo RUSTUP_HOME=/home/ayourtch/.rustup
+  CARGO_TARGET_DIR=/tmp/febpf-root-target /home/ayourtch/.cargo/bin/cargo ...`.
+  Keep root-owned build artifacts out of the checkout.
 - `Date.now()`/randomness are fine here (this is a normal shell, not a workflow
   sandbox). The scratchpad dir is session-specific — use whatever the current
   session's system prompt says.
@@ -573,8 +607,10 @@ buggy program replays identically under the debugger. Keep it that way.
 - After merging an agent branch: run both test configs + clippy FROM MAIN,
   `cargo build --release` (the corpus scan uses the release binary), rescan,
   then `git worktree remove --force <path>` + delete the branch.
-- ksnoop is a CORRECT rejection (kernel verdict parity, proven via upstream
-  bcc commit 0ae562c) — see the DO NOT "FIX" note under Production coverage.
+- Historical note: the old pinned ksnoop object was a correct kernel-parity
+  rejection. The refreshed object now verifies via febpf's deliberately more
+  precise scalar-expression identity; preserve the distinction documented
+  under Production coverage and in `scalar-identity.md`.
 - Strategy/roadmap ponderings live in `docs/ideas.md` (user endorsed the
   ranking there); don't re-litigate direction, extend it.
 
@@ -588,10 +624,13 @@ cargo build --release
 ./target/release/febpf bench examples/sum_loop.s --iters 50000 --jit   # ~11 GIPS
 cargo test --release -- --ignored soundness     # optional heavy verifier sweep
 ```
-Latest host result after the tail-call program-bundle foundation:
-default **315 passed / 4 ignored**; no-default-features **303 passed / 4
-ignored**; both strict clippy invocations
-clean. Ordinary tests do not regenerate tracked `tests/*.o`; any fixture diff
+Latest host result after tail calls, map-in-map, and scalar identity:
+default **328 passed / 4 ignored**; no-default-features **314 passed / 4
+ignored**; both strict clippy invocations are clean, as is the release build.
+The complete privileged conformance suite is also green: 500 runtime
+differentials, 1,000 verifier-frontier verdict comparisons, and the XDP,
+tail-call, and map-in-map differentials. Ordinary tests do not regenerate
+tracked `tests/*.o`; any fixture diff
 without `FEBPF_REGENERATE_FIXTURES=1` is now a regression. Explicitly generated
 objects can still differ by clang version and compilation path. Never delete or
 blindly rewrite user changes.
@@ -724,7 +763,7 @@ since febpf's virtual-address model is safe regardless):
     REFUSES to emit if it can't prove behavior was preserved.
 
 ### Production coverage — the corpus-driven loop (START HERE for "is it useful?")
-`scripts/fetch-corpus.sh` (gentle, pinned, cached) builds ~56 real `.bpf.o`
+`scripts/fetch-corpus.sh` (gentle, pinned, cached) builds 57 real `.bpf.o`
 from bcc libbpf-tools + libbpf-bootstrap using local clang + bpftool + kernel
 BTF. `scripts/scan-corpus.sh` runs febpf over them and prints a ranked
 histogram of the exact map types / helpers blocking the most real programs.
@@ -749,7 +788,12 @@ PERF_EVENT_ARRAY for this corpus). Coverage progression (loads / verifies):
   kernel and would have shown up as FEBPF-LAX in `vfuzz --kernel`.
 - + BTF-typed ctx pointers (`btf-ctx-pointers.md`): **100% / 98.2%** (55/56).
   bitesize/offcputime/runqlat/runqslower unblocked AND running. The one
-  remaining rejection is ksnoop — correct by design, see below.
+  remaining rejection in that historical corpus pin was ksnoop and matched
+  the host kernel; the next refreshed-corpus entry explains what changed.
+- + tail-call program graphs, static `ARRAY_OF_MAPS`, and sound scalar
+  expression identity (`tail-calls.md`, `map-in-map.md`,
+  `scalar-identity.md`): **100% / 100% (57/57)** on the refreshed corpus. The
+  scanner reports one static tail-call graph separately.
 **Workflow: merge a coverage batch → `./scripts/scan-corpus.sh` → the histogram
 names the next batch.** febpf is an analysis/test/CI/debug engine, NOT a datapath
 runtime — "production useful" means verify/explain/differential-test/debug real
@@ -761,35 +805,34 @@ measure the previous build; and helper names in the histogram come from the
 uapi header now — the old hardcoded table had wrong ids (#113 was labelled
 ringbuf_output; it is probe_read_kernel).
 
-What blocks the remaining 1 object (2026-07-11 scan, after the BTF-ctx
-batch — item 1 of the previous list is DONE, `btf-ctx-pointers.md`):
-1. **1 × `ksnoop` — DO NOT "FIX"; the rejection is correct.** Investigated
-   2026-07-11 (full write-up in `tracing-helpers.md`): the real kernel
-   verifier rejects this exact object with the identical error — upstream bcc
-   commit `0ae562c` (2025-07-13, after our v0.31.0 corpus pin) changed
-   `output_trace()`'s `trace_len` from u16 to u64 precisely because of it.
-   febpf is at verdict parity here. The upstream-FIXED ksnoop needs one more
-   verifier feature to pass: **linked scalar ids** (kernel
-   `sync_linked_regs`, commit 75748837b7e5 — mov links src/dst ids, branch
-   refinements propagate to same-id regs/spills; pruning subsumption must
-   compare id links via an idmap or it becomes unsound). That's the named
-   next verifier feature, relevant only once the corpus pin advances.
+The refreshed BCC `ksnoop` now verifies because febpf tracks copied and
+recomputed scalar-expression identity. Important nuance: this is not kernel
+verdict parity on the current host. That kernel drops the relevant identity at
+the first mask and rejects even the minimized safe pattern; febpf retains the
+proof under the deliberately narrow, regression-tested rules in
+`scalar-identity.md`. Preserve the mismatched-mask rejection and the exhaustive
+kernel-frontier checks when changing this logic.
 
 ## Known limitations / where to go next (roughly prioritized)
 
-1. **XDP web packet workbench** — parked by the user for now. When unparked,
+1. **Broaden production coverage** — add another pinned, representative corpus
+   lane, then let its scan choose the next map/helper/ELF/verifier feature.
+   Preserve reproducibility and report multi-program graphs explicitly. Do not
+   mistake 57/57 in today's corpus for universal eBPF coverage.
+2. **XDP web packet workbench** — parked by the user for now. When unparked,
    add pcap upload/verdict table/click-to-debug/export `.febpf`; see LATEST's
    oside notes. Do not make febpf core depend on current oside.
-2. **XDP JIT execution** — interpreter is complete; `--jit` rejects XDP
+3. **XDP JIT execution** — interpreter is complete; `--jit` rejects XDP
    clearly. Teach the native/deferred path to synthesize full virtual packet
    addresses for u32 xdp_md data/data_end loads, then differential-test
    interpreter vs JIT across capture packets.
-3. **Real-world map/helper coverage** — still missing PROG_ARRAY/tail-calls,
-   maps-of-maps, SK/TASK/INODE_STORAGE, LPM_TRIE, sock/dev/xsk maps and many
-   helpers. Re-run the pinned corpus before choosing a batch.
-4. **Verifier depth** — dynptr, spin locks, bpf_loop/iterators, linked scalar
-   ids. `vfuzz --kernel` (keep at 0 FEBPF-LAX) is the conformance check.
-5. **ELF/kfunc/legacy gaps** — `R_BPF_64_ABS*`, static multi-object linking,
+4. **Real-world map/helper coverage** — still missing SK/TASK/INODE_STORAGE,
+   LPM_TRIE, sock/dev/xsk maps and many helpers. Implement them when a widened
+   corpus makes them relevant, not from the list alone.
+5. **Verifier depth** — dynptr, spin locks, bpf_loop/iterators, broader linked
+   scalar relationships. Expression identity is implemented; `vfuzz --kernel`
+   (keep at 0 FEBPF-LAX) remains the conformance check.
+6. **ELF/kfunc/legacy gaps** — `R_BPF_64_ABS*`, static multi-object linking,
    kfuncs, and legacy `ld_abs`/`ld_ind`; add when real workloads demand them.
 
 ## Working style the user likes
@@ -802,4 +845,4 @@ batch — item 1 of the previous list is DONE, `btf-ctx-pointers.md`):
   JIT I validated against the interpreter; when I built the ELF loader I
   validated against real clang + bpftool. Match that bar.
 
-— past-me, updated 2026-07-11
+— past-me, updated 2026-07-12
