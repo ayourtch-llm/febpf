@@ -30,73 +30,94 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 attach-target batch complete; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 xdp-tools expansion complete; authoritative)
 
-The production-corpus moonshot remains active. Explicit application attach
-targets are implemented and committed at `143e1ed` (`elf: support explicit
-attach targets`). At checkpoint-writing time that implementation was committed
-and the only worktree modification was this `HANDOFF.md` update. No Codex
-subagent or external terminal collaborator is active.
+The production-corpus moonshot remains active. The xdp-tools production
+expansion and its general functionality are committed at `814ced9` (`xdp:
+support routing and locked flow state`). The prior explicit attach-target batch
+is committed at `143e1ed`, with its documentation at `3253a07`. At checkpoint
+writing, the implementation tree was clean and only this `HANDOFF.md` edit was
+uncommitted. No build/test/scanner process, Codex subagent, or external terminal
+collaborator is active.
 
-Completed in `143e1ed`:
+Completed in `814ced9`:
 
-- The public typed API is `AttachTarget { selector, function }` with exact
-  `AttachTargetSelector::Program` and `::Section` variants, consumed through
-  `load_with_target_btf_and_attach_targets`. The old
-  `load_with_target_btf` API remains the empty-override wrapper.
-- Overrides support fentry/fexit/fmod_ret function targets and are applied to
-  ctx prototype resolution without changing the original ELF section or
-  program identity. They require supplied target BTF and a real function
-  prototype. Missing BTF/function, empty function, duplicate, overlapping,
-  unmatched, non-BTF, iterator, and tp_btf misuse are fatal; no prototype is
-  fabricated and no explicit override can fall back to an untyped ctx.
-- The CLI accepts repeatable, unambiguous
-  `--attach-target program:<name>=<function>` and
-  `--attach-target section:<section>=<function>` options. The same overrides
-  are applied by both `programs` enumeration and selected-program loading.
-- The scanner mirrors evidence from the pinned BCC userspace loaders for
-  cachestat (`folio_account_dirtied`), ext4 fsdist/fsslower, and the documented
-  funclatency `vfs_read` case. It does not invent replacements for alternate
-  programs that their applications disable or for functions absent from the
-  running target BTF. Scanner tests prove propagation to enumeration and
-  verification and prove a missing real function cannot be counted as OK.
-- A self-contained committed `attach_target.o` fixture makes strict success
-  and validation tests independent of the running kernel BTF.
+- The pinned xdp-tools v1.6.3 lane expanded from xdp-bench to five additional
+  production families: xdp-forward flowtable, flowtable-sample, ordinary
+  forwarding, monitor, and trafficgen. Offline rebuilding now produces 119
+  total objects.
+- `bpf_fib_lookup` (#69) uses an exact XDP ctx plus initialized writable
+  `MEM_RDWR` buffer. Standalone execution validates the region and returns the
+  kernel's NOT_FWDED outcome without inventing host route/neighbour state.
+- `bpf_ktime_get_coarse_ns` (#160) advances snapshotted deterministic logical
+  time by one millisecond. `bpf_csum_diff` (#28) implements the kernel
+  nullable/multiple-of-four buffer contract and checksum composition; its
+  privileged kernel oracle test skipped locally because BPF privilege was
+  unavailable rather than claiming a differential result.
+- `bpf_spin_lock`/`unlock` (#93/#94) preserve the exact aligned top-level BTF
+  lock offset in `MapDef` and replay v1. Verification tracks the held map/offset
+  per path; rejects wrong/non-BTF fields, nested locks, mismatched/unbalanced
+  unlocks, helper/local calls and legacy packet loads while held, invalid map
+  kinds, and direct access overlapping the lock. Map updates preserve an
+  existing lock word or zero it on insertion. Interpreter/JIT validate the
+  actual writable word and use single-invocation no-op locking.
+- Undefined `__ksym` call relocations now resolve only to non-extern FUNCs in
+  supplied target BTF and encode a KFUNC call. Missing target functions are
+  explicit `ENVIRONMENT:missing-kfunc`, not generic relocation failures. Full
+  typed kfunc verification/execution is deliberately not fabricated.
+- Self-contained spin-lock, kfunc-object, and kfunc-target fixtures cover BTF
+  metadata and strict relocation behavior. `docs/specs/xdp-routing-locks.md`
+  and additive replay tag `MAP_SPIN_LOCKS` document the contracts.
 
 Exact validation and measurement:
 
-- Default all-target tests: **442 passed + 4 ignored**.
-- Std interpreter-only all-target tests: **424 passed + 4 ignored**.
+- Default all-target tests: **451 passed + 4 ignored**.
+- Std interpreter-only all-target tests: **433 passed + 4 ignored**.
 - Strict Clippy passes in default and
   `--no-default-features --features std` profiles.
 - True thumb no-std check and strict Clippy both pass.
-- `cargo build --release` passes.
-- `NO_BUILD=1 ./scripts/scan-corpus.sh`: all **114/114 families** and
-  **787/787 entries** load; **106/114 families** are compatible and **776/787
-  entries verify (98.6%)**, comprising 627 strict and 149 explicitly privileged
-  uninitialized-stack entries. This closes 21 application-retargeted entries
-  and four families versus 755/787 and 102/114.
-- Remaining outcomes are exactly four honest attach-environment gaps in three
-  families (`biostacks` done, numamove page entry/exit, readahead
-  `__page_cache_alloc`) and seven poisoned application-supplied CO-RE entries
-  in five Gadget families. Unsupported-map and unknown-helper histograms remain
-  empty; there is no ordinary verifier rejection.
+- `cargo build --release` passes. The final tiny spin-map invariant then passed
+  its focused test and both strict Clippy profiles.
+- Full `NO_BUILD=1 ./scripts/scan-corpus.sh`: **119 families**, 117 instantiate
+  on this target, and **811 enumerable entries all load**. **109/119 families**
+  are compatible and **800/811 entries verify (98.6%)**: 651 strict plus 149
+  explicitly privileged uninitialized-stack entries.
+- Remaining entry outcomes are exactly four honest attach-target environment
+  gaps and seven poisoned application-supplied CO-RE entries. The two
+  xdp-flowtable families are object-level `ENVIRONMENT:missing-kfunc` because
+  `/sys/kernel/btf/vmlinux` lacks `bpf_xdp_flow_lookup`. Unsupported-map and
+  unknown-helper histograms are empty; there is no ordinary verifier rejection.
 
-Immediate resume order:
+Decisions and unfinished findings that must survive refresh:
 
-1. Commit this checkpoint/protocol documentation, verify a clean tree, then
-   expand the pinned source corpus with the next reproducible production
-   families. Rank blockers by distinct family first and entry count second.
-2. Preserve application/autoload and missing-target cases as explicit
-   environment/configuration outcomes. Do not retarget disabled numamove lanes,
-   invent a biostacks done function, or weaken poisoned CO-RE handling merely
-   to improve the percentage.
-3. For each new evidence-selected batch: implement the smallest general
-   kernel-compatible behavior, test verifier/interpreter/JIT/replay surfaces as
-   applicable, run the full matrix and scanner, commit, then widen again.
-4. When production compatibility is genuinely saturated (the user's target is
-   real-world 99.9%, not a denominator trick), continue with high-value items
-   from `IDEAS.md` using the same committed-batch discipline.
+- Do not count the two flowtable families compatible on this host and do not
+  synthesize a flowtable pointer. A worthwhile future layer is typed kfunc
+  verification plus an explicit user-registered kfunc implementation returning
+  VM-owned BTF-shaped data; default absence remains an environment gap.
+- The user proposed a ConnectX-7/DPDK userland XDP subject. The agreed likely
+  architecture is a generic packet-provider/batch boundary, with AF_XDP as the
+  zero-dependency first backend and DPDK as a separate optional workspace
+  adapter/sidecar. Keep mlx5/kernel ownership; direct PCI/VFIO mlx5 ownership is
+  a separate driver project. This is a high-value post-saturation `ideas.md`
+  item: veth copy mode first, kernel differential, then mlx5 zero-copy, saving
+  the first mismatch as `.febpf` replay.
+- Preserve application/autoload, missing-target, missing-kfunc, and poisoned
+  CO-RE cases as explicit environment/configuration outcomes. Never improve a
+  percentage by inventing prototypes, network state, disabled lanes, or corpus
+  denominators.
+
+Immediate resume order after tttt refresh:
+
+1. Verify HEAD/worktree against this checkpoint and commit this HANDOFF update
+   if it is still the only modification.
+2. Continue corpus expansion from reproducible production sources. Audit the
+   remaining pinned xdp-tools xdp-dump/xdp-filter generated source layout or add
+   the next small pinned upstream; rank blockers by distinct family first.
+3. If a target BTF with `bpf_xdp_flow_lookup` becomes available, measure the
+   already-resolved KFUNC path honestly before designing typed kfunc execution.
+4. Continue one full-matrix, measured, committed batch at a time. At genuine
+   real-world saturation, add the generic packet-provider/AF_XDP design to
+   `docs/ideas.md` and implement it before any DPDK-specific adapter.
 
 ## ACTIVE RESUME CHECKPOINT (2026-07-12 22:50 UTC, read this first)
 
