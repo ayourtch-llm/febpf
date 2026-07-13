@@ -4,14 +4,19 @@ _Strategy ponderings from the 2026-07-11 session, so they survive context
 resets. These are ranked assessments, not commitments. The corpus loop
 (HANDOFF "Production coverage") remains the active thrust._
 
-## Active after corpus saturation: packet providers and AF_XDP
+## Active after corpus saturation: composable execution add-ons
 
 The pinned production corpus reached zero ordinary verifier rejections on
-2026-07-13. The next active architecture is a generic packet-provider/batch
-boundary, with AF_XDP copy mode as its first real backend. DPDK stays a later,
-optional workspace adapter rather than becoming a febpf core dependency.
+2026-07-13. Packet-provider work exposed a more general boundary: XDP is one
+invocation add-on, not a mode that should absorb the VM. `ExecutionEnvironment`
+now owns the compositional boundary described in
+`specs/execution-addons.md`; XDP, skb, raw packet, metadata packet selection,
+and an independently borrowed sequence-output sink exercise it. AF_XDP remains
+the first intended live backend, while DPDK stays a later optional workspace
+adapter rather than a febpf core dependency.
 
-The provider owns packet storage and transport; the VM owns eBPF semantics.
+The provider owns packet storage and transport; an invocation environment
+borrows live resources; the VM owns durable program semantics.
 The boundary must describe:
 
 - the mutable frame window plus explicit headroom/tailroom capacity;
@@ -28,17 +33,20 @@ The boundary must describe:
   sufficient capacity; the standalone owned-packet path continues returning
   `-EOPNOTSUPP` instead of inventing headroom or tailroom.
 
-Implementation order:
+Revised implementation order:
 
-1. Put the existing owned-packet interpreter/JIT path behind the provider
-   contract and prove byte-for-byte/verdict equivalence with a deterministic
-   mock provider.
-2. Add Linux AF_XDP copy mode using raw syscalls and target/feature gating,
+1. Continue factoring invocation-only services that still live in `Vm`, with
+   synthetic BTF kernel memory and output/diagnostic sinks as the next audit.
+   Keep typed slots and measure at least two consumers before generalizing a
+   builder or hook interface.
+2. Activate provider resize capabilities through the shared packet window,
+   preserving `-EOPNOTSUPP` for plain slices.
+3. Add Linux AF_XDP copy mode using raw syscalls and target/feature gating,
    keeping the default build zero-dependency. Exercise it on a veth pair and
    differentially compare selected frames with kernel XDP test-run behavior.
-3. Add mlx5 zero-copy only after copy mode is stable and the environment
+4. Add mlx5 zero-copy only after copy mode is stable and the environment
    supports it. Preserve normal kernel driver ownership.
-4. If still valuable, expose the same boundary to a separate optional DPDK
+5. If still valuable, expose the same boundary to a separate optional DPDK
    adapter/sidecar. Direct PCI/VFIO mlx5 ownership is a different driver
    project and is not implied by this plan.
 

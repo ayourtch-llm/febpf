@@ -4,9 +4,10 @@ use febpf::builder::{AluOp, Builder};
 use febpf::helpers::{id, ArgKind, HelperSig, MemBus, RetKind};
 use febpf::insn::{self, alu, class, jmp};
 use febpf::verifier::Config;
-use febpf::{asm, Program, Vm};
+use febpf::{asm, ContextModel, Program, Vm};
 use febpf::{
-    CompletedXdpFrame, XdpAction, XdpFrame, XdpMetadata, XdpProvider, XdpRedirect, XdpVerdict,
+    CompletedXdpFrame, ExecutionEnvironment, XdpAction, XdpFrame, XdpMetadata, XdpProvider,
+    XdpRedirect, XdpVerdict,
 };
 use std::collections::VecDeque;
 
@@ -33,6 +34,46 @@ fn no_data_adapter_executes_an_input_free_program() {
     vm.verify(Config::default()).unwrap();
 
     assert_eq!(vm.run_no_data().unwrap(), 42);
+}
+
+#[test]
+fn composed_environment_is_the_public_execution_boundary() {
+    let mut vm = Vm::new(program(
+        "r1 = 23\n\
+         r2 = 0\n\
+         call redirect\n\
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 24,
+        ctx_writable: false,
+        xdp: true,
+        ..Config::default()
+    })
+    .unwrap();
+
+    let mut packet = [0xaa];
+    let outcome = vm
+        .run_environment(ExecutionEnvironment::xdp_slice(&mut packet).unwrap())
+        .unwrap();
+    assert_eq!(outcome.return_value, 4);
+    assert_eq!(
+        outcome.redirect,
+        Some(XdpRedirect::Interface {
+            ifindex: 23,
+            flags: 0,
+        })
+    );
+
+    let mut context_without_packet = [0u8; 24];
+    let error = vm
+        .run_environment(ExecutionEnvironment::for_context(
+            &mut context_without_packet,
+            ContextModel::Xdp,
+        ))
+        .unwrap_err();
+    assert!(error.to_string().contains("packet-window add-on"), "{error}");
 }
 
 #[test]
@@ -353,8 +394,8 @@ fn redirect_destination_requires_final_redirect_and_replays_with_snapshot() {
         ..Config::default()
     })
     .unwrap();
-    let mut ctx = vm.prepare_xdp(&[1]).unwrap();
-    let mut machine = vm.machine_prepared_xdp(&mut ctx).unwrap();
+    let mut frame = febpf::packet::XdpFrame::new(&[1]);
+    let mut machine = vm.machine_xdp(&mut frame).unwrap();
     for _ in 0..3 {
         assert_eq!(machine.step().unwrap(), None);
     }

@@ -870,10 +870,13 @@ fn cmd_replay(o: &Opts) -> Result<ExitCode, String> {
         start_at: replay.stop_at,
         ..Default::default()
     };
-    match (replay.legacy_packet, replay.packet.is_some()) {
-        (febpf::verifier::LegacyPacketProfile::Disabled, _) => debug::repl(&mut vm, &mut ctx, opts),
-        (_, false) => debug::repl_raw(&mut vm, &mut ctx, opts),
-        (_, true) => debug::repl_prepared_xdp(&mut vm, &mut ctx, opts),
+    if let Some(packet) = &replay.packet {
+        let mut frame = febpf::packet::XdpFrame::new(packet);
+        debug::repl_xdp(&mut vm, &mut frame, opts)
+    } else if replay.legacy_packet == febpf::verifier::LegacyPacketProfile::Disabled {
+        debug::repl(&mut vm, &mut ctx, opts)
+    } else {
+        debug::repl_raw(&mut vm, &mut ctx, opts)
     }
     .map_err(|e| e.to_string())?;
     Ok(ExitCode::SUCCESS)
@@ -1404,8 +1407,8 @@ fn run() -> Result<ExitCode, String> {
             }
             if xdp {
                 let packet = read_packet(&o)?;
-                ctx = vm.prepare_xdp(&packet)?;
-                debug::repl_prepared_xdp(&mut vm, &mut ctx, debug::DebuggerOpts::default())
+                let mut frame = febpf::packet::XdpFrame::new(&packet);
+                debug::repl_xdp(&mut vm, &mut frame, debug::DebuggerOpts::default())
                     .map_err(|e| e.to_string())?;
             } else {
                 debug::repl(&mut vm, &mut ctx, debug::DebuggerOpts::default())

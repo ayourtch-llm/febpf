@@ -149,7 +149,7 @@ fn xdp_packet_round_trips_and_replays() {
     let parsed = Replay::from_bytes(&rec.to_bytes()).unwrap();
     assert_eq!(parsed, rec);
     let (mut vm, mut ctx) = parsed.build_vm().unwrap();
-    assert_eq!(vm.run(&mut ctx).unwrap(), 0x1234);
+    assert_eq!(parsed.run(&mut vm, &mut ctx).unwrap(), 0x1234);
 }
 
 #[test]
@@ -222,10 +222,10 @@ fn legacy_xdp_replay_debugger_steps_against_recorded_packet() {
     )
     .unwrap();
     let replay = Replay::from_bytes(&replay.to_bytes()).unwrap();
-    let (mut vm, mut ctx) = replay.build_vm().unwrap();
+    let (mut vm, _ctx) = replay.build_vm().unwrap();
+    let mut frame = febpf::packet::XdpFrame::new(replay.packet.as_deref().unwrap());
     let opts = febpf::debug::DebuggerOpts::default();
-    let mut session = febpf::debug::DebugSession::new_prepared_xdp(&mut vm, &mut ctx, &opts)
-        .unwrap();
+    let mut session = febpf::debug::DebugSession::new_xdp(&mut vm, &mut frame, &opts).unwrap();
     assert_eq!(session.machine().step().unwrap(), None);
     assert_eq!(session.machine().step().unwrap(), None);
     assert_eq!(session.machine().regs[0], 0xab);
@@ -379,7 +379,7 @@ fn xdp_tail_call_bundle_round_trips_and_replays() {
     let parsed = Replay::from_bytes(&replay.to_bytes()).unwrap();
     assert_eq!(parsed, replay);
     let (mut vm, mut ctx) = parsed.build_vm().unwrap();
-    assert_eq!(vm.run(&mut ctx).unwrap(), 2);
+    assert_eq!(parsed.run(&mut vm, &mut ctx).unwrap(), 2);
 }
 
 #[test]

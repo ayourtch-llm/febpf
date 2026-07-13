@@ -36,6 +36,7 @@ pub mod debuginfo;
 pub mod disasm;
 #[cfg(feature = "std")]
 pub mod elf;
+pub mod execution;
 #[cfg(feature = "std")]
 pub mod equiv;
 #[cfg(feature = "std")]
@@ -70,8 +71,9 @@ mod soundness;
 mod wasm;
 
 pub use interp::{EbpfError, Machine, MetadataLayout, Program, RegionAccess, Vm};
+pub use execution::{ContextModel, ExecutionEnvironment, ExecutionOutcome};
 pub use packet::{
-    CompletedXdpFrame, XdpAction, XdpBatchStats, XdpFrame, XdpMetadata, XdpProvider,
-    XdpProviderError, XdpRedirect, XdpVerdict,
+    CompletedXdpFrame, XdpAction, XdpBatchStats, XdpCapabilities, XdpFrame, XdpMetadata,
+    XdpProvider, XdpProviderError, XdpRedirect, XdpVerdict,
 };
 pub use verifier::{Config as VerifierConfig, VerifyError};

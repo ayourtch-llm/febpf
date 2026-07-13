@@ -379,8 +379,9 @@ impl Replay {
         }
     }
 
-    /// Build a `Vm` from this replay with the seed and preload applied, ready
-    /// to run or drop into the debugger. `ctx` is the (mutable) working copy.
+    /// Build a `Vm` from this replay with the seed and preload applied. Use
+    /// [`Replay::run`] to select the recorded invocation adapter; `ctx` is the
+    /// mutable working copy for non-XDP records.
     pub fn build_vm(&self) -> Result<(Vm, Vec<u8>), String> {
         let mut vm = Vm::new(self.program())?;
         let config = self.verifier_config();
@@ -405,28 +406,19 @@ impl Replay {
         }
         vm.set_prandom_seed(self.seed);
         apply_preload(&mut vm, &self.preload)?;
-        let ctx = if let Some(packet) = &self.packet {
-            vm.prepare_xdp(packet)?
-        } else {
-            self.ctx.clone()
-        };
-        Ok((vm, ctx))
+        Ok((vm, self.ctx.clone()))
     }
 
     /// Execute a VM returned by [`Replay::build_vm`] with the recorded input
     /// adapter, including the packet backing required by legacy loads.
     pub fn run(&self, vm: &mut Vm, ctx: &mut [u8]) -> Result<u64, crate::interp::EbpfError> {
-        match (self.legacy_packet, self.packet.is_some()) {
-            (LegacyPacketProfile::Disabled, _) => vm.run(ctx),
-            (_, false) => vm.run_raw(ctx),
-            (_, true) => {
-                let mut machine = vm.machine_prepared_xdp(ctx)?;
-                loop {
-                    if let Some(result) = machine.step()? {
-                        return Ok(result);
-                    }
-                }
-            }
+        if let Some(packet) = &self.packet {
+            let mut packet = packet.clone();
+            vm.run_xdp(&mut packet)
+        } else if self.legacy_packet == LegacyPacketProfile::Disabled {
+            vm.run(ctx)
+        } else {
+            vm.run_raw(ctx)
         }
     }
 

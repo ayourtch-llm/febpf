@@ -8,7 +8,7 @@ mod common;
 
 use febpf::btf::{resolve_ctx_args, Btf, BtfCtx, CtxSlot};
 use febpf::verifier::Config;
-use febpf::{asm, Program, Vm};
+use febpf::{asm, ContextModel, ExecutionEnvironment, Program, Vm};
 use std::sync::Arc;
 
 fn fixture_bytes() -> Vec<u8> {
@@ -312,7 +312,7 @@ fn iterator_socket_conversions_are_exact_nullable_and_runtime_safe() {
 }
 
 #[test]
-fn seq_write_output_is_vm_owned_snapshotted_and_jit_stable() {
+fn seq_write_output_supports_composed_sink_snapshots_and_jit() {
     let Some(ctx) = live_iterator_ctx(
         "corpus/obj/inspektor-gadget__snapshot_process.o",
         "iter/task",
@@ -350,11 +350,30 @@ fn seq_write_output_is_vm_owned_snapshotted_and_jit_stable() {
     assert_eq!(vm.seq_output.len(), febpf::interp::SEQ_OUTPUT_CAPACITY);
     assert_eq!(vm.seq_output.last(), Some(&0xaa));
 
+    vm.seq_output.clear();
+    let mut external_output = Vec::new();
+    {
+        let env = ExecutionEnvironment::for_context(&mut record, ContextModel::Btf)
+            .with_seq_output(&mut external_output);
+        let mut machine = vm.machine_environment(env).unwrap();
+        let base = machine.snapshot();
+        while machine.step().unwrap().is_none() {}
+        let finished = machine.snapshot();
+        machine.restore(&base);
+        while machine.step().unwrap().is_none() {}
+        assert_eq!(machine.snapshot(), finished);
+    }
+    assert_eq!(external_output, b"\x01\x02\x03\x04\x05\x06\x07\x08");
+    assert!(vm.seq_output.is_empty());
+
     #[cfg(feature = "jit")]
     {
-        vm.seq_output.clear();
-        assert_eq!(vm.run_jit(&mut record).unwrap(), 0);
-        assert_eq!(vm.seq_output, b"\x01\x02\x03\x04\x05\x06\x07\x08");
+        external_output.clear();
+        let env = ExecutionEnvironment::for_context(&mut record, ContextModel::Btf)
+            .with_seq_output(&mut external_output);
+        assert_eq!(vm.run_environment_jit(env).unwrap().return_value, 0);
+        assert_eq!(external_output, b"\x01\x02\x03\x04\x05\x06\x07\x08");
+        assert!(vm.seq_output.is_empty());
     }
 }
 

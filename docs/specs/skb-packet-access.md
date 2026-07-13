@@ -20,8 +20,8 @@ Exact 32-bit loads of `data` and `data_end` at offsets 76 and 80 yield the
 same bounded VM packet-pointer classes as XDP. Direct access therefore needs a
 fresh end comparison proving the accessed prefix.
 
-`Vm::run_skb` and `Vm::run_skb_jit` copy caller packet bytes into the existing
-bounds-checked VM packet region and construct a zero-filled 192-byte context.
+`Vm::run_skb` and `Vm::run_skb_jit` borrow caller packet bytes as the shared
+bounds-checked invocation packet window and construct a zero-filled 192-byte context.
 `len` is the packet length. For an Ethernet-sized packet, `protocol` is derived
 from its outer EtherType in the host representation of the kernel's `__be16`;
 the other modeled metadata fields default to zero.
@@ -49,7 +49,7 @@ hybrid JIT use the same helper dispatcher and packet region.
 ## `skb_pull_data`
 
 `skb_pull_data` (#39) requires the original skb context and a scalar u32
-length. The VM-owned packet is already linear and writable, so zero or an
+length. The borrowed packet window is already linear and writable, so zero or an
 available length succeeds without changing bytes; a requested length beyond
 the packet returns `-ENOMEM`.
 

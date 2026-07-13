@@ -20,6 +20,7 @@ pub struct XdpFrame {
     data_end: usize,
     metadata: XdpMetadata,
     cookie: u64,
+    capabilities: XdpCapabilities,
 }
 
 impl XdpFrame {
@@ -31,6 +32,7 @@ impl XdpFrame {
             data_end: packet.len(),
             metadata: XdpMetadata::default(),
             cookie: 0,
+            capabilities: XdpCapabilities::default(),
         }
     }
 
@@ -49,6 +51,7 @@ impl XdpFrame {
             data_end,
             metadata: XdpMetadata::default(),
             cookie: 0,
+            capabilities: XdpCapabilities::default(),
         })
     }
 
@@ -105,9 +108,26 @@ impl XdpFrame {
         self.cookie = cookie;
     }
 
+    pub fn capabilities(&self) -> XdpCapabilities {
+        self.capabilities
+    }
+
+    pub fn set_capabilities(&mut self, capabilities: XdpCapabilities) {
+        self.capabilities = capabilities;
+    }
+
     /// Return the backing allocation and active window to the provider.
     pub fn into_storage(self) -> (Vec<u8>, usize, usize) {
         (self.storage, self.data_start, self.data_end)
+    }
+
+    pub(crate) fn execution_parts(&mut self) -> (&mut [u8], &mut usize, &mut usize, XdpCapabilities) {
+        (
+            &mut self.storage,
+            &mut self.data_start,
+            &mut self.data_end,
+            self.capabilities,
+        )
     }
 }
 
@@ -117,6 +137,16 @@ pub struct XdpMetadata {
     pub ingress_ifindex: u32,
     pub rx_queue_index: u32,
     pub egress_ifindex: u32,
+}
+
+/// Packet-window mutations an invocation provider can support.
+///
+/// These bits are reserved by the environment boundary; resize helpers do not
+/// consume them yet and continue to return `-EOPNOTSUPP`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XdpCapabilities {
+    pub adjust_head: bool,
+    pub adjust_tail: bool,
 }
 
 /// A recognized Linux XDP action.

@@ -231,15 +231,7 @@ pub struct Vm {
     /// Scratch backing for [`Region::KernelMem`] reads; logically an
     /// all-zeroes region, re-zeroed on every resolve. Not run state.
     kmem: Vec<u8>,
-    /// Backing for the direct-packet-access virtual region.
-    packet: Vec<u8>,
-    /// Set after verification with [`crate::verifier::Config::xdp`]; causes
-    /// xdp_md data/data_end loads to synthesize full virtual addresses.
-    xdp: bool,
-    /// Set after verification with the explicit `__sk_buff` model.
-    skb: bool,
-    /// Configurable pointer-bearing metadata layout armed by verification.
-    metadata_layout: Option<MetadataLayout>,
+    context_model: crate::execution::ContextModel,
     legacy_packet: crate::verifier::LegacyPacketProfile,
     legacy_packet_used: bool,
     tail_programs: Vec<TailProgram>,
@@ -334,10 +326,7 @@ impl Vm {
             debug: None,
             probe_mem: Vec::new(),
             kmem: Vec::new(),
-            packet: Vec::new(),
-            xdp: false,
-            skb: false,
-            metadata_layout: None,
+            context_model: crate::execution::ContextModel::Flat,
             legacy_packet: crate::verifier::LegacyPacketProfile::Disabled,
             legacy_packet_used: false,
             tail_programs: Vec::new(),
@@ -605,15 +594,11 @@ impl Vm {
         if cfg.btf_ctx.is_none() {
             cfg.btf_ctx = self.btf_ctx.clone();
         }
-        let xdp = cfg.xdp;
-        let skb = cfg.skb;
-        let metadata_layout = cfg.metadata_layout;
+        let context_model = context_model(&cfg);
         let legacy_packet = cfg.legacy_packet;
         let ok =
             crate::verifier::verify(&self.insns, &self.map_defs, self.user_helpers.sigs(), cfg)?;
-        self.xdp = xdp;
-        self.skb = skb;
-        self.metadata_layout = metadata_layout;
+        self.context_model = context_model;
         self.legacy_packet = legacy_packet;
         self.legacy_packet_used = self.insns.iter().any(is_legacy_packet_load);
         self.probe_mem = ok.probe_mem.clone();
@@ -639,9 +624,7 @@ impl Vm {
         if cfg.btf_ctx.is_none() {
             cfg.btf_ctx = self.btf_ctx.clone();
         }
-        let xdp = cfg.xdp;
-        let skb = cfg.skb;
-        let metadata_layout = cfg.metadata_layout;
+        let context_model = context_model(&cfg);
         let legacy_packet = cfg.legacy_packet;
         let ok = crate::verifier::verify(
             &self.insns,
@@ -656,9 +639,7 @@ impl Vm {
             evidence: &ok,
         })
         .map_err(VerifyWithPolicyError::Policy)?;
-        self.xdp = xdp;
-        self.skb = skb;
-        self.metadata_layout = metadata_layout;
+        self.context_model = context_model;
         self.legacy_packet = legacy_packet;
         self.legacy_packet_used = self.insns.iter().any(is_legacy_packet_load);
         self.probe_mem = ok.probe_mem.clone();
@@ -739,27 +720,27 @@ impl Vm {
 
     /// Execute the program with `ctx` as the memory r1 points to.
     pub fn run(&mut self, ctx: &mut [u8]) -> Result<u64, EbpfError> {
-        self.run_with_packet(ctx, LegacyPacketBacking::None)
+        let env = crate::execution::ExecutionEnvironment::borrowed(
+            ctx,
+            self.context_model,
+            crate::execution::PacketSource::None,
+        );
+        self.run_environment(env).map(|outcome| outcome.return_value)
     }
 
-    fn run_with_packet(
-        &mut self,
-        ctx: &mut [u8],
-        packet: LegacyPacketBacking,
-    ) -> Result<u64, EbpfError> {
-        self.run_with_packet_outcome(ctx, packet).map(|(r0, _)| r0)
-    }
-
-    fn run_with_packet_outcome(
-        &mut self,
-        ctx: &mut [u8],
-        packet: LegacyPacketBacking,
-    ) -> Result<(u64, Option<crate::packet::XdpRedirect>), EbpfError> {
-        self.require_packet_backing(packet)?;
-        let mut m = Machine::new_with_packet(self, ctx, packet);
+    /// Execute with an explicitly composed invocation environment.
+    pub fn run_environment<'a>(
+        &'a mut self,
+        env: crate::execution::ExecutionEnvironment<'a>,
+    ) -> Result<crate::execution::ExecutionOutcome, EbpfError> {
+        self.require_environment(&env)?;
+        let mut m = Machine::new_with_environment(self, env);
         loop {
             if let Some(ret) = m.step()? {
-                return Ok((ret, m.xdp_redirect));
+                return Ok(crate::execution::ExecutionOutcome {
+                    return_value: ret,
+                    redirect: m.env.redirect,
+                });
             }
         }
     }
@@ -778,13 +759,21 @@ impl Vm {
     /// the buffer's host pointer to the program. Writes made by the program are
     /// visible in `buffer` when execution returns.
     pub fn run_raw(&mut self, buffer: &mut [u8]) -> Result<u64, EbpfError> {
-        self.run_with_packet(buffer, LegacyPacketBacking::Context)
+        let env = crate::execution::ExecutionEnvironment::borrowed(
+            buffer,
+            self.context_model,
+            crate::execution::PacketSource::Context,
+        );
+        self.run_environment(env).map(|outcome| outcome.return_value)
     }
 
     fn prepare_metadata(&self, metadata: &mut [u8], packet_base: u64) -> Result<u32, EbpfError> {
         let fail = |msg: String| EbpfError { pc: 0, msg };
-        let layout = self.metadata_layout.ok_or_else(|| fail(
-            "metadata execution requires successful metadata-layout verification".into()))?;
+        let crate::execution::ContextModel::Metadata(layout) = self.context_model else {
+            return Err(fail(
+                "metadata execution requires successful metadata-layout verification".into(),
+            ));
+        };
         if metadata.len() < layout.required_len() {
             return Err(fail(format!("metadata buffer is too short: need {} bytes, got {}",
                 layout.required_len(), metadata.len())));
@@ -816,13 +805,20 @@ impl Vm {
     /// successful verification.
     pub fn run_metadata(&mut self, metadata: &mut [u8], packet_base: u64) -> Result<u64, EbpfError> {
         let index = self.prepare_metadata(metadata, packet_base)?;
-        self.run_with_packet(metadata, LegacyPacketBacking::Owned(index))
+        let env = crate::execution::ExecutionEnvironment::owned_packet(
+            metadata,
+            self.context_model,
+            index,
+        );
+        self.run_environment(env).map(|outcome| outcome.return_value)
     }
 
     /// Execute with a zero-filled fixed metadata buffer of the verified size.
     pub fn run_fixed_metadata(&mut self, packet_base: u64) -> Result<u64, EbpfError> {
-        let layout = self.metadata_layout.ok_or_else(|| EbpfError { pc: 0, msg:
-            "metadata execution requires successful metadata-layout verification".into() })?;
+        let crate::execution::ContextModel::Metadata(layout) = self.context_model else {
+            return Err(EbpfError { pc: 0, msg:
+                "metadata execution requires successful metadata-layout verification".into() });
+        };
         self.run_metadata(&mut vec![0u8; layout.required_len()], packet_base)
     }
 
@@ -834,45 +830,48 @@ impl Vm {
         packet_base: u64,
     ) -> Result<u64, EbpfError> {
         let index = self.prepare_metadata(metadata, packet_base)?;
-        self.run_jit_with_packet(metadata, LegacyPacketBacking::Owned(index))
+        let env = crate::execution::ExecutionEnvironment::owned_packet(
+            metadata,
+            self.context_model,
+            index,
+        );
+        self.run_environment_jit(env).map(|outcome| outcome.return_value)
     }
 
     /// JIT counterpart of [`Vm::run_fixed_metadata`].
     #[cfg(feature = "jit")]
     pub fn run_fixed_metadata_jit(&mut self, packet_base: u64) -> Result<u64, EbpfError> {
-        let layout = self.metadata_layout.ok_or_else(|| EbpfError { pc: 0, msg:
-            "metadata execution requires successful metadata-layout verification".into() })?;
+        let crate::execution::ContextModel::Metadata(layout) = self.context_model else {
+            return Err(EbpfError { pc: 0, msg:
+                "metadata execution requires successful metadata-layout verification".into() });
+        };
         self.run_metadata_jit(&mut vec![0u8; layout.required_len()], packet_base)
     }
 
     /// Execute an XDP program over `packet`. The method constructs the
-    /// virtual `xdp_md` context internally and copies packet writes back to
-    /// the caller on both successful exit and runtime error.
+    /// virtual `xdp_md` context internally and borrows the packet for the
+    /// duration of the invocation.
     pub fn run_xdp(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
-        let mut frame = crate::packet::XdpFrame::new(packet);
-        let result = self.run_xdp_frame(&mut frame).map(|verdict| verdict.return_value);
-        packet.copy_from_slice(frame.data());
-        result
+        let env = crate::execution::ExecutionEnvironment::xdp_slice(packet)
+            .map_err(|msg| EbpfError { pc: 0, msg })?;
+        self.run_environment(env).map(|outcome| outcome.return_value)
     }
 
     /// Execute one provider-owned XDP frame.
     ///
-    /// Only the active data window is staged through the VM. Headroom and
-    /// tailroom remain provider-owned and unchanged; resize helpers therefore
-    /// retain their standalone `-EOPNOTSUPP` behavior.
+    /// The invocation borrows the provider's storage and active bounds
+    /// directly. Resize helpers still retain their standalone
+    /// `-EOPNOTSUPP` behavior until the capability slot is wired to them.
     pub fn run_xdp_frame(
         &mut self,
         frame: &mut crate::packet::XdpFrame,
     ) -> Result<crate::packet::XdpVerdict, EbpfError> {
-        let metadata = frame.metadata();
-        let packet = frame.data_mut();
-        let mut ctx = self.prepare_xdp(packet).map_err(|msg| EbpfError { pc: 0, msg })?;
-        ctx[12..16].copy_from_slice(&metadata.ingress_ifindex.to_le_bytes());
-        ctx[16..20].copy_from_slice(&metadata.rx_queue_index.to_le_bytes());
-        ctx[20..24].copy_from_slice(&metadata.egress_ifindex.to_le_bytes());
-        let result = self.run_with_packet_outcome(&mut ctx, LegacyPacketBacking::VmPacket);
-        packet.copy_from_slice(&self.packet);
-        result.map(|(r0, redirect)| crate::packet::XdpVerdict::with_redirect(r0, redirect))
+        let env = crate::execution::ExecutionEnvironment::xdp(frame)
+            .map_err(|msg| EbpfError { pc: 0, msg })?;
+        let result = self.run_environment(env);
+        result.map(|outcome| {
+            crate::packet::XdpVerdict::with_redirect(outcome.return_value, outcome.redirect)
+        })
     }
 
     /// Process at most `budget` frames from a packet provider.
@@ -909,12 +908,9 @@ impl Vm {
     /// JIT counterpart of [`Vm::run_xdp`].
     #[cfg(feature = "jit")]
     pub fn run_xdp_jit(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
-        let mut frame = crate::packet::XdpFrame::new(packet);
-        let result = self
-            .run_xdp_frame_jit(&mut frame)
-            .map(|verdict| verdict.return_value);
-        packet.copy_from_slice(frame.data());
-        result
+        let env = crate::execution::ExecutionEnvironment::xdp_slice(packet)
+            .map_err(|msg| EbpfError { pc: 0, msg })?;
+        self.run_environment_jit(env).map(|outcome| outcome.return_value)
     }
 
     /// JIT counterpart of [`Vm::run_xdp_frame`].
@@ -923,15 +919,12 @@ impl Vm {
         &mut self,
         frame: &mut crate::packet::XdpFrame,
     ) -> Result<crate::packet::XdpVerdict, EbpfError> {
-        let metadata = frame.metadata();
-        let packet = frame.data_mut();
-        let mut ctx = self.prepare_xdp(packet).map_err(|msg| EbpfError { pc: 0, msg })?;
-        ctx[12..16].copy_from_slice(&metadata.ingress_ifindex.to_le_bytes());
-        ctx[16..20].copy_from_slice(&metadata.rx_queue_index.to_le_bytes());
-        ctx[20..24].copy_from_slice(&metadata.egress_ifindex.to_le_bytes());
-        let result = self.run_jit_with_packet_outcome(&mut ctx, LegacyPacketBacking::VmPacket);
-        packet.copy_from_slice(&self.packet);
-        result.map(|(r0, redirect)| crate::packet::XdpVerdict::with_redirect(r0, redirect))
+        let env = crate::execution::ExecutionEnvironment::xdp(frame)
+            .map_err(|msg| EbpfError { pc: 0, msg })?;
+        let result = self.run_environment_jit(env);
+        result.map(|outcome| {
+            crate::packet::XdpVerdict::with_redirect(outcome.return_value, outcome.redirect)
+        })
     }
 
     /// JIT counterpart of [`Vm::run_xdp_provider`].
@@ -962,64 +955,31 @@ impl Vm {
         Ok(stats)
     }
 
-    /// Execute an skb-context program over VM-owned packet bytes. The method
+    /// Execute an skb-context program over caller-owned packet bytes. The method
     /// constructs a zero-filled `struct __sk_buff` record with `len` set to
     /// the packet length; no host skb or packet pointer is exposed.
     pub fn run_skb(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
-        let mut ctx = self.prepare_skb(packet).map_err(|msg| EbpfError { pc: 0, msg })?;
-        let result = self.run_with_packet(&mut ctx, LegacyPacketBacking::VmPacket);
-        packet.copy_from_slice(&self.packet);
-        result
+        let env = crate::execution::ExecutionEnvironment::skb(packet)
+            .map_err(|msg| EbpfError { pc: 0, msg })?;
+        self.run_environment(env).map(|outcome| outcome.return_value)
     }
 
     /// JIT counterpart of [`Vm::run_skb`].
     #[cfg(feature = "jit")]
     pub fn run_skb_jit(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
-        let mut ctx = self.prepare_skb(packet).map_err(|msg| EbpfError { pc: 0, msg })?;
-        let result = self.run_jit_with_packet(&mut ctx, LegacyPacketBacking::VmPacket);
-        packet.copy_from_slice(&self.packet);
-        result
-    }
-
-    /// Install packet bytes and return febpf's synthetic `struct __sk_buff`.
-    pub fn prepare_skb(&mut self, packet: &[u8]) -> Result<Vec<u8>, String> {
-        if !self.skb {
-            return Err("skb execution requires successful verification with Config::skb".into());
-        }
-        if packet.len() > u32::MAX as usize {
-            return Err("packet is too large for __sk_buff.len".into());
-        }
-        self.packet.clear();
-        self.packet.extend_from_slice(packet);
-        let mut ctx = vec![0u8; 192];
-        ctx[0..4].copy_from_slice(&(packet.len() as u32).to_le_bytes());
-        // For Ethernet packet input, synthesize skb->protocol from the outer
-        // EtherType exactly as the little-endian eBPF host observes __be16.
-        if packet.len() >= 14 {
-            let protocol = u16::from_le_bytes([packet[12], packet[13]]) as u32;
-            ctx[16..20].copy_from_slice(&protocol.to_le_bytes());
-        }
-        Ok(ctx)
-    }
-
-    /// Install packet bytes and return the synthetic `xdp_md` context used by
-    /// [`Vm::machine`]. This is the debugger/replay counterpart of
-    /// [`Vm::run_xdp`]. The VM must first verify under XDP rules.
-    pub fn prepare_xdp(&mut self, packet: &[u8]) -> Result<Vec<u8>, String> {
-        if !self.xdp {
-            return Err("XDP execution requires successful verification with Config::xdp".into());
-        }
-        if packet.len() > u32::MAX as usize {
-            return Err("packet is too large for xdp_md data/data_end".into());
-        }
-        self.packet.clear();
-        self.packet.extend_from_slice(packet);
-        Ok(vec![0u8; 24])
+        let env = crate::execution::ExecutionEnvironment::skb(packet)
+            .map_err(|msg| EbpfError { pc: 0, msg })?;
+        self.run_environment_jit(env).map(|outcome| outcome.return_value)
     }
 
     /// Create a single-stepping execution (for the debugger).
     pub fn machine<'a>(&'a mut self, ctx: &'a mut [u8]) -> Machine<'a> {
-        Machine::new(self, ctx)
+        let env = crate::execution::ExecutionEnvironment::borrowed(
+            ctx,
+            self.context_model,
+            crate::execution::PacketSource::None,
+        );
+        Machine::new_with_environment(self, env)
     }
 
     /// Create a single-stepping execution whose context is also the legacy
@@ -1029,26 +989,31 @@ impl Vm {
         &'a mut self,
         buffer: &'a mut [u8],
     ) -> Result<Machine<'a>, EbpfError> {
-        self.require_packet_backing(LegacyPacketBacking::Context)?;
-        Ok(Machine::new_with_packet(
-            self,
+        let env = crate::execution::ExecutionEnvironment::borrowed(
             buffer,
-            LegacyPacketBacking::Context,
-        ))
+            self.context_model,
+            crate::execution::PacketSource::Context,
+        );
+        self.machine_environment(env)
     }
 
-    /// Create a single-stepping XDP execution after [`Vm::prepare_xdp`].
-    /// Legacy packet loads read the VM's prepared packet region.
-    pub fn machine_prepared_xdp<'a>(
+    /// Create a single-stepping XDP invocation that borrows `frame` directly.
+    pub fn machine_xdp<'a>(
         &'a mut self,
-        ctx: &'a mut [u8],
+        frame: &'a mut crate::packet::XdpFrame,
     ) -> Result<Machine<'a>, EbpfError> {
-        self.require_packet_backing(LegacyPacketBacking::VmPacket)?;
-        Ok(Machine::new_with_packet(
-            self,
-            ctx,
-            LegacyPacketBacking::VmPacket,
-        ))
+        let env = crate::execution::ExecutionEnvironment::xdp(frame)
+            .map_err(|msg| EbpfError { pc: 0, msg })?;
+        self.machine_environment(env)
+    }
+
+    /// Create a single-stepping execution over a composed environment.
+    pub fn machine_environment<'a>(
+        &'a mut self,
+        env: crate::execution::ExecutionEnvironment<'a>,
+    ) -> Result<Machine<'a>, EbpfError> {
+        self.require_environment(&env)?;
+        Ok(Machine::new_with_environment(self, env))
     }
 
     /// Compile the program to native code (idempotent). Requires a supported
@@ -1070,31 +1035,32 @@ impl Vm {
     /// if the host architecture is unsupported.
     #[cfg(feature = "jit")]
     pub fn run_jit(&mut self, ctx: &mut [u8]) -> Result<u64, EbpfError> {
-        self.run_jit_with_packet(ctx, LegacyPacketBacking::None)
+        let env = crate::execution::ExecutionEnvironment::borrowed(
+            ctx,
+            self.context_model,
+            crate::execution::PacketSource::None,
+        );
+        self.run_environment_jit(env).map(|outcome| outcome.return_value)
     }
 
     /// JIT counterpart of [`Vm::run_raw`].
     #[cfg(feature = "jit")]
     pub fn run_raw_jit(&mut self, buffer: &mut [u8]) -> Result<u64, EbpfError> {
-        self.run_jit_with_packet(buffer, LegacyPacketBacking::Context)
+        let env = crate::execution::ExecutionEnvironment::borrowed(
+            buffer,
+            self.context_model,
+            crate::execution::PacketSource::Context,
+        );
+        self.run_environment_jit(env).map(|outcome| outcome.return_value)
     }
 
     #[cfg(feature = "jit")]
-    fn run_jit_with_packet(
-        &mut self,
-        ctx: &mut [u8],
-        packet: LegacyPacketBacking,
-    ) -> Result<u64, EbpfError> {
-        self.run_jit_with_packet_outcome(ctx, packet).map(|(r0, _)| r0)
-    }
-
-    #[cfg(feature = "jit")]
-    fn run_jit_with_packet_outcome(
-        &mut self,
-        ctx: &mut [u8],
-        packet: LegacyPacketBacking,
-    ) -> Result<(u64, Option<crate::packet::XdpRedirect>), EbpfError> {
-        self.require_packet_backing(packet)?;
+    /// JIT counterpart of [`Vm::run_environment`].
+    pub fn run_environment_jit<'a>(
+        &'a mut self,
+        env: crate::execution::ExecutionEnvironment<'a>,
+    ) -> Result<crate::execution::ExecutionOutcome, EbpfError> {
+        self.require_environment(&env)?;
         if let Err(e) = self.compile() {
             return Err(EbpfError { pc: 0, msg: e });
         }
@@ -1104,7 +1070,7 @@ impl Vm {
             .iter_mut()
             .map(|p| p.jit.take().unwrap())
             .collect();
-        let mut m = Machine::new_with_packet(self, ctx, packet);
+        let mut m = Machine::new_with_environment(self, env);
         let r = loop {
             let native = if m.active_program == 0 {
                 &jit
@@ -1123,17 +1089,41 @@ impl Vm {
             }
             break Ok(m.regs[0]);
         };
-        let redirect = m.xdp_redirect;
+        let redirect = m.env.redirect;
         drop(m);
         self.jit = Some(jit);
         for (target, native) in self.tail_programs.iter_mut().zip(tail_jits.drain(..)) {
             target.jit = Some(native);
         }
-        r.map(|r0| (r0, redirect))
+        r.map(|return_value| crate::execution::ExecutionOutcome {
+            return_value,
+            redirect,
+        })
     }
 
-    fn require_packet_backing(&self, packet: LegacyPacketBacking) -> Result<(), EbpfError> {
-        if self.legacy_packet_used && packet == LegacyPacketBacking::None {
+    fn require_environment(
+        &self,
+        env: &crate::execution::ExecutionEnvironment<'_>,
+    ) -> Result<(), EbpfError> {
+        if env.model() != self.context_model {
+            return Err(EbpfError {
+                pc: 0,
+                msg: "execution context model does not match verified program".into(),
+            });
+        }
+        if matches!(
+            self.context_model,
+            crate::execution::ContextModel::Xdp | crate::execution::ContextModel::Skb
+        ) && !env.has_packet_window()
+        {
+            return Err(EbpfError {
+                pc: 0,
+                msg: "verified packet context requires a packet-window add-on".into(),
+            });
+        }
+        if self.legacy_packet_used
+            && env.packet_source == crate::execution::PacketSource::None
+        {
             Err(EbpfError {
                 pc: 0,
                 msg: "legacy packet input unavailable for this execution adapter".into(),
@@ -1146,6 +1136,20 @@ impl Vm {
 
 fn is_legacy_packet_load(ins: &Insn) -> bool {
     ins.class() == class::LD && matches!(ins.mem_mode(), mode::ABS | mode::IND)
+}
+
+fn context_model(cfg: &crate::verifier::Config) -> crate::execution::ContextModel {
+    if cfg.xdp {
+        crate::execution::ContextModel::Xdp
+    } else if cfg.skb {
+        crate::execution::ContextModel::Skb
+    } else if let Some(layout) = cfg.metadata_layout {
+        crate::execution::ContextModel::Metadata(layout)
+    } else if cfg.btf_ctx.is_some() {
+        crate::execution::ContextModel::Btf
+    } else {
+        crate::execution::ContextModel::Flat
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1169,8 +1173,7 @@ pub struct Snapshot {
     insn_count: u64,
     frames: Vec<SavedFrame>,
     stack: Vec<u8>,
-    ctx: Vec<u8>,
-    packet: Vec<u8>,
+    environment: crate::execution::EnvironmentSnapshot,
     /// Region table: map-value regions are created lazily in execution order,
     /// so replay must resume handle allocation from the snapshotted state or
     /// guest-visible virtual addresses would diverge from the original run.
@@ -1185,7 +1188,6 @@ pub struct Snapshot {
     logical_boot_ns: u64,
     active_program: u32,
     tail_call_count: u32,
-    xdp_redirect: Option<crate::packet::XdpRedirect>,
 }
 
 impl Snapshot {
@@ -1305,7 +1307,7 @@ pub enum MapStep {
 /// single-step (the debugger does), or [`Vm::run`] to run to completion.
 pub struct Machine<'a> {
     vm: &'a mut Vm,
-    ctx: &'a mut [u8],
+    env: crate::execution::ExecutionEnvironment<'a>,
     pub regs: [u64; NUM_REGS],
     pub pc: usize,
     frames: Vec<SavedFrame>,
@@ -1323,16 +1325,6 @@ pub struct Machine<'a> {
     jit_switch_pending: bool,
     active_program: u32,
     tail_call_count: u32,
-    legacy_packet_backing: LegacyPacketBacking,
-    xdp_redirect: Option<crate::packet::XdpRedirect>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LegacyPacketBacking {
-    None,
-    Context,
-    VmPacket,
-    Owned(u32),
 }
 
 /// Memory bus for user helpers: bounds-checked access to the VM's regions.
@@ -1453,18 +1445,14 @@ impl<'a> Machine<'a> {
 
     /// Redirect destination most recently selected by this invocation.
     pub fn xdp_redirect(&self) -> Option<crate::packet::XdpRedirect> {
-        self.xdp_redirect
+        self.env.redirect
     }
 
-    fn new(vm: &'a mut Vm, ctx: &'a mut [u8]) -> Machine<'a> {
-        Self::new_with_packet(vm, ctx, LegacyPacketBacking::None)
-    }
-
-    fn new_with_packet(
+    fn new_with_environment(
         vm: &'a mut Vm,
-        ctx: &'a mut [u8],
-        legacy_packet_backing: LegacyPacketBacking,
+        mut env: crate::execution::ExecutionEnvironment<'a>,
     ) -> Machine<'a> {
+        assert_eq!(vm.context_model, env.model(), "execution context model mismatch");
         vm.stack.iter_mut().for_each(|b| *b = 0);
         // BTF-typed programs: the ctx is an array of 8-byte arguments, and
         // non-null pointer arguments must hold kernel-memory addresses.
@@ -1474,7 +1462,7 @@ impl<'a> Machine<'a> {
         if let Some(bc) = &vm.btf_ctx {
             for (i, slot) in bc.args.iter().enumerate() {
                 if matches!(slot, crate::btf::CtxSlot::Ptr { .. }) {
-                    if let Some(b) = ctx.get_mut(i * 8..i * 8 + 8) {
+                    if let Some(b) = env.context_mut().get_mut(i * 8..i * 8 + 8) {
                         let addr = mkaddr(KMEM_HANDLE, (i as u32 + 1) << 20);
                         b.copy_from_slice(&addr.to_le_bytes());
                     }
@@ -1483,11 +1471,11 @@ impl<'a> Machine<'a> {
         }
         let mut regs = [0u64; NUM_REGS];
         regs[1] = mkaddr(CTX_HANDLE, 0);
-        regs[2] = ctx.len() as u64;
+        regs[2] = env.context().len() as u64;
         regs[REG_FP as usize] = mkaddr(STACK0_HANDLE, STACK_SIZE as u32);
         Machine {
             vm,
-            ctx,
+            env,
             regs,
             pc: 0,
             frames: Vec::new(),
@@ -1500,8 +1488,6 @@ impl<'a> Machine<'a> {
             jit_switch_pending: false,
             active_program: 0,
             tail_call_count: 0,
-            legacy_packet_backing,
-            xdp_redirect: None,
         }
     }
 
@@ -1513,8 +1499,7 @@ impl<'a> Machine<'a> {
             insn_count: self.insn_count,
             frames: self.frames.clone(),
             stack: self.vm.stack.clone(),
-            ctx: self.ctx.to_vec(),
-            packet: self.vm.packet.clone(),
+            environment: self.env.snapshot(),
             regions: self.vm.regions.clone(),
             owned_regions: self.vm.owned_regions.clone(),
             maps: self.vm.maps.iter().map(Map::snapshot).collect(),
@@ -1526,7 +1511,6 @@ impl<'a> Machine<'a> {
             logical_boot_ns: self.logical_boot_ns,
             active_program: self.active_program,
             tail_call_count: self.tail_call_count,
-            xdp_redirect: self.xdp_redirect,
         }
     }
 
@@ -1537,8 +1521,7 @@ impl<'a> Machine<'a> {
         self.insn_count = s.insn_count;
         self.frames = s.frames.clone();
         self.vm.stack.copy_from_slice(&s.stack);
-        self.ctx.copy_from_slice(&s.ctx);
-        self.vm.packet.clone_from(&s.packet);
+        self.env.restore(&s.environment);
         self.vm.regions = s.regions.clone();
         self.vm.owned_regions.clone_from(&s.owned_regions);
         for (m, ms) in self.vm.maps.iter_mut().zip(&s.maps) {
@@ -1552,7 +1535,6 @@ impl<'a> Machine<'a> {
         self.logical_boot_ns = s.logical_boot_ns;
         self.active_program = s.active_program;
         self.tail_call_count = s.tail_call_count;
-        self.xdp_redirect = s.xdp_redirect;
         #[cfg(feature = "jit")]
         {
             self.jit_fault = None;
@@ -1587,7 +1569,7 @@ impl<'a> Machine<'a> {
         self.active_program = st.active_program;
         self.tail_call_count = st.tail_call_count;
         self.vm.stack.copy_from_slice(&st.stack);
-        self.ctx.copy_from_slice(&st.ctx);
+        self.env.context_mut().copy_from_slice(&st.ctx);
     }
 
     /// Save the live per-instance state back into `st` (inverse of
@@ -1602,7 +1584,7 @@ impl<'a> Machine<'a> {
         st.active_program = self.active_program;
         st.tail_call_count = self.tail_call_count;
         st.stack.copy_from_slice(&self.vm.stack);
-        st.ctx.copy_from_slice(self.ctx);
+        st.ctx.copy_from_slice(self.env.context());
     }
 
     /// Classify the instruction at the current pc as a map-visible operation,
@@ -1692,7 +1674,7 @@ impl<'a> Machine<'a> {
         let handle = (addr >> 32) as usize;
         let off = addr as u32 as usize;
         let buf: &[u8] = match self.vm.regions.get(handle).copied()? {
-            Region::Ctx => self.ctx,
+            Region::Ctx => self.env.context(),
             Region::Stack(f) => {
                 &self.vm.stack[f as usize * STACK_SIZE..(f as usize + 1) * STACK_SIZE]
             }
@@ -1837,13 +1819,14 @@ impl<'a> Machine<'a> {
     #[inline]
     fn mem(&mut self, addr: u64, len: usize, write: bool) -> Result<&mut [u8], EbpfError> {
         let pc = self.pc;
+        let (ctx, packet) = self.env.memory_parts();
         resolve_slice(
             &self.vm.regions,
             &mut self.vm.maps,
             &mut self.vm.stack,
-            self.ctx,
+            ctx,
             &mut self.vm.kmem,
-            &mut self.vm.packet,
+            packet,
             &mut self.vm.owned_regions,
             addr,
             len,
@@ -2044,11 +2027,11 @@ impl<'a> Machine<'a> {
                         .and_then(|off| usize::try_from(off).ok())
                         .and_then(|start| start.checked_add(size).map(|end| (start, end)))
                         .and_then(|(start, end)| {
-                            let packet: &[u8] = match self.legacy_packet_backing {
-                                LegacyPacketBacking::None => return None,
-                                LegacyPacketBacking::Context => self.ctx,
-                                LegacyPacketBacking::VmPacket => &self.vm.packet,
-                                LegacyPacketBacking::Owned(index) => self
+                            let packet: &[u8] = match self.env.packet_source {
+                                crate::execution::PacketSource::None => return None,
+                                crate::execution::PacketSource::Context => self.env.context(),
+                                crate::execution::PacketSource::Window => self.env.packet(),
+                                crate::execution::PacketSource::Owned(index) => self
                                     .vm
                                     .owned_regions
                                     .get(index as usize)
@@ -2108,10 +2091,14 @@ impl<'a> Machine<'a> {
                 // verifier has typed this as XDP, synthesize those full
                 // addresses at the load boundary.
                 let packet_ptr = if size == 4 && addr >> 32 == CTX_HANDLE as u64 {
-                    match (self.vm.xdp, self.vm.skb, addr as u32) {
-                        (true, _, 0) | (_, true, 76) => Some(mkaddr(PACKET_HANDLE, 0)),
-                        (true, _, 4) | (_, true, 80) => {
-                            Some(mkaddr(PACKET_HANDLE, self.vm.packet.len() as u32))
+                    match (self.vm.context_model, addr as u32) {
+                        (crate::execution::ContextModel::Xdp, 0)
+                        | (crate::execution::ContextModel::Skb, 76) => {
+                            Some(mkaddr(PACKET_HANDLE, 0))
+                        }
+                        (crate::execution::ContextModel::Xdp, 4)
+                        | (crate::execution::ContextModel::Skb, 80) => {
+                            Some(mkaddr(PACKET_HANDLE, self.env.packet_len() as u32))
                         }
                         _ => None,
                     }
@@ -2500,14 +2487,17 @@ impl<'a> Machine<'a> {
             }
             helpers::id::SEQ_WRITE => {
                 let data = self.read_bytes(args[1], args[2] as usize)?;
-                let fits = self
-                    .vm
-                    .seq_output
+                let output = if let Some(output) = self.env.seq_output_mut() {
+                    output
+                } else {
+                    &mut self.vm.seq_output
+                };
+                let fits = output
                     .len()
                     .checked_add(data.len())
                     .is_some_and(|len| len <= SEQ_OUTPUT_CAPACITY);
                 if fits {
-                    self.vm.seq_output.extend_from_slice(&data);
+                    output.extend_from_slice(&data);
                     0
                 } else {
                     (-75i64) as u64 // -EOVERFLOW; leave prior output intact
@@ -2575,7 +2565,7 @@ impl<'a> Machine<'a> {
             // same spirit as get_current_task (docs/specs/tracing-helpers.md).
             helpers::id::GET_SOCKET_COOKIE => 0x0000_0000_c00c_1e01,
             helpers::id::REDIRECT_MAP => {
-                self.xdp_redirect = None;
+                self.env.redirect = None;
                 let m = self.map_from_ptr(args[0])?;
                 let key_value = args[1] as u32;
                 let key = key_value.to_ne_bytes();
@@ -2583,7 +2573,7 @@ impl<'a> Machine<'a> {
                     .lookup(&key)
                     .is_some_and(|value| self.vm.maps[m].value(value).iter().any(|&byte| byte != 0));
                 if populated {
-                    self.xdp_redirect = Some(crate::packet::XdpRedirect::Map {
+                    self.env.redirect = Some(crate::packet::XdpRedirect::Map {
                         map_index: m as u32,
                         map_kind: self.vm.maps[m].def.kind,
                         key: key_value,
@@ -2600,15 +2590,15 @@ impl<'a> Machine<'a> {
             helpers::id::XDP_LOAD_BYTES => {
                 let start = args[1] as u32 as usize;
                 let len = args[3] as u32 as usize;
-                if self.legacy_packet_backing != LegacyPacketBacking::VmPacket
+                if self.env.packet_source != crate::execution::PacketSource::Window
                     || start > 0xffff
                     || len > 0xffff
                 {
                     (-14i64) as u64 // -EFAULT
                 } else {
                     match start.checked_add(len) {
-                        Some(end) if end <= self.vm.packet.len() => {
-                            let data = self.vm.packet[start..end].to_vec();
+                        Some(end) if end <= self.env.packet_len() => {
+                            let data = self.env.packet()[start..end].to_vec();
                             self.mem(args[2], len, true)?.copy_from_slice(&data);
                             0
                         }
@@ -2619,16 +2609,16 @@ impl<'a> Machine<'a> {
             helpers::id::XDP_STORE_BYTES => {
                 let start = args[1] as u32 as usize;
                 let len = args[3] as u32 as usize;
-                if self.legacy_packet_backing != LegacyPacketBacking::VmPacket
+                if self.env.packet_source != crate::execution::PacketSource::Window
                     || start > 0xffff
                     || len > 0xffff
                 {
                     (-14i64) as u64 // -EFAULT
                 } else {
                     match start.checked_add(len) {
-                        Some(end) if end <= self.vm.packet.len() => {
+                        Some(end) if end <= self.env.packet_len() => {
                             let data = self.read_bytes(args[2], len)?;
-                            self.vm.packet[start..end].copy_from_slice(&data);
+                            self.env.packet_mut()[start..end].copy_from_slice(&data);
                             0
                         }
                         _ => (-22i64) as u64, // -EINVAL
@@ -2645,10 +2635,10 @@ impl<'a> Machine<'a> {
                 0
             }
             helpers::id::REDIRECT => {
-                self.xdp_redirect = None;
-                if self.vm.xdp {
+                self.env.redirect = None;
+                if self.vm.context_model == crate::execution::ContextModel::Xdp {
                     if args[1] == 0 {
-                        self.xdp_redirect = Some(crate::packet::XdpRedirect::Interface {
+                        self.env.redirect = Some(crate::packet::XdpRedirect::Interface {
                             ifindex: args[0] as u32,
                             flags: args[1],
                         });
@@ -2656,7 +2646,7 @@ impl<'a> Machine<'a> {
                     } else {
                         0
                     } // XDP_REDIRECT / XDP_ABORTED
-                } else if self.vm.skb {
+                } else if self.vm.context_model == crate::execution::ContextModel::Skb {
                     if args[1] & !1 == 0 { 7 } else { 2 } // TC_ACT_REDIRECT / SHOT
                 } else {
                     0
@@ -2667,10 +2657,10 @@ impl<'a> Machine<'a> {
                 let len = args[3] as u32 as usize;
                 match start.checked_add(len) {
                     Some(end)
-                        if end <= self.vm.packet.len()
-                            && self.legacy_packet_backing == LegacyPacketBacking::VmPacket =>
+                        if end <= self.env.packet_len()
+                            && self.env.packet_source == crate::execution::PacketSource::Window =>
                     {
-                        let data = self.vm.packet[start..end].to_vec();
+                        let data = self.env.packet()[start..end].to_vec();
                         self.mem(args[2], len, true)?.copy_from_slice(&data);
                         0
                     }
@@ -2679,10 +2669,10 @@ impl<'a> Machine<'a> {
             }
             helpers::id::SKB_PULL_DATA => {
                 let len = args[1] as u32 as usize;
-                if self.legacy_packet_backing != LegacyPacketBacking::VmPacket {
+                if self.env.packet_source != crate::execution::PacketSource::Window {
                     (-14i64) as u64 // no skb packet backing
-                } else if len == 0 || len <= self.vm.packet.len() {
-                    0 // the VM-owned packet is already linear and writable
+                } else if len == 0 || len <= self.env.packet_len() {
+                    0 // the borrowed packet window is already linear and writable
                 } else {
                     (-12i64) as u64 // -ENOMEM, matching skb_ensure_writable
                 }
@@ -2892,13 +2882,14 @@ impl<'a> Machine<'a> {
                     .user_helpers
                     .take(hid)
                     .ok_or_else(|| self.err(format!("call to unknown helper #{hid}")))?;
+                let (ctx, packet) = self.env.memory_parts();
                 let mut bus = Bus {
                     regions: &self.vm.regions,
                     maps: &mut self.vm.maps,
                     stack: &mut self.vm.stack,
-                    ctx: self.ctx,
+                    ctx,
                     kmem: &mut self.vm.kmem,
-                    packet: &mut self.vm.packet,
+                    packet,
                     owned_regions: &mut self.vm.owned_regions,
                 };
                 let result = helper.call(args, &mut bus);

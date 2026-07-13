@@ -262,14 +262,14 @@ impl<'a> DebugSession<'a> {
         Ok(Self::from_machine(m, opts))
     }
 
-    /// Start a debugger over a packet installed by [`Vm::prepare_xdp`].
-    pub fn new_prepared_xdp(
+    /// Start a debugger with an XDP invocation add-on.
+    pub fn new_xdp(
         vm: &'a mut Vm,
-        ctx: &'a mut [u8],
+        frame: &'a mut crate::packet::XdpFrame,
         opts: &DebuggerOpts,
     ) -> Result<Self, crate::interp::EbpfError> {
         vm.echo_printk = opts.echo_printk;
-        let m = vm.machine_prepared_xdp(ctx)?;
+        let m = vm.machine_xdp(frame)?;
         Ok(Self::from_machine(m, opts))
     }
 
@@ -1325,14 +1325,13 @@ pub fn repl_raw(vm: &mut Vm, ctx: &mut [u8], opts: DebuggerOpts) -> io::Result<O
     repl_session(session, opts)
 }
 
-/// Run the debugger with the packet previously installed by
-/// [`Vm::prepare_xdp`] as the legacy packet backing.
-pub fn repl_prepared_xdp(
+/// Run the debugger with an XDP invocation add-on.
+pub fn repl_xdp(
     vm: &mut Vm,
-    ctx: &mut [u8],
+    frame: &mut crate::packet::XdpFrame,
     opts: DebuggerOpts,
 ) -> io::Result<Option<u64>> {
-    let session = DebugSession::new_prepared_xdp(vm, ctx, &opts).map_err(io::Error::other)?;
+    let session = DebugSession::new_xdp(vm, frame, &opts).map_err(io::Error::other)?;
     repl_session(session, opts)
 }
 

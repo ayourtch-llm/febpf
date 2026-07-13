@@ -196,7 +196,7 @@ The adapters bind packet bytes as follows:
 | Adapter | Legacy packet backing | Notes |
 |---|---|---|
 | `run_raw` / `run_raw_jit` | the caller's mutable raw buffer | Context accesses through `r1` and legacy reads alias the same bytes. |
-| `run_xdp` / XDP JIT counterpart | the dedicated `Vm::packet` region | This userspace composition is useful but is not a claim that Linux accepts legacy loads for XDP program type. |
+| `run_xdp` / XDP JIT counterpart | the invocation environment's packet window | This userspace composition is useful but is not a claim that Linux accepts legacy loads for XDP program type. |
 | `run_metadata` / `run_metadata_jit` | the registered RW owned region named by the prepared `data` field | Validate the base, handle, permissions, and exact active region before entry. |
 | `run_fixed_metadata` and JIT counterpart | same owned region as configurable metadata | The zero-filled metadata buffer does not become the packet. |
 | `run`, `run_no_data`, ordinary `run_jit` | none | Reject before execution if the program uses legacy loads. |
@@ -207,7 +207,7 @@ make the binding explicit; do not alias two mutable Rust slices or copy raw
 input merely to simplify borrowing. Legacy reads only need a shared view,
 while ordinary context stores retain the caller's mutable view.
 
-`run_xdp` continues to copy packet mutations back on clean exit and runtime
+`run_xdp` mutates its borrowed packet input directly on clean exit and runtime
 error. Metadata execution continues to mutate the owned region. A legacy load
 never changes either backing.
 
@@ -285,10 +285,9 @@ packet profile disabled", "DW requires Rbpf041", "r6 is not packet context",
 
 ## Snapshot, debugger, race, and replay
 
-`Snapshot` already captures registers, context, `Vm::packet`, owned regions,
-PC, and counters. Add the active packet-view identity and profile if they are
-not VM-stable fields. Restoration must select the same backing without storing
-a Rust reference or host address. Stepping backward across a successful load
+`Snapshot` captures registers, logical environment bytes and topology, owned
+regions, PC, and counters. Restoration requires the same invocation-resource
+topology without storing a Rust reference or host address. Stepping backward across a successful load
 restores `r0..r5`; stepping backward across implicit exit reopens the machine
 at the legacy instruction.
 

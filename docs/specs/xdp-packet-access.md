@@ -22,8 +22,8 @@ loads have the following types:
 
 | Offset | Field | Verifier result | Standalone value |
 |---:|---|---|---:|
-| 0 | `data` | `PtrKind::Packet` | VM packet start |
-| 4 | `data_end` | `PtrKind::PacketEnd` | VM packet end |
+| 0 | `data` | `PtrKind::Packet` | invocation packet start |
+| 4 | `data_end` | `PtrKind::PacketEnd` | invocation packet end |
 | 12 | `ingress_ifindex` | scalar | provider metadata, or 0 |
 | 16 | `rx_queue_index` | scalar | provider metadata, or 0 |
 | 20 | `egress_ifindex` | scalar | provider metadata, or 0 |
@@ -57,13 +57,13 @@ byte count.
 
 ## Runtime model
 
-The packet is a dedicated bounds-checked virtual-address region. `run_xdp`
+The packet is a borrowed, bounds-checked invocation resource. `run_xdp`
 constructs a zero-backed 24-byte `xdp_md` internally; the interpreter
 synthesizes full febpf virtual addresses when the ABI's 32-bit `data` fields
-are loaded. The slice adapter supplies zero scalar metadata. The
+are loaded. `Vm` never stages the packet. The slice adapter supplies zero scalar metadata. The
 provider-neutral `XdpFrame` adapter supplies typed interface and queue values,
 explicit headroom/tailroom, and an opaque provider cookie as specified in
-`packet-providers.md`. Packet writes are copied back on exit or runtime error.
+`packet-providers.md`. Packet writes happen directly in caller/provider storage.
 
 ## Byte-copy helpers
 
@@ -73,13 +73,12 @@ offset, a memory buffer, and a bounded u32 length. Load accepts writable,
 previously uninitialized stack memory and marks the full destination range
 initialized. Store requires every source byte to be initialized.
 
-Both helpers operate on the same VM-owned packet region as direct packet
+Both helpers operate on the same invocation packet window as direct packet
 access. An offset or length above `0xffff` returns `-EFAULT`; an interval past
 the packet end returns `-EINVAL`. Failures are atomic: load preserves the
 destination and store preserves the packet. A successful store changes packet
 contents but not its extent, so existing `data_end` range proofs remain valid.
-Interpreter and hybrid JIT share this helper implementation, and packet writes
-are copied back through the ordinary `run_xdp` contract.
+Interpreter and hybrid JIT share this helper implementation and resource resolver.
 
 `redirect` (#23) accepts scalar interface-index and flags arguments under the
 explicit XDP model. Zero flags produce the `XDP_REDIRECT` verdict; unsupported

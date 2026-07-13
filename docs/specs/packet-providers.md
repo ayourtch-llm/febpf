@@ -33,15 +33,16 @@ Providers can adopt an existing `Vec` without another copy through
 An opaque `u64` cookie survives execution unchanged for descriptor or queue
 bookkeeping.
 
-Only the active window is staged in febpf's existing virtual packet region.
-The guest sees virtual `data`/`data_end` addresses, never the allocation's host
-address. Provider `XdpMetadata` supplies `ingress_ifindex`, `rx_queue_index`,
+An invocation environment borrows the frame storage and its active bounds
+directly; `Vm` does not stage or own them. The guest still sees virtual
+`data`/`data_end` addresses, never the allocation's host address. Provider
+`XdpMetadata` supplies `ingress_ifindex`, `rx_queue_index`,
 and `egress_ifindex`; febpf writes those scalar values into the synthetic
 `xdp_md`. `data_meta` remains unsupported and unexposed.
 
-The legacy `run_xdp(&mut [u8])` and `run_xdp_jit(&mut [u8])` adapters now pass
-through this frame path and preserve their return-value and write-back
-contracts. `run_xdp_frame` returns both the raw `u64` value and an optional
+The legacy `run_xdp(&mut [u8])` and `run_xdp_jit(&mut [u8])` adapters construct
+the same environment directly over the slice and preserve their return-value
+and mutation contracts. `run_xdp_frame` returns both the raw `u64` value and an optional
 recognized action (`ABORTED`, `DROP`, `PASS`, `TX`, or `REDIRECT`). Unknown raw
 values remain visible and are not silently coerced.
 
@@ -73,8 +74,9 @@ socket or transmit a frame themselves.
 
 ## Replay
 
-Provider execution stays on the same deterministic VM packet backing used by
-`.febpf` replay and time travel. The first boundary does not automatically
+Provider execution, `.febpf` replay, and time travel use the same logical
+environment snapshot; snapshots contain bytes and bounds, never host
+addresses. The first boundary does not automatically
 record every live frame. A live backend may explicitly record a selected
 frame using the existing replay format; adding metadata/cookie capture requires
 a versioned replay extension rather than changing existing files silently.

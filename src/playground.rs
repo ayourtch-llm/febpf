@@ -324,7 +324,7 @@ impl Session {
             vm.set_prandom_seed(seed);
         }
         crate::replay::apply_preload(&mut vm, &self.preload)?;
-        let mut ctx = if let Some(packet) = &self.packet {
+        let mut frame = if let Some(packet) = &self.packet {
             vm.verify(crate::verifier::Config {
                 ctx_size: 24,
                 ctx_writable: false,
@@ -334,7 +334,7 @@ impl Session {
                 ..Default::default()
             })
             .map_err(|e| format!("replayed XDP program no longer verifies: {e}"))?;
-            vm.prepare_xdp(packet)?
+            Some(crate::packet::XdpFrame::new(packet))
         } else {
             if self.legacy_packet != verifier::LegacyPacketProfile::Disabled {
                 vm.verify(crate::verifier::Config {
@@ -345,14 +345,13 @@ impl Session {
                 })
                 .map_err(|e| format!("replayed legacy program no longer verifies: {e}"))?;
             }
-            self.ctx_template.clone()
+            None
         };
-        let mut m = match (self.legacy_packet, self.packet.is_some()) {
-            (verifier::LegacyPacketProfile::Disabled, _) => vm.machine(&mut ctx),
-            (_, false) => vm.machine_raw(&mut ctx).map_err(|e| e.to_string())?,
-            (_, true) => vm
-                .machine_prepared_xdp(&mut ctx)
-                .map_err(|e| e.to_string())?,
+        let mut ctx = self.ctx_template.clone();
+        let mut m = match (&mut frame, self.legacy_packet) {
+            (Some(frame), _) => vm.machine_xdp(frame).map_err(|e| e.to_string())?,
+            (None, verifier::LegacyPacketProfile::Disabled) => vm.machine(&mut ctx),
+            (None, _) => vm.machine_raw(&mut ctx).map_err(|e| e.to_string())?,
         };
         let mut status = Status::Running;
         while m.insn_count < self.steps {
