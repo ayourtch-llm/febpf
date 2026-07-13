@@ -45,7 +45,17 @@ contracts. `run_xdp_frame` returns both the raw `u64` value and an optional
 recognized action (`ABORTED`, `DROP`, `PASS`, `TX`, or `REDIRECT`). Unknown raw
 values remain visible and are not silently coerced.
 
-## Capacity and redirect contract
+A successful `redirect` helper records an interface index and raw flags. A
+successful `redirect_map` records the stable loaded-map index, map kind, u32
+key, and raw flags. This provider-neutral `XdpRedirect` is included in the
+verdict only when the final action is `XDP_REDIRECT`; a helper result ignored
+by a program cannot accidentally transmit a frame. A later failed redirect
+helper clears an earlier selection. The selection is invocation state and is
+included in debugger snapshots, so reverse execution reproduces it exactly.
+The legacy integer-only adapter intentionally discards this richer completion
+payload.
+
+## Capacity contract
 
 Headroom and tailroom are descriptive in this first boundary version. The VM
 does not yet have an active provider-capability callback, so
@@ -55,12 +65,11 @@ must make capability opt-in explicit, update the virtual packet bounds
 atomically, and preserve the existing standalone behavior when capability is
 absent.
 
-Likewise, `XDP_REDIRECT` is currently delivered as a verdict action, matching
-the old standalone behavior; the selected interface or map entry is not yet a
-completion payload. Before AF_XDP transport lands, the verdict will gain a
-provider-neutral redirect destination. XSKMAP resolution will then consult
-socket ownership supplied by that backend. febpf maps must never fabricate a
-live socket or transmit a frame themselves.
+Redirect delivery records intent only; it never transmits a frame. An AF_XDP
+provider will decide whether a recorded destination is owned and deliver or
+reject it during completion. In particular, XSKMAP resolution must consult
+socket ownership supplied by that backend. febpf maps never fabricate a live
+socket or transmit a frame themselves.
 
 ## Replay
 
@@ -75,5 +84,5 @@ a versioned replay extension rather than changing existing files silently.
 For the same program, packet bytes, zero metadata, maps, PRNG seed, and
 execution engine, the slice and frame adapters must produce identical raw
 return values and mutated active bytes. Tests also require spare capacity,
-metadata, cookies, ordering, batch limits, and runtime-error completion to
-survive the boundary.
+metadata, cookies, ordering, batch limits, runtime-error completion, redirect
+destinations, and redirect snapshot replay to survive the boundary.

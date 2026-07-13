@@ -83,8 +83,10 @@ are copied back through the ordinary `run_xdp` contract.
 
 `redirect` (#23) accepts scalar interface-index and flags arguments under the
 explicit XDP model. Zero flags produce the `XDP_REDIRECT` verdict; unsupported
-nonzero flags produce `XDP_ABORTED`. Standalone execution records the verdict
-only and does not pretend to transmit the packet.
+nonzero flags produce `XDP_ABORTED`. The provider frame API also records the
+selected interface; `redirect_map` records its loaded-map identity, kind, key,
+and flags. Standalone execution still does not pretend to transmit the packet,
+and the legacy slice API continues to return only the integer verdict.
 
 This slice covers verifier semantics, deterministic interpreter execution,
 automatic ELF program-type selection, raw packet-file CLI runs, a

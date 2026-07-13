@@ -72,6 +72,6 @@ mod wasm;
 pub use interp::{EbpfError, Machine, MetadataLayout, Program, RegionAccess, Vm};
 pub use packet::{
     CompletedXdpFrame, XdpAction, XdpBatchStats, XdpFrame, XdpMetadata, XdpProvider,
-    XdpProviderError, XdpVerdict,
+    XdpProviderError, XdpRedirect, XdpVerdict,
 };
 pub use verifier::{Config as VerifierConfig, VerifyError};

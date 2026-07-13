@@ -5,7 +5,9 @@ use febpf::helpers::{id, ArgKind, HelperSig, MemBus, RetKind};
 use febpf::insn::{self, alu, class, jmp};
 use febpf::verifier::Config;
 use febpf::{asm, Program, Vm};
-use febpf::{CompletedXdpFrame, XdpAction, XdpFrame, XdpMetadata, XdpProvider, XdpVerdict};
+use febpf::{
+    CompletedXdpFrame, XdpAction, XdpFrame, XdpMetadata, XdpProvider, XdpRedirect, XdpVerdict,
+};
 use std::collections::VecDeque;
 
 fn program(source: &str) -> Program {
@@ -273,6 +275,117 @@ fn xdp_provider_receives_runtime_failures_as_completions() {
     assert_eq!(stats.completed, 1);
     assert!(provider.completed[0].result.is_err());
     assert_eq!(provider.completed[0].frame.data(), [7]);
+}
+
+#[test]
+fn xdp_verdict_delivers_direct_and_map_redirect_destinations() {
+    let config = || Config {
+        ctx_size: 24,
+        ctx_writable: false,
+        xdp: true,
+        ..Config::default()
+    };
+    let mut direct = Vm::new(program("r1 = 17\nr2 = 0\ncall redirect\nexit")).unwrap();
+    direct.verify(config()).unwrap();
+    let mut frame = XdpFrame::new(&[1]);
+    let verdict = direct.run_xdp_frame(&mut frame).unwrap();
+    assert_eq!(verdict.action, Some(XdpAction::Redirect));
+    assert_eq!(
+        verdict.redirect,
+        Some(XdpRedirect::Interface {
+            ifindex: 17,
+            flags: 0,
+        })
+    );
+
+    let mut map = Vm::new(program(
+        ".map targets xskmap 4 4 4\n\
+         *(u32 *)(r10 - 4) = 2\n\
+         *(u32 *)(r10 - 8) = 7\n\
+         r1 = map[targets]\n\
+         r2 = r10\n\
+         r2 += -4\n\
+         r3 = r10\n\
+         r3 += -8\n\
+         r4 = 0\n\
+         call map_update_elem\n\
+         r1 = map[targets]\n\
+         r2 = 2\n\
+         r3 = 0x100\n\
+         call redirect_map\n\
+         exit",
+    ))
+    .unwrap();
+    map.verify(config()).unwrap();
+    let verdict = map.run_xdp_frame(&mut frame).unwrap();
+    let expected = Some(XdpRedirect::Map {
+        map_index: 0,
+        map_kind: febpf::maps::MapKind::XskMap,
+        key: 2,
+        flags: 0x100,
+    });
+    assert_eq!(verdict.redirect, expected);
+
+    #[cfg(feature = "jit")]
+    {
+        let verdict = map.run_xdp_frame_jit(&mut frame).unwrap();
+        assert_eq!(verdict.redirect, expected);
+    }
+}
+
+#[test]
+fn redirect_destination_requires_final_redirect_and_replays_with_snapshot() {
+    let mut vm = Vm::new(program(
+        "r1 = 17\n\
+         r2 = 0\n\
+         call redirect\n\
+         r1 = 18\n\
+         r2 = 1\n\
+         call redirect\n\
+         r0 = 4\n\
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 24,
+        ctx_writable: false,
+        xdp: true,
+        ..Config::default()
+    })
+    .unwrap();
+    let mut ctx = vm.prepare_xdp(&[1]).unwrap();
+    let mut machine = vm.machine_prepared_xdp(&mut ctx).unwrap();
+    for _ in 0..3 {
+        assert_eq!(machine.step().unwrap(), None);
+    }
+    let selected = Some(XdpRedirect::Interface {
+        ifindex: 17,
+        flags: 0,
+    });
+    assert_eq!(machine.xdp_redirect(), selected);
+    let snapshot = machine.snapshot();
+    for _ in 0..3 {
+        assert_eq!(machine.step().unwrap(), None);
+    }
+    assert_eq!(machine.xdp_redirect(), None);
+    machine.restore(&snapshot);
+    assert_eq!(machine.xdp_redirect(), selected);
+
+    drop(machine);
+    let mut no_redirect = Vm::new(program("r1 = 17\nr2 = 0\ncall redirect\nr0 = 2\nexit")).unwrap();
+    no_redirect
+        .verify(Config {
+            ctx_size: 24,
+            ctx_writable: false,
+            xdp: true,
+            ..Config::default()
+        })
+        .unwrap();
+    let mut frame = XdpFrame::new(&[1]);
+    assert_eq!(
+        no_redirect.run_xdp_frame(&mut frame).unwrap().redirect,
+        None
+    );
 }
 
 #[test]

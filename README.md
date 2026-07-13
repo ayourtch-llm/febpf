@@ -269,8 +269,9 @@ including time-travel `rstep`.
 - **JIT**: `docs/specs/jit-backend.md` — architecture-independent frontend +
   `JitBackend` trait; x86-64 and aarch64 done, riscv64 documented as drop-in.
 - **Packet providers**: `docs/specs/packet-providers.md` — owned active frame
-  windows, typed XDP metadata, bounded completion batches, and identical
-  interpreter/JIT adapters without exposing transport pointers to eBPF.
+  windows, typed XDP metadata, bounded completion batches, provider-neutral
+  redirect destinations, and identical interpreter/JIT adapters without
+  exposing transport pointers to eBPF.
 - **CI**: `.github/workflows/ci.yml` runs the suite, clippy (`-D warnings`) and
   the differential fuzzer on all three JIT platforms — each runner executes
   machine code generated for that exact CPU.
@@ -283,7 +284,7 @@ including time-travel `rstep`.
 
 ## Tests
 
-The current suite has **470 passing tests** with default features and **452**
+The current suite has **472 passing tests** with default features and **454**
 with the std interpreter-only profile, plus four intentionally ignored
 exhaustive soundness sweeps in each configuration. Coverage includes ISA semantics,
 verifier acceptance and rejection, abstract-operator soundness, maps/helpers,

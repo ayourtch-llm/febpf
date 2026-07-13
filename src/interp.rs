@@ -747,11 +747,19 @@ impl Vm {
         ctx: &mut [u8],
         packet: LegacyPacketBacking,
     ) -> Result<u64, EbpfError> {
+        self.run_with_packet_outcome(ctx, packet).map(|(r0, _)| r0)
+    }
+
+    fn run_with_packet_outcome(
+        &mut self,
+        ctx: &mut [u8],
+        packet: LegacyPacketBacking,
+    ) -> Result<(u64, Option<crate::packet::XdpRedirect>), EbpfError> {
         self.require_packet_backing(packet)?;
         let mut m = Machine::new_with_packet(self, ctx, packet);
         loop {
             if let Some(ret) = m.step()? {
-                return Ok(ret);
+                return Ok((ret, m.xdp_redirect));
             }
         }
     }
@@ -862,9 +870,9 @@ impl Vm {
         ctx[12..16].copy_from_slice(&metadata.ingress_ifindex.to_le_bytes());
         ctx[16..20].copy_from_slice(&metadata.rx_queue_index.to_le_bytes());
         ctx[20..24].copy_from_slice(&metadata.egress_ifindex.to_le_bytes());
-        let result = self.run_with_packet(&mut ctx, LegacyPacketBacking::VmPacket);
+        let result = self.run_with_packet_outcome(&mut ctx, LegacyPacketBacking::VmPacket);
         packet.copy_from_slice(&self.packet);
-        result.map(crate::packet::XdpVerdict::new)
+        result.map(|(r0, redirect)| crate::packet::XdpVerdict::with_redirect(r0, redirect))
     }
 
     /// Process at most `budget` frames from a packet provider.
@@ -921,9 +929,9 @@ impl Vm {
         ctx[12..16].copy_from_slice(&metadata.ingress_ifindex.to_le_bytes());
         ctx[16..20].copy_from_slice(&metadata.rx_queue_index.to_le_bytes());
         ctx[20..24].copy_from_slice(&metadata.egress_ifindex.to_le_bytes());
-        let result = self.run_jit_with_packet(&mut ctx, LegacyPacketBacking::VmPacket);
+        let result = self.run_jit_with_packet_outcome(&mut ctx, LegacyPacketBacking::VmPacket);
         packet.copy_from_slice(&self.packet);
-        result.map(crate::packet::XdpVerdict::new)
+        result.map(|(r0, redirect)| crate::packet::XdpVerdict::with_redirect(r0, redirect))
     }
 
     /// JIT counterpart of [`Vm::run_xdp_provider`].
@@ -1077,6 +1085,15 @@ impl Vm {
         ctx: &mut [u8],
         packet: LegacyPacketBacking,
     ) -> Result<u64, EbpfError> {
+        self.run_jit_with_packet_outcome(ctx, packet).map(|(r0, _)| r0)
+    }
+
+    #[cfg(feature = "jit")]
+    fn run_jit_with_packet_outcome(
+        &mut self,
+        ctx: &mut [u8],
+        packet: LegacyPacketBacking,
+    ) -> Result<(u64, Option<crate::packet::XdpRedirect>), EbpfError> {
         self.require_packet_backing(packet)?;
         if let Err(e) = self.compile() {
             return Err(EbpfError { pc: 0, msg: e });
@@ -1106,12 +1123,13 @@ impl Vm {
             }
             break Ok(m.regs[0]);
         };
+        let redirect = m.xdp_redirect;
         drop(m);
         self.jit = Some(jit);
         for (target, native) in self.tail_programs.iter_mut().zip(tail_jits.drain(..)) {
             target.jit = Some(native);
         }
-        r
+        r.map(|r0| (r0, redirect))
     }
 
     fn require_packet_backing(&self, packet: LegacyPacketBacking) -> Result<(), EbpfError> {
@@ -1167,6 +1185,7 @@ pub struct Snapshot {
     logical_boot_ns: u64,
     active_program: u32,
     tail_call_count: u32,
+    xdp_redirect: Option<crate::packet::XdpRedirect>,
 }
 
 impl Snapshot {
@@ -1305,6 +1324,7 @@ pub struct Machine<'a> {
     active_program: u32,
     tail_call_count: u32,
     legacy_packet_backing: LegacyPacketBacking,
+    xdp_redirect: Option<crate::packet::XdpRedirect>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1431,6 +1451,11 @@ impl<'a> Machine<'a> {
         }
     }
 
+    /// Redirect destination most recently selected by this invocation.
+    pub fn xdp_redirect(&self) -> Option<crate::packet::XdpRedirect> {
+        self.xdp_redirect
+    }
+
     fn new(vm: &'a mut Vm, ctx: &'a mut [u8]) -> Machine<'a> {
         Self::new_with_packet(vm, ctx, LegacyPacketBacking::None)
     }
@@ -1476,6 +1501,7 @@ impl<'a> Machine<'a> {
             active_program: 0,
             tail_call_count: 0,
             legacy_packet_backing,
+            xdp_redirect: None,
         }
     }
 
@@ -1500,6 +1526,7 @@ impl<'a> Machine<'a> {
             logical_boot_ns: self.logical_boot_ns,
             active_program: self.active_program,
             tail_call_count: self.tail_call_count,
+            xdp_redirect: self.xdp_redirect,
         }
     }
 
@@ -1525,6 +1552,7 @@ impl<'a> Machine<'a> {
         self.logical_boot_ns = s.logical_boot_ns;
         self.active_program = s.active_program;
         self.tail_call_count = s.tail_call_count;
+        self.xdp_redirect = s.xdp_redirect;
         #[cfg(feature = "jit")]
         {
             self.jit_fault = None;
@@ -2547,13 +2575,21 @@ impl<'a> Machine<'a> {
             // same spirit as get_current_task (docs/specs/tracing-helpers.md).
             helpers::id::GET_SOCKET_COOKIE => 0x0000_0000_c00c_1e01,
             helpers::id::REDIRECT_MAP => {
+                self.xdp_redirect = None;
                 let m = self.map_from_ptr(args[0])?;
-                let key = (args[1] as u32).to_ne_bytes();
+                let key_value = args[1] as u32;
+                let key = key_value.to_ne_bytes();
                 let populated = self.vm.maps[m]
                     .lookup(&key)
                     .is_some_and(|value| self.vm.maps[m].value(value).iter().any(|&byte| byte != 0));
                 if populated {
-                    4 // XDP_REDIRECT; standalone execution records only the verdict
+                    self.xdp_redirect = Some(crate::packet::XdpRedirect::Map {
+                        map_index: m as u32,
+                        map_kind: self.vm.maps[m].def.kind,
+                        key: key_value,
+                        flags: args[2],
+                    });
+                    4 // XDP_REDIRECT; the provider decides how to deliver it
                 } else {
                     args[2] & 3 // kernel fallback action encoded in flag bits 0..1
                 }
@@ -2609,8 +2645,17 @@ impl<'a> Machine<'a> {
                 0
             }
             helpers::id::REDIRECT => {
+                self.xdp_redirect = None;
                 if self.vm.xdp {
-                    if args[1] == 0 { 4 } else { 0 } // XDP_REDIRECT / XDP_ABORTED
+                    if args[1] == 0 {
+                        self.xdp_redirect = Some(crate::packet::XdpRedirect::Interface {
+                            ifindex: args[0] as u32,
+                            flags: args[1],
+                        });
+                        4
+                    } else {
+                        0
+                    } // XDP_REDIRECT / XDP_ABORTED
                 } else if self.vm.skb {
                     if args[1] & !1 == 0 { 7 } else { 2 } // TC_ACT_REDIRECT / SHOT
                 } else {

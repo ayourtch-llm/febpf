@@ -9,6 +9,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::maps::MapKind;
 use crate::EbpfError;
 
 /// An owned packet buffer with an explicit active data window.
@@ -129,6 +130,21 @@ pub enum XdpAction {
     Redirect = 4,
 }
 
+/// Destination selected by a successful XDP redirect helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XdpRedirect {
+    Interface {
+        ifindex: u32,
+        flags: u64,
+    },
+    Map {
+        map_index: u32,
+        map_kind: MapKind,
+        key: u32,
+        flags: u64,
+    },
+}
+
 impl XdpAction {
     pub fn from_return_value(value: u64) -> Option<Self> {
         match value {
@@ -147,6 +163,7 @@ impl XdpAction {
 pub struct XdpVerdict {
     pub return_value: u64,
     pub action: Option<XdpAction>,
+    pub redirect: Option<XdpRedirect>,
 }
 
 impl XdpVerdict {
@@ -154,6 +171,18 @@ impl XdpVerdict {
         Self {
             return_value,
             action: XdpAction::from_return_value(return_value),
+            redirect: None,
+        }
+    }
+
+    pub(crate) fn with_redirect(return_value: u64, redirect: Option<XdpRedirect>) -> Self {
+        let action = XdpAction::from_return_value(return_value);
+        Self {
+            return_value,
+            action,
+            redirect: (action == Some(XdpAction::Redirect))
+                .then_some(redirect)
+                .flatten(),
         }
     }
 }
