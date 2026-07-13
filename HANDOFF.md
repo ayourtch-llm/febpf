@@ -133,25 +133,30 @@ while retaining byte initialization. Prune comparison explicitly preserves
 the initialization mask; a fully initialized remembered slot cannot cover a
 partially initialized arrival.
 
-This removes the false pc-494 frontier, but does **not** make accumulated
-precision-mask activation safe. With a genuinely unknown branch scalar, the
-existing nullable-map-value adversarial path is still pruned before its bad
-deref when finalized checkpoints apply their accumulated masks. Production
-comparison therefore remains deliberately fully precise (`precise_regs` and
-`precise_spills` all set); do not enable compression until that missing
-transitive dependency is isolated and regression-tested.
+The initial pre-Scalar32 activation appeared to prune a nullable-map-value
+failure and was therefore kept disabled. Repeating that experiment after the
+aligned-u32 model and adapting the trace fixture to use a genuinely unknown
+scalar no longer reproduces the failure. `d741e76` (`verifier: activate scalar
+precision checkpoints`) now applies accumulated register/spill masks when a
+single-frame checkpoint finalizes; multi-frame/local-call checkpoints remain
+fully precise. A new adversarial diamond proves the important transitive case:
+a scalar decides whether a nullable pointer is checked before dereference. If
+conditional precision propagation is removed, the test is incorrectly
+accepted because the bad path prunes; with the production implementation it
+rejects at the nullable dereference. Keep that regression when extending
+history transfer rules.
 
-Exact final measurements from the rebuilt release binary under the unchanged
-one-million instruction budget:
+Exact activated measurements from the rebuilt release binary under the
+unchanged one-million instruction budget:
 
-- `xdp_request_func` now fails for complexity at insn 3458; hottest joins are
-  pc 3420 16561/825, pc 3422 16559/573, pc 4787 16553/3, pc 3419 16493/509,
-  and pc 3424 16424/525.
-- `xdp_forward_func` fails for complexity at insn 171; hottest joins are pc
-  215 16323/4096, pc 244 15919/5, pc 150 8995/1187, pc 192 8864/3868, and pc
-  3195 4622/324.
-- Default all-target tests: **461 passed + 4 ignored**. Std-only all-target
-  tests: **443 passed + 4 ignored**. Strict Clippy passes for default/all-
+- `xdp_request_func` fails for complexity at insn 2744; hottest joins are pc
+  3416 17393/3423, pc 4787 14964/1, pc 3422 14958/491, pc 3424 14883/490, and
+  pc 3426 14877/485.
+- `xdp_forward_func` fails for complexity at insn 5800; hottest joins are pc
+  150 14232/4096, pc 215 10362/3737, pc 244 7330/23, pc 192 6716/1945, and pc
+  3194 6044/2059.
+- Default all-target tests: **462 passed + 4 ignored**. Std-only all-target
+  tests: **444 passed + 4 ignored**. Strict Clippy passes for default/all-
   features and std-only. True `thumbv7em-none-eabihf` no-std check and strict
   Clippy pass.
 - The definitive rebuilt-release scan remains **137 families**, 135
@@ -280,13 +285,14 @@ In-progress investigation after `3f9bb65` (not committed):
 
 Immediate resume order:
 
-1. Isolate why applying accumulated precision masks still prunes the genuine
-   nullable-map-value bad path. Reduce it to checkpoint ancestry/history and
-   add a focused adversarial regression before changing comparison semantics.
-2. Activate compression only if dead/live register, aligned u32/u64 stack,
-   stack initialization, pointer/nullability, packet-range, and equality-
-   correlation tests all stay sound. Do not reintroduce global syntactic
-   liveness, generic widening, or a higher instruction budget.
+1. Inspect request pc 3416 and forward pcs 150/215 with the activated precise
+   masks. Determine which scalar/spill locations remain precise and which
+   instruction-history transfer forces each large partition; do not infer the
+   cause from state counts alone.
+2. Extend precision backtracking only for a concrete missing transfer proved
+   by xvs and an adversarial regression. Keep local-call/multi-frame states
+   fully precise, and do not reintroduce global syntactic liveness, generic
+   widening, independent packet-range ordering, or a higher budget.
 3. Measure both xvs entries after each coherent precision step. Once one is
    genuinely compatible, run the full matrix and complete 137-family scan,
    document and commit, then select the next remaining production blocker.
