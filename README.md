@@ -317,3 +317,15 @@ ELF tests consume committed `tests/*.o` fixtures without modifying them. To
 explicitly rebuild fixtures with a BPF-capable clang, run
 `FEBPF_REGENERATE_FIXTURES=1 cargo test`. The four larger soundness sweeps run
 separately with `cargo test --release -- --ignored soundness`.
+
+## License
+
+febpf's original source and its committed test fixtures are licensed under
+the [Apache License, Version 2.0](LICENSE). A `"GPL"` value in a BPF object's
+ELF `license` section is a declaration interpreted by the Linux BPF loader; it
+is not a source-code license notice for febpf.
+
+The optional real-world corpus is downloaded and built into the git-ignored
+`corpus/` working directory. Those sources and objects retain their upstream
+licenses and are not relicensed by febpf; see
+[`docs/specs/corpus-tooling.md`](docs/specs/corpus-tooling.md).

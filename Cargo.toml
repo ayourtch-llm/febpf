@@ -3,7 +3,7 @@ name = "febpf"
 version = "0.1.0"
 edition = "2021"
 description = "Fast userland eBPF engine with built-in verifier, debugger and program analysis"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 [lib]
 name = "febpf"

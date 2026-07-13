@@ -37,6 +37,9 @@ their more specific SPDX declarations: 24 GPL-2.0, 10
 BSD-2-Clause, and one Apache-2.0. Corpus downloads and compiled objects remain
 git-ignored; users redistributing them must preserve and evaluate the upstream
 license terms rather than treating febpf's repository license as a substitute.
+Likewise, a `"GPL"` string in a committed fixture's BPF ELF `license` section
+is kernel-loader metadata controlling access to GPL-only BPF facilities, not an
+SPDX or copyright license for febpf's locally authored fixture source.
 
 The first combined scan exposed two loader/enumerator defects that were fixed
 before recording the baseline below:
