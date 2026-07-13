@@ -30,7 +30,69 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 redirect delivery landed; resize capability next; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 composable invocation add-ons landed; authoritative)
+
+The architecture redirection requested by the user is committed as `22ab9db`
+(`runtime: compose invocation add-ons`). At checkpoint writing HEAD is
+`22ab9db`; only this HANDOFF update is intentionally uncommitted. The recurring
+tttt job `cron-1` was deleted at the user's request. No scanner or build started
+by this batch remains active. Several sleeping cargo test processes in the
+pre-existing `pty-2`/`pty-3`/`pty-4` terminal sessions predate this refactor;
+they were not used or killed, and own none of the changed files. No subagent
+was used.
+
+The key correction is architectural rather than another XDP feature. `Vm` no
+longer owns or stages packet bytes, XDP/SKB booleans, or metadata-layout run
+state. Verification selects one durable `ContextModel`; each `Machine` borrows
+an `ExecutionEnvironment` containing context bytes, an optional packet window,
+legacy packet-source identity, optional sequence-output sink, and redirect
+completion. `ExecutionOutcome`, `Vm::run_environment`, and
+`Vm::machine_environment` make this boundary public. Convenience methods for
+XDP slices/frames/providers, skb, raw packet, metadata-owned packet, replay,
+debugger, playground, and JIT are thin adapters over it. The old
+`prepare_xdp`/`machine_prepared_xdp` staging protocol is gone.
+
+This is deliberately proven by more than XDP: skb and raw inputs use the same
+packet resolver, metadata selects an owned packet through the environment,
+and BTF iterator execution can compose an independently borrowed `seq_write`
+sink. External sink state participates in snapshot/restore and interpreter/JIT
+agreement. A verified XDP/SKB model without a packet-window add-on rejects
+before instruction zero. `XdpCapabilities` are present on provider frames but
+remain reserved: adjust-head/tail still return `-EOPNOTSUPP` for every adapter.
+The default VM-owned sequence buffer remains as a compatibility sink when an
+environment does not override it; this is an explicit remaining extraction,
+not claimed as completed purity.
+
+Exact validation and measurement for `22ab9db`:
+
+- Default all-target tests: **473 passed + 4 ignored**.
+- Std interpreter-only all-target tests: **455 passed + 4 ignored**.
+- Strict Clippy passed for default/all-targets and std-only/all-targets.
+- True `thumbv7em-none-eabihf` no-std check and strict Clippy passed.
+- Release build and complete corpus scan: **137 families**, 135 instantiate,
+  **835/835 entries load**, **126/137 families fully compatible**, and
+  **822/835 entries verify (98.4%)**: 673 strict + 149 privileged-uninitialized
+  stack. The only entry gaps remain six missing attach targets and seven
+  poisoned CO-RE relocations; two object-level flowtable families remain
+  missing-kfunc. Unsupported-map and unknown-helper histograms remain empty.
+- `git diff --check` passed.
+
+Immediate resume order:
+
+1. Audit and extract the remaining invocation-only services from `Vm`, starting
+   with synthetic BTF kernel memory and output/diagnostic sinks. Use typed
+   environment slots and prove composition with multiple context families;
+   do not invent a generic hook/builder until repeated consumers justify it.
+2. Once that boundary is stable, activate the already-reserved provider resize
+   capabilities through the shared packet window. Preserve slice
+   `-EOPNOTSUPP`, failure atomicity, stale-alias verifier rules, JIT parity, and
+   snapshots.
+3. Only then add Linux AF_XDP copy mode as a backend adapter. DPDK remains an
+   optional later adapter; neither transport belongs in `Vm`.
+
+The checkpoint immediately below is historical and superseded by this one.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-13 redirect delivery landed; resize capability next; superseded)
 
 The provider-neutral redirect batch is committed as `fb73fc7` (`xdp: deliver
 provider redirect destinations`). At checkpoint writing HEAD is `fb73fc7`;
