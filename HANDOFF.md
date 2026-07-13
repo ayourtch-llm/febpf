@@ -30,7 +30,66 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 C map control landed; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 C helper add-on landed; authoritative)
+
+Invocation-local custom C helpers are committed as `bcbec9d` (`ffi: add
+invocation-local C helpers`). At checkpoint writing HEAD is `bcbec9d`; only
+this HANDOFF update is intentionally uncommitted. The recurring tttt job
+remains deleted. No build, scanner, subagent, or external terminal collaborator
+is active.
+
+The helper ABI follows the composable-add-on boundary rather than retaining
+host services in the default VM. `febpf_vm_define_helper` installs only a
+durable verifier signature before verification. `febpf_vm_run_v2` binds an
+exact-stride array of callback/user-token pairs for one invocation. The safe v1
+signature subset is unused/scalar/size plus sized read, write, and read-write
+memory, with scalar return. Guest virtual pointers never become C pointers:
+callbacks receive bounded copied views, failed callbacks perform no writeback,
+and successful writable views commit in argument order. Bindings are restored
+to unavailable placeholders after execution or caught Rust unwinding. The
+interpreter and JIT share the same dispatch path.
+
+`examples/c-helper-host` proves the real header/shared-library contract. A
+failed callback mutates only its copy; interpreter and JIT calls then update
+caller context through successful copied writeback and print exact output
+`helper-state: interp=123/42 jit=123/100 calls=3`. The C library now exports
+exactly fifteen `febpf_*` symbols.
+
+Exact validation for `bcbec9d`: default all-target remains **477 passed + 4
+ignored**; std-only remains **459 + 4**; default/JIT C API is **487 + 4**; std
+interpreter-only C API is **469 + 4**. Strict Clippy passed all four profiles.
+True thumb no-std check/Clippy, staticlib, cdylib, C-API doctests, all five C11
+hosts, `git diff --check`, and the symbol audit passed. The current rustfmt
+1.9.0/rustc 1.96.1 toolchain still proposes a repository-wide pre-existing
+reflow, so no unrelated formatter rewrite was mixed into this batch.
+
+The complete release corpus was remeasured and remains **137 families**, 135
+loaded, **126 fully compatible**, **835/835 entries loaded**, and **822/835
+verified (98.4%)**: 673 strict + 149 privileged-uninitialized. The same six
+missing attach targets, seven poisoned relocations, and two object-level
+missing kfuncs remain; unsupported-map and unknown-helper histograms are empty.
+
+Immediate resume order:
+
+1. The next ranked application-controlled production gap is attach-target
+   override configuration: four families/six entries are honest environment
+   gaps on this kernel. Audit the existing CLI/Object override path and add a
+   versioned, exact-name C construction option without inventing target BTF or
+   silently converting missing kernel types into verifier success. Prove it on
+   a real pinned object/target pair and keep absent host BTF honest.
+2. Then expose verification-time static tail-call bundle linking for the one
+   measured production graph. Keep callback/helper bindings invocation-local;
+   program graph identity is durable verified program state.
+3. Keep typed ring/perf/queue consumption, map-in-map linking, `.febpf`
+   capture/snapshot handles, provider-owned resize/redirect completion, and
+   pointer-returning helpers independent until a host measures them. AF_XDP
+   live-veth remains a provisioned-host gap; zero-copy and DPDK remain optional
+   later adapters.
+
+The map-control checkpoint immediately below is historical and superseded by
+this one.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-13 C map control landed; superseded)
 
 Versioned native map configuration and runtime control are committed as
 `4ea5d74` (`ffi: configure and control maps from C`), following the ELF/CO-RE
@@ -104,7 +163,7 @@ Exact validation and measurement for `4ea5d74`:
   kfuncs remain; unsupported-map and unknown-helper histograms are empty.
 - `rustfmt --check`, `git diff --check`, and the thirteen-symbol audit passed.
 
-Immediate resume order:
+Historical resume order at that checkpoint:
 
 1. The next independent embedding gap is custom C helpers. Audit
    `UserHelpers`, verifier signatures, callback mutability/panic behavior,
