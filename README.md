@@ -270,8 +270,9 @@ including time-travel `rstep`.
   `JitBackend` trait; x86-64 and aarch64 done, riscv64 documented as drop-in.
 - **Packet providers**: `docs/specs/packet-providers.md` — owned active frame
   windows, typed XDP metadata, bounded completion batches, provider-neutral
-  redirect destinations, and identical interpreter/JIT adapters without
-  exposing transport pointers to eBPF.
+  redirect destinations, capability-gated resizing, and identical
+  interpreter/JIT adapters without exposing transport pointers to eBPF. The
+  opt-in Linux `af-xdp` feature supplies a raw-UAPI copy-mode backend.
 - **CI**: `.github/workflows/ci.yml` runs the suite, clippy (`-D warnings`) and
   the differential fuzzer on all three JIT platforms — each runner executes
   machine code generated for that exact CPU.
@@ -279,12 +280,14 @@ including time-travel `rstep`.
   `docs/specs/core-relocations.md`.
 - **Known gaps**: kfuncs, dynptrs, spin locks, `bpf_loop`/iterators,
   `R_BPF_64_ABS*` relocations, static multi-object linking, and a riscv64 JIT
-  backend. Live AF_XDP transport and provider-capable packet resizing are not
-  implemented yet; standalone adjust-head/tail remains honestly unsupported.
+  backend. AF_XDP zero-copy/shared-UMEM/multi-buffer operation is not
+  implemented; privileged live-veth validation of copy mode remains an honest
+  environment gap. Standalone slice adjust-head/tail remains unsupported,
+  while provider-owned frames can explicitly advertise resize capacity.
 
 ## Tests
 
-The current suite has **472 passing tests** with default features and **454**
+The current suite has **475 passing tests** with default features and **457**
 with the std interpreter-only profile, plus four intentionally ignored
 exhaustive soundness sweeps in each configuration. Coverage includes ISA semantics,
 verifier acceptance and rejection, abstract-operator soundness, maps/helpers,

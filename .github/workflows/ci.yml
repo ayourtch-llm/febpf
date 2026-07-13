@@ -80,6 +80,17 @@ jobs:
       - name: Clippy (no jit)
         run: cargo clippy --all-targets --no-default-features --features std -- -D warnings
 
+      # AF_XDP is a Linux-only, opt-in transport adapter. Its deterministic
+      # ring/layout/policy tests need no privileges; the live socket test stays
+      # ignored unless a runner is explicitly provisioned with a veth/XSKMAP.
+      - name: Test AF_XDP adapter
+        if: runner.os == 'Linux'
+        run: cargo test --features af-xdp --lib af_xdp::tests
+
+      - name: Clippy AF_XDP adapter
+        if: runner.os == 'Linux'
+        run: cargo clippy --features af-xdp --all-targets -- -D warnings
+
       # The differential fuzzer is the real test of the JIT: it runs random
       # programs under the interpreter and the JIT and requires identical r0.
       # `cargo test` already runs 4k seeds; this adds a much wider sweep with a

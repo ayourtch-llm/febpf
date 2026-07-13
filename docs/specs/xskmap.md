@@ -15,7 +15,10 @@ looked up or inserted. The verifier accepts XSKMAP for `bpf_redirect_map` and
 retains the existing rule that ordinary maps are rejected. Interpreter and JIT
 use the same deterministic standalone contract as other redirect maps: a
 populated slot returns `XDP_REDIRECT`, while an absent slot returns the helper's
-fallback action. febpf does not fabricate an AF_XDP socket or transmit data.
+fallback action. febpf does not fabricate an AF_XDP socket. The optional Linux
+AF_XDP adapter can separately bind its real socket to sparse `(map index, key)`
+completion slots; this is provider state and never changes deterministic map
+contents.
 
 The kind is available through the assembler, ELF loader, kernel-map adapter,
 and additive replay-v1 map-kind tag. All five added upstream programs load and

@@ -19,6 +19,9 @@ std = []
 # compile-time-compatible stub; portable interpreter-only builds (including
 # Windows and wasm) use `--no-default-features --features std`.
 jit = ["std"]
+# Linux AF_XDP copy-mode transport. This remains opt-in so the core library
+# keeps its allocator-only, platform-neutral dependency surface.
+af-xdp = ["std"]
 
 [[bin]]
 name = "febpf"

@@ -118,7 +118,9 @@ first implementation must migrate multiple independent consumers:
 4. one non-packet resource (`SeqOutput`) to demonstrate actual composition;
 5. snapshots/replay across installed resources.
 
-Only after that matrix is green should AF_XDP or further XDP capability work
-resume. The initial implementation retains the existing VM-owned sequence and
-printk buffers as default convenience sinks for API compatibility, while an
-explicit environment can override either with an independently borrowed sink.
+That matrix is green. Provider resize capabilities and the opt-in Linux AF_XDP
+copy-mode adapter were subsequently built over this boundary; neither added
+transport state to `Vm`. The implementation retains the existing VM-owned
+sequence and printk buffers as default convenience sinks for API compatibility,
+while an explicit environment can override either with an independently
+borrowed sink.

@@ -25,6 +25,8 @@ extern crate alloc;
 
 #[cfg(feature = "std")]
 pub mod analysis;
+#[cfg(all(feature = "af-xdp", target_os = "linux"))]
+pub mod af_xdp;
 pub mod asm;
 pub mod btf;
 pub mod builder;

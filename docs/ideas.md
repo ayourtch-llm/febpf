@@ -41,11 +41,12 @@ Revised implementation order:
    output, distinguishing intentionally cross-invocation state from resources.
    Keep typed slots and measure multiple consumers before generalizing a
    builder or hook interface.
-2. Activate provider resize capabilities through the shared packet window,
-   preserving `-EOPNOTSUPP` for plain slices.
-3. Add Linux AF_XDP copy mode using raw syscalls and target/feature gating,
-   keeping the default build zero-dependency. Exercise it on a veth pair and
-   differentially compare selected frames with kernel XDP test-run behavior.
+2. Provider resize capabilities are active through the shared packet window;
+   plain slices preserve `-EOPNOTSUPP`.
+3. Linux AF_XDP copy mode is now an opt-in raw-UAPI `XdpProvider` adapter. Its
+   deterministic ABI/ring/routing tests are complete; privileged veth and
+   XSKMAP validation remains environment-gated and must not be reported as
+   reproduced where `CAP_NET_RAW`/BPF setup is unavailable.
 4. Add mlx5 zero-copy only after copy mode is stable and the environment
    supports it. Preserve normal kernel driver ownership.
 5. If still valuable, expose the same boundary to a separate optional DPDK

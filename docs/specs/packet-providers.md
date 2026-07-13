@@ -2,8 +2,9 @@
 
 febpf separates packet transport from eBPF execution. The public boundary is
 backend-neutral and allocator-only (`no_std` compatible); XDP is its first
-program-family adapter. AF_XDP will be the first live backend, but no AF_XDP,
-socket, ring, or host-pointer type appears in the VM API.
+program-family adapter. The opt-in Linux AF_XDP copy-mode module is the first
+live backend, but no AF_XDP socket, ring, or host-pointer type appears in the
+VM API.
 
 ## Ownership and batching
 
@@ -72,11 +73,13 @@ behavior. The verifier invalidates all packet/data-end aliases across either
 helper regardless of the runtime result; programs must reload them from
 `xdp_md` and prove fresh bounds.
 
-Redirect delivery records intent only; it never transmits a frame. An AF_XDP
-provider will decide whether a recorded destination is owned and deliver or
-reject it during completion. In particular, XSKMAP resolution must consult
-socket ownership supplied by that backend. febpf maps never fabricate a live
-socket or transmit a frame themselves.
+Redirect delivery in the core records intent only; it never transmits a frame.
+The opt-in Linux AF_XDP provider decides whether a recorded destination is
+owned and delivers or rejects it during completion. In particular, XSKMAP
+resolution consults sparse socket ownership supplied by that backend. febpf
+maps never fabricate a live socket or transmit a frame themselves. See
+[`af-xdp-copy.md`](af-xdp-copy.md) for the live adapter's deliberately narrower
+delivery rules.
 
 ## Replay
 
