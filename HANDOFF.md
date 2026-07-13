@@ -30,7 +30,94 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 AF_XDP copy adapter landed; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 native C embedding API landed; authoritative)
+
+The application-extension packaging baseline requested by the user is
+committed as `a73d983` (`ffi: add versioned native C embedding API`). The
+architecture redirection remains in `22ab9db` (`runtime: compose invocation
+add-ons`) and `08e6b5b` (`runtime: extract invocation host services`), with
+the generic packet boundary and AF_XDP copy-mode backend completed through
+`445a159` and `6e15d26`. At checkpoint writing HEAD is `a73d983`; only this
+HANDOFF update is intentionally uncommitted. The recurring tttt job `cron-1`
+was deleted at the user's request. No scanner, build, subagent, or external
+terminal collaborator started by this batch remains active.
+
+The new opt-in `c-api` feature exposes a hand-written ABI v1 through
+`include/febpf.h`. It has seven exported functions: ABI version, thread-local
+last-error copying, assembly and raw-bytecode constructors, destroy, verify,
+and run. VM handles are opaque. Versioned input structs begin with
+`struct_size`, reject truncation and unknown flags, and accept larger structs
+for additive evolution. Status values and model/output identifiers use fixed
+`uint32_t` values. Exported VM operations catch Rust panics before the ABI
+boundary. Both cdylib and staticlib selection remain explicit through
+`cargo rustc -- --crate-type=...`, so the manifest stays rlib-only and true
+no-std consumers do not acquire a native allocator or panic-runtime burden.
+
+The load-bearing invariant survives the C surface: a C handle retains only
+durable `Vm` state plus the last verified context model. Each run snapshots the
+descriptor and creates a fresh `ExecutionEnvironment` containing caller-owned
+context or packet bytes and invocation-local printk/sequence callbacks. No C
+buffer, callback, or user token is retained. XDP directly borrows the packet
+slice through `ExecutionEnvironment::xdp_slice`; it is not staged in `Vm`, and
+host pointers are never exposed as guest pointers. Interpreter execution is
+the default; requesting JIT from a library built without `jit` returns an
+honest unsupported status. Output produced before a later runtime failure is
+still delivered, while the result slot is written only on success.
+
+The zero-dependency C11 host in `examples/c-host` is compiled and run by
+`scripts/test-c-api.sh`. It constructs an assembly plugin, verifies a writable
+Flat context, receives `trace_printk` through its callback, mutates the caller's
+context, and returns r0. CI exercises the Rust ABI tests, strict Clippy, the
+static library artifact, the shared library, and the compiled C host. The
+deliberate v1 omissions are recorded in `docs/specs/c-api.md`: ELF/CO-RE entry
+selection, map administration, C helper callbacks, capture/replay handles,
+metadata/BTF contexts, provider-owned resizable frames, and rich redirect
+completion must earn separately versioned descriptors or handles rather than
+be packed into durable VM modes.
+
+Exact validation and measurement for `a73d983`:
+
+- Default all-target tests remain **475 passed + 4 ignored**; std-only remain
+  **457 passed + 4 ignored**.
+- Default/JIT `c-api` all-target tests: **480 passed + 4 ignored**. Std
+  interpreter-only `c-api` all-target tests: **462 passed + 4 ignored**.
+- Strict Clippy passed for default, std-only, default/JIT C API, and std-only C
+  API profiles. True `thumbv7em-none-eabihf` no-std check and strict Clippy
+  passed. Release build and C-API doctests passed.
+- Explicit cdylib and staticlib builds passed. The C host compiled as C11 with
+  `-Wall -Wextra -Werror`, linked the shared library, printed `printk: n=42`
+  and `result=9 context=[9,7]`, and exited zero.
+- The complete release corpus scan is unchanged: **137 families**, 135
+  instantiate, **835/835 entries load**, **126/137 families fully compatible**,
+  and **822/835 entries verify (98.4%)**: 673 strict + 149
+  privileged-uninitialized-stack. The remaining outcomes are still six honest
+  missing-attach-target environment gaps, seven poisoned application CO-RE
+  relocations, and two object-level flowtable missing-kfunc families.
+  Unsupported-map and unknown-helper histograms remain empty.
+- `rustfmt --check` and `git diff --check` passed.
+
+Immediate resume order:
+
+1. Build one compelling, still zero-dependency application host: prefer an
+   eBPF-scriptable streaming log filter over an HTTP server because it can be
+   production-shaped without importing a networking stack. Define a small
+   versioned Flat context ABI, load the plugin from a file, process bounded
+   input records, expose accept/drop and safe in-place redaction, and cover it
+   through both Rust integration tests and the compiled C host path.
+2. Treat that host as an abstraction test. Record every place it cannot be
+   expressed through the existing per-run `ExecutionEnvironment`. Add only
+   measured, composable capabilities; do not turn log processing, XDP, ELF,
+   maps, or callbacks into modes stored in `Vm` and do not grow C ABI v1 merely
+   for convenience.
+3. If the example proves a real need, rank ELF entry selection, C helper
+   callbacks, and map control independently and give each a separately
+   versioned descriptor/handle. AF_XDP live validation remains an honest
+   privilege/configuration gap for a provisioned host. Zero-copy and DPDK stay
+   optional later adapters.
+
+The checkpoint immediately below is historical and superseded by this one.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-13 AF_XDP copy adapter landed; superseded)
 
 The architecture redirection requested by the user is committed as `22ab9db`
 (`runtime: compose invocation add-ons`), with the non-packet proof follow-up in
