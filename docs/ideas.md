@@ -4,6 +4,44 @@ _Strategy ponderings from the 2026-07-11 session, so they survive context
 resets. These are ranked assessments, not commitments. The corpus loop
 (HANDOFF "Production coverage") remains the active thrust._
 
+## Active after corpus saturation: packet providers and AF_XDP
+
+The pinned production corpus reached zero ordinary verifier rejections on
+2026-07-13. The next active architecture is a generic packet-provider/batch
+boundary, with AF_XDP copy mode as its first real backend. DPDK stays a later,
+optional workspace adapter rather than becoming a febpf core dependency.
+
+The provider owns packet storage and transport; the VM owns eBPF semantics.
+The boundary must describe:
+
+- the mutable frame window plus explicit headroom/tailroom capacity;
+- synthesis of the program-specific context (`xdp_md` first) without exposing
+  host pointers to eBPF;
+- bounded batches in and verdicts out, including PASS/DROP/TX and redirect
+  delivery rather than only an integer return value;
+- sparse XSKMAP socket ownership supplied by the backend, never fabricated by
+  the map implementation;
+- optional capture of the selected input, metadata, maps, nondeterminism, and
+  result into the existing `.febpf` replay format;
+- provider capability negotiation for resizing. `xdp_adjust_head` and
+  `xdp_adjust_tail` may mutate a frame only when the provider explicitly owns
+  sufficient capacity; the standalone owned-packet path continues returning
+  `-EOPNOTSUPP` instead of inventing headroom or tailroom.
+
+Implementation order:
+
+1. Put the existing owned-packet interpreter/JIT path behind the provider
+   contract and prove byte-for-byte/verdict equivalence with a deterministic
+   mock provider.
+2. Add Linux AF_XDP copy mode using raw syscalls and target/feature gating,
+   keeping the default build zero-dependency. Exercise it on a veth pair and
+   differentially compare selected frames with kernel XDP test-run behavior.
+3. Add mlx5 zero-copy only after copy mode is stable and the environment
+   supports it. Preserve normal kernel driver ownership.
+4. If still valuable, expose the same boundary to a separate optional DPDK
+   adapter/sidecar. Direct PCI/VFIO mlx5 ownership is a different driver
+   project and is not implied by this plan.
+
 ## Ranked: what makes people go "wow" next
 
 febpf's differentiators to build on: zero-dep, deterministic replay,

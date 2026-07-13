@@ -30,7 +30,7 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 xvs pruning frontier; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 corpus saturated; packet provider next; authoritative)
 
 The corpus-first continuation is active. The prior checkpoint documentation
 was committed as `21047c5`, and the complete xvs production-lane batch was
@@ -209,6 +209,53 @@ Exact final release measurements under the unchanged budget:
   entries, two xvs complexity rejections, and two flowtable missing-kfunc
   families remain classified honestly; both blocker histograms are empty.
 
+Corpus-saturation update: `b78bbea` (`verifier: prune with whole-cfg
+liveness`) closes both xvs complexity rejections under the unchanged
+one-million instruction budget. Temporary component diagnostics showed that
+the remaining large partitions were dominated by dead packet/map/stack
+pointer variants rather than scalar precision. The verifier now computes a
+conservative backward may-liveness fixed point over both successors of every
+branch and projects dead registers/stack slots from prune comparison. Exact
+helper signatures determine register uses; any helper memory/`Any` argument
+keeps all stack slots live. Only aligned full-slot stores kill a stack slot.
+Programs containing local BPF calls deliberately fall back to the older exact
+branch-free-tail projection because inter-frame liveness is not modeled.
+
+This does not recreate the rejected pre-precision liveness prototype. The
+previous pc-494 failure lost protocol/control correlation before aligned-u32
+stack identity, activated scalar precision backtracking, and one-way packet-
+proof ordering existed. With those invariants now composed, request and
+forward both verify and pc 494 remains unreachable. Focused branching-CFG
+tests prove dead pointer variants prune, live pointer/scalar distinctions do
+not, live stack initialization does not, and local calls take the conservative
+fallback. The existing discriminating nullable/control, packet-range,
+bounded/unbounded-loop, equality, and aligned-u32 tests remain green.
+
+Exact final measurements:
+
+- `xdp_request_func`: **verification PASSED**, 502771 processed instructions,
+  100230 states explored, 50115 pruned, call depth 1, 456-byte stack.
+- `xdp_forward_func`: **verification PASSED**, 386134 processed instructions,
+  81278 states explored, 40639 pruned, call depth 1, 480-byte stack.
+- Default all-target tests: **468 passed + 4 ignored**. Std-only all-target
+  tests: **450 passed + 4 ignored**. Strict Clippy passes in both profiles;
+  true `thumbv7em-none-eabihf` no-std check and strict Clippy pass.
+- Definitive rebuilt-release scan: **137 families**, 135 instantiate,
+  **835/835 entries load**, **126/137 families fully compatible**, and
+  **822/835 entries verify (98.4%)**: 673 strict + 149 privileged-uninitialized-
+  stack. There are **zero ordinary verifier rejections**. The only remaining
+  entry outcomes are six honest missing-attach-target environment gaps and
+  seven poisoned application CO-RE relocations; two object-level flowtable
+  families remain missing-kfunc on this host. Both blocker histograms are
+  empty.
+
+This is genuine saturation of the pinned executable corpus. Preserve the
+environment/configuration classifications; do not manufacture attach targets,
+kfuncs, target types, or improved denominators. The active work now moves to
+the agreed ranked idea: a generic packet-provider/batch boundary, then an
+AF_XDP copy-mode backend with zero new dependencies. DPDK remains optional and
+later.
+
 Completed and committed in `3f9bb65`:
 
 - Added immutable production upstream `davidcoles/xvs` v0.2.10 at commit
@@ -327,18 +374,19 @@ In-progress investigation after `3f9bb65` (not committed):
 
 Immediate resume order:
 
-1. Inspect request pcs 4725/4481 and forward pcs 150/4624 with component-level
-   diagnostics like the temporary pc-3416 probe. Distinguish packet pointer
-   offset/range differences from strict pointer kind/nullability and from
-   actually precise scalar/spill dependencies; remove heavy diagnostics after
-   measuring.
-2. Extend subsumption or precision backtracking only for a concrete relation
-   proved by xvs and an adversarial regression. Keep local-call/multi-frame
-   states fully precise, and do not reintroduce global syntactic liveness,
-   generic widening, reversed packet-proof ordering, or a higher budget.
-3. Measure both xvs entries after each coherent precision step. Once one is
-   genuinely compatible, run the full matrix and complete 137-family scan,
-   document and commit, then select the next remaining production blocker.
+1. Define the generic packet-provider/batch contract in a focused spec and in
+   `docs/ideas.md`: packet ownership, mutable frame extent/headroom/tailroom,
+   metadata/context synthesis, verdict/redirect delivery, batching, and replay
+   capture. Keep verifier packet semantics independent of provider choice.
+2. Refactor the current owned-packet XDP path behind that boundary with a mock
+   provider and differential tests proving unchanged interpreter/JIT/replay
+   behavior. Make `xdp_adjust_head`/`xdp_adjust_tail` delegate resizing only
+   when the provider explicitly owns capacity; standalone remains honest
+   `-EOPNOTSUPP`.
+3. Add AF_XDP copy mode first using raw Linux syscalls and feature/target
+   gating, tested on veth before mlx5. Preserve XSKMAP sparse socket ownership
+   and save the first kernel/febpf mismatch as `.febpf`. Consider zero-copy
+   only after copy mode; keep DPDK a separate optional workspace adapter.
 
 Continuation batch completed after this checkpoint was written:
 
