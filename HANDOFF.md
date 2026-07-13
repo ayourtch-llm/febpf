@@ -30,7 +30,55 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 C attach targets landed; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 Criterion performance harness; authoritative)
+
+Reproducible performance infrastructure is committed as `c14aed0` (`perf: add
+reproducible Criterion harness`). At checkpoint writing HEAD is `c14aed0`; only
+this HANDOFF update is intentionally uncommitted. The recurring tttt job
+remains deleted. No build, benchmark, scanner, subagent, or external terminal
+collaborator is active.
+
+Criterion 0.8.2 lives entirely in the separately locked, unpublished `perf/`
+crate; the root febpf package retains zero dependencies and the true no-std
+graph is unchanged. `./perf/run` is the supported one-command entry point and
+accepts Criterion filters and saved-baseline arguments. The committed harness
+uses only febpf's public API and committed fixtures. It measures warm
+interpreter and precompiled-JIT execution separately from JIT compilation,
+verification, and ELF/BTF/CO-RE loading. Its bench profile matches febpf's LTO
+and single-codegen-unit release settings.
+
+The complete isolated run on this AMD Ryzen 9 3900X/rustc 1.96.1 host produced
+95% intervals recorded in README: interpreter **12.035–12.134 us**
+(247.49–249.52 M insn/s), warm JIT **289.02–292.36 ns**
+(10.272–10.390 G insn/s), JIT compile **8.134–8.328 us**, verifier
+**1.459–1.463 ms**, and CO-RE load **8.408–8.453 us**. These are explicitly
+host observations, not portable promises. The previous ad-hoc README speedup
+claims were removed.
+
+Validation: `./perf/run`, locked performance-crate check, strict performance
+Clippy, runner syntax, root default/std all-target tests and strict Clippy, true
+thumb no-std check/Clippy, and `git diff --check` pass. CI compiles the locked
+harness on x86-64 and aarch64 Linux without using hosted timing as a merge
+gate. All Criterion transitive packages declare permissive licenses; the root
+normal dependency tree contains only febpf.
+
+Immediate resume order remains production-driven:
+
+1. Expose verification-time static tail-call bundle linking for the one
+   measured production graph. Audit `prog_array_inits`, bundle verification,
+   exact program/map selection, durable graph identity, and interpreter/JIT
+   dispatch. Do not model program identity as an invocation-local callback.
+2. Add Criterion cases only when a coherent implementation batch creates a
+   meaningful boundary or suspected regression; do not turn the harness into
+   another synthetic feature backlog.
+3. Preserve honest corpus/environment gaps and the composable add-on boundary.
+   AF_XDP live-veth remains provisioned-host work; zero-copy and DPDK remain
+   optional later adapters.
+
+The C attach-target checkpoint immediately below is historical and superseded
+by this one.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-13 C attach targets landed; superseded)
 
 Exact application-side BTF attach retargeting is committed as `91f7b91`
 (`ffi: configure BTF attach targets from C`). At checkpoint writing HEAD is
