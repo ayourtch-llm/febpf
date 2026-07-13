@@ -119,6 +119,49 @@ joins. Bounded and unbounded loop regressions pass; branch accounting is
 direct-child and propagates upward only on a zero transition to avoid the
 rejected O(depth^2) implementation.
 
+Aligned-u32 continuation update: `7d89d96` finalized the safe checkpoint
+ancestry infrastructure, and `d32f7ea` (`verifier: preserve aligned u32 stack
+scalars`) is the newest semantic batch. The pc-494 packet counterexample was
+not itself evidence that checkpoint compression was invalid: xvs stores its
+parsed protocol as an aligned 32-bit stack value at offset -288, reloads it
+after helper clobbers, and needs that value's scalar identity to keep the UDP
+62-byte proof separate from the TCP offset-70 access. The verifier previously
+reduced that reload to an unrelated unknown scalar. It now preserves exact
+aligned u32 scalar ranges and equality identity, propagates JMP32 refinement
+through such reloads, and degrades provenance conservatively on other writes
+while retaining byte initialization. Prune comparison explicitly preserves
+the initialization mask; a fully initialized remembered slot cannot cover a
+partially initialized arrival.
+
+This removes the false pc-494 frontier, but does **not** make accumulated
+precision-mask activation safe. With a genuinely unknown branch scalar, the
+existing nullable-map-value adversarial path is still pruned before its bad
+deref when finalized checkpoints apply their accumulated masks. Production
+comparison therefore remains deliberately fully precise (`precise_regs` and
+`precise_spills` all set); do not enable compression until that missing
+transitive dependency is isolated and regression-tested.
+
+Exact final measurements from the rebuilt release binary under the unchanged
+one-million instruction budget:
+
+- `xdp_request_func` now fails for complexity at insn 3458; hottest joins are
+  pc 3420 16561/825, pc 3422 16559/573, pc 4787 16553/3, pc 3419 16493/509,
+  and pc 3424 16424/525.
+- `xdp_forward_func` fails for complexity at insn 171; hottest joins are pc
+  215 16323/4096, pc 244 15919/5, pc 150 8995/1187, pc 192 8864/3868, and pc
+  3195 4622/324.
+- Default all-target tests: **461 passed + 4 ignored**. Std-only all-target
+  tests: **443 passed + 4 ignored**. Strict Clippy passes for default/all-
+  features and std-only. True `thumbv7em-none-eabihf` no-std check and strict
+  Clippy pass.
+- The definitive rebuilt-release scan remains **137 families**, 135
+  instantiate, **835/835 entries load**, **125/137 compatible families**, and
+  **820/835 entries verify (98.2%)**: 671 strict + 149 privileged-uninitialized-
+  stack. Honest remaining outcomes are six missing-attach-target entries,
+  seven poisoned CO-RE entries, and the two xvs complexity rejections; two
+  flowtable families remain missing-kfunc. Unsupported-map and unknown-helper
+  histograms remain empty.
+
 Completed and committed in `3f9bb65`:
 
 - Added immutable production upstream `davidcoles/xvs` v0.2.10 at commit
@@ -237,14 +280,16 @@ In-progress investigation after `3f9bb65` (not committed):
 
 Immediate resume order:
 
-1. Implement real precision dependencies/relational partitioning for earlier
-   conditional joins; do not reintroduce global syntactic liveness or generic
-   widening.
-2. Use both xvs entries to measure convergence without raising the one-million
-   budget. Add adversarial dead/live register, stack-initialization, pointer,
-   nullability, packet-range, and equality-correlation tests.
-3. Run the full matrix and 137-family scan, document exact results, and commit
-   the liveness/pruning batch cleanly. Then select the next production lane.
+1. Isolate why applying accumulated precision masks still prunes the genuine
+   nullable-map-value bad path. Reduce it to checkpoint ancestry/history and
+   add a focused adversarial regression before changing comparison semantics.
+2. Activate compression only if dead/live register, aligned u32/u64 stack,
+   stack initialization, pointer/nullability, packet-range, and equality-
+   correlation tests all stay sound. Do not reintroduce global syntactic
+   liveness, generic widening, or a higher instruction budget.
+3. Measure both xvs entries after each coherent precision step. Once one is
+   genuinely compatible, run the full matrix and complete 137-family scan,
+   document and commit, then select the next remaining production blocker.
 
 Continuation batch completed after this checkpoint was written:
 
