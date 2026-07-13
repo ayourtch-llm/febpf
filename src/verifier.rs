@@ -752,9 +752,14 @@ struct Frame {
     regs: [RegState; NUM_REGS],
     /// Equality class for scalar registers (0 = no tracked equality).
     scalar_ids: [u32; NUM_REGS],
+    /// Scalar locations whose exact abstract value must participate in state
+    /// pruning. Initially conservative; precision backtracking will clear and
+    /// restore these marks at checkpoint boundaries.
+    precise_regs: u16,
     stack: [SlotState; SLOTS],
     /// Scalar equality class for aligned 8-byte spills.
     spill_ids: [u32; SLOTS],
+    precise_spills: u64,
     /// Where execution resumes in the caller (frames > 0).
     ret_pc: usize,
 }
@@ -764,8 +769,10 @@ impl Frame {
         Frame {
             regs: [RegState::Uninit; NUM_REGS],
             scalar_ids: [0; NUM_REGS],
+            precise_regs: u16::MAX,
             stack: [SlotState::EMPTY; SLOTS],
             spill_ids: [0; SLOTS],
+            precise_spills: u64::MAX,
             ret_pc,
         }
     }
@@ -837,12 +844,22 @@ impl VState {
                 if current && live_regs & (1 << r) == 0 {
                     continue;
                 }
+                if matches!(of.regs[r], RegState::Scalar(_))
+                    && of.precise_regs & (1 << r) == 0
+                {
+                    continue;
+                }
                 if !nf.regs[r].subsumed_by(&of.regs[r]) {
                     return false;
                 }
             }
             for s in 0..SLOTS {
                 if current && live_stack & (1 << s) == 0 {
+                    continue;
+                }
+                if matches!(of.stack[s], SlotState::Spill(RegState::Scalar(_)))
+                    && of.precise_spills & (1 << s) == 0
+                {
                     continue;
                 }
                 if !nf.stack[s].subsumed_by(&of.stack[s]) {
@@ -859,10 +876,22 @@ impl VState {
             for (frame_index, frame) in state.frames.iter().enumerate() {
                 let current = frame_index + 1 == state.frames.len();
                 for (r, id) in frame.scalar_ids.iter().enumerate() {
-                    out.push(if current && live_regs & (1 << r) == 0 { 0 } else { *id });
+                    out.push(if (current && live_regs & (1 << r) == 0)
+                        || frame.precise_regs & (1 << r) == 0
+                    {
+                        0
+                    } else {
+                        *id
+                    });
                 }
                 for (s, id) in frame.spill_ids.iter().enumerate() {
-                    out.push(if current && live_stack & (1 << s) == 0 { 0 } else { *id });
+                    out.push(if (current && live_stack & (1 << s) == 0)
+                        || frame.precise_spills & (1 << s) == 0
+                    {
+                        0
+                    } else {
+                        *id
+                    });
                 }
             }
             out
