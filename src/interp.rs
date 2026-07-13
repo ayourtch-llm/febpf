@@ -841,19 +841,117 @@ impl Vm {
     /// virtual `xdp_md` context internally and copies packet writes back to
     /// the caller on both successful exit and runtime error.
     pub fn run_xdp(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
+        let mut frame = crate::packet::XdpFrame::new(packet);
+        let result = self.run_xdp_frame(&mut frame).map(|verdict| verdict.return_value);
+        packet.copy_from_slice(frame.data());
+        result
+    }
+
+    /// Execute one provider-owned XDP frame.
+    ///
+    /// Only the active data window is staged through the VM. Headroom and
+    /// tailroom remain provider-owned and unchanged; resize helpers therefore
+    /// retain their standalone `-EOPNOTSUPP` behavior.
+    pub fn run_xdp_frame(
+        &mut self,
+        frame: &mut crate::packet::XdpFrame,
+    ) -> Result<crate::packet::XdpVerdict, EbpfError> {
+        let metadata = frame.metadata();
+        let packet = frame.data_mut();
         let mut ctx = self.prepare_xdp(packet).map_err(|msg| EbpfError { pc: 0, msg })?;
+        ctx[12..16].copy_from_slice(&metadata.ingress_ifindex.to_le_bytes());
+        ctx[16..20].copy_from_slice(&metadata.rx_queue_index.to_le_bytes());
+        ctx[20..24].copy_from_slice(&metadata.egress_ifindex.to_le_bytes());
         let result = self.run_with_packet(&mut ctx, LegacyPacketBacking::VmPacket);
         packet.copy_from_slice(&self.packet);
-        result
+        result.map(crate::packet::XdpVerdict::new)
+    }
+
+    /// Process at most `budget` frames from a packet provider.
+    ///
+    /// Every received frame is returned through [`crate::packet::XdpProvider::complete`],
+    /// including executions that end in a runtime error. The method stops
+    /// early when the provider reports no work.
+    pub fn run_xdp_provider<P: crate::packet::XdpProvider>(
+        &mut self,
+        provider: &mut P,
+        budget: usize,
+    ) -> Result<crate::packet::XdpBatchStats, crate::packet::XdpProviderError<P::Error>> {
+        let mut stats = crate::packet::XdpBatchStats::default();
+        for _ in 0..budget {
+            let Some(mut frame) = provider
+                .receive()
+                .map_err(crate::packet::XdpProviderError::Receive)?
+            else {
+                break;
+            };
+            stats.received += 1;
+            let result = self.run_xdp_frame(&mut frame);
+            if result.is_err() {
+                stats.runtime_errors += 1;
+            }
+            provider
+                .complete(crate::packet::CompletedXdpFrame { frame, result })
+                .map_err(crate::packet::XdpProviderError::Complete)?;
+            stats.completed += 1;
+        }
+        Ok(stats)
     }
 
     /// JIT counterpart of [`Vm::run_xdp`].
     #[cfg(feature = "jit")]
     pub fn run_xdp_jit(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
+        let mut frame = crate::packet::XdpFrame::new(packet);
+        let result = self
+            .run_xdp_frame_jit(&mut frame)
+            .map(|verdict| verdict.return_value);
+        packet.copy_from_slice(frame.data());
+        result
+    }
+
+    /// JIT counterpart of [`Vm::run_xdp_frame`].
+    #[cfg(feature = "jit")]
+    pub fn run_xdp_frame_jit(
+        &mut self,
+        frame: &mut crate::packet::XdpFrame,
+    ) -> Result<crate::packet::XdpVerdict, EbpfError> {
+        let metadata = frame.metadata();
+        let packet = frame.data_mut();
         let mut ctx = self.prepare_xdp(packet).map_err(|msg| EbpfError { pc: 0, msg })?;
+        ctx[12..16].copy_from_slice(&metadata.ingress_ifindex.to_le_bytes());
+        ctx[16..20].copy_from_slice(&metadata.rx_queue_index.to_le_bytes());
+        ctx[20..24].copy_from_slice(&metadata.egress_ifindex.to_le_bytes());
         let result = self.run_jit_with_packet(&mut ctx, LegacyPacketBacking::VmPacket);
         packet.copy_from_slice(&self.packet);
-        result
+        result.map(crate::packet::XdpVerdict::new)
+    }
+
+    /// JIT counterpart of [`Vm::run_xdp_provider`].
+    #[cfg(feature = "jit")]
+    pub fn run_xdp_provider_jit<P: crate::packet::XdpProvider>(
+        &mut self,
+        provider: &mut P,
+        budget: usize,
+    ) -> Result<crate::packet::XdpBatchStats, crate::packet::XdpProviderError<P::Error>> {
+        let mut stats = crate::packet::XdpBatchStats::default();
+        for _ in 0..budget {
+            let Some(mut frame) = provider
+                .receive()
+                .map_err(crate::packet::XdpProviderError::Receive)?
+            else {
+                break;
+            };
+            stats.received += 1;
+            let result = self.run_xdp_frame_jit(&mut frame);
+            if result.is_err() {
+                stats.runtime_errors += 1;
+            }
+            provider
+                .complete(crate::packet::CompletedXdpFrame { frame, result })
+                .map_err(crate::packet::XdpProviderError::Complete)?;
+            stats.completed += 1;
+        }
+        Ok(stats)
     }
 
     /// Execute an skb-context program over VM-owned packet bytes. The method

@@ -5,6 +5,8 @@ use febpf::helpers::{id, ArgKind, HelperSig, MemBus, RetKind};
 use febpf::insn::{self, alu, class, jmp};
 use febpf::verifier::Config;
 use febpf::{asm, Program, Vm};
+use febpf::{CompletedXdpFrame, XdpAction, XdpFrame, XdpMetadata, XdpProvider, XdpVerdict};
+use std::collections::VecDeque;
 
 fn program(source: &str) -> Program {
     let assembled = asm::assemble(source).expect("assembly failed");
@@ -89,6 +91,188 @@ fn run_xdp_synthesizes_metadata_and_copies_packet_writes_back() {
 
     let mut empty = [];
     assert_eq!(vm.run_xdp(&mut empty).unwrap(), 0);
+}
+
+#[test]
+fn xdp_frame_preserves_provider_capacity_and_matches_slice_adapter() {
+    let source = "r2 = *(u32 *)(r1 + 0)\n\
+                  r3 = *(u32 *)(r1 + 4)\n\
+                  r4 = r2\n\
+                  r4 += 1\n\
+                  if r4 > r3 goto short\n\
+                  *(u8 *)(r2 + 0) = 0xaa\n\
+                  r0 = 2\n\
+                  exit\n\
+                  short:\n\
+                  r0 = 1\n\
+                  exit";
+    let config = Config {
+        ctx_size: 24,
+        ctx_writable: false,
+        xdp: true,
+        ..Config::default()
+    };
+    let mut slice_vm = Vm::new(program(source)).unwrap();
+    slice_vm.verify(config.clone()).unwrap();
+    let mut frame_vm = Vm::new(program(source)).unwrap();
+    frame_vm.verify(config).unwrap();
+
+    let mut packet = [1, 2, 3];
+    let slice_return = slice_vm.run_xdp(&mut packet).unwrap();
+    let mut frame = XdpFrame::with_capacity(&[1, 2, 3], 17, 29).unwrap();
+    let verdict = frame_vm.run_xdp_frame(&mut frame).unwrap();
+
+    assert_eq!(verdict, XdpVerdict::new(slice_return));
+    assert_eq!(verdict.action, Some(XdpAction::Pass));
+    assert_eq!(frame.data(), packet);
+    assert_eq!(frame.headroom(), 17);
+    assert_eq!(frame.tailroom(), 29);
+    assert_eq!(frame.capacity(), 49);
+
+    #[cfg(feature = "jit")]
+    {
+        let mut jit_vm = Vm::new(program(source)).unwrap();
+        jit_vm
+            .verify(Config {
+                ctx_size: 24,
+                ctx_writable: false,
+                xdp: true,
+                ..Config::default()
+            })
+            .unwrap();
+        let mut jit_frame = XdpFrame::with_capacity(&[1, 2, 3], 17, 29).unwrap();
+        let jit_verdict = jit_vm.run_xdp_frame_jit(&mut jit_frame).unwrap();
+        assert_eq!(jit_verdict, verdict);
+        assert_eq!(jit_frame, frame);
+    }
+}
+
+#[test]
+fn xdp_frame_metadata_is_synthesized_without_exposing_provider_storage() {
+    let mut vm = Vm::new(program(
+        "r0 = *(u32 *)(r1 + 12)\n\
+         r2 = *(u32 *)(r1 + 16)\n\
+         r0 += r2\n\
+         r2 = *(u32 *)(r1 + 20)\n\
+         r0 += r2\n\
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 24,
+        ctx_writable: false,
+        xdp: true,
+        ..Config::default()
+    })
+    .unwrap();
+    let mut frame = XdpFrame::from_storage(vec![0, 0, 9, 8, 0], 2, 4).unwrap();
+    frame.set_metadata(XdpMetadata {
+        ingress_ifindex: 10,
+        rx_queue_index: 20,
+        egress_ifindex: 12,
+    });
+    frame.set_cookie(0xfeed_beef);
+
+    assert_eq!(vm.run_xdp_frame(&mut frame).unwrap().return_value, 42);
+    assert_eq!(frame.data(), [9, 8]);
+    assert_eq!(frame.cookie(), 0xfeed_beef);
+    let (storage, start, end) = frame.into_storage();
+    assert_eq!(storage, [0, 0, 9, 8, 0]);
+    assert_eq!((start, end), (2, 4));
+}
+
+#[derive(Default)]
+struct MockXdpProvider {
+    pending: VecDeque<XdpFrame>,
+    completed: Vec<CompletedXdpFrame>,
+}
+
+impl XdpProvider for MockXdpProvider {
+    type Error = &'static str;
+
+    fn receive(&mut self) -> Result<Option<XdpFrame>, Self::Error> {
+        Ok(self.pending.pop_front())
+    }
+
+    fn complete(&mut self, completed: CompletedXdpFrame) -> Result<(), Self::Error> {
+        self.completed.push(completed);
+        Ok(())
+    }
+}
+
+#[test]
+fn xdp_provider_processing_is_bounded_and_returns_frames_in_order() {
+    let mut vm = Vm::new(program(
+        "r2 = *(u32 *)(r1 + 0)\n\
+                                  r3 = *(u32 *)(r1 + 4)\n\
+                                  r4 = r2\n\
+                                  r4 += 1\n\
+                                  if r4 > r3 goto out\n\
+                                  r0 = *(u8 *)(r2 + 0)\n\
+                                  exit\n\
+                                  out:\n\
+                                  r0 = 0\n\
+                                  exit",
+    ))
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 24,
+        ctx_writable: false,
+        xdp: true,
+        ..Config::default()
+    })
+    .unwrap();
+    let mut provider = MockXdpProvider {
+        pending: [[1u8], [2], [3]]
+            .into_iter()
+            .map(|packet| XdpFrame::new(&packet))
+            .collect(),
+        completed: Vec::new(),
+    };
+
+    let first = vm.run_xdp_provider(&mut provider, 2).unwrap();
+    assert_eq!(first.received, 2);
+    assert_eq!(first.completed, 2);
+    assert_eq!(first.runtime_errors, 0);
+    assert_eq!(provider.pending.len(), 1);
+    assert_eq!(provider.completed[0].frame.data(), [1]);
+    assert_eq!(
+        provider.completed[0].result.as_ref().unwrap().return_value,
+        1
+    );
+    assert_eq!(provider.completed[1].frame.data(), [2]);
+    assert_eq!(
+        provider.completed[1].result.as_ref().unwrap().return_value,
+        2
+    );
+
+    let second = vm.run_xdp_provider(&mut provider, 8).unwrap();
+    assert_eq!(second.received, 1);
+    assert_eq!(second.completed, 1);
+    assert_eq!(provider.completed[2].frame.data(), [3]);
+}
+
+#[test]
+fn xdp_provider_receives_runtime_failures_as_completions() {
+    let mut vm = Vm::new(program("r0 = 2\nexit")).unwrap();
+    vm.verify(Config {
+        ctx_size: 24,
+        ctx_writable: false,
+        xdp: true,
+        ..Config::default()
+    })
+    .unwrap();
+    vm.insn_limit = 0;
+    let mut provider = MockXdpProvider {
+        pending: [XdpFrame::new(&[7])].into_iter().collect(),
+        completed: Vec::new(),
+    };
+
+    let stats = vm.run_xdp_provider(&mut provider, 1).unwrap();
+    assert_eq!(stats.runtime_errors, 1);
+    assert_eq!(stats.completed, 1);
+    assert!(provider.completed[0].result.is_err());
+    assert_eq!(provider.completed[0].frame.data(), [7]);
 }
 
 #[test]

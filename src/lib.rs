@@ -48,6 +48,7 @@ pub mod jit;
 #[cfg(feature = "std")]
 pub mod kbpf;
 pub mod maps;
+pub mod packet;
 #[cfg(feature = "std")]
 pub mod optimize;
 #[cfg(feature = "std")]
@@ -69,4 +70,8 @@ mod soundness;
 mod wasm;
 
 pub use interp::{EbpfError, Machine, MetadataLayout, Program, RegionAccess, Vm};
+pub use packet::{
+    CompletedXdpFrame, XdpAction, XdpBatchStats, XdpFrame, XdpMetadata, XdpProvider,
+    XdpProviderError, XdpVerdict,
+};
 pub use verifier::{Config as VerifierConfig, VerifyError};

@@ -24,9 +24,9 @@ loads have the following types:
 |---:|---|---|---:|
 | 0 | `data` | `PtrKind::Packet` | VM packet start |
 | 4 | `data_end` | `PtrKind::PacketEnd` | VM packet end |
-| 12 | `ingress_ifindex` | scalar | 0 |
-| 16 | `rx_queue_index` | scalar | 0 |
-| 20 | `egress_ifindex` | scalar | 0 |
+| 12 | `ingress_ifindex` | scalar | provider metadata, or 0 |
+| 16 | `rx_queue_index` | scalar | provider metadata, or 0 |
+| 20 | `egress_ifindex` | scalar | provider metadata, or 0 |
 
 Offset 8 (`data_meta`) remains rejected: it is a packet-metadata pointer, not
 a scalar, and febpf does not yet model an XDP metadata region. All other field,
@@ -60,10 +60,10 @@ byte count.
 The packet is a dedicated bounds-checked virtual-address region. `run_xdp`
 constructs a zero-backed 24-byte `xdp_md` internally; the interpreter
 synthesizes full febpf virtual addresses when the ABI's 32-bit `data` fields
-are loaded. The three supported scalar metadata fields therefore read zero.
-Packet writes are copied back to the caller on exit or runtime error. A typed
-metadata input API is intentionally deferred until a workload needs nonzero
-interface or queue identities.
+are loaded. The slice adapter supplies zero scalar metadata. The
+provider-neutral `XdpFrame` adapter supplies typed interface and queue values,
+explicit headroom/tailroom, and an opaque provider cookie as specified in
+`packet-providers.md`. Packet writes are copied back on exit or runtime error.
 
 ## Byte-copy helpers
 
