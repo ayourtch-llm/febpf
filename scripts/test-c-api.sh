@@ -53,3 +53,10 @@ if [[ "$ACTUAL" != "$EXPECTED" ]]; then
     printf 'expected:\n%s\nactual:\n%s\n' "$EXPECTED" "$ACTUAL" >&2
     exit 1
 fi
+
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+    -I include examples/c-elf-host/main.c \
+    -L target/c-api -Wl,-rpath,"$RPATH" -lfebpf \
+    -o target/c-elf-example
+
+target/c-elf-example tests/core_probe.o text tests/core_target.o

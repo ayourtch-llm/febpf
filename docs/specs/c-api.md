@@ -20,6 +20,11 @@ C example, and runs it against that library.
 - `febpf_vm_create_assembly` and `febpf_vm_create_bytecode` copy their inputs
   into an opaque VM handle. Raw bytecode is the ordinary little-endian sequence
   of eight-byte eBPF instruction slots.
+- `febpf_vm_create_elf` loads a relocatable eBPF object, selects an exact
+  program name, and accepts target BTF as either a raw blob or an ELF object
+  containing `.BTF`. Objects that need kernel BTF must receive it; multi-entry
+  objects require an explicit selector. Section kind constrains later
+  verification to XDP, skb, or Flat semantics as appropriate.
 - `febpf_vm_verify` always runs febpf's verifier and selects Flat, XDP, or skb
   context semantics. Writable flat context, strict alignment, privileged
   uninitialized-stack policy, verifier budget, and runtime instruction limit
@@ -40,13 +45,30 @@ unknown flags, but accepts a larger size so fields can be appended compatibly.
 Statuses are fixed-width `uint32_t` constants rather than C enums whose ABI can
 vary by compiler.
 
+### ELF construction
+
+`febpf_elf_options_v1` keeps loading separate from verification and execution.
+All object, selector, and target-BTF bytes are consumed during construction;
+the handle retains only the relocated program, maps, BTF-derived verifier
+metadata, and section-derived context constraint. A target may be a raw BTF
+blob such as `/sys/kernel/btf/vmlinux` or a complete ELF carrying `.BTF`.
+
+An omitted selector is accepted only for a single-entry object. An object with
+CO-RE relocations or a BTF-typed context is rejected without target BTF rather
+than running against compiler-local layout. XDP and skb-family ELF sections
+must subsequently be verified under their matching context model. V1 also
+fails closed on loader warnings and static tail-call initializers, because it
+has neither a warning sink nor a verification-time bundle-link descriptor.
+
 ## Architectural boundary
 
-The C layer stores only durable `Vm` state plus the last successfully verified
-context model. Every run translates caller buffers and output callbacks into a
-fresh `ExecutionEnvironment`; no caller pointer, callback, packet, context, or
-sink is retained after the function returns. XDP packet bytes are borrowed
-directly through `ExecutionEnvironment::xdp_slice`, not staged in `Vm`.
+The C layer stores only durable `Vm` state, the last successfully verified
+context model, and an ELF section's optional context-model constraint. Every
+run translates caller buffers and output callbacks into a fresh
+`ExecutionEnvironment`; no caller pointer, object/BTF bytes, callback, packet,
+context, or sink is retained after the function returns. XDP packet bytes are
+borrowed directly through `ExecutionEnvironment::xdp_slice`, not staged in
+`Vm`.
 
 Guest-visible pointers remain febpf virtual addresses. A C pointer is never
 placed in an eBPF register. The host must still obey ordinary FFI ownership:
@@ -57,20 +79,29 @@ and reported as `FEBPF_STATUS_PANIC`.
 
 ## Deliberate v1 limits
 
-ELF entry selection/CO-RE target BTF, map administration, custom C helper
-callbacks, snapshots/replay, metadata/BTF contexts, provider-owned resizable
-frames, and rich redirect completion are not silently squeezed into v1. They
-need separately versioned descriptors or handles. The Rust embedding API
-remains the complete surface in the meantime.
+Map administration, custom C helper callbacks, snapshots/replay,
+application-supplied attach targets, provider-owned resizable frames, and rich
+redirect completion are not silently squeezed into v1. Static `PROG_ARRAY`
+initializers are rejected until verification-time bundle linking has a
+versioned contract. Loader warnings are errors because v1 has no warning sink.
+These gaps need separately versioned descriptors or handles. The Rust
+embedding API remains the complete surface in the meantime.
 
 ## Validation record
 
-- Default/JIT `c-api` all-target tests: **480 passed + 4 ignored**.
-- Std interpreter-only `c-api` all-target tests: **462 passed + 4 ignored**.
+- Default all-target tests: **477 passed + 4 ignored**; std-only:
+  **459 passed + 4 ignored**.
+- Default/JIT `c-api` all-target tests: **484 passed + 4 ignored**.
+- Std interpreter-only `c-api` all-target tests: **466 passed + 4 ignored**.
 - Strict Clippy passes for both C API feature profiles; the ordinary default,
   std-only, and true thumb no-std profiles remain green.
-- Both explicit cdylib and staticlib builds succeed. The C11 host compiles with
-  `-Wall -Wextra -Werror`, dynamically links the seven exported v1 symbols,
-  and prints `printk: n=42` plus `result=9 context=[9,7]` before exiting zero.
-- The complete pinned corpus remains unchanged at 137 families, 835/835 entries
-  loaded, and 822/835 verified (673 strict + 149 privileged-uninitialized).
+- Both explicit cdylib and staticlib builds succeed. The C11 hosts compile with
+  `-Wall -Wextra -Werror`, dynamically link the eight exported v1 symbols,
+  and exercise assembly, streaming Flat-context filtering, and ELF/CO-RE. The
+  ELF host drops its input buffers immediately after construction and prints
+  `core-result=123` after relocating against a target-BTF ELF.
+- The complete pinned corpus remains unchanged at 137 families, 135 objects
+  loaded, 126 fully compatible families, 835/835 entries loaded, and 822/835
+  verified (673 strict + 149 privileged-uninitialized). The remaining six
+  attach-target, seven poisoned-relocation, and two missing-kfunc gaps retain
+  their honest classifications; blocker histograms remain empty.

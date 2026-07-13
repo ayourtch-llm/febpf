@@ -275,9 +275,10 @@ including time-travel `rstep`.
   opt-in Linux `af-xdp` feature supplies a raw-UAPI copy-mode backend.
 - **Native embedding**: `include/febpf.h` and `docs/specs/c-api.md` — an
   opt-in, versioned C ABI with opaque VM ownership, explicit verification,
-  composable per-run resources, interpreter/JIT selection, and thread-local
-  diagnostics. `examples/c-host` is a minimal dependency-free host;
-  `examples/c-log-filter` is a streaming accept/drop/redaction application.
+  ELF/CO-RE loading, composable per-run resources, interpreter/JIT selection,
+  and thread-local diagnostics. `examples/c-host` is a minimal dependency-free
+  host; `examples/c-log-filter` is a streaming accept/drop/redaction
+  application. `examples/c-elf-host` demonstrates copied-input CO-RE loading.
 - **CI**: `.github/workflows/ci.yml` runs the suite, clippy (`-D warnings`) and
   the differential fuzzer on all three JIT platforms — each runner executes
   machine code generated for that exact CPU.

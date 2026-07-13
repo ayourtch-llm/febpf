@@ -6,7 +6,7 @@
 
 use crate::execution::{ExecutionEnvironment, ExecutionOutcome};
 use crate::verifier::{Config, UninitStackPolicy};
-use crate::{asm, insn, Program, Vm};
+use crate::{asm, elf, insn, Program, Vm};
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -40,6 +40,8 @@ const INVOCATION_KNOWN_FLAGS: u32 = INVOCATION_JIT;
 pub const OUTPUT_PRINTK: u32 = 1;
 pub const OUTPUT_SEQUENCE: u32 = 2;
 
+const ELF_KNOWN_FLAGS: u32 = 0;
+
 pub type OutputFn =
     unsafe extern "C" fn(user_data: *mut c_void, kind: u32, data: *const u8, len: usize);
 
@@ -70,13 +72,27 @@ pub struct InvocationV1 {
     pub output_user_data: *mut c_void,
 }
 
+/// ELF loading configuration. Set `struct_size = sizeof(febpf_elf_options_v1)`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ElfOptionsV1 {
+    pub struct_size: usize,
+    pub flags: u32,
+    pub reserved: u32,
+    pub program_name: *const u8,
+    pub program_name_len: usize,
+    pub target_btf: *const u8,
+    pub target_btf_len: usize,
+}
+
 /// Opaque to C callers.
 pub struct CApiVm {
     vm: Vm,
     verified_model: Option<VerifiedModel>,
+    required_model: Option<VerifiedModel>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum VerifiedModel {
     Flat,
     Xdp,
@@ -237,6 +253,7 @@ pub unsafe extern "C" fn febpf_vm_create_assembly(
         let handle = Box::into_raw(Box::new(CApiVm {
             vm,
             verified_model: None,
+            required_model: None,
         }));
         // SAFETY: output was checked and receives the newly owned handle.
         unsafe { output.write(handle) };
@@ -273,6 +290,161 @@ pub unsafe extern "C" fn febpf_vm_create_bytecode(
         let handle = Box::into_raw(Box::new(CApiVm {
             vm,
             verified_model: None,
+            required_model: None,
+        }));
+        // SAFETY: output was checked and receives the newly owned handle.
+        unsafe { output.write(handle) };
+        Ok(())
+    })
+}
+
+fn required_model(kind: elf::ProgramKind) -> Option<VerifiedModel> {
+    if kind.is_xdp() {
+        Some(VerifiedModel::Xdp)
+    } else if kind.is_skb() {
+        Some(VerifiedModel::Skb)
+    } else {
+        None
+    }
+}
+
+fn model_name(model: VerifiedModel) -> &'static str {
+    match model {
+        VerifiedModel::Flat => "Flat",
+        VerifiedModel::Xdp => "XDP",
+        VerifiedModel::Skb => "skb",
+    }
+}
+
+/// Construct an opaque VM from a relocatable eBPF ELF object.
+///
+/// # Safety
+/// Object/options-selected byte regions must be readable and `output` writable.
+#[no_mangle]
+pub unsafe extern "C" fn febpf_vm_create_elf(
+    object: *const u8,
+    object_len: usize,
+    options: *const ElfOptionsV1,
+    output: *mut *mut CApiVm,
+) -> u32 {
+    boundary(|| {
+        if output.is_null() {
+            return Err(invalid("output VM pointer is null"));
+        }
+        // SAFETY: output was checked and is caller-owned.
+        unsafe { output.write(null_mut()) };
+        // SAFETY: caller promises a versioned readable input structure.
+        let options = unsafe { input_struct(options, "ELF options")? };
+        if options.flags & !ELF_KNOWN_FLAGS != 0 {
+            return Err(invalid(format!(
+                "unknown ELF flags 0x{:x}",
+                options.flags & !ELF_KNOWN_FLAGS
+            )));
+        }
+        if options.reserved != 0 {
+            return Err(invalid("ELF options.reserved must be zero"));
+        }
+        // SAFETY: caller contracts are forwarded to checked helpers.
+        let object = unsafe { bytes(object, object_len, "ELF object")? };
+        let selector = unsafe {
+            bytes(
+                options.program_name,
+                options.program_name_len,
+                "ELF program name",
+            )?
+        };
+        let selector = str::from_utf8(selector)
+            .map_err(|error| invalid(format!("ELF program name is not UTF-8: {error}")))?;
+        let target_input =
+            unsafe { bytes(options.target_btf, options.target_btf_len, "target BTF")? };
+        if target_input.is_empty() && elf::needs_kernel_btf(object) {
+            return Err((
+                STATUS_PROGRAM,
+                "ELF object requires target BTF for CO-RE or a BTF-typed context".into(),
+            ));
+        }
+        let target = if target_input.is_empty() {
+            None
+        } else if target_input.starts_with(b"\x7fELF") {
+            Some(
+                elf::read_section(target_input, ".BTF")
+                    .map_err(|error| (STATUS_PROGRAM, format!("target BTF ELF: {error}")))?
+                    .ok_or_else(|| {
+                        (
+                            STATUS_PROGRAM,
+                            "target BTF ELF has no nonempty .BTF section".into(),
+                        )
+                    })?
+                    .0,
+            )
+        } else {
+            Some(target_input.to_vec())
+        };
+        let mut loaded = elf::load_with_target_btf(object, target.as_deref())
+            .map_err(|error| (STATUS_PROGRAM, format!("ELF loading failed: {error}")))?;
+        if !loaded.warnings.is_empty() {
+            return Err((
+                STATUS_PROGRAM,
+                format!(
+                    "ELF loading produced unsupported warnings: {}",
+                    loaded.warnings.join("; ")
+                ),
+            ));
+        }
+        if !loaded.prog_array_inits.is_empty() {
+            return Err((
+                STATUS_UNSUPPORTED,
+                "ELF static PROG_ARRAY initialization is not supported by C ABI v1".into(),
+            ));
+        }
+        let index = if selector.is_empty() {
+            if loaded.programs.len() != 1 {
+                let names: Vec<&str> = loaded
+                    .programs
+                    .iter()
+                    .map(|program| program.name.as_str())
+                    .collect();
+                return Err((
+                    STATUS_PROGRAM,
+                    format!(
+                        "ELF program name is required; available: {}",
+                        names.join(", ")
+                    ),
+                ));
+            }
+            0
+        } else {
+            loaded
+                .programs
+                .iter()
+                .position(|program| program.name == selector)
+                .ok_or_else(|| {
+                    let names: Vec<&str> = loaded
+                        .programs
+                        .iter()
+                        .map(|program| program.name.as_str())
+                        .collect();
+                    (
+                        STATUS_PROGRAM,
+                        format!(
+                            "no ELF program '{selector}'; available: {}",
+                            names.join(", ")
+                        ),
+                    )
+                })?
+        };
+        let chosen = loaded.programs.swap_remove(index);
+        let model = required_model(chosen.kind);
+        let vm = Vm::new(Program {
+            insns: chosen.insns,
+            maps: loaded.maps,
+            btf_ctx: chosen.btf_ctx,
+        })
+        .map_err(|error| (STATUS_PROGRAM, format!("program creation failed: {error}")))?;
+        let handle = Box::into_raw(Box::new(CApiVm {
+            vm,
+            verified_model: None,
+            required_model: model,
         }));
         // SAFETY: output was checked and receives the newly owned handle.
         unsafe { output.write(handle) };
@@ -327,6 +499,18 @@ pub unsafe extern "C" fn febpf_vm_verify(
                 ))
             }
         };
+        if let Some(required) = handle.required_model {
+            if model != required {
+                return Err((
+                    STATUS_VERIFY,
+                    format!(
+                        "ELF entry requires {} context model, got {}",
+                        model_name(required),
+                        model_name(model)
+                    ),
+                ));
+            }
+        }
         let mut config = Config {
             ctx_size,
             ctx_writable: options.flags & VERIFY_CONTEXT_WRITABLE != 0,
@@ -779,5 +963,140 @@ mod tests {
             assert!(last_error().contains("without JIT support"));
         }
         assert_eq!(unsafe { febpf_vm_destroy(vm) }, STATUS_OK);
+    }
+
+    #[test]
+    fn elf_constructor_selects_and_core_relocates_without_retaining_inputs() {
+        let object = include_bytes!("../tests/core_probe.o").to_vec();
+        let target = include_bytes!("../tests/core_target.o").to_vec();
+        let name = b"text".to_vec();
+        let options = ElfOptionsV1 {
+            struct_size: size_of::<ElfOptionsV1>(),
+            flags: 0,
+            reserved: 0,
+            program_name: name.as_ptr(),
+            program_name_len: name.len(),
+            target_btf: target.as_ptr(),
+            target_btf_len: target.len(),
+        };
+        let mut vm = null_mut();
+        assert_eq!(
+            unsafe { febpf_vm_create_elf(object.as_ptr(), object.len(), &options, &mut vm) },
+            STATUS_OK,
+            "{}",
+            last_error()
+        );
+        drop((object, target, name));
+        assert_eq!(unsafe { verify(vm, CONTEXT_FLAT, 64) }, STATUS_OK);
+
+        let mut context = [0u8; 64];
+        context[4..8].copy_from_slice(&100i32.to_le_bytes());
+        context[12..16].copy_from_slice(&20i32.to_le_bytes());
+        context[16..24].copy_from_slice(&3i64.to_le_bytes());
+        let invocation = InvocationV1 {
+            struct_size: size_of::<InvocationV1>(),
+            flags: 0,
+            reserved: 0,
+            context: context.as_mut_ptr(),
+            context_len: context.len(),
+            packet: null_mut(),
+            packet_len: 0,
+            output: None,
+            output_user_data: null_mut(),
+        };
+        let mut result = 0;
+        assert_eq!(
+            unsafe { febpf_vm_run(vm, &invocation, &mut result) },
+            STATUS_OK
+        );
+        assert_eq!(result, 123);
+        assert_eq!(unsafe { febpf_vm_destroy(vm) }, STATUS_OK);
+    }
+
+    #[test]
+    fn elf_constructor_rejects_ambiguous_bundles_and_enforces_section_model() {
+        let multi = include_bytes!("../tests/multi_entry.o");
+        let empty = ElfOptionsV1 {
+            struct_size: size_of::<ElfOptionsV1>(),
+            flags: 0,
+            reserved: 0,
+            program_name: null_mut(),
+            program_name_len: 0,
+            target_btf: null_mut(),
+            target_btf_len: 0,
+        };
+        let mut vm = null_mut();
+        assert_eq!(
+            unsafe { febpf_vm_create_elf(multi.as_ptr(), multi.len(), &empty, &mut vm) },
+            STATUS_PROGRAM
+        );
+        assert!(last_error().contains("program name is required"));
+        assert!(vm.is_null());
+
+        let core = include_bytes!("../tests/core_probe.o");
+        let core_name = b"text";
+        let no_target = ElfOptionsV1 {
+            program_name: core_name.as_ptr(),
+            program_name_len: core_name.len(),
+            ..empty
+        };
+        assert_eq!(
+            unsafe { febpf_vm_create_elf(core.as_ptr(), core.len(), &no_target, &mut vm) },
+            STATUS_PROGRAM
+        );
+        assert!(last_error().contains("requires target BTF"));
+        assert!(vm.is_null());
+
+        let object = include_bytes!("../tests/btf_maps.o");
+        let name = b"xdp";
+        let options = ElfOptionsV1 {
+            program_name: name.as_ptr(),
+            program_name_len: name.len(),
+            ..empty
+        };
+        assert_eq!(
+            unsafe { febpf_vm_create_elf(object.as_ptr(), object.len(), &options, &mut vm) },
+            STATUS_OK,
+            "{}",
+            last_error()
+        );
+        assert_eq!(unsafe { verify(vm, CONTEXT_FLAT, 0) }, STATUS_VERIFY);
+        assert!(last_error().contains("requires XDP context model"));
+        assert_eq!(unsafe { verify(vm, CONTEXT_XDP, 0) }, STATUS_OK);
+        let mut packet = [0u8; 1];
+        let invocation = InvocationV1 {
+            struct_size: size_of::<InvocationV1>(),
+            flags: 0,
+            reserved: 0,
+            context: null_mut(),
+            context_len: 0,
+            packet: packet.as_mut_ptr(),
+            packet_len: packet.len(),
+            output: None,
+            output_user_data: null_mut(),
+        };
+        let mut result = 0;
+        assert_eq!(
+            unsafe { febpf_vm_run(vm, &invocation, &mut result) },
+            STATUS_OK,
+            "{}",
+            last_error()
+        );
+        assert_eq!(result, 5);
+        assert_eq!(unsafe { febpf_vm_destroy(vm) }, STATUS_OK);
+
+        let tail = include_bytes!("../tests/tail_call.o");
+        let tail_name = b"xdp/entry";
+        let tail_options = ElfOptionsV1 {
+            program_name: tail_name.as_ptr(),
+            program_name_len: tail_name.len(),
+            ..empty
+        };
+        assert_eq!(
+            unsafe { febpf_vm_create_elf(tail.as_ptr(), tail.len(), &tail_options, &mut vm) },
+            STATUS_UNSUPPORTED
+        );
+        assert!(last_error().contains("PROG_ARRAY"));
+        assert!(vm.is_null());
     }
 }

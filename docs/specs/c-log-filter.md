@@ -49,16 +49,16 @@ state contains the verified program and its maps; record storage and output
 policy remain invocation/host state.
 
 The example therefore does not justify adding a log model, record provider, or
-generic untyped callback to ABI v1. Future needs should be measured separately:
-ELF entry selection improves plugin distribution, custom helpers expose host
-services, and map handles expose durable control state. They have different
-ownership and compatibility contracts and should not be combined into a
-miscellaneous VM adapter.
+generic untyped callback to ABI v1. ELF entry selection is now an independent
+construction descriptor. Future needs should still be measured separately:
+custom helpers expose host services and map handles expose durable control
+state. They have different ownership and compatibility contracts and should
+not be combined into a miscellaneous VM adapter.
 
 ## Validation
 
 `scripts/test-c-api.sh` compiles this host with C11, `-Wall -Wextra -Werror`,
 then pipes three records through the example plugin. It requires exact output
 `INFO ready` and `TOKEN=*ecret`; the intervening `DEBUG noisy` record must be
-absent. The same run rebuilds and dynamically links the native C API. All five
+absent. The same run rebuilds and dynamically links the native C API. All seven
 Rust C-boundary tests and strict all-target C-API Clippy also pass.

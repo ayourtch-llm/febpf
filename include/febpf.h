@@ -22,6 +22,20 @@ typedef uint32_t febpf_status;
 
 typedef struct febpf_vm febpf_vm;
 
+typedef struct febpf_elf_options_v1 {
+    size_t struct_size;
+    uint32_t flags;
+    uint32_t reserved;
+
+    /* Exact loaded-program name. Required when the object has multiple entries. */
+    const uint8_t *program_name;
+    size_t program_name_len;
+
+    /* Raw BTF or an ELF containing .BTF; required when the object needs it. */
+    const uint8_t *target_btf;
+    size_t target_btf_len;
+} febpf_elf_options_v1;
+
 typedef uint32_t febpf_context_model;
 #define FEBPF_CONTEXT_FLAT 0u
 #define FEBPF_CONTEXT_XDP 1u
@@ -88,6 +102,11 @@ febpf_status febpf_vm_create_assembly(const uint8_t *source,
 febpf_status febpf_vm_create_bytecode(const uint8_t *program,
                                       size_t program_len,
                                       febpf_vm **output);
+/* Object, selector, and target-BTF bytes are copied/consumed during the call. */
+febpf_status febpf_vm_create_elf(const uint8_t *object,
+                                 size_t object_len,
+                                 const febpf_elf_options_v1 *options,
+                                 febpf_vm **output);
 
 /* NULL is accepted. Every non-NULL handle must be destroyed exactly once. */
 febpf_status febpf_vm_destroy(febpf_vm *handle);
