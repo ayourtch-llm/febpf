@@ -27,6 +27,10 @@ C example, and runs it against that library.
   verification to XDP, skb, or Flat semantics as appropriate.
 - `febpf_vm_create_elf_v2` adds exact-name, nonzero map-capacity overrides
   before storage is instantiated. The original constructor remains unchanged.
+- `febpf_vm_create_elf_v3` additionally accepts exact program- or
+  section-selected attach targets. Each target must resolve to a real function
+  in the explicitly supplied target BTF; missing target BTF and missing
+  functions remain construction failures.
 - `febpf_vm_verify` always runs febpf's verifier and selects Flat, XDP, or skb
   context semantics. Writable flat context, strict alignment, privileged
   uninitialized-stack policy, verifier budget, and runtime instruction limit
@@ -58,6 +62,11 @@ vary by compiler.
 
 `febpf_elf_options_v1` keeps loading separate from verification and execution;
 `febpf_elf_options_v2` adds only pre-instantiation map-capacity configuration.
+`febpf_elf_options_v3` composes those map overrides with an exact-stride array
+of application attach targets. A selector is either one exact loaded-program
+name or one exact ELF section; its function name retargets only BTF context
+typing for `fentry`, `fexit`, or `fmod_ret`. It does not fabricate target BTF,
+change CO-RE's target, or suppress unrelated loader warnings.
 All object, selector, and target-BTF bytes are consumed during construction;
 the handle retains only the relocated program, maps, BTF-derived verifier
 metadata, and section-derived context constraint. A target may be a raw BTF
@@ -117,24 +126,26 @@ and reported as `FEBPF_STATUS_PANIC`.
 
 Typed ring/perf/queue consumption, program/map-in-map linking, nonzero per-CPU
 lane access, pointer-returning custom helpers, snapshots/replay,
-application-supplied attach targets, provider-owned resizable frames, and rich
-redirect completion are not silently squeezed into generic byte-map
-operations. Static `PROG_ARRAY` initializers are rejected until
-verification-time bundle linking has a versioned contract. Loader warnings are
-errors because v1 has no warning sink. These gaps need separately versioned
-descriptors or handles. The Rust embedding API remains the complete surface in
-the meantime.
+provider-owned resizable frames, and rich redirect completion are not silently
+squeezed into generic byte-map operations. Static `PROG_ARRAY` initializers are
+rejected until verification-time bundle linking has a versioned contract.
+Loader warnings are errors because v1 has no warning sink. These gaps need
+separately versioned descriptors or handles. The Rust embedding API remains the
+complete surface in the meantime.
 
 ## Validation record
 
 - Default all-target tests: **477 passed + 4 ignored**; std-only:
   **459 passed + 4 ignored**.
-- Default/JIT `c-api` all-target tests: **487 passed + 4 ignored**.
-- Std interpreter-only `c-api` all-target tests: **469 passed + 4 ignored**.
+- Default/JIT `c-api` all-target tests: **488 passed + 4 ignored**.
+- Std interpreter-only `c-api` all-target tests: **470 passed + 4 ignored**.
 - Strict Clippy passes for both C API feature profiles; the ordinary default,
   std-only, and true thumb no-std profiles remain green.
-- Both explicit cdylib and staticlib builds succeed. The C11 hosts compile with
-  `-Wall -Wextra -Werror`, dynamically link the fifteen exported v1 symbols,
+- Both explicit cdylib and staticlib builds succeed. Those command-line native
+  crate types use isolated target directories with LTO disabled so GNU linkers
+  on hosted aarch64 Linux never receive LLVM-bitcode objects; ordinary release
+  builds retain profile LTO. The C11 hosts compile with
+  `-Wall -Wextra -Werror`, dynamically link the sixteen exported v1 symbols,
   and exercise assembly, streaming Flat-context filtering, and ELF/CO-RE. The
   ELF host drops its input buffers immediately after construction and prints
   `core-result=123` after relocating against a target-BTF ELF. The map host
@@ -142,6 +153,11 @@ the meantime.
   construction-time capacity and runtime durability. The helper host prints
   `helper-state: interp=123/42 jit=123/100 calls=3` after proving failed-call
   isolation, copied memory writeback, and interpreter/JIT parity.
+- The attach-target host first proves an unretargeted missing BTF function is
+  rejected, then verifies the committed fixture as `dummy_target ->
+  actual_target`. On this provisioned host it also verifies pinned BCC
+  `cachestat` as `account_page_dirtied -> folio_account_dirtied` against the
+  live kernel BTF.
 - The complete pinned corpus remains unchanged at 137 families, 135 objects
   loaded, 126 fully compatible families, 835/835 entries loaded, and 822/835
   verified (673 strict + 149 privileged-uninitialized). The remaining six

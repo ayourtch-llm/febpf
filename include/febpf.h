@@ -58,6 +58,34 @@ typedef struct febpf_elf_options_v2 {
     size_t map_override_count;
 } febpf_elf_options_v2;
 
+typedef uint32_t febpf_attach_target_selector;
+#define FEBPF_ATTACH_TARGET_PROGRAM 1u
+#define FEBPF_ATTACH_TARGET_SECTION 2u
+
+typedef struct febpf_attach_target_v1 {
+    size_t struct_size;
+    febpf_attach_target_selector selector_kind;
+    uint32_t reserved;
+    const uint8_t *selector;
+    size_t selector_len;
+    const uint8_t *function;
+    size_t function_len;
+} febpf_attach_target_v1;
+
+typedef struct febpf_elf_options_v3 {
+    size_t struct_size;
+    uint32_t flags;
+    uint32_t reserved;
+    const uint8_t *program_name;
+    size_t program_name_len;
+    const uint8_t *target_btf;
+    size_t target_btf_len;
+    const febpf_map_max_entries_v1 *map_overrides;
+    size_t map_override_count;
+    const febpf_attach_target_v1 *attach_targets;
+    size_t attach_target_count;
+} febpf_elf_options_v3;
+
 typedef uint32_t febpf_map_kind;
 #define FEBPF_MAP_HASH 1u
 #define FEBPF_MAP_ARRAY 2u
@@ -233,6 +261,10 @@ febpf_status febpf_vm_create_elf(const uint8_t *object,
 febpf_status febpf_vm_create_elf_v2(const uint8_t *object,
                                     size_t object_len,
                                     const febpf_elf_options_v2 *options,
+                                    febpf_vm **output);
+febpf_status febpf_vm_create_elf_v3(const uint8_t *object,
+                                    size_t object_len,
+                                    const febpf_elf_options_v3 *options,
                                     febpf_vm **output);
 
 /* NULL is accepted. Every non-NULL handle must be destroyed exactly once. */

@@ -95,7 +95,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cargo test --features c-api --lib c_api::tests
-          cargo rustc --lib --release --features c-api -- --crate-type=staticlib
+          # Command-line crate types sit outside Cargo's ordinary release graph.
+          # Isolate this artifact and avoid feeding LTO bitcode to GNU linkers
+          # that cannot consume it (notably the hosted aarch64 Linux runner).
+          CARGO_PROFILE_RELEASE_LTO=false cargo rustc \
+            --target-dir target/c-api-static \
+            --lib --release --features c-api -- --crate-type=staticlib
           ./scripts/test-c-api.sh
 
       - name: Clippy native C embedding API

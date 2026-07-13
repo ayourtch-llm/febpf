@@ -282,6 +282,7 @@ including time-travel `rstep`.
   accept/drop/redaction application. `examples/c-elf-host` demonstrates
   copied-input CO-RE loading, and `examples/c-map-host` durable state control.
   `examples/c-helper-host` demonstrates a host service with copied memory views.
+  `examples/c-attach-host` proves application-side BTF attach retargeting.
 - **CI**: `.github/workflows/ci.yml` runs the suite, clippy (`-D warnings`) and
   the differential fuzzer on all three JIT platforms — each runner executes
   machine code generated for that exact CPU.

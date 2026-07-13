@@ -4,16 +4,24 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
-cargo rustc --lib --release --features c-api -- --crate-type=cdylib
+# This command-line crate type is intentionally built outside Cargo's normal
+# release graph. Keep it in an isolated directory and disable profile LTO for
+# this artifact: some GNU linkers cannot consume the LLVM bitcode objects that
+# rustc otherwise emits for a dynamically requested cdylib. Ordinary release
+# builds still use the manifest's LTO setting.
+C_API_BUILD_DIR=${C_API_BUILD_DIR:-target/c-api-build}
+CARGO_PROFILE_RELEASE_LTO=false cargo rustc \
+    --target-dir "$C_API_BUILD_DIR" \
+    --lib --release --features c-api -- --crate-type=cdylib
 
 case "$(uname -s)" in
     Linux)
-        LIB_PATTERN='target/release/deps/libfebpf-*.so'
+        LIB_PATTERN="$C_API_BUILD_DIR/release/deps/libfebpf-*.so"
         LIB_NAME='libfebpf.so'
         RPATH='$ORIGIN/c-api'
         ;;
     Darwin)
-        LIB_PATTERN='target/release/deps/libfebpf-*.dylib'
+        LIB_PATTERN="$C_API_BUILD_DIR/release/deps/libfebpf-*.dylib"
         LIB_NAME='libfebpf.dylib'
         RPATH='@loader_path/c-api'
         ;;
@@ -79,4 +87,27 @@ if [[ "$HELPER_ACTUAL" != "$HELPER_EXPECTED" ]]; then
     echo "C helper output did not match" >&2
     printf 'expected:\n%s\nactual:\n%s\n' "$HELPER_EXPECTED" "$HELPER_ACTUAL" >&2
     exit 1
+fi
+
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+    -I include examples/c-attach-host/main.c \
+    -L target/c-api -Wl,-rpath,"$RPATH" -lfebpf \
+    -o target/c-attach-example
+
+ATTACH_ACTUAL=$(target/c-attach-example \
+    tests/attach_target.o fentry/dummy_target tests/attach_target.o \
+    fentry/dummy_target actual_target)
+ATTACH_EXPECTED='attach-target: fentry/dummy_target -> actual_target verified'
+if [[ "$ATTACH_ACTUAL" != "$ATTACH_EXPECTED" ]]; then
+    echo "C attach-target output did not match" >&2
+    printf 'expected:\n%s\nactual:\n%s\n' "$ATTACH_EXPECTED" "$ATTACH_ACTUAL" >&2
+    exit 1
+fi
+
+# When the honest pinned corpus and live kernel BTF are provisioned, exercise
+# the same host against BCC cachestat's real application-side retargeting.
+if [[ -r corpus/obj/bcc__cachestat.o && -r /sys/kernel/btf/vmlinux ]]; then
+    target/c-attach-example \
+        corpus/obj/bcc__cachestat.o fentry/account_page_dirtied \
+        /sys/kernel/btf/vmlinux fentry/account_page_dirtied folio_account_dirtied
 fi

@@ -46,6 +46,9 @@ pub const OUTPUT_SEQUENCE: u32 = 2;
 
 const ELF_KNOWN_FLAGS: u32 = 0;
 
+pub const ATTACH_TARGET_PROGRAM: u32 = 1;
+pub const ATTACH_TARGET_SECTION: u32 = 2;
+
 pub type OutputFn =
     unsafe extern "C" fn(user_data: *mut c_void, kind: u32, data: *const u8, len: usize);
 
@@ -182,6 +185,36 @@ pub struct ElfOptionsV2 {
     pub target_btf_len: usize,
     pub map_overrides: *const MapMaxEntriesV1,
     pub map_override_count: usize,
+}
+
+/// One exact program/section selector and real target-BTF function name.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AttachTargetV1 {
+    pub struct_size: usize,
+    pub selector_kind: u32,
+    pub reserved: u32,
+    pub selector: *const u8,
+    pub selector_len: usize,
+    pub function: *const u8,
+    pub function_len: usize,
+}
+
+/// ELF loading configuration with map and attach-target overrides.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ElfOptionsV3 {
+    pub struct_size: usize,
+    pub flags: u32,
+    pub reserved: u32,
+    pub program_name: *const u8,
+    pub program_name_len: usize,
+    pub target_btf: *const u8,
+    pub target_btf_len: usize,
+    pub map_overrides: *const MapMaxEntriesV1,
+    pub map_override_count: usize,
+    pub attach_targets: *const AttachTargetV1,
+    pub attach_target_count: usize,
 }
 
 /// Copied metadata for one exact-name map.
@@ -498,11 +531,88 @@ unsafe fn map_overrides(
     Ok(result)
 }
 
+unsafe fn attach_targets(
+    pointer: *const AttachTargetV1,
+    count: usize,
+) -> CResult<Vec<elf::AttachTarget>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if pointer.is_null() {
+        return Err(invalid("attach_targets is null but count is nonzero"));
+    }
+    count
+        .checked_mul(core::mem::size_of::<AttachTargetV1>())
+        .filter(|size| *size <= isize::MAX as usize)
+        .ok_or_else(|| invalid("attach-target array is too large"))?;
+    let mut result = Vec::with_capacity(count);
+    for index in 0..count {
+        // SAFETY: the caller promises an array containing `count` descriptors.
+        let item = unsafe { input_struct(pointer.add(index), "attach target")? };
+        if item.struct_size != core::mem::size_of::<AttachTargetV1>() {
+            return Err(invalid(format!(
+                "attach_targets[{index}].struct_size must equal {} for this fixed-stride array",
+                core::mem::size_of::<AttachTargetV1>()
+            )));
+        }
+        if item.reserved != 0 {
+            return Err(invalid(format!(
+                "attach_targets[{index}].reserved must be zero"
+            )));
+        }
+        // SAFETY: descriptor-selected byte regions live for this call.
+        let selector = unsafe {
+            bytes(
+                item.selector,
+                item.selector_len,
+                "attach-target selector",
+            )?
+        };
+        let selector = str::from_utf8(selector)
+            .map_err(|error| invalid(format!("attach-target selector is not UTF-8: {error}")))?;
+        if selector.is_empty() {
+            return Err(invalid(format!(
+                "attach_targets[{index}] has an empty selector"
+            )));
+        }
+        let selector = match item.selector_kind {
+            ATTACH_TARGET_PROGRAM => elf::AttachTargetSelector::Program(selector.to_owned()),
+            ATTACH_TARGET_SECTION => elf::AttachTargetSelector::Section(selector.to_owned()),
+            other => {
+                return Err(invalid(format!(
+                    "attach_targets[{index}] has unknown selector kind {other}"
+                )))
+            }
+        };
+        // SAFETY: descriptor-selected byte regions live for this call.
+        let function = unsafe {
+            bytes(
+                item.function,
+                item.function_len,
+                "attach-target function",
+            )?
+        };
+        let function = str::from_utf8(function)
+            .map_err(|error| invalid(format!("attach-target function is not UTF-8: {error}")))?;
+        if function.is_empty() {
+            return Err(invalid(format!(
+                "attach_targets[{index}] has an empty function"
+            )));
+        }
+        result.push(elf::AttachTarget {
+            selector,
+            function: function.to_owned(),
+        });
+    }
+    Ok(result)
+}
+
 fn create_elf_handle(
     object: &[u8],
     selector: &str,
     target_input: &[u8],
     overrides: &[(String, u32)],
+    attach_targets: &[elf::AttachTarget],
 ) -> CResult<*mut CApiVm> {
     if target_input.is_empty() && elf::needs_kernel_btf(object) {
         return Err((
@@ -527,8 +637,12 @@ fn create_elf_handle(
     } else {
         Some(target_input.to_vec())
     };
-    let mut loaded = elf::load_with_target_btf(object, target.as_deref())
-        .map_err(|error| (STATUS_PROGRAM, format!("ELF loading failed: {error}")))?;
+    let mut loaded = elf::load_with_target_btf_and_attach_targets(
+        object,
+        target.as_deref(),
+        attach_targets,
+    )
+    .map_err(|error| (STATUS_PROGRAM, format!("ELF loading failed: {error}")))?;
     if !loaded.warnings.is_empty() {
         return Err((
             STATUS_PROGRAM,
@@ -647,7 +761,7 @@ pub unsafe extern "C" fn febpf_vm_create_elf(
                 options.target_btf_len,
             )?
         };
-        let handle = create_elf_handle(object, selector, target, &[])?;
+        let handle = create_elf_handle(object, selector, target, &[], &[])?;
         // SAFETY: output was checked and receives the newly owned handle.
         unsafe { output.write(handle) };
         Ok(())
@@ -687,7 +801,49 @@ pub unsafe extern "C" fn febpf_vm_create_elf_v2(
         // SAFETY: caller promises an array of versioned descriptors.
         let overrides =
             unsafe { map_overrides(options.map_overrides, options.map_override_count)? };
-        let handle = create_elf_handle(object, selector, target, &overrides)?;
+        let handle = create_elf_handle(object, selector, target, &overrides, &[])?;
+        // SAFETY: output was checked and receives the newly owned handle.
+        unsafe { output.write(handle) };
+        Ok(())
+    })
+}
+
+/// Construct an ELF VM with map-capacity and attach-target overrides.
+///
+/// # Safety
+/// All descriptor-selected regions must be readable and `output` writable.
+#[no_mangle]
+pub unsafe extern "C" fn febpf_vm_create_elf_v3(
+    object: *const u8,
+    object_len: usize,
+    options: *const ElfOptionsV3,
+    output: *mut *mut CApiVm,
+) -> u32 {
+    boundary(|| {
+        if output.is_null() {
+            return Err(invalid("output VM pointer is null"));
+        }
+        // SAFETY: output was checked and is caller-owned.
+        unsafe { output.write(null_mut()) };
+        // SAFETY: caller promises a versioned readable input structure.
+        let options = unsafe { input_struct(options, "ELF v3 options")? };
+        check_elf_options(options.flags, options.reserved)?;
+        let (object, selector, target) = unsafe {
+            elf_inputs(
+                object,
+                object_len,
+                options.program_name,
+                options.program_name_len,
+                options.target_btf,
+                options.target_btf_len,
+            )?
+        };
+        // SAFETY: caller promises arrays of exact-stride descriptors.
+        let overrides =
+            unsafe { map_overrides(options.map_overrides, options.map_override_count)? };
+        let attach_targets =
+            unsafe { attach_targets(options.attach_targets, options.attach_target_count)? };
+        let handle = create_elf_handle(object, selector, target, &overrides, &attach_targets)?;
         // SAFETY: output was checked and receives the newly owned handle.
         unsafe { output.write(handle) };
         Ok(())
@@ -2006,6 +2162,72 @@ mod tests {
         );
         assert_eq!(result, 123);
         assert_eq!(unsafe { febpf_vm_destroy(vm) }, STATUS_OK);
+    }
+
+    #[test]
+    fn elf_v3_applies_exact_attach_targets_and_keeps_missing_btf_honest() {
+        let object = include_bytes!("../tests/attach_target.o");
+        let program_name = b"fentry/dummy_target";
+        let section = b"fentry/dummy_target";
+        let function = b"actual_target";
+        let override_ = AttachTargetV1 {
+            struct_size: size_of::<AttachTargetV1>(),
+            selector_kind: ATTACH_TARGET_SECTION,
+            reserved: 0,
+            selector: section.as_ptr(),
+            selector_len: section.len(),
+            function: function.as_ptr(),
+            function_len: function.len(),
+        };
+        let options = ElfOptionsV3 {
+            struct_size: size_of::<ElfOptionsV3>(),
+            flags: 0,
+            reserved: 0,
+            program_name: program_name.as_ptr(),
+            program_name_len: program_name.len(),
+            target_btf: object.as_ptr(),
+            target_btf_len: object.len(),
+            map_overrides: core::ptr::null(),
+            map_override_count: 0,
+            attach_targets: &override_,
+            attach_target_count: 1,
+        };
+        let mut vm = null_mut();
+        assert_eq!(
+            unsafe { febpf_vm_create_elf_v3(object.as_ptr(), object.len(), &options, &mut vm) },
+            STATUS_OK,
+            "{}",
+            last_error()
+        );
+        assert_eq!(unsafe { verify(vm, CONTEXT_FLAT, 8) }, STATUS_OK);
+        assert_eq!(unsafe { febpf_vm_destroy(vm) }, STATUS_OK);
+
+        let no_target = ElfOptionsV3 {
+            target_btf: core::ptr::null(),
+            target_btf_len: 0,
+            ..options
+        };
+        assert_eq!(
+            unsafe { febpf_vm_create_elf_v3(object.as_ptr(), object.len(), &no_target, &mut vm) },
+            STATUS_PROGRAM
+        );
+        assert!(last_error().contains("target BTF"), "{}", last_error());
+        assert!(vm.is_null());
+
+        let bad_override = AttachTargetV1 {
+            selector_kind: 99,
+            ..override_
+        };
+        let bad_options = ElfOptionsV3 {
+            attach_targets: &bad_override,
+            ..options
+        };
+        assert_eq!(
+            unsafe { febpf_vm_create_elf_v3(object.as_ptr(), object.len(), &bad_options, &mut vm) },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert!(last_error().contains("selector kind 99"));
+        assert!(vm.is_null());
     }
 
     #[test]
