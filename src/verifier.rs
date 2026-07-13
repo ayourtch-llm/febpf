@@ -1576,7 +1576,7 @@ pub struct Verifier<'a> {
     /// Append-only storage backing stable checkpoint parent identities.
     checkpoints: Vec<Checkpoint>,
     prune_points: Vec<bool>,
-    tail_projection: Vec<Option<(u16, u64)>>,
+    state_projection: Vec<Option<(u16, u64)>>,
     insn_state: Vec<Option<(String, usize)>>,
     /// Join-over-all-visits of the current frame's registers per insn (see
     /// [`VerifyOk::pc_regs`]).
@@ -1634,7 +1634,7 @@ impl<'a> Verifier<'a> {
             seen: LookupMap::new(),
             checkpoints: Vec::new(),
             prune_points: Vec::new(),
-            tail_projection: Vec::new(),
+            state_projection: Vec::new(),
             insn_state: Vec::new(),
             pc_regs: Vec::new(),
             next_null_id: 1,
@@ -1670,7 +1670,7 @@ impl<'a> Verifier<'a> {
         }
         self.check_structure()?;
         self.compute_prune_points();
-        self.compute_tail_projections();
+        self.compute_state_projections();
         self.insn_state = vec![None; self.insns.len()];
         self.pc_regs = vec![None; self.insns.len()];
         self.probe_mem = vec![false; self.insns.len()];
@@ -1729,7 +1729,7 @@ impl<'a> Verifier<'a> {
                     let backoff = pl.miss_streak >= MISS_STREAK_LIMIT
                         && !pl.arrivals.is_multiple_of(BACKOFF_SCAN_EVERY);
                     if !backoff {
-                        let projection = self.tail_projection[pc];
+                        let projection = self.state_projection[pc];
                         if pl.states.iter().any(|&old| {
                             state.subsumed_by_projected(
                                 &self.checkpoints[old].state,
@@ -2364,10 +2364,173 @@ impl<'a> Verifier<'a> {
         self.prune_points = pts;
     }
 
-    fn compute_tail_projections(&mut self) {
-        self.tail_projection = (0..self.insns.len())
-            .map(|pc| self.prune_points[pc].then(|| self.tail_projection_from(pc)).flatten())
-            .collect();
+    fn compute_state_projections(&mut self) {
+        if let Some(live) = self.global_liveness() {
+            self.state_projection = live
+                .into_iter()
+                .enumerate()
+                .map(|(pc, projection)| self.prune_points[pc].then_some(projection))
+                .collect();
+        } else {
+            self.state_projection = (0..self.insns.len())
+                .map(|pc| self.prune_points[pc].then(|| self.tail_projection_from(pc)).flatten())
+                .collect();
+        }
+    }
+
+    /// Conservative backward may-liveness for single-frame programs. Both
+    /// sides of every branch are unioned to a fixed point; helper buffers keep
+    /// all stack slots live. Local calls fall back to the narrower acyclic-tail
+    /// projection because inter-frame argument/return liveness is not modeled.
+    fn global_liveness(&self) -> Option<Vec<(u16, u64)>> {
+        let n = self.insns.len();
+        let mut valid = vec![false; n];
+        let mut pc = 0;
+        while pc < n {
+            valid[pc] = true;
+            pc += if self.insns[pc].is_wide() { 2 } else { 1 };
+        }
+        if (0..n).filter(|&pc| valid[pc]).any(|pc| {
+            let ins = self.insns[pc];
+            matches!(ins.class(), class::JMP | class::JMP32)
+                && ins.op() == jmp::CALL
+                && ins.src == call_kind::LOCAL
+        }) {
+            return None;
+        }
+        let mut live = vec![(0u16, 0u64); n];
+        loop {
+            let mut changed = false;
+            for pc in (0..n).rev().filter(|&pc| valid[pc]) {
+                let ins = self.insns[pc];
+                let width = if ins.is_wide() { 2 } else { 1 };
+                let mut out_regs = 0u16;
+                let mut out_stack = 0u64;
+                let mut successor = |next: usize| {
+                    if next < n {
+                        out_regs |= live[next].0;
+                        out_stack |= live[next].1;
+                    }
+                };
+                if matches!(ins.class(), class::JMP | class::JMP32) {
+                    match ins.op() {
+                        jmp::EXIT => {}
+                        jmp::JA => {
+                            let rel = if ins.class() == class::JMP32 {
+                                ins.imm as i64
+                            } else {
+                                ins.off as i64
+                            };
+                            successor(usize::try_from(pc as i64 + 1 + rel).ok()?);
+                        }
+                        jmp::CALL => successor(pc + width),
+                        _ => {
+                            successor(pc + width);
+                            successor(usize::try_from(pc as i64 + 1 + ins.off as i64).ok()?);
+                        }
+                    }
+                } else {
+                    successor(pc + width);
+                }
+
+                let bit = |r: u8| 1u16 << r;
+                let mut uses = 0u16;
+                let mut defs = 0u16;
+                let mut stack_uses = 0u64;
+                let mut stack_defs = 0u64;
+                match ins.class() {
+                    class::LD if ins.is_wide() => defs |= bit(ins.dst),
+                    class::LD => {
+                        uses |= bit(6);
+                        if ins.mem_mode() == mode::IND {
+                            uses |= bit(ins.src);
+                        }
+                        defs |= bit(0);
+                    }
+                    class::LDX => {
+                        uses |= bit(ins.src);
+                        defs |= bit(ins.dst);
+                        if ins.src == REG_FP && ins.off < 0 {
+                            let byte = usize::try_from(STACK_SIZE as i64 + ins.off as i64).ok()?;
+                            let end = byte.checked_add(ins.mem_size())?;
+                            if end > STACK_SIZE {
+                                return None;
+                            }
+                            for slot in byte / 8..end.div_ceil(8) {
+                                stack_uses |= 1 << slot;
+                            }
+                        }
+                    }
+                    class::ST | class::STX => {
+                        uses |= bit(ins.dst);
+                        if ins.class() == class::STX {
+                            uses |= bit(ins.src);
+                            if ins.mem_mode() == mode::ATOMIC {
+                                uses |= bit(0);
+                            }
+                        }
+                        if ins.dst == REG_FP && ins.mem_size() == 8 && ins.off < 0 {
+                            let byte = usize::try_from(STACK_SIZE as i64 + ins.off as i64).ok()?;
+                            if byte.is_multiple_of(8) && byte / 8 < SLOTS {
+                                stack_defs |= 1 << (byte / 8);
+                            }
+                        }
+                    }
+                    class::ALU | class::ALU64 => {
+                        if ins.op() != alu::MOV {
+                            uses |= bit(ins.dst);
+                        }
+                        if ins.is_src_reg() && ins.op() != alu::NEG && ins.op() != alu::END {
+                            uses |= bit(ins.src);
+                        }
+                        defs |= bit(ins.dst);
+                    }
+                    class::JMP | class::JMP32 => match ins.op() {
+                        jmp::EXIT => uses |= bit(0),
+                        jmp::CALL => {
+                            let sig = self.sig_for(ins.imm as u32)?;
+                            for (arg, kind) in sig.args.iter().enumerate() {
+                                if !matches!(kind, ArgKind::None) {
+                                    uses |= bit((arg + 1) as u8);
+                                }
+                                if matches!(
+                                    kind,
+                                    ArgKind::MapKey
+                                        | ArgKind::MapValue
+                                        | ArgKind::MemRead { .. }
+                                        | ArgKind::MemReadOrNull { .. }
+                                        | ArgKind::MemWrite { .. }
+                                        | ArgKind::MemReadWrite { .. }
+                                        | ArgKind::Any
+                                ) {
+                                    stack_uses = u64::MAX;
+                                }
+                            }
+                            defs |= bit(0) | bit(1) | bit(2) | bit(3) | bit(4) | bit(5);
+                        }
+                        jmp::JA => {}
+                        _ => {
+                            uses |= bit(ins.dst);
+                            if ins.is_src_reg() {
+                                uses |= bit(ins.src);
+                            }
+                        }
+                    },
+                    _ => return None,
+                }
+                let incoming = (
+                    uses | (out_regs & !defs),
+                    stack_uses | (out_stack & !stack_defs),
+                );
+                if incoming != live[pc] {
+                    live[pc] = incoming;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Some(live);
+            }
+        }
     }
 
     /// Exact incoming liveness for a unique, acyclic instruction path ending
@@ -5174,5 +5337,11 @@ mod precision_tests {
 
         assert!(packet(20).subsumed_by(&packet(10)));
         assert!(!packet(10).subsumed_by(&packet(20)));
+    }
+
+    #[test]
+    fn global_liveness_falls_back_for_local_calls() {
+        let v = verifier("call sub\nexit\nsub:\nr0 = 0\nexit\n");
+        assert!(v.global_liveness().is_none());
     }
 }

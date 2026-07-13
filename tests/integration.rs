@@ -779,6 +779,86 @@ fn branch_free_tail_pruning_ignores_only_overwritten_registers() {
     assert!(ok.stats.states_pruned > 0, "tail projection should prune a dead r3 variant");
 }
 
+#[test]
+fn cfg_liveness_prunes_dead_pointer_across_branching_continuation() {
+    let mut vm = Vm::new(program(
+        "r2 = *(u64 *)(r1 + 0)
+         if r2 == 0 goto pointer
+         r3 = 7
+         goto join
+        pointer:
+         r3 = r10
+        join:
+         r3 = 0
+         if r2 == 1 goto one
+         r0 = 0
+         exit
+        one:
+         r0 = 1
+         exit",
+    ))
+    .unwrap();
+    let ok = vm
+        .verify(Config {
+            ctx_size: 8,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        ok.stats.states_pruned > 0,
+        "whole-CFG liveness should prune the dead r3 variant"
+    );
+}
+
+#[test]
+fn cfg_liveness_keeps_pointer_used_after_branching_join() {
+    let error = verify_err_ctx(
+        "r2 = *(u64 *)(r1 + 0)
+         *(u64 *)(r10 - 8) = 1
+         if r2 == 0 goto pointer
+         r3 = 7
+         goto join
+        pointer:
+         r3 = r10
+         r3 += -8
+        join:
+         if r2 == 42 goto out
+         r0 = *(u64 *)(r3)
+         exit
+        out:
+         r0 = 0
+         exit",
+        8,
+    );
+    assert!(
+        error.contains("loads need a pointer"),
+        "live pointer variant was pruned: {error}"
+    );
+}
+
+#[test]
+fn cfg_liveness_keeps_stack_initialization_across_branching_join() {
+    let error = verify_err_ctx(
+        "r2 = *(u64 *)(r1 + 0)
+         if r2 == 0 goto init
+         goto join
+        init:
+         *(u64 *)(r10 - 8) = 1
+        join:
+         if r2 == 42 goto out
+         r0 = *(u64 *)(r10 - 8)
+         exit
+        out:
+         r0 = 0
+         exit",
+        8,
+    );
+    assert!(
+        error.contains("uninitialized stack"),
+        "live stack variant was pruned: {error}"
+    );
+}
+
 // ------------------------------------------------------------------ memory
 
 #[test]
