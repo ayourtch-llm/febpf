@@ -2,15 +2,16 @@
 //!
 //! This module owns only marshalling and opaque handles. Invocation resources
 //! are translated into [`crate::ExecutionEnvironment`] values for one call;
-//! no C pointer or callback becomes durable VM state.
+//! no invocation buffer, callback, or user token becomes durable VM state.
 
 use crate::execution::{ExecutionEnvironment, ExecutionOutcome};
+use crate::helpers::{self, ArgKind, HelperSig, MemBus, RetKind, UserHelper};
 use crate::maps::{MapKind, MapUpdateMode, NR_CPUS};
 use crate::verifier::{Config, UninitStackPolicy};
 use crate::{asm, elf, insn, Program, Vm};
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::ptr::null_mut;
 use std::slice;
 use std::str;
@@ -48,6 +49,23 @@ const ELF_KNOWN_FLAGS: u32 = 0;
 pub type OutputFn =
     unsafe extern "C" fn(user_data: *mut c_void, kind: u32, data: *const u8, len: usize);
 
+pub const HELPER_ARG_UNUSED: u32 = 0;
+pub const HELPER_ARG_SCALAR: u32 = 1;
+pub const HELPER_ARG_MEMORY_READ: u32 = 2;
+pub const HELPER_ARG_MEMORY_WRITE: u32 = 3;
+pub const HELPER_ARG_MEMORY_READ_WRITE: u32 = 4;
+pub const HELPER_ARG_SIZE: u32 = 5;
+
+pub const HELPER_VALUE_READABLE: u32 = 1 << 0;
+pub const HELPER_VALUE_WRITABLE: u32 = 1 << 1;
+
+pub type HelperFn = unsafe extern "C" fn(
+    user_data: *mut c_void,
+    helper_id: u32,
+    args: *const HelperValueV1,
+    result: *mut u64,
+) -> u32;
+
 /// Verification configuration. Set `struct_size = sizeof(febpf_verify_options_v1)`.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -73,6 +91,58 @@ pub struct InvocationV1 {
     pub packet_len: usize,
     pub output: Option<OutputFn>,
     pub output_user_data: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HelperArgV1 {
+    pub kind: u32,
+    pub size_arg: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HelperSignatureV1 {
+    pub struct_size: usize,
+    pub helper_id: u32,
+    pub flags: u32,
+    pub args: [HelperArgV1; 5],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HelperValueV1 {
+    pub kind: u32,
+    pub flags: u32,
+    pub scalar: u64,
+    pub data: *mut u8,
+    pub data_len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HelperBindingV1 {
+    pub struct_size: usize,
+    pub helper_id: u32,
+    pub reserved: u32,
+    pub callback: Option<HelperFn>,
+    pub user_data: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct InvocationV2 {
+    pub struct_size: usize,
+    pub flags: u32,
+    pub reserved: u32,
+    pub context: *mut u8,
+    pub context_len: usize,
+    pub packet: *mut u8,
+    pub packet_len: usize,
+    pub output: Option<OutputFn>,
+    pub output_user_data: *mut c_void,
+    pub helpers: *const HelperBindingV1,
+    pub helper_count: usize,
 }
 
 /// ELF loading configuration. Set `struct_size = sizeof(febpf_elf_options_v1)`.
@@ -716,6 +786,121 @@ pub unsafe extern "C" fn febpf_vm_verify(
     })
 }
 
+fn helper_arg(desc: HelperArgV1, index: usize) -> CResult<ArgKind> {
+    let kind = match desc.kind {
+        HELPER_ARG_UNUSED => ArgKind::None,
+        HELPER_ARG_SCALAR => ArgKind::Scalar,
+        HELPER_ARG_SIZE => ArgKind::Size,
+        HELPER_ARG_MEMORY_READ | HELPER_ARG_MEMORY_WRITE | HELPER_ARG_MEMORY_READ_WRITE => {
+            if desc.size_arg >= 5 {
+                return Err(invalid(format!(
+                    "helper argument {index} size_arg {} is outside 0..5",
+                    desc.size_arg
+                )));
+            }
+            match desc.kind {
+                HELPER_ARG_MEMORY_READ => ArgKind::MemRead {
+                    size_arg: desc.size_arg as u8,
+                },
+                HELPER_ARG_MEMORY_WRITE => ArgKind::MemWrite {
+                    size_arg: desc.size_arg as u8,
+                },
+                _ => ArgKind::MemReadWrite {
+                    size_arg: desc.size_arg as u8,
+                },
+            }
+        }
+        other => {
+            return Err(invalid(format!(
+                "helper argument {index} has unknown kind {other}"
+            )))
+        }
+    };
+    if !matches!(
+        desc.kind,
+        HELPER_ARG_MEMORY_READ | HELPER_ARG_MEMORY_WRITE | HELPER_ARG_MEMORY_READ_WRITE
+    ) && desc.size_arg != 0
+    {
+        return Err(invalid(format!(
+            "helper argument {index} size_arg must be zero for this kind"
+        )));
+    }
+    Ok(kind)
+}
+
+fn unavailable_helper(helper_id: u32) -> Box<dyn UserHelper> {
+    Box::new(move |_: [u64; 5], _: &mut dyn MemBus| {
+        Err(format!(
+            "C helper #{helper_id} has no binding for this invocation"
+        ))
+    })
+}
+
+/// Define a verifier-visible custom helper. Its callback remains per-run.
+///
+/// # Safety
+/// Both pointers must be live and exclusively borrowed for this call.
+#[no_mangle]
+pub unsafe extern "C" fn febpf_vm_define_helper(
+    handle: *mut CApiVm,
+    signature: *const HelperSignatureV1,
+) -> u32 {
+    boundary(|| {
+        // SAFETY: caller contracts are forwarded to checked helpers.
+        let handle = unsafe { vm_mut(handle)? };
+        let signature = unsafe { input_struct(signature, "helper signature")? };
+        if handle.verified_model.is_some() {
+            return Err((
+                STATUS_VERIFY,
+                "helpers must be defined before successful verification".into(),
+            ));
+        }
+        if signature.helper_id < helpers::id::FIRST_USER {
+            return Err(invalid(format!(
+                "custom helper id {} is below the first user id {}",
+                signature.helper_id,
+                helpers::id::FIRST_USER
+            )));
+        }
+        if signature.flags != 0 {
+            return Err(invalid(format!(
+                "unknown helper signature flags 0x{:x}",
+                signature.flags
+            )));
+        }
+        let mut args = [ArgKind::None; 5];
+        for (index, desc) in signature.args.into_iter().enumerate() {
+            args[index] = helper_arg(desc, index)?;
+        }
+        for (index, arg) in args.iter().enumerate() {
+            let size_arg = match arg {
+                ArgKind::MemRead { size_arg }
+                | ArgKind::MemWrite { size_arg }
+                | ArgKind::MemReadWrite { size_arg } => Some(*size_arg as usize),
+                _ => None,
+            };
+            if let Some(size_arg) = size_arg {
+                if !matches!(args[size_arg], ArgKind::Size) {
+                    return Err(invalid(format!(
+                        "helper argument {index} names argument {size_arg} as its size, but that argument is not SIZE"
+                    )));
+                }
+            }
+        }
+        let helper_id = signature.helper_id;
+        handle.vm.user_helpers.register(
+            helper_id,
+            HelperSig {
+                name: "c_helper",
+                args,
+                ret: RetKind::Scalar,
+            },
+            unavailable_helper(helper_id),
+        );
+        Ok(())
+    })
+}
+
 fn execute(
     vm: &mut Vm,
     environment: ExecutionEnvironment<'_>,
@@ -739,6 +924,91 @@ fn execute(
             "this febpf library was built without JIT support".into(),
         ))
     }
+}
+
+fn invoke_c_helper(
+    binding: HelperBindingV1,
+    kinds: [ArgKind; 5],
+    args: [u64; 5],
+    mem: &mut dyn MemBus,
+) -> Result<u64, String> {
+    let callback = binding
+        .callback
+        .ok_or_else(|| format!("C helper #{} callback is null", binding.helper_id))?;
+    let mut storage: [Vec<u8>; 5] = core::array::from_fn(|_| Vec::new());
+    for (index, kind) in kinds.iter().enumerate() {
+        let (size_arg, zero_for_write) = match kind {
+            ArgKind::MemRead { size_arg } | ArgKind::MemReadWrite { size_arg } => {
+                (Some(*size_arg), false)
+            }
+            ArgKind::MemWrite { size_arg } => (Some(*size_arg), true),
+            _ => (None, false),
+        };
+        let Some(size_arg) = size_arg else {
+            continue;
+        };
+        let len = usize::try_from(args[size_arg as usize])
+            .map_err(|_| format!("C helper #{} memory length is too large", binding.helper_id))?;
+        storage[index].resize(len, 0);
+        // Reading first validates the complete view. Write-only callbacks see
+        // zeroes, and no guest mutation occurs before callback success.
+        mem.read(args[index], &mut storage[index])?;
+        if zero_for_write {
+            storage[index].fill(0);
+        }
+    }
+    let values: [HelperValueV1; 5] = core::array::from_fn(|index| {
+        let (kind, flags) = match kinds[index] {
+            ArgKind::None => (HELPER_ARG_UNUSED, 0),
+            ArgKind::Scalar => (HELPER_ARG_SCALAR, 0),
+            ArgKind::Size => (HELPER_ARG_SIZE, 0),
+            ArgKind::MemRead { .. } => (HELPER_ARG_MEMORY_READ, HELPER_VALUE_READABLE),
+            ArgKind::MemWrite { .. } => (HELPER_ARG_MEMORY_WRITE, HELPER_VALUE_WRITABLE),
+            ArgKind::MemReadWrite { .. } => (
+                HELPER_ARG_MEMORY_READ_WRITE,
+                HELPER_VALUE_READABLE | HELPER_VALUE_WRITABLE,
+            ),
+            _ => unreachable!("C helper signatures expose only the checked subset"),
+        };
+        let memory = matches!(
+            kinds[index],
+            ArgKind::MemRead { .. } | ArgKind::MemWrite { .. } | ArgKind::MemReadWrite { .. }
+        );
+        HelperValueV1 {
+            kind,
+            flags,
+            scalar: if memory { 0 } else { args[index] },
+            data: if memory {
+                storage[index].as_mut_ptr()
+            } else {
+                null_mut()
+            },
+            data_len: if memory { storage[index].len() } else { 0 },
+        }
+    });
+    let mut result = 0u64;
+    // SAFETY: the callback and user token are supplied for this invocation;
+    // values and copied buffers remain live until the callback returns.
+    let status = unsafe {
+        callback(
+            binding.user_data,
+            binding.helper_id,
+            values.as_ptr(),
+            &mut result,
+        )
+    };
+    if status != STATUS_OK {
+        return Err(format!(
+            "C helper #{} callback returned status {status}",
+            binding.helper_id
+        ));
+    }
+    for (index, kind) in kinds.iter().enumerate() {
+        if matches!(kind, ArgKind::MemWrite { .. } | ArgKind::MemReadWrite { .. }) {
+            mem.write(args[index], &storage[index])?;
+        }
+    }
+    Ok(result)
 }
 
 fn emit_outputs(invocation: &InvocationV1, printk: &[String], sequence: &[u8]) {
@@ -843,27 +1113,155 @@ pub unsafe extern "C" fn febpf_vm_run(
         let handle = unsafe { vm_mut(handle)? };
         // SAFETY: caller promises a versioned readable input structure.
         let invocation = unsafe { input_struct(invocation, "invocation")? };
-        if invocation.reserved != 0 {
-            return Err(invalid("invocation.reserved must be zero"));
-        }
-        if invocation.flags & !INVOCATION_KNOWN_FLAGS != 0 {
+        let value = run_invocation(handle, &invocation)?;
+        // SAFETY: result was checked and is caller-owned.
+        unsafe { result.write(value) };
+        Ok(())
+    })
+}
+
+fn run_invocation(handle: &mut CApiVm, invocation: &InvocationV1) -> CResult<u64> {
+    if invocation.reserved != 0 {
+        return Err(invalid("invocation.reserved must be zero"));
+    }
+    if invocation.flags & !INVOCATION_KNOWN_FLAGS != 0 {
+        return Err(invalid(format!(
+            "unknown invocation flags 0x{:x}",
+            invocation.flags & !INVOCATION_KNOWN_FLAGS
+        )));
+    }
+    let model = handle.verified_model.ok_or_else(|| {
+        (
+            STATUS_VERIFY,
+            "VM has not been successfully verified".into(),
+        )
+    })?;
+    let jit = invocation.flags & INVOCATION_JIT != 0;
+    match model {
+        VerifiedModel::Flat => run_flat(handle, invocation, jit),
+        VerifiedModel::Xdp => run_xdp(handle, invocation, jit),
+        VerifiedModel::Skb => run_skb(handle, invocation, jit),
+    }
+}
+
+unsafe fn helper_bindings(
+    pointer: *const HelperBindingV1,
+    count: usize,
+) -> CResult<Vec<HelperBindingV1>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if pointer.is_null() {
+        return Err(invalid("helper bindings are null but helper_count is nonzero"));
+    }
+    // SAFETY: caller promises a readable fixed-stride array of `count` items.
+    let bindings = unsafe { slice::from_raw_parts(pointer, count) };
+    let mut copied = Vec::with_capacity(count);
+    for (index, binding) in bindings.iter().copied().enumerate() {
+        if binding.struct_size != core::mem::size_of::<HelperBindingV1>() {
             return Err(invalid(format!(
-                "unknown invocation flags 0x{:x}",
-                invocation.flags & !INVOCATION_KNOWN_FLAGS
+                "helpers[{index}].struct_size must equal {} for this fixed-stride array",
+                core::mem::size_of::<HelperBindingV1>()
             )));
         }
-        let model = handle.verified_model.ok_or_else(|| {
-            (
-                STATUS_VERIFY,
-                "VM has not been successfully verified".into(),
-            )
-        })?;
-        let jit = invocation.flags & INVOCATION_JIT != 0;
-        let value = match model {
-            VerifiedModel::Flat => run_flat(handle, &invocation, jit)?,
-            VerifiedModel::Xdp => run_xdp(handle, &invocation, jit)?,
-            VerifiedModel::Skb => run_skb(handle, &invocation, jit)?,
+        if binding.reserved != 0 {
+            return Err(invalid(format!("helpers[{index}].reserved must be zero")));
+        }
+        if binding.callback.is_none() {
+            return Err(invalid(format!("helpers[{index}].callback is null")));
+        }
+        if copied
+            .iter()
+            .any(|existing: &HelperBindingV1| existing.helper_id == binding.helper_id)
+        {
+            return Err(invalid(format!(
+                "duplicate binding for helper #{}",
+                binding.helper_id
+            )));
+        }
+        copied.push(binding);
+    }
+    Ok(copied)
+}
+
+fn run_with_helper_bindings(
+    handle: &mut CApiVm,
+    invocation: &InvocationV1,
+    bindings: &[HelperBindingV1],
+) -> CResult<u64> {
+    let mut configured = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let signature = handle
+            .vm
+            .user_helpers
+            .sigs()
+            .iter()
+            .find(|(helper_id, _)| *helper_id == binding.helper_id)
+            .map(|(_, signature)| signature.clone())
+            .ok_or_else(|| {
+                invalid(format!(
+                    "helper #{} was not defined before verification",
+                    binding.helper_id
+                ))
+            })?;
+        configured.push((*binding, signature));
+    }
+    for (binding, signature) in &configured {
+        let binding = *binding;
+        let kinds = signature.args;
+        handle.vm.user_helpers.register(
+            binding.helper_id,
+            signature.clone(),
+            Box::new(move |args: [u64; 5], mem: &mut dyn MemBus| {
+                invoke_c_helper(binding, kinds, args, mem)
+            }),
+        );
+    }
+    let outcome = catch_unwind(AssertUnwindSafe(|| run_invocation(handle, invocation)));
+    for (binding, signature) in configured {
+        handle.vm.user_helpers.register(
+            binding.helper_id,
+            signature,
+            unavailable_helper(binding.helper_id),
+        );
+    }
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => resume_unwind(payload),
+    }
+}
+
+/// Execute once with invocation-local custom helper bindings.
+///
+/// # Safety
+/// The handle, descriptor, result, bindings, callbacks, user tokens, and
+/// descriptor-selected buffers must remain live for this call.
+#[no_mangle]
+pub unsafe extern "C" fn febpf_vm_run_v2(
+    handle: *mut CApiVm,
+    invocation: *const InvocationV2,
+    result: *mut u64,
+) -> u32 {
+    boundary(|| {
+        if result.is_null() {
+            return Err(invalid("result pointer is null"));
+        }
+        // SAFETY: caller contracts are forwarded to checked helpers.
+        let handle = unsafe { vm_mut(handle)? };
+        let invocation = unsafe { input_struct(invocation, "v2 invocation")? };
+        let bindings = unsafe { helper_bindings(invocation.helpers, invocation.helper_count)? };
+        let base = InvocationV1 {
+            struct_size: core::mem::size_of::<InvocationV1>(),
+            flags: invocation.flags,
+            reserved: invocation.reserved,
+            context: invocation.context,
+            context_len: invocation.context_len,
+            packet: invocation.packet,
+            packet_len: invocation.packet_len,
+            output: invocation.output,
+            output_user_data: invocation.output_user_data,
         };
+        let value = run_with_helper_bindings(handle, &base, &bindings)?;
         // SAFETY: result was checked and is caller-owned.
         unsafe { result.write(value) };
         Ok(())
@@ -1240,6 +1638,144 @@ mod tests {
         assert_eq!(result, 9);
         assert_eq!(context, [9, 7]);
         assert_eq!(output, [(OUTPUT_PRINTK, b"n=42".to_vec())]);
+        assert_eq!(unsafe { febpf_vm_destroy(vm) }, STATUS_OK);
+    }
+
+    #[test]
+    fn custom_helpers_use_invocation_local_copied_views() {
+        const HELPER_ID: u32 = helpers::id::FIRST_USER;
+        let vm = create("r2 = 4\ncall 65536\nexit");
+        let signature = HelperSignatureV1 {
+            struct_size: size_of::<HelperSignatureV1>(),
+            helper_id: HELPER_ID,
+            flags: 0,
+            args: [
+                HelperArgV1 {
+                    kind: HELPER_ARG_MEMORY_READ_WRITE,
+                    size_arg: 1,
+                },
+                HelperArgV1 {
+                    kind: HELPER_ARG_SIZE,
+                    size_arg: 0,
+                },
+                HelperArgV1 {
+                    kind: HELPER_ARG_UNUSED,
+                    size_arg: 0,
+                },
+                HelperArgV1 {
+                    kind: HELPER_ARG_UNUSED,
+                    size_arg: 0,
+                },
+                HelperArgV1 {
+                    kind: HELPER_ARG_UNUSED,
+                    size_arg: 0,
+                },
+            ],
+        };
+        assert_eq!(
+            unsafe { febpf_vm_define_helper(vm, &signature) },
+            STATUS_OK,
+            "{}",
+            last_error()
+        );
+        assert_eq!(unsafe { verify(vm, CONTEXT_FLAT, 4) }, STATUS_OK);
+
+        #[repr(C)]
+        struct CallbackState {
+            calls: u32,
+            fail: bool,
+            contract_ok: bool,
+        }
+        unsafe extern "C" fn callback(
+            user_data: *mut c_void,
+            helper_id: u32,
+            args: *const HelperValueV1,
+            result: *mut u64,
+        ) -> u32 {
+            // SAFETY: the test supplies live callback state and five values.
+            let state = unsafe { &mut *user_data.cast::<CallbackState>() };
+            let args = unsafe { slice::from_raw_parts(args, 5) };
+            state.calls += 1;
+            state.contract_ok = helper_id == HELPER_ID
+                && args[0].kind == HELPER_ARG_MEMORY_READ_WRITE
+                && args[0].flags == HELPER_VALUE_READABLE | HELPER_VALUE_WRITABLE
+                && args[0].scalar == 0
+                && !args[0].data.is_null()
+                && args[0].data_len == 4
+                && args[1].kind == HELPER_ARG_SIZE
+                && args[1].scalar == 4;
+            unsafe { *args[0].data = (*args[0].data).wrapping_add(1) };
+            if state.fail {
+                return 91;
+            }
+            unsafe { result.write(0x55) };
+            STATUS_OK
+        }
+
+        let mut state = CallbackState {
+            calls: 0,
+            fail: true,
+            contract_ok: false,
+        };
+        let binding = HelperBindingV1 {
+            struct_size: size_of::<HelperBindingV1>(),
+            helper_id: HELPER_ID,
+            reserved: 0,
+            callback: Some(callback),
+            user_data: (&mut state as *mut CallbackState).cast(),
+        };
+        let mut context = [7u8, 8, 9, 10];
+        let invocation = |flags, context: &mut [u8; 4]| InvocationV2 {
+            struct_size: size_of::<InvocationV2>(),
+            flags,
+            reserved: 0,
+            context: context.as_mut_ptr(),
+            context_len: context.len(),
+            packet: null_mut(),
+            packet_len: 0,
+            output: None,
+            output_user_data: null_mut(),
+            helpers: &binding,
+            helper_count: 1,
+        };
+        let mut result = 0;
+        assert_eq!(
+            unsafe { febpf_vm_run_v2(vm, &invocation(0, &mut context), &mut result) },
+            STATUS_RUNTIME
+        );
+        assert!(last_error().contains("returned status 91"));
+        assert_eq!(context, [7, 8, 9, 10], "failed callback must not write back");
+        assert!(state.contract_ok);
+
+        // SAFETY: the callback is not active and the binding points at state.
+        unsafe { (*binding.user_data.cast::<CallbackState>()).fail = false };
+        assert_eq!(
+            unsafe { febpf_vm_run_v2(vm, &invocation(0, &mut context), &mut result) },
+            STATUS_OK,
+            "{}",
+            last_error()
+        );
+        assert_eq!(result, 0x55);
+        assert_eq!(context, [8, 8, 9, 10]);
+
+        #[cfg(feature = "jit")]
+        {
+            let mut jit_context = [20u8, 1, 2, 3];
+            assert_eq!(
+                unsafe {
+                    febpf_vm_run_v2(
+                        vm,
+                        &invocation(INVOCATION_JIT, &mut jit_context),
+                        &mut result,
+                    )
+                },
+                STATUS_OK,
+                "{}",
+                last_error()
+            );
+            assert_eq!(result, 0x55);
+            assert_eq!(jit_context, [21, 1, 2, 3]);
+        }
         assert_eq!(unsafe { febpf_vm_destroy(vm) }, STATUS_OK);
     }
 

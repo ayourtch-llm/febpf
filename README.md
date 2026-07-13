@@ -276,10 +276,12 @@ including time-travel `rstep`.
 - **Native embedding**: `include/febpf.h` and `docs/specs/c-api.md` — an
   opt-in, versioned C ABI with opaque VM ownership, explicit verification,
   ELF/CO-RE loading, composable per-run resources, interpreter/JIT selection,
-  versioned map control, and thread-local diagnostics. `examples/c-host` is a
+  versioned map control, invocation-local custom helpers, and thread-local
+  diagnostics. `examples/c-host` is a
   minimal dependency-free host; `examples/c-log-filter` is a streaming
   accept/drop/redaction application. `examples/c-elf-host` demonstrates
   copied-input CO-RE loading, and `examples/c-map-host` durable state control.
+  `examples/c-helper-host` demonstrates a host service with copied memory views.
 - **CI**: `.github/workflows/ci.yml` runs the suite, clippy (`-D warnings`) and
   the differential fuzzer on all three JIT platforms — each runner executes
   machine code generated for that exact CPU.
@@ -294,7 +296,7 @@ including time-travel `rstep`.
 
 ## Tests
 
-The current suite has **475 passing tests** with default features and **457**
+The current suite has **477 passing tests** with default features and **459**
 with the std interpreter-only profile, plus four intentionally ignored
 exhaustive soundness sweeps in each configuration. Coverage includes ISA semantics,
 verifier acceptance and rejection, abstract-operator soundness, maps/helpers,

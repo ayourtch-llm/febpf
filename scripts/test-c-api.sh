@@ -67,3 +67,16 @@ target/c-elf-example tests/core_probe.o text tests/core_target.o
     -o target/c-map-example
 
 target/c-map-example tests/legacy_maps.o tests/global_data.o
+
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+    -I include examples/c-helper-host/main.c \
+    -L target/c-api -Wl,-rpath,"$RPATH" -lfebpf \
+    -o target/c-helper-example
+
+HELPER_ACTUAL=$(target/c-helper-example)
+HELPER_EXPECTED='helper-state: interp=123/42 jit=123/100 calls=3'
+if [[ "$HELPER_ACTUAL" != "$HELPER_EXPECTED" ]]; then
+    echo "C helper output did not match" >&2
+    printf 'expected:\n%s\nactual:\n%s\n' "$HELPER_EXPECTED" "$HELPER_ACTUAL" >&2
+    exit 1
+fi

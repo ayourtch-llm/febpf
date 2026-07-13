@@ -145,6 +145,70 @@ typedef struct febpf_invocation_v1 {
     void *output_user_data;
 } febpf_invocation_v1;
 
+typedef uint32_t febpf_helper_arg_kind;
+#define FEBPF_HELPER_ARG_UNUSED 0u
+#define FEBPF_HELPER_ARG_SCALAR 1u
+#define FEBPF_HELPER_ARG_MEMORY_READ 2u
+#define FEBPF_HELPER_ARG_MEMORY_WRITE 3u
+#define FEBPF_HELPER_ARG_MEMORY_READ_WRITE 4u
+#define FEBPF_HELPER_ARG_SIZE 5u
+
+typedef struct febpf_helper_arg_v1 {
+    febpf_helper_arg_kind kind;
+    /* Zero-based argument index carrying this memory view's byte length. */
+    uint32_t size_arg;
+} febpf_helper_arg_v1;
+
+typedef struct febpf_helper_signature_v1 {
+    size_t struct_size;
+    uint32_t helper_id;
+    uint32_t flags;
+    febpf_helper_arg_v1 args[5];
+} febpf_helper_signature_v1;
+
+#define FEBPF_HELPER_VALUE_READABLE (1u << 0)
+#define FEBPF_HELPER_VALUE_WRITABLE (1u << 1)
+
+typedef struct febpf_helper_value_v1 {
+    febpf_helper_arg_kind kind;
+    uint32_t flags;
+    uint64_t scalar;
+    /* A bounded copied view, borrowed only for the callback. */
+    uint8_t *data;
+    size_t data_len;
+} febpf_helper_value_v1;
+
+/*
+ * Return FEBPF_STATUS_OK to commit writable views and `result`. Any other
+ * status aborts the helper call without copying writable views back.
+ */
+typedef febpf_status (*febpf_helper_fn)(void *user_data,
+                                        uint32_t helper_id,
+                                        const febpf_helper_value_v1 args[5],
+                                        uint64_t *result);
+
+typedef struct febpf_helper_binding_v1 {
+    size_t struct_size;
+    uint32_t helper_id;
+    uint32_t reserved;
+    febpf_helper_fn callback;
+    void *user_data;
+} febpf_helper_binding_v1;
+
+typedef struct febpf_invocation_v2 {
+    size_t struct_size;
+    uint32_t flags;
+    uint32_t reserved;
+    uint8_t *context;
+    size_t context_len;
+    uint8_t *packet;
+    size_t packet_len;
+    febpf_output_fn output;
+    void *output_user_data;
+    const febpf_helper_binding_v1 *helpers;
+    size_t helper_count;
+} febpf_invocation_v2;
+
 uint32_t febpf_c_abi_version(void);
 
 /*
@@ -178,6 +242,10 @@ febpf_status febpf_vm_destroy(febpf_vm *handle);
 febpf_status febpf_vm_verify(febpf_vm *handle,
                              const febpf_verify_options_v1 *options);
 
+/* Define a verifier-visible scalar-returning helper before verification. */
+febpf_status febpf_vm_define_helper(febpf_vm *handle,
+                                    const febpf_helper_signature_v1 *signature);
+
 /*
  * Invocation buffers are borrowed exclusively for this call. The VM handle
  * must not be used concurrently. `result` receives r0 only on success.
@@ -185,6 +253,9 @@ febpf_status febpf_vm_verify(febpf_vm *handle,
 febpf_status febpf_vm_run(febpf_vm *handle,
                           const febpf_invocation_v1 *invocation,
                           uint64_t *result);
+febpf_status febpf_vm_run_v2(febpf_vm *handle,
+                             const febpf_invocation_v2 *invocation,
+                             uint64_t *result);
 
 /* Runtime map access uses exact names and CPU 0 values for per-CPU maps. */
 febpf_status febpf_vm_map_info(febpf_vm *handle,
