@@ -30,7 +30,60 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 corpus saturated; packet provider next; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 provider boundary landed; redirect delivery next; authoritative)
+
+The first post-saturation packet-provider batch is committed as `6a6010e`
+(`xdp: add packet provider boundary`). At checkpoint writing, HEAD is
+`6a6010e`; only this HANDOFF update is intentionally uncommitted. No test,
+build, scanner, subagent, or external terminal collaborator is active.
+
+The new allocator-only `src/packet.rs` boundary remains compatible with true
+`no_std` builds. `XdpFrame` owns storage plus an explicit active data window,
+headroom/tailroom, typed scalar `xdp_md` metadata, and an opaque provider
+cookie. `XdpProvider` transfers one owned frame at a time and reclaims every
+frame through completion; `Vm::run_xdp_provider(..., budget)` makes that a
+bounded batch. Runtime VM failures are completion data rather than transport
+failures, so frame ownership is not silently lost. Interpreter and JIT expose
+matching frame and provider adapters. Legacy `run_xdp(&mut [u8])` behavior is
+preserved through the same frame execution path.
+
+Focused differential tests prove slice/frame interpreter/JIT equality,
+active-byte mutation, preservation of spare capacity and opaque cookies,
+provider metadata synthesis, bounded ordered completion, and runtime-error
+completion. The contract and honest gaps are documented in
+`docs/specs/packet-providers.md`; `xdp_adjust_head`/`xdp_adjust_tail` still
+return `-EOPNOTSUPP`, and redirect currently delivers only the action rather
+than fabricating a destination.
+
+Exact validation for `6a6010e`:
+
+- Default all-target tests: **470 passed + 4 ignored**.
+- Std interpreter-only all-target tests: **452 passed + 4 ignored**.
+- Strict Clippy passed for default/all-targets and std-only/all-targets.
+- True `thumbv7em-none-eabihf` no-std check and strict Clippy passed.
+- `git diff --check` passed. The production corpus was not rescanned because
+  this runtime-only boundary does not alter loading or verification; the
+  saturated `b78bbea` measurements below remain authoritative.
+
+Immediate resume order:
+
+1. Complete provider-neutral redirect delivery. Record the selected direct
+   interface or redirect-map index/key/flags during helper execution, include
+   it only when the final action is `XDP_REDIRECT`, snapshot/restore it for
+   deterministic stepping, and return it in `XdpVerdict`. Keep standalone
+   helpers verdict-only in effect: recording a destination must not transmit.
+2. Add explicit per-frame/provider resize capability and make adjust-head/tail
+   update the active window and virtual packet bounds atomically only when
+   capacity permits. Preserve standalone `run_xdp` as `-EOPNOTSUPP`; cover
+   interpreter/JIT, stale-alias verifier rules, failure atomicity, and replay.
+3. Implement Linux AF_XDP copy mode behind target/feature gating with raw
+   syscalls and zero new dependencies. Validate on veth, preserve backend-owned
+   sparse XSKMAP sockets, and record the first mismatch as `.febpf`. Zero-copy
+   and DPDK remain later work.
+
+Everything below this insertion is historical corpus/verifier context. The
+corpus-saturation measurements remain valid, but older "Immediate resume"
+lists are superseded by the one above.
 
 The corpus-first continuation is active. The prior checkpoint documentation
 was committed as `21047c5`, and the complete xvs production-lane batch was
