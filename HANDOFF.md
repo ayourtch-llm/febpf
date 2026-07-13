@@ -150,6 +150,13 @@ In-progress investigation after `3f9bb65` (not committed):
   families, 835/835 loaded entries, 125 compatible families, and 820/835
   verified (671 strict + 149 privileged); the honest remaining classifications
   are unchanged.
+- A subsequent packet-range subsumption experiment was rejected and removed.
+  Treating an otherwise identical pointer with a stronger proven packet range
+  as covered by a weaker-proof state is valid pointwise, and reduced forward's
+  hottest pc 150 from 3965 to 2033 states, but it again made request falsely
+  reject at pc 494 (62-byte proof before offset-70 access). Packet proof and
+  branch partition are relational; never order ranges independently in prune
+  comparisons without preserving the control correlation.
 
 Immediate resume order:
 
