@@ -30,7 +30,101 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 C ELF/CO-RE loading landed; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 C map control landed; authoritative)
+
+Versioned native map configuration and runtime control are committed as
+`4ea5d74` (`ffi: configure and control maps from C`), following the ELF/CO-RE
+constructor milestone. Apache-2.0 licensing and removal of the stray tracked
+`x` fuzzer note are committed as `4f3e219` (`docs: license project under
+Apache-2.0`). At checkpoint writing HEAD is `4f3e219`; only this HANDOFF update
+is intentionally uncommitted. The recurring tttt job remains deleted. No
+build, scanner, subagent, or external terminal collaborator is active.
+
+The license audit found one contributor under two email identities and no
+Cargo dependencies. The four locally authored C fixtures containing
+`SEC("license") = "GPL"` use the Linux BPF loader declaration; they do not
+carry GPL SPDX or copyright notices. The pinned real-world GPL/LGPL sources and
+their compiled objects remain under the git-ignored `corpus/` tree and retain
+their upstream terms. The README and corpus specification state both
+boundaries explicitly. The packaged crate contains `LICENSE` and Apache-2.0
+Cargo metadata and excludes `x`; the default all-target suite remains 477
+passed plus four ignored. One toolchain drift is recorded honestly: current
+rustfmt 1.9.0 (rustc 1.96.1, 2026-06-26) wants to reflow many pre-existing Rust
+files, although the map checkpoint's formatter validation passed. No unrelated
+formatter rewrite was made for the license-only batch.
+
+The ABI now separates two map lifetimes. `febpf_vm_create_elf_v2` adds a
+fixed-stride array of exact-name, nonzero `febpf_map_max_entries_v1` overrides.
+They are applied to `elf::Object` before `Vm::new`, so storage allocation,
+map-in-map validation, verifier definitions, and virtual region identity all
+see the final capacity. V1 construction remains unchanged. Array element sizes
+must be exact; a future enlarged element needs an explicit stride rather than
+an unsafe guessed layout.
+
+Runtime map operations address maps by exact UTF-8 name and copy all bytes:
+`febpf_vm_map_info`, `lookup`, `update`, and `delete`. Info reports stable
+kernel-aligned kind numbers, readonly/per-CPU flags, key/value sizes, capacity,
+and logical CPU count. Lookup/update expose only CPU 0 for per-CPU maps because
+that is febpf's deterministic execution CPU; the flag/count make the omitted
+lanes honest. ANY/NOEXIST/EXIST semantics, LRU recency, frozen-map EPERM,
+capacity E2BIG, array-delete EINVAL, and absent-key ENOENT are preserved.
+Unknown maps/keys return `FEBPF_STATUS_NOT_FOUND`; semantic map failures return
+`FEBPF_STATUS_MAP`; bad caller buffer sizes remain invalid arguments. No `Map`,
+value pointer, guest address, or storage layout crosses the ABI.
+
+Generic byte operations intentionally reject ringbuf/perf output, queues,
+program arrays, and maps-of-maps, which need typed ownership contracts. Map
+calls require exclusive VM use, so update-mode checks and mutation are atomic
+with respect to other ABI calls. Durable map state remains VM state and is
+visible to subsequent invocations.
+
+`examples/c-map-host` proves both lifetimes. It changes the real
+`legacy_maps.o::counts` capacity from 16 to 1, inserts one hash key, and gets
+E2BIG on a second. It then runs `global_data.o` twice around a C-side `.data`
+update and reads exact output `map-state: first=410 second=820 counter=20
+scale=8`; frozen `.rodata.cst16` returns EPERM. The shared library exports
+exactly thirteen `febpf_*` symbols.
+
+Exact validation and measurement for `4ea5d74`:
+
+- Default all-target: **477 passed + 4 ignored**; std-only: **459 passed + 4
+  ignored**.
+- Default/JIT C API: **486 passed + 4 ignored**; std interpreter-only C API:
+  **468 passed + 4 ignored**.
+- Strict all-target Clippy passed for default, std-only, default/JIT C API, and
+  std-only C API. True `thumbv7em-none-eabihf` no-std check and strict Clippy,
+  release build, and C-API doctests passed.
+- Explicit cdylib and staticlib builds passed. All four C11 hosts compile with
+  `-Wall -Wextra -Werror`; assembly, log filtering, CO-RE, capacity override,
+  durable map state, and frozen-map rejection all pass.
+- Complete rebuilt-release corpus remains **137 families**, 135 loaded,
+  **126 fully compatible**, **835/835 entries loaded**, and **822/835 verified
+  (98.4%)**: 673 strict + 149 privileged-uninitialized. The same six missing
+  attach targets, seven poisoned relocations, and two object-level missing
+  kfuncs remain; unsupported-map and unknown-helper histograms are empty.
+- `rustfmt --check`, `git diff --check`, and the thirteen-symbol audit passed.
+
+Immediate resume order:
+
+1. The next independent embedding gap is custom C helpers. Audit
+   `UserHelpers`, verifier signatures, callback mutability/panic behavior,
+   guest virtual memory translation, JIT dispatch, snapshots, and whether the
+   callback/user token belongs in durable VM host services or a per-invocation
+   `ExecutionEnvironment` add-on. Do not assume the current Rust placement is
+   the correct C ownership model.
+2. Design a typed, versioned helper descriptor. Never hand C a guest or host
+   pointer masquerading as the other. Prefer scalar arguments plus explicit
+   bounded copied/borrowed memory views derived from verifier signatures. Make
+   callback failure a deterministic guest return or runtime error, and prove
+   interpreter/JIT parity with a real C host service.
+3. Keep typed ring/perf/queue/map-in-map operations, static tail-call linking,
+   attach-target overrides, and `.febpf` capture handles independent until a
+   host measures them. AF_XDP live traffic remains a provisioned-host gap;
+   zero-copy and DPDK remain optional later adapters.
+
+The checkpoint immediately below is historical and superseded by this one.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-13 C ELF/CO-RE loading landed; superseded)
 
 Native production-plugin distribution is committed as `608224d` (`ffi: load
 ELF and CO-RE programs from C`), on top of the C ABI and application-host
