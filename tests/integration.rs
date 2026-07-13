@@ -3420,6 +3420,40 @@ fn explain_null_deref_names_origin_and_branch() {
 }
 
 #[test]
+fn precision_backtracking_keeps_scalar_control_of_nullable_deref() {
+    let error = verify_err(
+        ".map m array 4 8 1
+         w1 = 0
+         *(u32 *)(r10 - 4) = r1
+         r1 = map[m]
+         r2 = r10
+         r2 += -4
+         call map_lookup_elem
+         r6 = r0
+         call ktime_get_ns
+         r7 = r0
+         if r7 != 0 goto safe
+         goto join
+        safe:
+         r0 = 0
+        join:
+         if r7 == 0 goto bad
+         if r6 == 0 goto out
+         r0 = *(u64 *)(r6)
+        out:
+         r0 = 0
+         exit
+        bad:
+         r0 = *(u64 *)(r6)
+         exit",
+    );
+    assert!(
+        error.contains("may be NULL"),
+        "scalar-controlled bad path was pruned: {error}"
+    );
+}
+
+#[test]
 fn explain_stack_oob_names_insn() {
     let (e, text) = explain_err(
         "

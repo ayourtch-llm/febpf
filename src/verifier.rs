@@ -2570,12 +2570,11 @@ impl<'a> Verifier<'a> {
                     break;
                 }
                 if checkpoint.state.frames.len() == 1 {
+                    let required_regs = checkpoint.required_regs;
+                    let required_spills = checkpoint.required_spills;
                     let frame = checkpoint.state.cur_mut();
-                    // Keep compression disabled until every transitive
-                    // dependency is represented. Accumulated masks still
-                    // prune a reachable nullable-pointer failure path.
-                    frame.precise_regs = u16::MAX;
-                    frame.precise_spills = u64::MAX;
+                    frame.precise_regs = required_regs;
+                    frame.precise_spills = required_spills;
                 } else {
                     for frame in &mut checkpoint.state.frames {
                         frame.precise_regs = u16::MAX;
