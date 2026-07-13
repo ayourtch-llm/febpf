@@ -30,13 +30,14 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 provider packet-window resizing landed; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 AF_XDP copy adapter landed; authoritative)
 
 The architecture redirection requested by the user is committed as `22ab9db`
 (`runtime: compose invocation add-ons`), with the non-packet proof follow-up in
 `08e6b5b` (`runtime: extract invocation host services`) and provider resize
-support in `445a159` (`xdp: resize provider packet windows`). At checkpoint
-writing HEAD is `445a159`; only this HANDOFF update is intentionally
+support in `445a159` (`xdp: resize provider packet windows`). The first live
+backend is committed as `6e15d26` (`af-xdp: add copy-mode packet provider`). At
+checkpoint writing HEAD is `6e15d26`; only this HANDOFF update is intentionally
 uncommitted. The recurring tttt job `cron-1` was deleted at the user's request.
 No scanner or build started by this batch remains active. Several sleeping
 cargo test processes in the pre-existing `pty-2`/`pty-3`/`pty-4` terminal
@@ -87,11 +88,36 @@ intentionally durable/cross-invocation state rather than blindly moving every
 mutable field. Default VM-owned printk/sequence vectors remain compatibility
 sinks only when an explicit environment does not override them.
 
-Exact validation and measurement through `445a159`:
+The opt-in Cargo feature `af-xdp` now exposes a Linux raw-UAPI copy-mode
+`AfXdpProvider`. All socket, private UMEM, ring, interface, queue, and
+descriptor state stays inside `src/af_xdp.rs`; `Vm` was not modified. RX copies
+one UMEM chunk into an ordinary `XdpFrame`, preserves real active bounds,
+installs metadata and resize capabilities, and uses an opaque token-to-chunk
+table for completion. Rings use the kernel-returned offsets and acquire/release
+SPSC ownership. TX completion supports `XDP_TX`, explicit PASS recycle/TX
+policy, same-interface redirect, and only exact sparse XSKMAP slots registered
+by the provider. Unowned redirects fail honestly after reclaiming the frame.
+The real socket FD is exposed with `AsRawFd` for an embedding host to install
+in its kernel XSKMAP; program attachment and kernel-map updates remain outside
+febpf.
+
+Live validation is an environment gap. This host has `CONFIG_XDP_SOCKETS=y`,
+but unprivileged BPF is disabled, noninteractive sudo is unavailable, and the
+ignored live test on `lo` reached socket setup then failed with `EPERM`.
+Therefore no veth was created, no feeder XDP/XSKMAP was installed, and no live
+packet-flow success is claimed. Deterministic UAPI layout, ring wrap/full,
+configuration, interface lookup, PASS, same-interface, and sparse-slot policy
+tests do pass. Zero-copy, shared UMEM, multi-buffer operation, and cross-socket
+or cross-interface completion routing remain deliberately unimplemented.
+
+Exact validation and measurement through `6e15d26`:
 
 - Default all-target tests: **475 passed + 4 ignored**.
 - Std interpreter-only all-target tests: **457 passed + 4 ignored**.
-- Strict Clippy passed for default/all-targets and std-only/all-targets.
+- AF_XDP-feature all-target tests: **480 passed + 5 ignored**; the extra ignored
+  test is the explicitly provisioned live socket test.
+- Strict Clippy passed for default/all-targets, std-only/all-targets, and
+  AF_XDP-feature/all-targets.
 - True `thumbv7em-none-eabihf` no-std check and strict Clippy passed.
 - Release build and complete corpus scan: **137 families**, 135 instantiate,
   **835/835 entries load**, **126/137 families fully compatible**, and
@@ -103,13 +129,18 @@ Exact validation and measurement through `445a159`:
 
 Immediate resume order:
 
-1. Add Linux AF_XDP copy mode strictly as a backend adapter over
-   `ExecutionEnvironment`/`XdpProvider`; do not add transport state to `Vm`.
-   Keep target/feature gating and the environment/configuration-dependent veth
-   validation honest. Bind provider-owned sparse XSKMAP sockets during
-   completion and preserve owned-frame delivery semantics.
-2. Re-measure the complete pinned corpus after the coherent adapter batch.
-   DPDK remains an optional later adapter, not a VM feature.
+1. Do not spin on privileged AF_XDP validation in this environment. When a
+   provisioned host is available, create a veth, attach a minimal feeder XDP
+   program, install `provider.as_raw_fd()` in its real XSKMAP, run PASS/TX/DROP
+   and resize traffic, and record the first mismatch as `.febpf`.
+2. Corpus saturation and the two ranked boundary milestones (generic provider
+   plus AF_XDP copy mode) are complete. The next unprivileged coherent project
+   should be the ranked application-extension packaging audit: stabilize the
+   embedding surface, then add a zero-dependency C ABI/header and one small
+   example host. Keep invocation resources composed through
+   `ExecutionEnvironment`; do not reintroduce modes in `Vm`.
+3. DPDK and AF_XDP zero-copy remain optional later adapters, not the default
+   next step and never VM features.
 
 The checkpoint immediately below is historical and superseded by this one.
 
