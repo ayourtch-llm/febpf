@@ -18,6 +18,8 @@ typedef uint32_t febpf_status;
 #define FEBPF_STATUS_VERIFY 3u
 #define FEBPF_STATUS_RUNTIME 4u
 #define FEBPF_STATUS_UNSUPPORTED 5u
+#define FEBPF_STATUS_NOT_FOUND 6u
+#define FEBPF_STATUS_MAP 7u
 #define FEBPF_STATUS_PANIC 255u
 
 typedef struct febpf_vm febpf_vm;
@@ -35,6 +37,63 @@ typedef struct febpf_elf_options_v1 {
     const uint8_t *target_btf;
     size_t target_btf_len;
 } febpf_elf_options_v1;
+
+typedef struct febpf_map_max_entries_v1 {
+    size_t struct_size;
+    const uint8_t *map_name;
+    size_t map_name_len;
+    uint32_t max_entries;
+    uint32_t reserved;
+} febpf_map_max_entries_v1;
+
+typedef struct febpf_elf_options_v2 {
+    size_t struct_size;
+    uint32_t flags;
+    uint32_t reserved;
+    const uint8_t *program_name;
+    size_t program_name_len;
+    const uint8_t *target_btf;
+    size_t target_btf_len;
+    const febpf_map_max_entries_v1 *map_overrides;
+    size_t map_override_count;
+} febpf_elf_options_v2;
+
+typedef uint32_t febpf_map_kind;
+#define FEBPF_MAP_HASH 1u
+#define FEBPF_MAP_ARRAY 2u
+#define FEBPF_MAP_PROG_ARRAY 3u
+#define FEBPF_MAP_PERF_EVENT_ARRAY 4u
+#define FEBPF_MAP_PERCPU_HASH 5u
+#define FEBPF_MAP_PERCPU_ARRAY 6u
+#define FEBPF_MAP_STACK_TRACE 7u
+#define FEBPF_MAP_CGROUP_ARRAY 8u
+#define FEBPF_MAP_LRU_HASH 9u
+#define FEBPF_MAP_ARRAY_OF_MAPS 12u
+#define FEBPF_MAP_HASH_OF_MAPS 13u
+#define FEBPF_MAP_DEVMAP 14u
+#define FEBPF_MAP_CPUMAP 16u
+#define FEBPF_MAP_XSKMAP 17u
+#define FEBPF_MAP_QUEUE 22u
+#define FEBPF_MAP_DEVMAP_HASH 25u
+#define FEBPF_MAP_RINGBUF 27u
+
+#define FEBPF_MAP_READONLY (1u << 0)
+#define FEBPF_MAP_PER_CPU (1u << 1)
+
+typedef struct febpf_map_info_v1 {
+    size_t struct_size;
+    febpf_map_kind kind;
+    uint32_t flags;
+    uint32_t key_size;
+    uint32_t value_size;
+    uint32_t max_entries;
+    uint32_t cpu_count;
+} febpf_map_info_v1;
+
+typedef uint32_t febpf_map_update_mode;
+#define FEBPF_MAP_UPDATE_ANY 0u
+#define FEBPF_MAP_UPDATE_NOEXIST 1u
+#define FEBPF_MAP_UPDATE_EXIST 2u
 
 typedef uint32_t febpf_context_model;
 #define FEBPF_CONTEXT_FLAT 0u
@@ -107,6 +166,10 @@ febpf_status febpf_vm_create_elf(const uint8_t *object,
                                  size_t object_len,
                                  const febpf_elf_options_v1 *options,
                                  febpf_vm **output);
+febpf_status febpf_vm_create_elf_v2(const uint8_t *object,
+                                    size_t object_len,
+                                    const febpf_elf_options_v2 *options,
+                                    febpf_vm **output);
 
 /* NULL is accepted. Every non-NULL handle must be destroyed exactly once. */
 febpf_status febpf_vm_destroy(febpf_vm *handle);
@@ -122,6 +185,32 @@ febpf_status febpf_vm_verify(febpf_vm *handle,
 febpf_status febpf_vm_run(febpf_vm *handle,
                           const febpf_invocation_v1 *invocation,
                           uint64_t *result);
+
+/* Runtime map access uses exact names and CPU 0 values for per-CPU maps. */
+febpf_status febpf_vm_map_info(febpf_vm *handle,
+                               const uint8_t *map_name,
+                               size_t map_name_len,
+                               febpf_map_info_v1 *info);
+febpf_status febpf_vm_map_lookup(febpf_vm *handle,
+                                 const uint8_t *map_name,
+                                 size_t map_name_len,
+                                 const uint8_t *key,
+                                 size_t key_len,
+                                 uint8_t *value,
+                                 size_t value_len);
+febpf_status febpf_vm_map_update(febpf_vm *handle,
+                                 const uint8_t *map_name,
+                                 size_t map_name_len,
+                                 const uint8_t *key,
+                                 size_t key_len,
+                                 const uint8_t *value,
+                                 size_t value_len,
+                                 febpf_map_update_mode mode);
+febpf_status febpf_vm_map_delete(febpf_vm *handle,
+                                 const uint8_t *map_name,
+                                 size_t map_name_len,
+                                 const uint8_t *key,
+                                 size_t key_len);
 
 #ifdef __cplusplus
 }

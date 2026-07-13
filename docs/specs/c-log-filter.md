@@ -60,5 +60,5 @@ not be combined into a miscellaneous VM adapter.
 `scripts/test-c-api.sh` compiles this host with C11, `-Wall -Wextra -Werror`,
 then pipes three records through the example plugin. It requires exact output
 `INFO ready` and `TOKEN=*ecret`; the intervening `DEBUG noisy` record must be
-absent. The same run rebuilds and dynamically links the native C API. All seven
+absent. The same run rebuilds and dynamically links the native C API. All nine
 Rust C-boundary tests and strict all-target C-API Clippy also pass.

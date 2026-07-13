@@ -60,3 +60,10 @@ fi
     -o target/c-elf-example
 
 target/c-elf-example tests/core_probe.o text tests/core_target.o
+
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+    -I include examples/c-map-host/main.c \
+    -L target/c-api -Wl,-rpath,"$RPATH" -lfebpf \
+    -o target/c-map-example
+
+target/c-map-example tests/legacy_maps.o tests/global_data.o

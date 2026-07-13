@@ -5,6 +5,7 @@
 //! no C pointer or callback becomes durable VM state.
 
 use crate::execution::{ExecutionEnvironment, ExecutionOutcome};
+use crate::maps::{MapKind, MapUpdateMode, NR_CPUS};
 use crate::verifier::{Config, UninitStackPolicy};
 use crate::{asm, elf, insn, Program, Vm};
 use std::cell::RefCell;
@@ -22,6 +23,8 @@ pub const STATUS_PROGRAM: u32 = 2;
 pub const STATUS_VERIFY: u32 = 3;
 pub const STATUS_RUNTIME: u32 = 4;
 pub const STATUS_UNSUPPORTED: u32 = 5;
+pub const STATUS_NOT_FOUND: u32 = 6;
+pub const STATUS_MAP: u32 = 7;
 pub const STATUS_PANIC: u32 = 255;
 
 pub const CONTEXT_FLAT: u32 = 0;
@@ -84,6 +87,52 @@ pub struct ElfOptionsV1 {
     pub target_btf: *const u8,
     pub target_btf_len: usize,
 }
+
+/// One exact-name map capacity override used before ELF map instantiation.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MapMaxEntriesV1 {
+    pub struct_size: usize,
+    pub map_name: *const u8,
+    pub map_name_len: usize,
+    pub max_entries: u32,
+    pub reserved: u32,
+}
+
+/// ELF loading configuration with pre-construction map capacity overrides.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ElfOptionsV2 {
+    pub struct_size: usize,
+    pub flags: u32,
+    pub reserved: u32,
+    pub program_name: *const u8,
+    pub program_name_len: usize,
+    pub target_btf: *const u8,
+    pub target_btf_len: usize,
+    pub map_overrides: *const MapMaxEntriesV1,
+    pub map_override_count: usize,
+}
+
+/// Copied metadata for one exact-name map.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MapInfoV1 {
+    pub struct_size: usize,
+    pub kind: u32,
+    pub flags: u32,
+    pub key_size: u32,
+    pub value_size: u32,
+    pub max_entries: u32,
+    pub cpu_count: u32,
+}
+
+pub const MAP_READONLY: u32 = 1 << 0;
+pub const MAP_PER_CPU: u32 = 1 << 1;
+
+pub const MAP_UPDATE_ANY: u32 = 0;
+pub const MAP_UPDATE_NOEXIST: u32 = 1;
+pub const MAP_UPDATE_EXIST: u32 = 2;
 
 /// Opaque to C callers.
 pub struct CApiVm {
@@ -316,6 +365,188 @@ fn model_name(model: VerifiedModel) -> &'static str {
     }
 }
 
+fn check_elf_options(flags: u32, reserved: u32) -> CResult<()> {
+    if flags & !ELF_KNOWN_FLAGS != 0 {
+        return Err(invalid(format!(
+            "unknown ELF flags 0x{:x}",
+            flags & !ELF_KNOWN_FLAGS
+        )));
+    }
+    if reserved != 0 {
+        return Err(invalid("ELF options.reserved must be zero"));
+    }
+    Ok(())
+}
+
+unsafe fn map_overrides(
+    pointer: *const MapMaxEntriesV1,
+    count: usize,
+) -> CResult<Vec<(String, u32)>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if pointer.is_null() {
+        return Err(invalid("map_overrides is null but count is nonzero"));
+    }
+    let total_bytes = count
+        .checked_mul(core::mem::size_of::<MapMaxEntriesV1>())
+        .filter(|size| *size <= isize::MAX as usize)
+        .ok_or_else(|| invalid("map override array is too large"))?;
+    let _ = total_bytes;
+    let mut result = Vec::with_capacity(count);
+    for index in 0..count {
+        // SAFETY: the caller promises an array containing `count` descriptors.
+        let item = unsafe { input_struct(pointer.add(index), "map override")? };
+        if item.struct_size != core::mem::size_of::<MapMaxEntriesV1>() {
+            return Err(invalid(format!(
+                "map_overrides[{index}].struct_size must equal {} for this fixed-stride array",
+                core::mem::size_of::<MapMaxEntriesV1>()
+            )));
+        }
+        if item.reserved != 0 {
+            return Err(invalid(format!(
+                "map_overrides[{index}].reserved must be zero"
+            )));
+        }
+        if item.max_entries == 0 {
+            return Err(invalid(format!(
+                "map_overrides[{index}].max_entries must be nonzero"
+            )));
+        }
+        // SAFETY: the descriptor's byte region is caller-owned for this call.
+        let name = unsafe { bytes(item.map_name, item.map_name_len, "map override name")? };
+        let name = str::from_utf8(name)
+            .map_err(|error| invalid(format!("map override name is not UTF-8: {error}")))?;
+        if name.is_empty() {
+            return Err(invalid(format!("map_overrides[{index}] has an empty name")));
+        }
+        if result.iter().any(|(existing, _)| existing == name) {
+            return Err(invalid(format!("duplicate map override '{name}'")));
+        }
+        result.push((name.to_owned(), item.max_entries));
+    }
+    Ok(result)
+}
+
+fn create_elf_handle(
+    object: &[u8],
+    selector: &str,
+    target_input: &[u8],
+    overrides: &[(String, u32)],
+) -> CResult<*mut CApiVm> {
+    if target_input.is_empty() && elf::needs_kernel_btf(object) {
+        return Err((
+            STATUS_PROGRAM,
+            "ELF object requires target BTF for CO-RE or a BTF-typed context".into(),
+        ));
+    }
+    let target = if target_input.is_empty() {
+        None
+    } else if target_input.starts_with(b"\x7fELF") {
+        Some(
+            elf::read_section(target_input, ".BTF")
+                .map_err(|error| (STATUS_PROGRAM, format!("target BTF ELF: {error}")))?
+                .ok_or_else(|| {
+                    (
+                        STATUS_PROGRAM,
+                        "target BTF ELF has no nonempty .BTF section".into(),
+                    )
+                })?
+                .0,
+        )
+    } else {
+        Some(target_input.to_vec())
+    };
+    let mut loaded = elf::load_with_target_btf(object, target.as_deref())
+        .map_err(|error| (STATUS_PROGRAM, format!("ELF loading failed: {error}")))?;
+    if !loaded.warnings.is_empty() {
+        return Err((
+            STATUS_PROGRAM,
+            format!(
+                "ELF loading produced unsupported warnings: {}",
+                loaded.warnings.join("; ")
+            ),
+        ));
+    }
+    if !loaded.prog_array_inits.is_empty() {
+        return Err((
+            STATUS_UNSUPPORTED,
+            "ELF static PROG_ARRAY initialization is not supported by C ABI v1".into(),
+        ));
+    }
+    for (name, max_entries) in overrides {
+        loaded
+            .set_map_max_entries(name, *max_entries)
+            .map_err(|error| (STATUS_PROGRAM, error))?;
+    }
+    let index = if selector.is_empty() {
+        if loaded.programs.len() != 1 {
+            let names: Vec<&str> = loaded
+                .programs
+                .iter()
+                .map(|program| program.name.as_str())
+                .collect();
+            return Err((
+                STATUS_PROGRAM,
+                format!(
+                    "ELF program name is required; available: {}",
+                    names.join(", ")
+                ),
+            ));
+        }
+        0
+    } else {
+        loaded
+            .programs
+            .iter()
+            .position(|program| program.name == selector)
+            .ok_or_else(|| {
+                let names: Vec<&str> = loaded
+                    .programs
+                    .iter()
+                    .map(|program| program.name.as_str())
+                    .collect();
+                (
+                    STATUS_PROGRAM,
+                    format!(
+                        "no ELF program '{selector}'; available: {}",
+                        names.join(", ")
+                    ),
+                )
+            })?
+    };
+    let chosen = loaded.programs.swap_remove(index);
+    let model = required_model(chosen.kind);
+    let vm = Vm::new(Program {
+        insns: chosen.insns,
+        maps: loaded.maps,
+        btf_ctx: chosen.btf_ctx,
+    })
+    .map_err(|error| (STATUS_PROGRAM, format!("program creation failed: {error}")))?;
+    Ok(Box::into_raw(Box::new(CApiVm {
+        vm,
+        verified_model: None,
+        required_model: model,
+    })))
+}
+
+unsafe fn elf_inputs<'a>(
+    object: *const u8,
+    object_len: usize,
+    program_name: *const u8,
+    program_name_len: usize,
+    target_btf: *const u8,
+    target_btf_len: usize,
+) -> CResult<(&'a [u8], &'a str, &'a [u8])> {
+    // SAFETY: all byte-region contracts are supplied by the C caller.
+    let object = unsafe { bytes(object, object_len, "ELF object")? };
+    let selector = unsafe { bytes(program_name, program_name_len, "ELF program name")? };
+    let selector = str::from_utf8(selector)
+        .map_err(|error| invalid(format!("ELF program name is not UTF-8: {error}")))?;
+    let target = unsafe { bytes(target_btf, target_btf_len, "target BTF")? };
+    Ok((object, selector, target))
+}
+
 /// Construct an opaque VM from a relocatable eBPF ELF object.
 ///
 /// # Safety
@@ -335,117 +566,58 @@ pub unsafe extern "C" fn febpf_vm_create_elf(
         unsafe { output.write(null_mut()) };
         // SAFETY: caller promises a versioned readable input structure.
         let options = unsafe { input_struct(options, "ELF options")? };
-        if options.flags & !ELF_KNOWN_FLAGS != 0 {
-            return Err(invalid(format!(
-                "unknown ELF flags 0x{:x}",
-                options.flags & !ELF_KNOWN_FLAGS
-            )));
-        }
-        if options.reserved != 0 {
-            return Err(invalid("ELF options.reserved must be zero"));
-        }
-        // SAFETY: caller contracts are forwarded to checked helpers.
-        let object = unsafe { bytes(object, object_len, "ELF object")? };
-        let selector = unsafe {
-            bytes(
+        check_elf_options(options.flags, options.reserved)?;
+        let (object, selector, target) = unsafe {
+            elf_inputs(
+                object,
+                object_len,
                 options.program_name,
                 options.program_name_len,
-                "ELF program name",
+                options.target_btf,
+                options.target_btf_len,
             )?
         };
-        let selector = str::from_utf8(selector)
-            .map_err(|error| invalid(format!("ELF program name is not UTF-8: {error}")))?;
-        let target_input =
-            unsafe { bytes(options.target_btf, options.target_btf_len, "target BTF")? };
-        if target_input.is_empty() && elf::needs_kernel_btf(object) {
-            return Err((
-                STATUS_PROGRAM,
-                "ELF object requires target BTF for CO-RE or a BTF-typed context".into(),
-            ));
+        let handle = create_elf_handle(object, selector, target, &[])?;
+        // SAFETY: output was checked and receives the newly owned handle.
+        unsafe { output.write(handle) };
+        Ok(())
+    })
+}
+
+/// Construct an ELF VM with pre-instantiation map-capacity overrides.
+///
+/// # Safety
+/// All descriptor-selected regions must be readable and `output` writable.
+#[no_mangle]
+pub unsafe extern "C" fn febpf_vm_create_elf_v2(
+    object: *const u8,
+    object_len: usize,
+    options: *const ElfOptionsV2,
+    output: *mut *mut CApiVm,
+) -> u32 {
+    boundary(|| {
+        if output.is_null() {
+            return Err(invalid("output VM pointer is null"));
         }
-        let target = if target_input.is_empty() {
-            None
-        } else if target_input.starts_with(b"\x7fELF") {
-            Some(
-                elf::read_section(target_input, ".BTF")
-                    .map_err(|error| (STATUS_PROGRAM, format!("target BTF ELF: {error}")))?
-                    .ok_or_else(|| {
-                        (
-                            STATUS_PROGRAM,
-                            "target BTF ELF has no nonempty .BTF section".into(),
-                        )
-                    })?
-                    .0,
-            )
-        } else {
-            Some(target_input.to_vec())
+        // SAFETY: output was checked and is caller-owned.
+        unsafe { output.write(null_mut()) };
+        // SAFETY: caller promises a versioned readable input structure.
+        let options = unsafe { input_struct(options, "ELF v2 options")? };
+        check_elf_options(options.flags, options.reserved)?;
+        let (object, selector, target) = unsafe {
+            elf_inputs(
+                object,
+                object_len,
+                options.program_name,
+                options.program_name_len,
+                options.target_btf,
+                options.target_btf_len,
+            )?
         };
-        let mut loaded = elf::load_with_target_btf(object, target.as_deref())
-            .map_err(|error| (STATUS_PROGRAM, format!("ELF loading failed: {error}")))?;
-        if !loaded.warnings.is_empty() {
-            return Err((
-                STATUS_PROGRAM,
-                format!(
-                    "ELF loading produced unsupported warnings: {}",
-                    loaded.warnings.join("; ")
-                ),
-            ));
-        }
-        if !loaded.prog_array_inits.is_empty() {
-            return Err((
-                STATUS_UNSUPPORTED,
-                "ELF static PROG_ARRAY initialization is not supported by C ABI v1".into(),
-            ));
-        }
-        let index = if selector.is_empty() {
-            if loaded.programs.len() != 1 {
-                let names: Vec<&str> = loaded
-                    .programs
-                    .iter()
-                    .map(|program| program.name.as_str())
-                    .collect();
-                return Err((
-                    STATUS_PROGRAM,
-                    format!(
-                        "ELF program name is required; available: {}",
-                        names.join(", ")
-                    ),
-                ));
-            }
-            0
-        } else {
-            loaded
-                .programs
-                .iter()
-                .position(|program| program.name == selector)
-                .ok_or_else(|| {
-                    let names: Vec<&str> = loaded
-                        .programs
-                        .iter()
-                        .map(|program| program.name.as_str())
-                        .collect();
-                    (
-                        STATUS_PROGRAM,
-                        format!(
-                            "no ELF program '{selector}'; available: {}",
-                            names.join(", ")
-                        ),
-                    )
-                })?
-        };
-        let chosen = loaded.programs.swap_remove(index);
-        let model = required_model(chosen.kind);
-        let vm = Vm::new(Program {
-            insns: chosen.insns,
-            maps: loaded.maps,
-            btf_ctx: chosen.btf_ctx,
-        })
-        .map_err(|error| (STATUS_PROGRAM, format!("program creation failed: {error}")))?;
-        let handle = Box::into_raw(Box::new(CApiVm {
-            vm,
-            verified_model: None,
-            required_model: model,
-        }));
+        // SAFETY: caller promises an array of versioned descriptors.
+        let overrides =
+            unsafe { map_overrides(options.map_overrides, options.map_override_count)? };
+        let handle = create_elf_handle(object, selector, target, &overrides)?;
         // SAFETY: output was checked and receives the newly owned handle.
         unsafe { output.write(handle) };
         Ok(())
@@ -695,6 +867,293 @@ pub unsafe extern "C" fn febpf_vm_run(
         // SAFETY: result was checked and is caller-owned.
         unsafe { result.write(value) };
         Ok(())
+    })
+}
+
+fn map_kind_code(kind: MapKind) -> u32 {
+    match kind {
+        MapKind::Hash => 1,
+        MapKind::Array => 2,
+        MapKind::ProgArray => 3,
+        MapKind::PerfEventArray => 4,
+        MapKind::PerCpuHash => 5,
+        MapKind::PerCpuArray => 6,
+        MapKind::StackTrace => 7,
+        MapKind::CgroupArray => 8,
+        MapKind::LruHash => 9,
+        MapKind::ArrayOfMaps => 12,
+        MapKind::HashOfMaps => 13,
+        MapKind::DevMap => 14,
+        MapKind::CpuMap => 16,
+        MapKind::XskMap => 17,
+        MapKind::Queue => 22,
+        MapKind::DevMapHash => 25,
+        MapKind::RingBuf => 27,
+    }
+}
+
+fn byte_map_kind(kind: MapKind) -> bool {
+    matches!(
+        kind,
+        MapKind::Hash
+            | MapKind::Array
+            | MapKind::PerCpuHash
+            | MapKind::PerCpuArray
+            | MapKind::StackTrace
+            | MapKind::CgroupArray
+            | MapKind::LruHash
+            | MapKind::DevMap
+            | MapKind::CpuMap
+            | MapKind::XskMap
+            | MapKind::DevMapHash
+    )
+}
+
+unsafe fn map_name<'a>(pointer: *const u8, len: usize) -> CResult<&'a str> {
+    // SAFETY: caller promises a readable exact-name byte region.
+    let name = unsafe { bytes(pointer, len, "map name")? };
+    let name =
+        str::from_utf8(name).map_err(|error| invalid(format!("map name is not UTF-8: {error}")))?;
+    if name.is_empty() {
+        return Err(invalid("map name is empty"));
+    }
+    Ok(name)
+}
+
+fn map_index(handle: &CApiVm, name: &str) -> CResult<usize> {
+    let mut matches = handle
+        .vm
+        .maps
+        .iter()
+        .enumerate()
+        .filter(|(_, map)| map.def.name == name)
+        .map(|(index, _)| index);
+    let index = matches
+        .next()
+        .ok_or_else(|| (STATUS_NOT_FOUND, format!("no map named '{name}'")))?;
+    if matches.next().is_some() {
+        return Err((STATUS_MAP, format!("map name '{name}' is ambiguous")));
+    }
+    Ok(index)
+}
+
+fn require_map_lengths(
+    name: &str,
+    key_len: usize,
+    value_len: Option<usize>,
+    key_size: u32,
+    value_size: u32,
+) -> CResult<()> {
+    if key_len != key_size as usize {
+        return Err(invalid(format!(
+            "map '{name}' key length is {key_len}, need {key_size}"
+        )));
+    }
+    if let Some(value_len) = value_len {
+        if value_len != value_size as usize {
+            return Err(invalid(format!(
+                "map '{name}' value length is {value_len}, need {value_size}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn map_error(operation: &str, name: &str, errno: i64) -> (u32, String) {
+    let status = if errno == -2 {
+        STATUS_NOT_FOUND
+    } else {
+        STATUS_MAP
+    };
+    (
+        status,
+        format!("map '{name}' {operation} failed with errno {}", -errno),
+    )
+}
+
+unsafe fn require_output_struct<T>(pointer: *mut T, name: &str) -> CResult<()> {
+    if pointer.is_null() {
+        return Err(invalid(format!("{name} is null")));
+    }
+    // SAFETY: every versioned output starts with a caller-initialized size_t.
+    let actual = unsafe { pointer.cast::<usize>().read_unaligned() };
+    require_struct(actual, core::mem::size_of::<T>(), name)
+}
+
+/// Copy metadata for one exact-name map.
+///
+/// # Safety
+/// Name bytes must be readable and `info` must name a writable versioned struct.
+#[no_mangle]
+pub unsafe extern "C" fn febpf_vm_map_info(
+    handle: *mut CApiVm,
+    name: *const u8,
+    name_len: usize,
+    info: *mut MapInfoV1,
+) -> u32 {
+    boundary(|| {
+        // SAFETY: caller contracts are forwarded to checked helpers.
+        let handle = unsafe { vm_mut(handle)? };
+        let name = unsafe { map_name(name, name_len)? };
+        unsafe { require_output_struct(info, "map info")? };
+        let index = map_index(handle, name)?;
+        let map = &handle.vm.maps[index];
+        let per_cpu = matches!(map.def.kind, MapKind::PerCpuArray | MapKind::PerCpuHash);
+        let result = MapInfoV1 {
+            struct_size: core::mem::size_of::<MapInfoV1>(),
+            kind: map_kind_code(map.def.kind),
+            flags: if map.def.readonly { MAP_READONLY } else { 0 }
+                | if per_cpu { MAP_PER_CPU } else { 0 },
+            key_size: map.def.key_size,
+            value_size: map.def.value_size,
+            max_entries: map.def.max_entries,
+            cpu_count: if per_cpu { NR_CPUS } else { 1 },
+        };
+        // SAFETY: output size and writability were checked by contract.
+        unsafe { info.write_unaligned(result) };
+        Ok(())
+    })
+}
+
+/// Copy CPU 0's value for one key.
+///
+/// # Safety
+/// All byte regions must be live for this call and the value region writable.
+#[no_mangle]
+pub unsafe extern "C" fn febpf_vm_map_lookup(
+    handle: *mut CApiVm,
+    name: *const u8,
+    name_len: usize,
+    key: *const u8,
+    key_len: usize,
+    value: *mut u8,
+    value_len: usize,
+) -> u32 {
+    boundary(|| {
+        // SAFETY: caller contracts are forwarded to checked helpers.
+        let handle = unsafe { vm_mut(handle)? };
+        let name = unsafe { map_name(name, name_len)? };
+        let key = unsafe { bytes(key, key_len, "map key")? };
+        let value = unsafe { bytes_mut(value, value_len, "map value output")? };
+        let index = map_index(handle, name)?;
+        let map = &mut handle.vm.maps[index];
+        require_map_lengths(
+            name,
+            key.len(),
+            Some(value.len()),
+            map.def.key_size,
+            map.def.value_size,
+        )?;
+        if !byte_map_kind(map.def.kind) {
+            return Err((
+                STATUS_MAP,
+                format!(
+                    "map '{name}' kind {} has no byte-value lookup",
+                    map.def.kind
+                ),
+            ));
+        }
+        let reference = map
+            .lookup(key)
+            .ok_or_else(|| (STATUS_NOT_FOUND, format!("map '{name}' key not found")))?;
+        value.copy_from_slice(map.value(reference));
+        map.touch(key);
+        Ok(())
+    })
+}
+
+/// Insert or replace CPU 0's value for one key.
+///
+/// # Safety
+/// All descriptor-selected byte regions must be readable for this call.
+#[no_mangle]
+pub unsafe extern "C" fn febpf_vm_map_update(
+    handle: *mut CApiVm,
+    name: *const u8,
+    name_len: usize,
+    key: *const u8,
+    key_len: usize,
+    value: *const u8,
+    value_len: usize,
+    mode: u32,
+) -> u32 {
+    boundary(|| {
+        let mode = match mode {
+            MAP_UPDATE_ANY => MapUpdateMode::Any,
+            MAP_UPDATE_NOEXIST => MapUpdateMode::NoExist,
+            MAP_UPDATE_EXIST => MapUpdateMode::Exist,
+            other => return Err(invalid(format!("unknown map update mode {other}"))),
+        };
+        // SAFETY: caller contracts are forwarded to checked helpers.
+        let handle = unsafe { vm_mut(handle)? };
+        let name = unsafe { map_name(name, name_len)? };
+        let key = unsafe { bytes(key, key_len, "map key")? };
+        let value = unsafe { bytes(value, value_len, "map value")? };
+        let index = map_index(handle, name)?;
+        let map = &mut handle.vm.maps[index];
+        require_map_lengths(
+            name,
+            key.len(),
+            Some(value.len()),
+            map.def.key_size,
+            map.def.value_size,
+        )?;
+        if !byte_map_kind(map.def.kind) {
+            return Err((
+                STATUS_MAP,
+                format!(
+                    "map '{name}' kind {} has no byte-value update",
+                    map.def.kind
+                ),
+            ));
+        }
+        if map.def.readonly {
+            return Err(map_error("update", name, -1));
+        }
+        let exists = map.lookup(key).is_some();
+        if mode == MapUpdateMode::NoExist && exists {
+            return Err(map_error("update", name, -17));
+        }
+        if mode == MapUpdateMode::Exist && !exists {
+            return Err(map_error("update", name, -2));
+        }
+        map.update(key, value)
+            .map(|_| ())
+            .map_err(|errno| map_error("update", name, errno))
+    })
+}
+
+/// Delete one key from a byte-value map.
+///
+/// # Safety
+/// Name and key regions must be readable for this call.
+#[no_mangle]
+pub unsafe extern "C" fn febpf_vm_map_delete(
+    handle: *mut CApiVm,
+    name: *const u8,
+    name_len: usize,
+    key: *const u8,
+    key_len: usize,
+) -> u32 {
+    boundary(|| {
+        // SAFETY: caller contracts are forwarded to checked helpers.
+        let handle = unsafe { vm_mut(handle)? };
+        let name = unsafe { map_name(name, name_len)? };
+        let key = unsafe { bytes(key, key_len, "map key")? };
+        let index = map_index(handle, name)?;
+        let map = &mut handle.vm.maps[index];
+        require_map_lengths(name, key.len(), None, map.def.key_size, map.def.value_size)?;
+        if !byte_map_kind(map.def.kind) {
+            return Err((
+                STATUS_MAP,
+                format!(
+                    "map '{name}' kind {} has no byte-value delete",
+                    map.def.kind
+                ),
+            ));
+        }
+        map.delete(key)
+            .map_err(|errno| map_error("delete", name, errno))
     })
 }
 
@@ -1098,5 +1557,262 @@ mod tests {
         );
         assert!(last_error().contains("PROG_ARRAY"));
         assert!(vm.is_null());
+    }
+
+    #[test]
+    fn elf_v2_configures_capacity_and_runtime_map_operations_are_exact() {
+        let object = include_bytes!("../tests/legacy_maps.o");
+        let program_name = b"socket";
+        let map_name = b"counts";
+        let override_ = MapMaxEntriesV1 {
+            struct_size: size_of::<MapMaxEntriesV1>(),
+            map_name: map_name.as_ptr(),
+            map_name_len: map_name.len(),
+            max_entries: 1,
+            reserved: 0,
+        };
+        let options = ElfOptionsV2 {
+            struct_size: size_of::<ElfOptionsV2>(),
+            flags: 0,
+            reserved: 0,
+            program_name: program_name.as_ptr(),
+            program_name_len: program_name.len(),
+            target_btf: null_mut(),
+            target_btf_len: 0,
+            map_overrides: &override_,
+            map_override_count: 1,
+        };
+        let mut vm = null_mut();
+        assert_eq!(
+            unsafe { febpf_vm_create_elf_v2(object.as_ptr(), object.len(), &options, &mut vm) },
+            STATUS_OK,
+            "{}",
+            last_error()
+        );
+        let mut info = MapInfoV1 {
+            struct_size: size_of::<MapInfoV1>(),
+            kind: 0,
+            flags: 0,
+            key_size: 0,
+            value_size: 0,
+            max_entries: 0,
+            cpu_count: 0,
+        };
+        assert_eq!(
+            unsafe { febpf_vm_map_info(vm, map_name.as_ptr(), map_name.len(), &mut info) },
+            STATUS_OK
+        );
+        assert_eq!(
+            (info.kind, info.key_size, info.value_size, info.max_entries),
+            (1, 4, 8, 1)
+        );
+        assert_eq!((info.flags, info.cpu_count), (0, 1));
+
+        let key0 = 0u32.to_ne_bytes();
+        let key1 = 1u32.to_ne_bytes();
+        let value = 77u64.to_ne_bytes();
+        assert_eq!(
+            unsafe {
+                febpf_vm_map_update(
+                    vm,
+                    map_name.as_ptr(),
+                    map_name.len(),
+                    key0.as_ptr(),
+                    key0.len(),
+                    value.as_ptr(),
+                    value.len(),
+                    MAP_UPDATE_NOEXIST,
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe {
+                febpf_vm_map_update(
+                    vm,
+                    map_name.as_ptr(),
+                    map_name.len(),
+                    key0.as_ptr(),
+                    key0.len(),
+                    value.as_ptr(),
+                    value.len(),
+                    MAP_UPDATE_NOEXIST,
+                )
+            },
+            STATUS_MAP
+        );
+        assert!(last_error().contains("errno 17"));
+        assert_eq!(
+            unsafe {
+                febpf_vm_map_update(
+                    vm,
+                    map_name.as_ptr(),
+                    map_name.len(),
+                    key1.as_ptr(),
+                    key1.len(),
+                    value.as_ptr(),
+                    value.len(),
+                    MAP_UPDATE_ANY,
+                )
+            },
+            STATUS_MAP
+        );
+        assert!(last_error().contains("errno 7"));
+        let mut copied = [0u8; 8];
+        assert_eq!(
+            unsafe {
+                febpf_vm_map_lookup(
+                    vm,
+                    map_name.as_ptr(),
+                    map_name.len(),
+                    key0.as_ptr(),
+                    key0.len(),
+                    copied.as_mut_ptr(),
+                    copied.len(),
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(u64::from_ne_bytes(copied), 77);
+        assert_eq!(
+            unsafe {
+                febpf_vm_map_delete(
+                    vm,
+                    map_name.as_ptr(),
+                    map_name.len(),
+                    key0.as_ptr(),
+                    key0.len(),
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe {
+                febpf_vm_map_lookup(
+                    vm,
+                    map_name.as_ptr(),
+                    map_name.len(),
+                    key0.as_ptr(),
+                    key0.len(),
+                    copied.as_mut_ptr(),
+                    copied.len(),
+                )
+            },
+            STATUS_NOT_FOUND
+        );
+        assert_eq!(unsafe { febpf_vm_destroy(vm) }, STATUS_OK);
+    }
+
+    #[test]
+    fn elf_maps_remain_durable_across_runs_and_frozen_maps_reject_updates() {
+        let object = include_bytes!("../tests/global_data.o");
+        let program_name = b"socket";
+        let options = ElfOptionsV1 {
+            struct_size: size_of::<ElfOptionsV1>(),
+            flags: 0,
+            reserved: 0,
+            program_name: program_name.as_ptr(),
+            program_name_len: program_name.len(),
+            target_btf: null_mut(),
+            target_btf_len: 0,
+        };
+        let mut vm = null_mut();
+        assert_eq!(
+            unsafe { febpf_vm_create_elf(object.as_ptr(), object.len(), &options, &mut vm) },
+            STATUS_OK
+        );
+        let rodata = b".rodata.cst16";
+        let mut info = MapInfoV1 {
+            struct_size: size_of::<MapInfoV1>(),
+            kind: 0,
+            flags: 0,
+            key_size: 0,
+            value_size: 0,
+            max_entries: 0,
+            cpu_count: 0,
+        };
+        assert_eq!(
+            unsafe { febpf_vm_map_info(vm, rodata.as_ptr(), rodata.len(), &mut info) },
+            STATUS_OK
+        );
+        assert_ne!(info.flags & MAP_READONLY, 0);
+        assert_eq!(unsafe { verify(vm, CONTEXT_SKB, 0) }, STATUS_OK);
+
+        let invocation = InvocationV1 {
+            struct_size: size_of::<InvocationV1>(),
+            flags: 0,
+            reserved: 0,
+            context: null_mut(),
+            context_len: 0,
+            packet: null_mut(),
+            packet_len: 0,
+            output: None,
+            output_user_data: null_mut(),
+        };
+        let mut result = 0;
+        assert_eq!(
+            unsafe { febpf_vm_run(vm, &invocation, &mut result) },
+            STATUS_OK
+        );
+        assert_eq!(result, 410);
+
+        let key = 0u32.to_ne_bytes();
+        let data_name = b".data";
+        let bss_name = b".bss";
+        let mut value = [0u8; 8];
+        assert_eq!(
+            unsafe {
+                febpf_vm_map_lookup(
+                    vm,
+                    bss_name.as_ptr(),
+                    bss_name.len(),
+                    key.as_ptr(),
+                    key.len(),
+                    value.as_mut_ptr(),
+                    value.len(),
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(u64::from_ne_bytes(value), 10);
+        let seven = 7u64.to_ne_bytes();
+        assert_eq!(
+            unsafe {
+                febpf_vm_map_update(
+                    vm,
+                    data_name.as_ptr(),
+                    data_name.len(),
+                    key.as_ptr(),
+                    key.len(),
+                    seven.as_ptr(),
+                    seven.len(),
+                    MAP_UPDATE_EXIST,
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe { febpf_vm_run(vm, &invocation, &mut result) },
+            STATUS_OK
+        );
+        assert_eq!(result, 820);
+        let zero = [0u8; 16];
+        assert_eq!(
+            unsafe {
+                febpf_vm_map_update(
+                    vm,
+                    rodata.as_ptr(),
+                    rodata.len(),
+                    key.as_ptr(),
+                    key.len(),
+                    zero.as_ptr(),
+                    zero.len(),
+                    MAP_UPDATE_EXIST,
+                )
+            },
+            STATUS_MAP
+        );
+        assert!(last_error().contains("errno 1"));
+        assert_eq!(unsafe { febpf_vm_destroy(vm) }, STATUS_OK);
     }
 }

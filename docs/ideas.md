@@ -77,8 +77,10 @@ remaining zero-dependency. The streaming log-filter host proves a non-packet
 application needs no new VM mode: a versioned inline Flat context supports
 bounded accept/drop and safe in-place redaction. ELF/CO-RE construction now has
 its own versioned descriptor and section-derived verification constraint. Next
-additions remain independently measured: C helper callbacks, map control, and
-`.febpf` capture handles should not become one miscellaneous adapter.
+map configuration and CPU-0 runtime control are separate versioned lifetimes;
+no internal map pointer escapes. Remaining additions stay independently
+measured: C helper callbacks and `.febpf` capture handles should not become one
+miscellaneous adapter.
 
 ### 2. The XDP story (packet access) — already on the roadmap's critical path
 

@@ -25,6 +25,8 @@ C example, and runs it against that library.
   containing `.BTF`. Objects that need kernel BTF must receive it; multi-entry
   objects require an explicit selector. Section kind constrains later
   verification to XDP, skb, or Flat semantics as appropriate.
+- `febpf_vm_create_elf_v2` adds exact-name, nonzero map-capacity overrides
+  before storage is instantiated. The original constructor remains unchanged.
 - `febpf_vm_verify` always runs febpf's verifier and selects Flat, XDP, or skb
   context semantics. Writable flat context, strict alignment, privileged
   uninitialized-stack policy, verifier budget, and runtime instruction limit
@@ -37,6 +39,9 @@ C example, and runs it against that library.
 - An optional output callback receives invocation-local printk lines and binary
   sequence output, including output produced before a later runtime failure.
   Callback bytes are borrowed only until it returns.
+- `febpf_vm_map_info`, `febpf_vm_map_lookup`, `febpf_vm_map_update`, and
+  `febpf_vm_map_delete` provide copied, exact-name runtime map control. They
+  expose CPU 0 values for per-CPU maps and never expose internal pointers.
 - `febpf_vm_destroy` consumes the opaque handle. `febpf_last_error` copies the
   calling thread's diagnostic with a length-query contract.
 
@@ -47,7 +52,8 @@ vary by compiler.
 
 ### ELF construction
 
-`febpf_elf_options_v1` keeps loading separate from verification and execution.
+`febpf_elf_options_v1` keeps loading separate from verification and execution;
+`febpf_elf_options_v2` adds only pre-instantiation map-capacity configuration.
 All object, selector, and target-BTF bytes are consumed during construction;
 the handle retains only the relocated program, maps, BTF-derived verifier
 metadata, and section-derived context constraint. A target may be a raw BTF
@@ -79,27 +85,30 @@ and reported as `FEBPF_STATUS_PANIC`.
 
 ## Deliberate v1 limits
 
-Map administration, custom C helper callbacks, snapshots/replay,
-application-supplied attach targets, provider-owned resizable frames, and rich
-redirect completion are not silently squeezed into v1. Static `PROG_ARRAY`
-initializers are rejected until verification-time bundle linking has a
-versioned contract. Loader warnings are errors because v1 has no warning sink.
-These gaps need separately versioned descriptors or handles. The Rust
+Typed ring/perf/queue consumption, program/map-in-map linking, nonzero per-CPU
+lane access, custom C helper callbacks, snapshots/replay, application-supplied
+attach targets, provider-owned resizable frames, and rich redirect completion
+are not silently squeezed into generic byte-map operations. Static
+`PROG_ARRAY` initializers are rejected until verification-time bundle linking
+has a versioned contract. Loader warnings are errors because v1 has no warning
+sink. These gaps need separately versioned descriptors or handles. The Rust
 embedding API remains the complete surface in the meantime.
 
 ## Validation record
 
 - Default all-target tests: **477 passed + 4 ignored**; std-only:
   **459 passed + 4 ignored**.
-- Default/JIT `c-api` all-target tests: **484 passed + 4 ignored**.
-- Std interpreter-only `c-api` all-target tests: **466 passed + 4 ignored**.
+- Default/JIT `c-api` all-target tests: **486 passed + 4 ignored**.
+- Std interpreter-only `c-api` all-target tests: **468 passed + 4 ignored**.
 - Strict Clippy passes for both C API feature profiles; the ordinary default,
   std-only, and true thumb no-std profiles remain green.
 - Both explicit cdylib and staticlib builds succeed. The C11 hosts compile with
-  `-Wall -Wextra -Werror`, dynamically link the eight exported v1 symbols,
+  `-Wall -Wextra -Werror`, dynamically link the thirteen exported v1 symbols,
   and exercise assembly, streaming Flat-context filtering, and ELF/CO-RE. The
   ELF host drops its input buffers immediately after construction and prints
-  `core-result=123` after relocating against a target-BTF ELF.
+  `core-result=123` after relocating against a target-BTF ELF. The map host
+  prints `map-state: first=410 second=820 counter=20 scale=8` after proving
+  construction-time capacity and runtime durability.
 - The complete pinned corpus remains unchanged at 137 families, 135 objects
   loaded, 126 fully compatible families, 835/835 entries loaded, and 822/835
   verified (673 strict + 149 privileged-uninitialized). The remaining six
