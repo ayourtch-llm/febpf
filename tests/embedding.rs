@@ -6,8 +6,8 @@ use febpf::insn::{self, alu, class, jmp};
 use febpf::verifier::Config;
 use febpf::{asm, ContextModel, Program, Vm};
 use febpf::{
-    CompletedXdpFrame, ExecutionEnvironment, XdpAction, XdpFrame, XdpMetadata, XdpProvider,
-    XdpRedirect, XdpVerdict,
+    CompletedXdpFrame, ExecutionEnvironment, XdpAction, XdpCapabilities, XdpFrame, XdpMetadata,
+    XdpProvider, XdpRedirect, XdpVerdict,
 };
 use std::collections::VecDeque;
 
@@ -188,6 +188,235 @@ fn xdp_frame_preserves_provider_capacity_and_matches_slice_adapter() {
         assert_eq!(jit_verdict, verdict);
         assert_eq!(jit_frame, frame);
     }
+}
+
+#[test]
+fn xdp_frame_capabilities_resize_borrowed_windows_atomically() {
+    let tail_source = "r6 = r1\n\
+        r2 = 2\n\
+        call xdp_adjust_tail\n\
+        if r0 != 0 goto out\n\
+        r1 = r6\n\
+        r2 = *(u32 *)(r1 + 0)\n\
+        r0 = *(u32 *)(r1 + 4)\n\
+        r0 -= r2\n\
+      out:\n\
+        exit";
+    let config = || Config {
+        ctx_size: 24,
+        ctx_writable: false,
+        xdp: true,
+        ..Config::default()
+    };
+    let mut tail_vm = Vm::new(program(tail_source)).unwrap();
+    tail_vm.verify(config()).unwrap();
+
+    let mut slice = [1, 2];
+    assert_eq!(tail_vm.run_xdp(&mut slice).unwrap(), (-95i64) as u64);
+    assert_eq!(slice, [1, 2]);
+
+    let mut frame = XdpFrame::with_capacity(&[1, 2], 0, 2).unwrap();
+    frame.set_capabilities(XdpCapabilities {
+        adjust_head: false,
+        adjust_tail: true,
+    });
+    {
+        let mut machine = tail_vm.machine_xdp(&mut frame).unwrap();
+        let base = machine.snapshot();
+        while machine.step().unwrap().is_none() {}
+        let finished = machine.snapshot();
+        machine.restore(&base);
+        while machine.step().unwrap().is_none() {}
+        assert_eq!(machine.snapshot(), finished);
+    }
+    assert_eq!(frame.data(), [1, 2, 0, 0]);
+    assert_eq!(frame.tailroom(), 0);
+
+    let mut too_small = XdpFrame::with_capacity(&[1, 2], 0, 1).unwrap();
+    too_small.set_capabilities(XdpCapabilities {
+        adjust_head: false,
+        adjust_tail: true,
+    });
+    assert_eq!(
+        tail_vm
+            .run_xdp_frame(&mut too_small)
+            .unwrap()
+            .return_value,
+        (-22i64) as u64
+    );
+    assert_eq!(too_small.data(), [1, 2]);
+    assert_eq!(too_small.tailroom(), 1);
+
+    let shrink_source = tail_source.replace("r2 = 2", "r2 = -1");
+    let mut shrink_vm = Vm::new(program(&shrink_source)).unwrap();
+    shrink_vm.verify(config()).unwrap();
+    let mut shrink = XdpFrame::with_capacity(&[1, 2, 3], 0, 1).unwrap();
+    shrink.set_capabilities(XdpCapabilities {
+        adjust_head: false,
+        adjust_tail: true,
+    });
+    assert_eq!(
+        shrink_vm.run_xdp_frame(&mut shrink).unwrap().return_value,
+        2
+    );
+    assert_eq!(shrink.data(), [1, 2]);
+    assert_eq!(shrink.tailroom(), 2);
+
+    let excessive_source = tail_source.replace("r2 = 2", "r2 = -4");
+    let mut excessive_vm = Vm::new(program(&excessive_source)).unwrap();
+    excessive_vm.verify(config()).unwrap();
+    let mut excessive = XdpFrame::with_capacity(&[1, 2, 3], 0, 1).unwrap();
+    excessive.set_capabilities(XdpCapabilities {
+        adjust_head: false,
+        adjust_tail: true,
+    });
+    assert_eq!(
+        excessive_vm
+            .run_xdp_frame(&mut excessive)
+            .unwrap()
+            .return_value,
+        (-22i64) as u64
+    );
+    assert_eq!(excessive.data(), [1, 2, 3]);
+    assert_eq!(excessive.tailroom(), 1);
+
+    let mut provider_frame = XdpFrame::with_capacity(&[1, 2], 0, 2).unwrap();
+    provider_frame.set_capabilities(XdpCapabilities {
+        adjust_head: false,
+        adjust_tail: true,
+    });
+    let mut provider = MockXdpProvider {
+        pending: [provider_frame].into_iter().collect(),
+        completed: Vec::new(),
+    };
+    assert_eq!(tail_vm.run_xdp_provider(&mut provider, 1).unwrap().completed, 1);
+    assert_eq!(provider.completed[0].frame.data(), [1, 2, 0, 0]);
+
+    tail_vm.insn_limit = 3;
+    let mut faulted = XdpFrame::with_capacity(&[1, 2], 0, 2).unwrap();
+    faulted.set_capabilities(XdpCapabilities {
+        adjust_head: false,
+        adjust_tail: true,
+    });
+    assert!(tail_vm.run_xdp_frame(&mut faulted).is_err());
+    assert_eq!(faulted.data(), [1, 2, 0, 0]);
+
+    #[cfg(feature = "jit")]
+    {
+        let mut jit_vm = Vm::new(program(tail_source)).unwrap();
+        jit_vm.verify(config()).unwrap();
+        let mut jit_frame = XdpFrame::with_capacity(&[1, 2], 0, 2).unwrap();
+        jit_frame.set_capabilities(XdpCapabilities {
+            adjust_head: false,
+            adjust_tail: true,
+        });
+        assert_eq!(
+            jit_vm
+                .run_xdp_frame_jit(&mut jit_frame)
+                .unwrap()
+                .return_value,
+            4
+        );
+        assert_eq!(jit_frame.data(), frame.data());
+    }
+}
+
+#[test]
+fn xdp_adjust_head_moves_the_active_origin_in_both_directions() {
+    let source = |delta: i32| {
+        format!(
+            "r6 = r1\n\
+             r2 = {delta}\n\
+             call xdp_adjust_head\n\
+             if r0 != 0 goto out\n\
+             r1 = r6\n\
+             r2 = *(u32 *)(r1 + 0)\n\
+             r3 = *(u32 *)(r1 + 4)\n\
+             r4 = r2\n\
+             r4 += 1\n\
+             if r4 > r3 goto out\n\
+             r0 = *(u8 *)(r2 + 0)\n\
+           out:\n\
+             exit"
+        )
+    };
+    let config = || Config {
+        ctx_size: 24,
+        ctx_writable: false,
+        xdp: true,
+        ..Config::default()
+    };
+
+    let mut remove = Vm::new(program(&source(1))).unwrap();
+    remove.verify(config()).unwrap();
+    let mut frame = XdpFrame::with_capacity(&[1, 2, 3], 2, 0).unwrap();
+    frame.set_capabilities(XdpCapabilities {
+        adjust_head: true,
+        adjust_tail: false,
+    });
+    assert_eq!(remove.run_xdp_frame(&mut frame).unwrap().return_value, 2);
+    assert_eq!(frame.data(), [2, 3]);
+    assert_eq!(frame.headroom(), 3);
+
+    let mut unsupported = XdpFrame::with_capacity(&[1, 2, 3], 2, 0).unwrap();
+    unsupported.set_capabilities(XdpCapabilities {
+        adjust_head: false,
+        adjust_tail: true,
+    });
+    assert_eq!(
+        remove
+            .run_xdp_frame(&mut unsupported)
+            .unwrap()
+            .return_value,
+        (-95i64) as u64
+    );
+    assert_eq!(unsupported.data(), [1, 2, 3]);
+    assert_eq!(unsupported.headroom(), 2);
+
+    #[cfg(feature = "jit")]
+    {
+        let mut jit_vm = Vm::new(program(&source(1))).unwrap();
+        jit_vm.verify(config()).unwrap();
+        let mut jit_frame = XdpFrame::with_capacity(&[1, 2, 3], 2, 0).unwrap();
+        jit_frame.set_capabilities(XdpCapabilities {
+            adjust_head: true,
+            adjust_tail: false,
+        });
+        assert_eq!(
+            jit_vm
+                .run_xdp_frame_jit(&mut jit_frame)
+                .unwrap()
+                .return_value,
+            2
+        );
+        assert_eq!(jit_frame.data(), [2, 3]);
+    }
+
+    let mut expose = Vm::new(program(&source(-2))).unwrap();
+    expose.verify(config()).unwrap();
+    let mut frame = XdpFrame::from_storage(vec![9, 8, 1, 2], 2, 4).unwrap();
+    frame.set_capabilities(XdpCapabilities {
+        adjust_head: true,
+        adjust_tail: false,
+    });
+    assert_eq!(expose.run_xdp_frame(&mut frame).unwrap().return_value, 9);
+    assert_eq!(frame.data(), [9, 8, 1, 2]);
+    assert_eq!(frame.headroom(), 0);
+
+    let mut exhausted = XdpFrame::from_storage(vec![0, 1, 2], 1, 3).unwrap();
+    exhausted.set_capabilities(XdpCapabilities {
+        adjust_head: true,
+        adjust_tail: false,
+    });
+    assert_eq!(
+        expose
+            .run_xdp_frame(&mut exhausted)
+            .unwrap()
+            .return_value,
+        (-22i64) as u64
+    );
+    assert_eq!(exhausted.data(), [1, 2]);
+    assert_eq!(exhausted.headroom(), 1);
 }
 
 #[test]

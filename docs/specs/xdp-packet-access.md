@@ -80,6 +80,13 @@ destination and store preserves the packet. A successful store changes packet
 contents but not its extent, so existing `data_end` range proofs remain valid.
 Interpreter and hybrid JIT share this helper implementation and resource resolver.
 
+`xdp_adjust_head` (#44) and `xdp_adjust_tail` (#65) invalidate every prior
+packet/data-end alias at verification time. Provider frames may opt into either
+operation independently. Successful signed-32-bit deltas move the borrowed
+active bounds; tail growth zeroes newly exposed bytes. Missing capability
+returns `-EOPNOTSUPP`, capacity exhaustion returns `-EINVAL`, and failures do
+not mutate storage or bounds. Plain slice execution has no resize capability.
+
 `redirect` (#23) accepts scalar interface-index and flags arguments under the
 explicit XDP model. Zero flags produce the `XDP_REDIRECT` verdict; unsupported
 nonzero flags produce `XDP_ABORTED`. The provider frame API also records the

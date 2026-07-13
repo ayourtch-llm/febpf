@@ -306,6 +306,50 @@ impl<'a> ExecutionEnvironment<'a> {
         }
     }
 
+    pub(crate) fn adjust_head(&mut self, delta: i32) -> Result<(), i32> {
+        let packet = self.packet.as_mut().ok_or(-14)?; // -EFAULT
+        if !packet.capabilities.adjust_head {
+            return Err(-95); // -EOPNOTSUPP
+        }
+        if delta >= 0 {
+            let amount = delta as usize;
+            if amount > packet.len() {
+                return Err(-22); // -EINVAL
+            }
+            packet.data_start += amount;
+        } else {
+            let amount = delta.unsigned_abs() as usize;
+            if amount > packet.data_start {
+                return Err(-22);
+            }
+            packet.data_start -= amount;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn adjust_tail(&mut self, delta: i32) -> Result<(), i32> {
+        let packet = self.packet.as_mut().ok_or(-14)?; // -EFAULT
+        if !packet.capabilities.adjust_tail {
+            return Err(-95); // -EOPNOTSUPP
+        }
+        if delta >= 0 {
+            let amount = delta as usize;
+            let new_end = packet.data_end.checked_add(amount).ok_or(-22)?;
+            if new_end > packet.storage.len() {
+                return Err(-22); // -EINVAL
+            }
+            packet.storage[packet.data_end..new_end].fill(0);
+            packet.data_end = new_end;
+        } else {
+            let amount = delta.unsigned_abs() as usize;
+            if amount > packet.len() {
+                return Err(-22);
+            }
+            packet.data_end -= amount;
+        }
+        Ok(())
+    }
+
     pub(crate) fn memory_parts(&mut self) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
         let context = self.context.as_mut_slice();
         let packet: &mut [u8] = match &mut self.packet {

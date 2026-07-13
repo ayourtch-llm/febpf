@@ -75,12 +75,11 @@ Direct guest accesses use virtual packet offsets relative to the current
 window. Helper byte copies, legacy loads, interpreter deferred accesses, user
 helper `MemBus`, and JIT callbacks all resolve through this single resource.
 
-The window carries explicit head/tail capability bits, but this refactor does
-not yet activate them. `xdp_adjust_head` and `xdp_adjust_tail` therefore remain
-honestly `-EOPNOTSUPP` for every adapter. The next resize batch may mutate the
-borrowed bounds only when the installed window advertises the corresponding
-capability; bounds failures must be atomic and tail growth must zero newly
-exposed bytes. A slice adapter installs no resize capability.
+The window carries explicit head/tail capability bits. `xdp_adjust_head` and
+`xdp_adjust_tail` mutate borrowed bounds only when the installed window
+advertises the corresponding capability. Bounds failures are atomic and tail
+growth zeroes newly exposed bytes. A slice adapter installs no resize
+capability and therefore retains `-EOPNOTSUPP`.
 
 ## Hooks and completion
 

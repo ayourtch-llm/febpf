@@ -856,8 +856,8 @@ impl Vm {
     /// Execute one provider-owned XDP frame.
     ///
     /// The invocation borrows the provider's storage and active bounds
-    /// directly. Resize helpers still retain their standalone
-    /// `-EOPNOTSUPP` behavior until the capability slot is wired to them.
+    /// directly. Resize helpers mutate the active bounds only when the frame
+    /// advertises the corresponding capability.
     pub fn run_xdp_frame(
         &mut self,
         frame: &mut crate::packet::XdpFrame,
@@ -2685,14 +2685,14 @@ impl<'a> Machine<'a> {
                     (-12i64) as u64 // -ENOMEM, matching skb_ensure_writable
                 }
             }
-            helpers::id::XDP_ADJUST_HEAD | helpers::id::XDP_ADJUST_TAIL => {
-                // The standalone VM has no provider-owned XDP headroom or
-                // resizing boundary and must not fabricate either. The
-                // verifier still invalidates all packet-pointer aliases,
-                // exactly as the kernel does across this call, regardless of
-                // its runtime result.
-                (-95i64) as u64 // -EOPNOTSUPP
-            }
+            helpers::id::XDP_ADJUST_HEAD => self
+                .env
+                .adjust_head(args[1] as u32 as i32)
+                .map_or_else(|errno| errno as i64 as u64, |()| 0),
+            helpers::id::XDP_ADJUST_TAIL => self
+                .env
+                .adjust_tail(args[1] as u32 as i32)
+                .map_or_else(|errno| errno as i64 as u64, |()| 0),
             helpers::id::GET_STACKID => {
                 // (ctx, map, flags). Deterministic model: the id is the FNV-1a
                 // hash of the call stack's instruction indices, masked to 31

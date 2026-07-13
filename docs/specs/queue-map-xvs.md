@@ -18,10 +18,10 @@ kernel differential translation uses map type 22.
 The same production object requires `bpf_xdp_adjust_head` and
 `bpf_xdp_adjust_tail`. Verification uses their exact XDP context signatures
 and invalidates every prior packet/data-end alias after either call, regardless
-of the runtime result. Standalone execution returns `-EOPNOTSUPP`: febpf has no
-provider-owned packet headroom or resizing boundary and does not invent one. A
-future packet-provider backend may supply real resizing semantics without
-changing the helper contracts.
+of the runtime result. The slice adapter returns `-EOPNOTSUPP` and never
+invents capacity. A provider-owned `XdpFrame` can explicitly authorize head
+and/or tail adjustment; the shared invocation packet window then updates
+bounds atomically without changing the helper contracts.
 
 Clang also emits both 64-bit and MOV32-mediated `data_end - data` forms in this
 dataplane. febpf retains packet provenance through a MOV32 only to recognize

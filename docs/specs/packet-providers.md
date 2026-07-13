@@ -58,13 +58,19 @@ payload.
 
 ## Capacity contract
 
-Headroom and tailroom are descriptive in this first boundary version. The VM
-does not yet have an active provider-capability callback, so
-`xdp_adjust_head` and `xdp_adjust_tail` continue to return `-EOPNOTSUPP` and
-leave the active window and spare capacity unchanged. The next resizing batch
-must make capability opt-in explicit, update the virtual packet bounds
-atomically, and preserve the existing standalone behavior when capability is
-absent.
+Headroom and tailroom become mutable only when an `XdpFrame` advertises the
+corresponding `XdpCapabilities` bit. `xdp_adjust_head` moves the active start;
+positive deltas consume packet bytes and negative deltas expose provider
+headroom. `xdp_adjust_tail` moves the active end; positive deltas consume
+tailroom and zero every newly exposed byte, while negative deltas shrink the
+packet. Deltas use the helper's signed-32-bit interpretation.
+
+An unsupported capability returns `-EOPNOTSUPP`. A move beyond the active
+packet or available capacity returns `-EINVAL`. Every failure is atomic. The
+slice adapter advertises no resize capability, preserving its standalone
+behavior. The verifier invalidates all packet/data-end aliases across either
+helper regardless of the runtime result; programs must reload them from
+`xdp_md` and prove fresh bounds.
 
 Redirect delivery records intent only; it never transmits a frame. An AF_XDP
 provider will decide whether a recorded destination is owned and deliver or

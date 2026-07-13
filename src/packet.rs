@@ -141,8 +141,7 @@ pub struct XdpMetadata {
 
 /// Packet-window mutations an invocation provider can support.
 ///
-/// These bits are reserved by the environment boundary; resize helpers do not
-/// consume them yet and continue to return `-EOPNOTSUPP`.
+/// A disabled operation returns `-EOPNOTSUPP` without changing the frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct XdpCapabilities {
     pub adjust_head: bool,
