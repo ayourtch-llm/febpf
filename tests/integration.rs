@@ -3400,20 +3400,21 @@ fn explain_null_deref_names_origin_and_branch() {
         r2 = r10
         r2 += -4
         call map_lookup_elem
-        r1 = *(u32 *)(r10 - 4)
-        if r1 > 7 goto bad
+        r6 = r0
+        call ktime_get_ns
+        if r0 > 7 goto bad
         r0 = 0
         exit
     bad:
-        r0 = *(u64 *)(r0)
+        r0 = *(u64 *)(r6)
         exit",
     );
-    assert_eq!(e.pc, 11);
-    assert!(text.contains("->  11: r0 = *(u64 *)(r0)"), "{text}");
+    assert_eq!(e.pc, 12);
+    assert!(text.contains("->  12: r0 = *(u64 *)(r6)"), "{text}");
     assert!(text.contains("[taken]"), "{text}");
     assert!(text.contains("^ map value pointer may be NULL"), "{text}");
     assert!(
-        text.contains("r0 may be NULL here: it was returned by map_lookup_elem at insn 6"),
+        text.contains("r6 may be NULL here: it was returned by map_lookup_elem at insn 6"),
         "{text}"
     );
 }
@@ -3639,6 +3640,45 @@ fn jmp32_low_half_refinement_propagates_to_equal_copies_and_spills() {
         ..Default::default()
     })
     .expect("scalar ids should carry low-half facts to copies and aligned spills");
+}
+
+#[test]
+fn jmp32_refinement_propagates_through_aligned_u32_stack_reload() {
+    let mut vm = Vm::new(program(
+        "r1 = *(u64 *)(r1 + 0)
+         *(u32 *)(r10 - 8) = r1
+         r2 = *(u32 *)(r10 - 8)
+         if w2 != 6 goto out
+         r3 = *(u32 *)(r10 - 8)
+         if w3 != 6 goto bad
+        out:
+         r0 = 0
+         exit
+        bad:
+         r0 = r4
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 8,
+        ..Default::default()
+    })
+    .expect("aligned u32 stack scalars should retain branch refinement");
+
+    let e = verify_err_ctx(
+        "r1 = *(u64 *)(r1 + 0)
+         *(u32 *)(r10 - 8) = r1
+         *(u8 *)(r10 - 7) = 0
+         r2 = *(u32 *)(r10 - 8)
+         if w2 == 6 goto bad
+         r0 = 0
+         exit
+        bad:
+         r0 = r3
+         exit",
+        8,
+    );
+    assert!(e.contains("uninitialized"), "overlap retained stale scalar facts: {e}");
 }
 
 #[test]

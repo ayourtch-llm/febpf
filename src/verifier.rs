@@ -721,6 +721,10 @@ const SLOTS: usize = STACK_SIZE / 8;
 enum SlotState {
     /// Full 8-byte spill of a register (via aligned 8-byte store).
     Spill(RegState),
+    /// Exact aligned 32-bit scalar store in the low or high half of a slot.
+    /// Other initialized bytes may coexist; a subsequent non-exact store
+    /// conservatively drops the scalar value to byte-granular initialization.
+    Scalar32 { value: Scalar, half: u8, init: u8 },
     /// Byte-granular data; bit i set = byte i initialized.
     Bytes(u8),
 }
@@ -731,6 +735,7 @@ impl SlotState {
     fn init_mask(&self) -> u8 {
         match self {
             SlotState::Spill(_) => 0xff,
+            SlotState::Scalar32 { init, .. } => *init,
             SlotState::Bytes(m) => *m,
         }
     }
@@ -738,6 +743,19 @@ impl SlotState {
         match (old, self) {
             (SlotState::Spill(o), SlotState::Spill(n)) => n.subsumed_by(o),
             (SlotState::Spill(_), _) => false,
+            (
+                SlotState::Scalar32 {
+                    value: o,
+                    half: oh,
+                    init: oi,
+                },
+                SlotState::Scalar32 {
+                    value: n,
+                    half: nh,
+                    init: ni,
+                },
+            ) if oh == nh => oi & !ni == 0 && n.is_subset_of(o),
+            (SlotState::Scalar32 { .. }, _) => false,
             (SlotState::Bytes(om), n) => {
                 // old byte pattern must be covered: every byte old had
                 // initialized must be initialized in new
@@ -873,7 +891,7 @@ impl VState {
                     (
                         SlotState::Spill(RegState::Scalar(_)),
                         SlotState::Spill(RegState::Scalar(_))
-                    )
+                    ) | (SlotState::Scalar32 { .. }, SlotState::Scalar32 { .. })
                 )
                     && of.precise_spills & (1 << s) == 0
                 {
@@ -952,6 +970,9 @@ impl VState {
                 match &f.stack[s] {
                     SlotState::Spill(r) => {
                         let _ = write!(out, " [{off}]={r}");
+                    }
+                    SlotState::Scalar32 { value, half, init } => {
+                        let _ = write!(out, " [{off}]=scalar32(h{half},{init:08b},{value})");
                     }
                     SlotState::Bytes(m) => {
                         let _ = write!(out, " [{off}]=mm({m:08b})");
@@ -2550,10 +2571,9 @@ impl<'a> Verifier<'a> {
                 }
                 if checkpoint.state.frames.len() == 1 {
                     let frame = checkpoint.state.cur_mut();
-                    // Keep compression disabled until packet/control
-                    // correlation is represented transitively. Applying the
-                    // accumulated masks here currently exposes the xvs pc-494
-                    // counterexample; finalized ancestry itself is retained.
+                    // Keep compression disabled until every transitive
+                    // dependency is represented. Accumulated masks still
+                    // prune a reachable nullable-pointer failure path.
                     frame.precise_regs = u16::MAX;
                     frame.precise_spills = u64::MAX;
                 } else {
@@ -2660,9 +2680,13 @@ impl<'a> Verifier<'a> {
                         continue;
                     }
                     *regs &= !bit(ins.dst);
-                    if ins.src == REG_FP && ins.mem_size() == 8 && ins.off < 0 {
+                    if ins.src == REG_FP
+                        && matches!(ins.mem_size(), 4 | 8)
+                        && ins.off < 0
+                    {
                         let byte = match usize::try_from(STACK_SIZE as i64 + ins.off as i64) {
-                            Ok(byte) if byte.is_multiple_of(8) && byte < STACK_SIZE => byte,
+                            Ok(byte)
+                                if byte.is_multiple_of(ins.mem_size()) && byte < STACK_SIZE => byte,
                             _ => return false,
                         };
                         *spills |= 1 << (byte / 8);
@@ -2682,7 +2706,9 @@ impl<'a> Verifier<'a> {
                     if (*spills as u128) & touched == 0 {
                         continue;
                     }
-                    if ins.mem_size() != 8 || !byte.is_multiple_of(8) {
+                    if !matches!(ins.mem_size(), 4 | 8)
+                        || !byte.is_multiple_of(ins.mem_size())
+                    {
                         return false;
                     }
                     *spills &= !(1 << (byte / 8));
@@ -2745,6 +2771,11 @@ impl<'a> Verifier<'a> {
             for (slot, &scalar_id) in frame.stack.iter().zip(&frame.spill_ids) {
                 if scalar_id == id {
                     if let SlotState::Spill(RegState::Scalar(other)) = slot {
+                        let Some(meet) = Self::scalar_meet(common, *other) else {
+                            return;
+                        };
+                        common = meet;
+                    } else if let SlotState::Scalar32 { value: other, .. } = slot {
                         let Some(meet) = Self::scalar_meet(common, *other) else {
                             return;
                         };
@@ -3228,11 +3259,27 @@ impl<'a> Verifier<'a> {
         if matches!(val, RegState::Ptr(_)) {
             return Err(self.err(pc, "pointer spills must be 8-byte aligned stores"));
         }
+        if size == 4 && base.is_multiple_of(4) {
+            if let RegState::Scalar(value) = val {
+                let slot = base / 8;
+                let half = ((base % 8) / 4) as u8;
+                let written = 0x0fu8 << (half * 4);
+                let init = stack[slot].init_mask() | written;
+                stack[slot] = SlotState::Scalar32 {
+                    value: value.truncate32(),
+                    half,
+                    init,
+                };
+                frame.spill_ids[slot] = scalar_id;
+                return Ok(());
+            }
+        }
         for b in base..base + size as usize {
             let slot = b / 8;
             let bit = 1u8 << (b % 8);
             stack[slot] = match stack[slot] {
                 SlotState::Spill(_) => SlotState::Bytes(0xff), // overwrite keeps init
+                SlotState::Scalar32 { init, .. } => SlotState::Bytes(init | bit),
                 SlotState::Bytes(m) => SlotState::Bytes(m | bit),
             };
             frame.spill_ids[slot] = 0;
@@ -3253,6 +3300,18 @@ impl<'a> Verifier<'a> {
         if size == 8 && base.is_multiple_of(8) {
             match stack[base / 8] {
                 SlotState::Spill(v) => return Ok(v),
+                SlotState::Scalar32 { init: 0xff, .. } => {
+                    return Ok(RegState::Scalar(Scalar::unknown()));
+                }
+                SlotState::Scalar32 { .. } => {
+                    if self.cfg.uninit_stack == UninitStackPolicy::Allow {
+                        return Ok(RegState::Scalar(Scalar::unknown()));
+                    }
+                    return Err(self.err(
+                        pc,
+                        format!("read of partially uninitialized stack at off {off}"),
+                    ));
+                }
                 SlotState::Bytes(0xff) => return Ok(RegState::Scalar(Scalar::unknown())),
                 SlotState::Bytes(_) => {
                     if self.cfg.uninit_stack == UninitStackPolicy::Allow {
@@ -3262,6 +3321,13 @@ impl<'a> Verifier<'a> {
                         pc,
                         format!("read of partially uninitialized stack at off {off}"),
                     ));
+                }
+            }
+        }
+        if size == 4 && base.is_multiple_of(4) {
+            if let SlotState::Scalar32 { value, half, .. } = stack[base / 8] {
+                if half == ((base % 8) / 4) as u8 {
+                    return Ok(RegState::Scalar(value));
                 }
             }
         }
@@ -4100,6 +4166,8 @@ impl<'a> Verifier<'a> {
                 if *scalar_id == id {
                     if let SlotState::Spill(RegState::Scalar(scalar)) = slot {
                         *scalar = value;
+                    } else if let SlotState::Scalar32 { value: scalar, .. } = slot {
+                        *scalar = value.truncate32();
                     }
                 }
             }
@@ -4298,7 +4366,17 @@ impl<'a> Verifier<'a> {
                     self.check_mem_access(&state, pc, &p, ins.off as i64, size, false, true)?;
                 self.note_ldx_class(pc, matches!(p.kind, PtrKind::BtfId { .. }))?;
                 let loaded_id = stack
-                    .filter(|(_, off)| size == 8 && (STACK_SIZE as i64 + *off) % 8 == 0)
+                    .filter(|(frame, off)| {
+                        let base = (STACK_SIZE as i64 + *off) as usize;
+                        (size == 8 && base.is_multiple_of(8))
+                            || (size == 4
+                                && base.is_multiple_of(4)
+                                && matches!(
+                                    state.frames[*frame].stack[base / 8],
+                                    SlotState::Scalar32 { half, .. }
+                                        if half == ((base % 8) / 4) as u8
+                                ))
+                    })
                     .map(|(frame, off)| {
                         state.frames[frame].spill_ids
                             [((STACK_SIZE as i64 + off) as usize) / 8]
@@ -4369,11 +4447,19 @@ impl<'a> Verifier<'a> {
                     ));
                 }
                 if let Some((frame, off)) = self.check_mem_access(&state, pc, &p, ins.off as i64, size, true, true)? {
-                    let scalar_id = if cls == class::STX {
+                    let mut scalar_id = if cls == class::STX {
                         state.cur().scalar_ids[ins.src as usize]
                     } else {
                         0
                     };
+                    let stack_base = (STACK_SIZE as i64 + off) as usize;
+                    let exact_scalar_spill = matches!(size, 4 | 8)
+                        && stack_base.is_multiple_of(size as usize)
+                        && matches!(val, RegState::Scalar(s) if !s.is_const());
+                    if scalar_id == 0 && cls == class::STX && exact_scalar_spill {
+                        scalar_id = self.fresh_scalar_id();
+                        state.cur_mut().scalar_ids[ins.src as usize] = scalar_id;
+                    }
                     self.stack_store(&mut state, pc, frame, off, size, val, scalar_id)?
                 }
                 Ok(StepOutcome::Next(vec![(pc + 1, state)]))
@@ -5057,5 +5143,23 @@ mod precision_tests {
         );
         assert_eq!(v.checkpoints[0].state.cur().precise_regs, u16::MAX);
         assert_eq!(v.checkpoints[0].state.cur().precise_spills, u64::MAX);
+    }
+
+    #[test]
+    fn scalar32_subsumption_preserves_stack_initialization() {
+        let value = Scalar::unknown().truncate32();
+        let fully_initialized = SlotState::Scalar32 {
+            value,
+            half: 0,
+            init: 0xff,
+        };
+        let partially_initialized = SlotState::Scalar32 {
+            value,
+            half: 0,
+            init: 0x0f,
+        };
+
+        assert!(!partially_initialized.subsumed_by(&fully_initialized));
+        assert!(fully_initialized.subsumed_by(&partially_initialized));
     }
 }
