@@ -38,8 +38,9 @@ committed as `3f9bb65` (`xdp: cover xvs queue dataplane`). A tttt recurring
 job named `cron-1` injects the continuation plan every 30 minutes with
 `if_busy=wait`. The fully validated diagnostic/ALU32 continuation batch below
 is committed as `34877b9` (`verifier: diagnose xvs complexity frontier`). At
-checkpoint writing HEAD is `34877b9` and the worktree is clean. No test/build/
-scanner process or subagent is active.
+checkpoint writing the incremental branch-free-tail pruning batch is committed
+as `11a034e` (`verifier: prune branch-free exit tails`), HEAD is `11a034e`, and
+the worktree is clean. No test/build/scanner process or subagent is active.
 
 Completed and committed in `3f9bb65`:
 
@@ -152,14 +153,13 @@ In-progress investigation after `3f9bb65` (not committed):
 
 Immediate resume order:
 
-1. Commit the validated branch-free-tail projection batch cleanly.
-2. Implement real precision dependencies/relational partitioning for earlier
+1. Implement real precision dependencies/relational partitioning for earlier
    conditional joins; do not reintroduce global syntactic liveness or generic
    widening.
-3. Use both xvs entries to measure convergence without raising the one-million
+2. Use both xvs entries to measure convergence without raising the one-million
    budget. Add adversarial dead/live register, stack-initialization, pointer,
    nullability, packet-range, and equality-correlation tests.
-4. Run the full matrix and 137-family scan, document exact results, and commit
+3. Run the full matrix and 137-family scan, document exact results, and commit
    the liveness/pruning batch cleanly. Then select the next production lane.
 
 Continuation batch completed after this checkpoint was written:
