@@ -42,6 +42,14 @@ checkpoint writing the incremental branch-free-tail pruning batch is committed
 as `11a034e` (`verifier: prune branch-free exit tails`), HEAD is `11a034e`, and
 the worktree is clean. No test/build/scanner process or subagent is active.
 
+Refresh update: the checkpoint follow-up documentation is committed as
+`912963a`, and the rejected packet-range ordering experiment is documented in
+`e5a7db2`. At refresh scheduling HEAD is `e5a7db2`; the worktree is clean and
+no test, build, scanner, subagent, or external terminal collaborator is active.
+The newest authoritative resume action remains explicit relational precision/
+partition tracking for conditional joins. Do not redo the three removed global
+join/liveness prototypes or independent packet-range ordering.
+
 Completed and committed in `3f9bb65`:
 
 - Added immutable production upstream `davidcoles/xvs` v0.2.10 at commit
