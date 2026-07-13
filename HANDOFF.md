@@ -121,12 +121,21 @@ In-progress investigation after `3f9bb65` (not committed):
   its register/slot is syntactically dead: verifier precision/equality
   dependencies require Linux-style precision backtracking or an equivalent
   relational partition before such pruning is safe enough for this corpus.
+- A promising narrower next step was identified after the third prototype:
+  pc 3468 is the start of a deterministic acyclic tail (`map load`, fixed
+  stack load, unconditional jump, `redirect_map`, exit), and pc 4787 is the
+  exit itself. Implement state projection only at prune points whose entire
+  continuation is a branch-free acyclic tail, with live operands computed
+  exactly backward through that tail and helper uses taken from `HelperSig`.
+  Treat memory/unknown helper arguments and local calls conservatively, and
+  fall back to full-state comparison everywhere else. This should capture the
+  observed 4096-state/terminal explosion without touching the earlier packet
+  parser where global liveness caused the pc-494 false rejection.
 
 Immediate resume order:
 
-1. Implement conservative backward liveness/precision for prune comparisons,
-   starting with registers and then fixed stack bytes. Never discard a fact
-   that any continuation can read; model helpers and local calls conservatively.
+1. Implement and adversarially test branch-free acyclic-tail state projection
+   as described above. Do not reintroduce global syntactic liveness.
 2. Use both xvs entries to measure convergence without raising the one-million
    budget. Add adversarial dead/live register, stack-initialization, pointer,
    nullability, packet-range, and equality-correlation tests.
