@@ -30,11 +30,13 @@ pub mod id {
     pub const GET_CURRENT_TASK: u32 = 35;
     pub const CURRENT_TASK_UNDER_CGROUP: u32 = 37;
     pub const SKB_PULL_DATA: u32 = 39;
+    pub const XDP_ADJUST_HEAD: u32 = 44;
     pub const PROBE_READ_STR: u32 = 45;
     pub const GET_SOCKET_COOKIE: u32 = 46;
     pub const REDIRECT_MAP: u32 = 51;
     pub const GET_STACK: u32 = 67;
     pub const FIB_LOOKUP: u32 = 69;
+    pub const MAP_PUSH_ELEM: u32 = 87;
     pub const SPIN_LOCK: u32 = 93;
     pub const SPIN_UNLOCK: u32 = 94;
     pub const PROBE_READ_USER: u32 = 112;
@@ -149,6 +151,11 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
         id::MAP_DELETE_ELEM => HelperSig {
             name: "map_delete_elem",
             args: [ConstMapPtr, MapKey, None, None, None],
+            ret: RetKind::Scalar,
+        },
+        id::MAP_PUSH_ELEM => HelperSig {
+            name: "map_push_elem",
+            args: [ConstMapPtr, MapValue, Scalar, None, None],
             ret: RetKind::Scalar,
         },
         id::KTIME_GET_NS => HelperSig {
@@ -329,6 +336,11 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [SkbCtxPtr, Scalar, None, None, None],
             ret: RetKind::Scalar,
         },
+        id::XDP_ADJUST_HEAD => HelperSig {
+            name: "xdp_adjust_head",
+            args: [XdpCtxPtr, Scalar, None, None, None],
+            ret: RetKind::Scalar,
+        },
         id::PERF_EVENT_OUTPUT => HelperSig {
             name: "perf_event_output",
             // (ctx, map, flags, data, size); data is a readable region of `size`
@@ -448,6 +460,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::CSUM_DIFF,
         id::GET_STACK,
         id::FIB_LOOKUP,
+        id::MAP_PUSH_ELEM,
         id::SPIN_LOCK,
         id::SPIN_UNLOCK,
         id::PROBE_READ,
@@ -463,6 +476,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::SEQ_WRITE,
         id::CURRENT_TASK_UNDER_CGROUP,
         id::SKB_PULL_DATA,
+        id::XDP_ADJUST_HEAD,
         id::PERF_EVENT_OUTPUT,
         id::GET_FUNC_IP,
         id::TRACE_VPRINTK,

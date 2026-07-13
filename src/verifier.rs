@@ -3355,7 +3355,10 @@ impl<'a> Verifier<'a> {
         if let Some(id) = consume_id {
             Self::mark_consumed(state, id);
         }
-        if hid == crate::helpers::id::SKB_PULL_DATA {
+        if matches!(
+            hid,
+            crate::helpers::id::SKB_PULL_DATA | crate::helpers::id::XDP_ADJUST_HEAD
+        ) {
             Self::invalidate_packet_ptrs(state);
         }
 
@@ -3938,6 +3941,8 @@ impl<'a> Verifier<'a> {
     }
 
     fn step_alu(&mut self, pc: usize, state: &mut VState, ins: Insn) -> Result<(), VerifyError> {
+        const PACKET32_ID: u32 = u32::MAX - 1;
+        const PACKET_END32_ID: u32 = u32::MAX;
         let is32 = ins.class() == class::ALU;
         let op = ins.op();
         let dst_scalar_id = state.cur().scalar_ids[ins.dst as usize];
@@ -3958,6 +3963,7 @@ impl<'a> Verifier<'a> {
 
         if op == alu::MOV {
             let mut scalar_copy = false;
+            let mut packet32_copy = None;
             let v = match b {
                 RegState::Scalar(s) => {
                     let original = s;
@@ -3982,6 +3988,17 @@ impl<'a> Verifier<'a> {
                         return Err(self.err(pc, "sign-extending move of a pointer"));
                     }
                     if is32 {
+                        // XDP encodes data/data_end as u32 context fields.
+                        // Clang can copy either through a MOV32 before forming
+                        // their difference; retain only this packet provenance
+                        // so the narrowly allowed subtraction below still
+                        // recognizes the pair. Other ALU32 pointer operations
+                        // remain rejected.
+                        packet32_copy = match p.kind {
+                            PtrKind::Packet { .. } => Some(PACKET32_ID),
+                            PtrKind::PacketEnd => Some(PACKET_END32_ID),
+                            _ => None,
+                        };
                         self.warnings.push(format!(
                             "insn {pc}: 32-bit move truncates pointer r{} to scalar",
                             ins.src
@@ -3994,7 +4011,9 @@ impl<'a> Verifier<'a> {
                 RegState::Uninit => unreachable!(),
             };
             self.write_reg(state, pc, ins.dst, v)?;
-            if scalar_copy {
+            if let Some(id) = packet32_copy {
+                state.cur_mut().scalar_ids[ins.dst as usize] = id;
+            } else if scalar_copy {
                 let id = if src_scalar_id == 0 {
                     let id = self.fresh_scalar_id();
                     state.cur_mut().scalar_ids[ins.src as usize] = id;
@@ -4008,6 +4027,19 @@ impl<'a> Verifier<'a> {
         }
 
         let a = self.read_reg(state, pc, ins.dst)?;
+
+        if is32
+            && op == alu::SUB
+            && dst_scalar_id == PACKET_END32_ID
+            && src_scalar_id == PACKET32_ID
+        {
+            return self.write_reg(
+                state,
+                pc,
+                ins.dst,
+                RegState::Scalar(Scalar::from_tnum(Tnum::unknown().cast(4))),
+            );
+        }
 
         // pointer arithmetic
         let a_ptr = matches!(a, RegState::Ptr(_));
@@ -4045,6 +4077,16 @@ impl<'a> Verifier<'a> {
                 alu::SUB => {
                     match (a, b) {
                         (RegState::Ptr(pa), RegState::Ptr(pb)) => {
+                            if matches!(pa.kind, PtrKind::PacketEnd)
+                                && matches!(pb.kind, PtrKind::Packet { .. })
+                            {
+                                return self.write_reg(
+                                    state,
+                                    pc,
+                                    ins.dst,
+                                    RegState::Scalar(Scalar::unknown()),
+                                );
+                            }
                             if core::mem::discriminant(&pa.kind) != core::mem::discriminant(&pb.kind)
                             {
                                 return Err(self.err(

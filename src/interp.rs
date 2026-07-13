@@ -2310,6 +2310,14 @@ impl<'a> Machine<'a> {
                     Err(e) => e as u64,
                 }
             }
+            helpers::id::MAP_PUSH_ELEM => {
+                let m = self.map_from_ptr(args[0])?;
+                let val = self.read_bytes(args[1], self.vm.maps[m].def.value_size as usize)?;
+                match self.vm.maps[m].push(&val, args[2]) {
+                    Ok(()) => 0,
+                    Err(e) => e as u64,
+                }
+            }
             helpers::id::KTIME_GET_NS => {
                 self.nondet_calls += 1; // wall clock: replay cannot reproduce it
                 self.vm.start.elapsed_nanos()
@@ -2535,6 +2543,13 @@ impl<'a> Machine<'a> {
                 } else {
                     (-12i64) as u64 // -ENOMEM, matching skb_ensure_writable
                 }
+            }
+            helpers::id::XDP_ADJUST_HEAD => {
+                // The standalone VM has no provider-owned XDP headroom and
+                // must not fabricate it. The verifier still invalidates all
+                // packet-pointer aliases, exactly as the kernel does across
+                // this call, regardless of its runtime result.
+                (-95i64) as u64 // -EOPNOTSUPP
             }
             helpers::id::GET_STACKID => {
                 // (ctx, map, flags). Deterministic model: the id is the FNV-1a

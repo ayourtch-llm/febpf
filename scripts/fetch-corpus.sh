@@ -42,6 +42,7 @@ libbpf-bootstrap|libbpf/libbpf-bootstrap|fac4e8ddf011aead8e14962bf8db74542331264
 bcc|iovisor/bcc|v0.31.0|052022b0d128f56405b0c4fab818b7479fd0eacc|libbpf-tools/*.bpf.c
 cilium-ebpf|cilium/ebpf|v0.21.0|fd33a781ea9ebf9d1bff748707793deccc412c05|testdata/btf_map_init.c
 xdp-tools|xdp-project/xdp-tools|v1.6.3|8fbad9f0af621a22aa87ff2520b3735915b1f0fd|lib/libxdp/xsk_def_xdp_prog.c lib/libxdp/xsk_def_xdp_prog_5.3.c lib/util/*.bpf.c xdp-bench/*.bpf.c xdp-dump/xdpdump_bpf.c xdp-dump/xdpdump_xdp.c xdp-filter/xdpfilt_*.c xdp-forward/*.bpf.c xdp-monitor/*.bpf.c xdp-trafficgen/*.bpf.c
+xvs|davidcoles/xvs|v0.2.10|6b6011b2c9a7176de5490a8b1c6d829de26724d6|bpf/layer3.c
 inspektor-gadget|inspektor-gadget/inspektor-gadget|v0.54.0|0c733324b97dbbbe8d85b64ae93622a86fe7bf45|gadgets/*/program.bpf.c
 "
 
@@ -270,13 +271,20 @@ while IFS='|' read -r name path pin expected globs; do
 
     # Extra include dirs some repos want (their own headers next to sources).
     repo_inc=""
-    for d in "$dest" "$dest/headers" "$dest/libbpf-tools" "$dest/examples/c" "$dest/testdata"; do
+    for d in "$dest" "$dest/bpf" "$dest/headers" "$dest/libbpf-tools" "$dest/examples/c" "$dest/testdata"; do
         [ -d "$d" ] && repo_inc="$repo_inc -I$d"
     done
     if [ "$name" = inspektor-gadget ]; then
         # The pinned gadget sources use their checked-in architecture and
         # shared gadget headers; keep these ahead of the generic corpus headers.
         repo_inc="-I$dest/include/gadget/amd64 -I$dest/include $repo_inc"
+    fi
+    repo_cflags=""
+    if [ "$name" = xvs ]; then
+        # Match xvs's release Makefile defaults. Its BPF source intentionally
+        # uses glibc netinet headers; select the installed x86_64 stubs instead
+        # of requiring the optional 32-bit libc development package.
+        repo_cflags="-D__x86_64__ -DMAX_CPU_SUPPORT=8192 -DFLOW_QUEUE_SIZE=10000 -DICMP_QUEUE_SIZE=1000"
     fi
 
     printf '%s\n' "$files" | while read -r src; do
@@ -296,10 +304,10 @@ while IFS='|' read -r name path pin expected globs; do
         fi
         {
             echo "### $name: $src -> $out"
-            echo "clang $CFLAGS $compile_includes -c $src -o $out"
+            echo "clang $CFLAGS $repo_cflags $compile_includes -c $src -o $out"
         } >> "$BUILD_LOG"
         # shellcheck disable=SC2086
-        if clang $CFLAGS $compile_includes -c "$src" -o "$out" >>"$BUILD_LOG" 2>&1; then
+        if clang $CFLAGS $repo_cflags $compile_includes -c "$src" -o "$out" >>"$BUILD_LOG" 2>&1; then
             n_built=$((n_built + 1))
             echo "  built: $(basename "$out")"
         else

@@ -69,6 +69,8 @@ pub enum MapKind {
     DevMapHash,
     /// Queue-indexed AF_XDP socket map used by `bpf_redirect_map`.
     XskMap,
+    /// First-in, first-out value container used by `bpf_map_push_elem`.
+    Queue,
 }
 
 /// Userspace update mode for a map-in-map entry, matching the kernel's
@@ -136,6 +138,7 @@ impl core::fmt::Display for MapKind {
             MapKind::CpuMap => "cpumap",
             MapKind::DevMapHash => "devmap_hash",
             MapKind::XskMap => "xskmap",
+            MapKind::Queue => "queue",
         };
         write!(f, "{s}")
     }
@@ -238,6 +241,7 @@ enum Storage {
         /// Monotonic tick source for LRU recency.
         tick: u64,
     },
+    Queue(Vec<Box<[u8]>>),
     RingBuf {
         capacity: u32,
         reserved: Vec<Reservation>,
@@ -443,6 +447,14 @@ impl Map {
                 },
                 Vec::new(),
             )
+        } else if def.kind == MapKind::Queue {
+            if def.key_size != 0 || !def.init.is_empty() {
+                return Err(format!(
+                    "queue map '{}' requires key_size=0 and no initializer",
+                    def.name
+                ));
+            }
+            (Storage::Queue(Vec::new()), Vec::new())
         } else if def.kind == MapKind::RingBuf {
             // RingBuf: max_entries is the byte capacity (power of two expected;
             // not enforced so odd corpus objects still load).
@@ -495,6 +507,7 @@ impl Map {
             }
             Storage::Hash { index, .. } => index.get(key).map(|&i| ValueRef::Slab(i)),
             Storage::RingBuf { .. }
+            | Storage::Queue(_)
             | Storage::PerfEvent { .. }
             | Storage::ProgArray(_)
             | Storage::MapArray(_)
@@ -648,6 +661,7 @@ impl Map {
                 Ok(ValueRef::Slab(i))
             }
             Storage::RingBuf { .. }
+            | Storage::Queue(_)
             | Storage::PerfEvent { .. }
             | Storage::ProgArray(_)
             | Storage::MapArray(_)
@@ -655,6 +669,30 @@ impl Map {
                 unreachable!()
             }
         }
+    }
+
+    /// Append one value to a queue. `BPF_EXIST` overwrites the oldest value
+    /// when full; other flags report `E2BIG`, matching the kernel queue map.
+    pub fn push(&mut self, value: &[u8], flags: u64) -> Result<(), i64> {
+        if self.def.readonly {
+            return Err(-1);
+        }
+        if value.len() != self.def.value_size as usize {
+            return Err(-22);
+        }
+        let Storage::Queue(values) = &mut self.storage else {
+            return Err(-22);
+        };
+        if values.len() == self.def.max_entries as usize {
+            if flags != 2 {
+                return Err(-7);
+            }
+            values.remove(0);
+        } else if flags != 0 && flags != 2 {
+            return Err(-22);
+        }
+        values.push(value.to_vec().into_boxed_slice());
+        Ok(())
     }
 
     pub fn set_program(&mut self, index: u32, program: u32) -> Result<(), i64> {
@@ -771,6 +809,7 @@ impl Map {
         match &mut self.storage {
             Storage::Array(_) => Err(-22), // EINVAL: array elements cannot be deleted
             Storage::RingBuf { .. }
+            | Storage::Queue(_)
             | Storage::PerfEvent { .. }
             | Storage::ProgArray(_)
             | Storage::MapArray(_)
@@ -956,6 +995,11 @@ impl Map {
             Storage::MapHash { index } => index
                 .iter()
                 .map(|(key, &map)| (key.clone(), map.to_ne_bytes().to_vec()))
+                .collect(),
+            Storage::Queue(values) => values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| ((index as u32).to_ne_bytes().to_vec(), value.to_vec()))
                 .collect(),
             Storage::RingBuf { .. } | Storage::PerfEvent { .. } | Storage::ProgArray(_) => Vec::new(),
         }

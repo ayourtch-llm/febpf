@@ -164,6 +164,7 @@ const BPF_MAP_TYPE_HASH_OF_MAPS: u32 = 13;
 const BPF_MAP_TYPE_DEVMAP: u32 = 14;
 const BPF_MAP_TYPE_CPUMAP: u32 = 16;
 const BPF_MAP_TYPE_XSKMAP: u32 = 17;
+const BPF_MAP_TYPE_QUEUE: u32 = 22;
 const BPF_MAP_TYPE_DEVMAP_HASH: u32 = 25;
 const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 
@@ -1722,6 +1723,7 @@ fn map_kind(ty: u32) -> Result<MapKind, String> {
         BPF_MAP_TYPE_DEVMAP => Ok(MapKind::DevMap),
         BPF_MAP_TYPE_CPUMAP => Ok(MapKind::CpuMap),
         BPF_MAP_TYPE_XSKMAP => Ok(MapKind::XskMap),
+        BPF_MAP_TYPE_QUEUE => Ok(MapKind::Queue),
         BPF_MAP_TYPE_DEVMAP_HASH => Ok(MapKind::DevMapHash),
         BPF_MAP_TYPE_RINGBUF => Ok(MapKind::RingBuf),
         other => Err(format!(
@@ -1893,6 +1895,7 @@ mod btf_maps {
                     | crate::maps::MapKind::PerfEventArray
                     | crate::maps::MapKind::CgroupArray
                     | crate::maps::MapKind::StackTrace
+                    | crate::maps::MapKind::Queue
             );
             let spin_lock_off = value_type.and_then(|id| {
                 let Kind::Struct { members, .. } = &btf.ty(id).ok()?.kind else {

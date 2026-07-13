@@ -78,6 +78,25 @@ fn xdp_alu32_data_end_minus_data_is_a_u32_scalar() {
         Err(error) => error.to_string(),
     };
     assert!(error.contains("32-bit arithmetic on a pointer"), "{error}");
+
+    for subtraction in [
+        "r2 -= r1",
+        "w3 = w2\nw4 = w1\nw3 -= w4\nr2 = r3",
+    ] {
+        let mut vm = Vm::new(program(&format!(
+            "r2 = *(u32 *)(r1 + 4)\n\
+             r1 = *(u32 *)(r1 + 0)\n\
+             {subtraction}\n\
+             r0 = r2\n\
+             exit"
+        )))
+        .unwrap();
+        vm.verify(xdp_config()).unwrap();
+        let mut packet = [0u8; 37];
+        assert_eq!(vm.run_xdp(&mut packet).unwrap(), 37);
+        #[cfg(feature = "jit")]
+        assert_eq!(vm.run_xdp_jit(&mut packet).unwrap(), 37);
+    }
 }
 
 #[test]
@@ -1486,6 +1505,37 @@ fn xskmap_slots_are_sparse_and_queue_bounded() {
     .unwrap();
     assert_eq!(map.update(&4u32.to_ne_bytes(), &9u32.to_ne_bytes()), Err(-7));
     assert!(map.lookup(&4u32.to_ne_bytes()).is_none());
+}
+
+#[test]
+fn queue_map_pushes_fifo_and_overwrites_only_with_exist() {
+    use febpf::maps::{Map, MapDef, MapKind};
+
+    assert_eq!(febpf::helpers::helper_id("map_push_elem"), Some(87));
+    let mut map = Map::new(MapDef {
+        name: "events".into(),
+        kind: MapKind::Queue,
+        key_size: 0,
+        value_size: 4,
+        max_entries: 2,
+        readonly: false,
+        init: Vec::new(),
+        inner_map_idx: None,
+        map_in_map_values: Vec::new(),
+        spin_lock_off: None,
+    })
+    .unwrap();
+    map.push(&1u32.to_ne_bytes(), 0).unwrap();
+    map.push(&2u32.to_ne_bytes(), 0).unwrap();
+    assert_eq!(map.push(&3u32.to_ne_bytes(), 0), Err(-7));
+    map.push(&3u32.to_ne_bytes(), 2).unwrap();
+    assert_eq!(
+        map.iter_entries()
+            .into_iter()
+            .map(|(_, value)| u32::from_ne_bytes(value.try_into().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
 }
 
 #[test]

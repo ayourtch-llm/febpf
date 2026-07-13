@@ -365,6 +365,7 @@ pub fn assemble(source: &str) -> Result<Assembled, AsmError> {
                         "cpumap" => MapKind::CpuMap,
                         "devmap_hash" => MapKind::DevMapHash,
                         "xskmap" => MapKind::XskMap,
+                        "queue" => MapKind::Queue,
                         _ => return Err(format!("unknown map kind '{kind_s}'")),
                     };
                     let key_size = p.number()? as u32;
