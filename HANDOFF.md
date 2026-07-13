@@ -167,6 +167,48 @@ unchanged one-million instruction budget:
   flowtable families remain missing-kfunc. Unsupported-map and unknown-helper
   histograms remain empty.
 
+Packet-proof/helper continuation: `6459284` (`xdp: order packet proofs and add
+adjust tail`) is the newest production batch. Temporary component diagnostics
+showed that request pc 3416 had no precise scalar registers, while its packet
+pointer in r1 and spilled alias at stack -256 differed in 3415/3423 remembered
+states because paths accumulated different packet-range proofs. The earlier
+one-way packet-range experiment had predated Scalar32 and exposed pc 494 by
+losing the protocol/control relation. Retesting after exact u32 stack identity
+and activated precision no longer reproduces that false rejection. State
+subsumption now permits only the safe direction: a current packet pointer with
+an equal-or-stronger proof may be covered by an otherwise identical remembered
+pointer with a weaker proof. A focused unit test locks the direction.
+Resetting new active checkpoints to imprecise and mutating their masks
+immediately was also prototyped; both xvs entries produced byte-for-byte
+identical failure PCs and join counts, so timing of mask application is not the
+current blocker and that no-effect prototype was removed.
+
+That ordering immediately exposed xvs forward helper #65,
+`bpf_xdp_adjust_tail`. It now has the exact XDP ctx/scalar signature and, like
+`xdp_adjust_head`, invalidates all packet/data-end aliases regardless of return
+value. Standalone execution honestly returns `-EOPNOTSUPP` and leaves packet
+bytes unchanged because no packet provider owns resizing yet. A focused test
+covers helper-name/id lookup, stale-alias rejection, return value, and packet
+non-mutation. The generic packet-provider/AF_XDP work remains deferred until
+the corpus is saturated; do not pretend this standalone helper resizes.
+
+Exact final release measurements under the unchanged budget:
+
+- Request advances from insn 2744 to complexity at insn 4468; hottest joins
+  are pc 4787 9801/1, pc 3416 9346/3142, pc 4725 8185/2147, pc 4723 8001/377,
+  and pc 4481 7890/1808.
+- Forward passes the new helper and advances to complexity at insn 4615;
+  hottest joins are pc 150 16152/3569, pc 4624 7269/2421, pc 3194 6044/2059,
+  pc 3195 5778/2032, and pc 3253 5749/641.
+- Default all-target tests: **464 passed + 4 ignored**. Std-only all-target
+  tests: **446 passed + 4 ignored**. Both strict Clippy profiles and the true
+  thumb no-std check/strict Clippy pass.
+- The complete rebuilt-release scan remains exactly 137 families, 835/835
+  loaded entries, 125 compatible families, and 820/835 verified (671 strict +
+  149 privileged). The same six attach-target gaps, seven poisoned CO-RE
+  entries, two xvs complexity rejections, and two flowtable missing-kfunc
+  families remain classified honestly; both blocker histograms are empty.
+
 Completed and committed in `3f9bb65`:
 
 - Added immutable production upstream `davidcoles/xvs` v0.2.10 at commit
@@ -285,14 +327,15 @@ In-progress investigation after `3f9bb65` (not committed):
 
 Immediate resume order:
 
-1. Inspect request pc 3416 and forward pcs 150/215 with the activated precise
-   masks. Determine which scalar/spill locations remain precise and which
-   instruction-history transfer forces each large partition; do not infer the
-   cause from state counts alone.
-2. Extend precision backtracking only for a concrete missing transfer proved
-   by xvs and an adversarial regression. Keep local-call/multi-frame states
-   fully precise, and do not reintroduce global syntactic liveness, generic
-   widening, independent packet-range ordering, or a higher budget.
+1. Inspect request pcs 4725/4481 and forward pcs 150/4624 with component-level
+   diagnostics like the temporary pc-3416 probe. Distinguish packet pointer
+   offset/range differences from strict pointer kind/nullability and from
+   actually precise scalar/spill dependencies; remove heavy diagnostics after
+   measuring.
+2. Extend subsumption or precision backtracking only for a concrete relation
+   proved by xvs and an adversarial regression. Keep local-call/multi-frame
+   states fully precise, and do not reintroduce global syntactic liveness,
+   generic widening, reversed packet-proof ordering, or a higher budget.
 3. Measure both xvs entries after each coherent precision step. Once one is
    genuinely compatible, run the full matrix and complete 137-family scan,
    document and commit, then select the next remaining production blocker.
