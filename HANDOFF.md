@@ -44,11 +44,27 @@ the worktree is clean. No test/build/scanner process or subagent is active.
 
 Refresh update: the checkpoint follow-up documentation is committed as
 `912963a`, and the rejected packet-range ordering experiment is documented in
-`e5a7db2`. At refresh scheduling HEAD is `e5a7db2`; the worktree is clean and
-no test, build, scanner, subagent, or external terminal collaborator is active.
+`e5a7db2`. The checkpoint commit is `cfa72f9`; at refresh scheduling HEAD is
+`cfa72f9` and only this exact HEAD-correction in `HANDOFF.md` is intentionally
+uncommitted. No test, build, scanner, subagent, or external terminal
+collaborator is active.
 The newest authoritative resume action remains explicit relational precision/
 partition tracking for conditional joins. Do not redo the three removed global
 join/liveness prototypes or independent packet-range ordering.
+
+Continuation update: a prune-scan backoff experiment was also rejected and
+removed. Scanning every arrival after the miss-streak threshold made
+`xdp_request_func` consume enough memory that the verifier process was killed.
+Scanning every eighth arrival still exhausted one million instructions and
+increased remembered states at the conditional joins (pc 3422 from 529 to
+2247, pc 3424 from 1149 to 2732, and pc 3426 from 511 to 2682). The original
+one-in-64 backoff is restored. The xvs frontier is not caused by skipped
+subsumption scans; more frequent scans mostly retain additional incomparable
+states. Current-source release baseline remains request failure at pc 3472,
+with hottest joins pc 4787 28469/3, pc 3468 18656/1, pc 3422 16010/529,
+pc 3424 15966/1149, and pc 3426 15906/511. Forward remains a complexity
+failure as well. Continue with relational precision/partitioning, not backoff
+tuning.
 
 Completed and committed in `3f9bb65`:
 
