@@ -66,6 +66,38 @@ pc 3424 15966/1149, and pc 3426 15906/511. Forward remains a complexity
 failure as well. Continue with relational precision/partitioning, not backoff
 tuning.
 
+Precision-design update: inspection of the current upstream Linux verifier
+(`kernel/bpf/states.c` and `kernel/bpf/backtrack.c`) confirms that its useful
+state compression is not ordinary backward liveness. `regsafe()` treats an
+old imprecise scalar as covering any current scalar, but every scalar used for
+a branch, pointer offset, or memory proof triggers `bpf_mark_chain_precision()`.
+That routine walks recorded instruction history and checkpoint-parent states,
+marks the contributing registers/stack slots precise transitively, and mutates
+already checkpointed ancestors before they can be used for pruning. This is
+the missing invariant behind the failed febpf prototypes.
+
+Implement the febpf version as one coherent semantic change:
+
+1. Give remembered states stable checkpoint identities instead of storing
+   only replaceable `VState` clones in `PruneList`; running paths must retain a
+   parent checkpoint and the instruction/branch history since it.
+2. Add per-register and per-spill scalar precision marks. State subsumption
+   may ignore only an old scalar explicitly known imprecise; pointers,
+   initialization, nullability, locks, packet ranges, and equality classes
+   keep their existing strict contracts.
+3. On every conditional scalar refinement and every scalar use in pointer or
+   memory bounds, backtrack MOV/ALU/load/spill dependencies through the local
+   history and checkpoint parents. Unsupported transfers conservatively mark
+   all scalar registers/spills in the affected frames precise.
+4. A prune is valid only after required precision has been propagated into
+   the old checkpoint chain. Ring replacement must not invalidate parent
+   identities; use an arena/tombstone or generation-safe references.
+5. First land adversarial tests proving retroactive precision for dead/live
+   register copies, spills, equality-linked values, null branches, and packet
+   range/control correlation. Only then measure xvs. Do not approximate this
+   with global location masks or branch-history hashes: both lose the
+   transitive data dependencies the kernel algorithm preserves.
+
 Completed and committed in `3f9bb65`:
 
 - Added immutable production upstream `davidcoles/xvs` v0.2.10 at commit
