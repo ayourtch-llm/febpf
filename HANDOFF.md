@@ -30,7 +30,49 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 native C embedding API landed; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 C log-filter host landed; authoritative)
+
+The first production-shaped application of the native ABI is committed as
+`7d26ad2` (`examples: add C log-filter host`), on top of the ABI baseline
+`a73d983` and its checkpoint `99b4faf`. At checkpoint writing HEAD is
+`7d26ad2`; only this HANDOFF update is intentionally uncommitted. The recurring
+tttt job remains deleted. No build, scanner, subagent, or external terminal
+collaborator is active.
+
+`examples/c-log-filter` is a zero-dependency C11 streaming host. It loads and
+verifies one assembly plugin, then supplies each input line through a versioned
+4104-byte Flat context: two u32 fields followed by a 4096-byte inline record.
+The plugin returns accept/drop and may redact within the record. There are no
+embedded host pointers. The entire context is zeroed before every read because
+the verified guest may legally inspect fixed-capacity bytes beyond the logical
+length; this prevents stale C stack disclosure. After execution the host
+revalidates the guest-writable length and action before emitting anything.
+Oversized records, runtime failures, and unknown actions fail closed.
+
+This is the intended architectural result: a genuinely different non-packet
+application needed no new `Vm` mode, provider trait, or runtime state. The
+existing Flat model plus a fresh per-run `ExecutionEnvironment` expressed it.
+`scripts/test-c-api.sh` now compiles both C hosts under C11 with
+`-Wall -Wextra -Werror`, dynamically links the shared library, and checks exact
+log-filter output: `INFO ready` and `TOKEN=*ecret` survive, while `DEBUG noisy`
+is dropped. All five focused Rust C-boundary tests and strict C-API all-target
+Clippy pass. No Rust execution/loading/verifier source changed, so the complete
+corpus was not redundantly rescanned; the unchanged `a73d983` measurement below
+remains authoritative.
+
+The example measured the next blocker cleanly: production plugin distribution
+still requires assembly text or raw bytecode, while the real corpus is ELF and
+often needs a selected program/section and CO-RE target BTF. Continue with an
+additive, separately versioned ELF construction descriptor rather than adding
+ELF state to invocation descriptors or `Vm`. First audit the existing Rust ELF
+selection/target-BTF ownership, then expose the smallest copied-input C
+constructor and rejection diagnostics. Do not bundle custom helper callbacks
+or map administration into that constructor; those are separate ownership
+surfaces and must be ranked after the ELF host is real.
+
+The checkpoint immediately below is historical and superseded by this one.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-13 native C embedding API landed; superseded)
 
 The application-extension packaging baseline requested by the user is
 committed as `a73d983` (`ffi: add versioned native C embedding API`). The
