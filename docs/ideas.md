@@ -35,9 +35,11 @@ The boundary must describe:
 
 Revised implementation order:
 
-1. Continue factoring invocation-only services that still live in `Vm`, with
-   synthetic BTF kernel memory and output/diagnostic sinks as the next audit.
-   Keep typed slots and measure at least two consumers before generalizing a
+1. Continue factoring invocation-only services that still live in `Vm`.
+   Synthetic BTF kernel-memory scratch and borrowed sequence/printk sinks have
+   moved; next audit deterministic clock/random streams, profiling, and perf
+   output, distinguishing intentionally cross-invocation state from resources.
+   Keep typed slots and measure multiple consumers before generalizing a
    builder or hook interface.
 2. Activate provider resize capabilities through the shared packet window,
    preserving `-EOPNOTSUPP` for plain slices.

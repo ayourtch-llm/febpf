@@ -228,9 +228,6 @@ pub struct Vm {
     /// reads as zero). Armed by [`Vm::verify`]; empty when unverified, in
     /// which case such loads fault cleanly instead. Static per program.
     probe_mem: Vec<bool>,
-    /// Scratch backing for [`Region::KernelMem`] reads; logically an
-    /// all-zeroes region, re-zeroed on every resolve. Not run state.
-    kmem: Vec<u8>,
     context_model: crate::execution::ContextModel,
     legacy_packet: crate::verifier::LegacyPacketProfile,
     legacy_packet_used: bool,
@@ -325,7 +322,6 @@ impl Vm {
             jit: None,
             debug: None,
             probe_mem: Vec::new(),
-            kmem: Vec::new(),
             context_model: crate::execution::ContextModel::Flat,
             legacy_packet: crate::verifier::LegacyPacketProfile::Disabled,
             legacy_packet_used: false,
@@ -1703,7 +1699,9 @@ impl<'a> Machine<'a> {
     /// Toggle printk echoing (the debugger suppresses it during replay so
     /// reverse execution doesn't repeat output). Returns the previous value.
     pub fn set_echo_printk(&mut self, on: bool) -> bool {
-        core::mem::replace(&mut self.vm.echo_printk, on)
+        self.env
+            .set_echo_printk(on)
+            .unwrap_or_else(|| core::mem::replace(&mut self.vm.echo_printk, on))
     }
 
     /// A pointer to the register file, for the JIT prologue to load from and
@@ -1819,13 +1817,13 @@ impl<'a> Machine<'a> {
     #[inline]
     fn mem(&mut self, addr: u64, len: usize, write: bool) -> Result<&mut [u8], EbpfError> {
         let pc = self.pc;
-        let (ctx, packet) = self.env.memory_parts();
+        let (ctx, packet, kmem) = self.env.memory_parts();
         resolve_slice(
             &self.vm.regions,
             &mut self.vm.maps,
             &mut self.vm.stack,
             ctx,
-            &mut self.vm.kmem,
+            kmem,
             packet,
             &mut self.vm.owned_regions,
             addr,
@@ -2506,12 +2504,17 @@ impl<'a> Machine<'a> {
             helpers::id::TRACE_PRINTK => {
                 let fmt = self.read_bytes(args[0], args[1] as usize)?;
                 let line = self.format_printk(&fmt, &[args[2], args[3], args[4]])?;
+                let (output, _echo) = if let Some(sink) = self.env.printk_mut() {
+                    sink
+                } else {
+                    (&mut self.vm.printk, self.vm.echo_printk)
+                };
                 #[cfg(feature = "std")]
-                if self.vm.echo_printk {
+                if _echo {
                     eprintln!("printk: {line}");
                 }
                 let len = line.len() as u64;
-                self.vm.printk.push(line);
+                output.push(line);
                 len
             }
             helpers::id::TRACE_VPRINTK => {
@@ -2530,12 +2533,17 @@ impl<'a> Machine<'a> {
                         .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
                         .collect::<Vec<_>>();
                     let line = self.format_printk(&fmt, &values)?;
+                    let (output, _echo) = if let Some(sink) = self.env.printk_mut() {
+                        sink
+                    } else {
+                        (&mut self.vm.printk, self.vm.echo_printk)
+                    };
                     #[cfg(feature = "std")]
-                    if self.vm.echo_printk {
+                    if _echo {
                         eprintln!("printk: {line}");
                     }
                     let len = line.len() as u64;
-                    self.vm.printk.push(line);
+                    output.push(line);
                     len
                 }
             }
@@ -2882,13 +2890,13 @@ impl<'a> Machine<'a> {
                     .user_helpers
                     .take(hid)
                     .ok_or_else(|| self.err(format!("call to unknown helper #{hid}")))?;
-                let (ctx, packet) = self.env.memory_parts();
+                let (ctx, packet, kmem) = self.env.memory_parts();
                 let mut bus = Bus {
                     regions: &self.vm.regions,
                     maps: &mut self.vm.maps,
                     stack: &mut self.vm.stack,
                     ctx,
-                    kmem: &mut self.vm.kmem,
+                    kmem,
                     packet,
                     owned_regions: &mut self.vm.owned_regions,
                 };

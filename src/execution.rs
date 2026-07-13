@@ -72,9 +72,16 @@ pub struct ExecutionEnvironment<'a> {
     context: ContextStorage<'a>,
     model: ContextModel,
     packet: Option<PacketWindow<'a>>,
+    kernel_memory: Vec<u8>,
+    printk: Option<PrintkSink<'a>>,
     seq_output: Option<&'a mut Vec<u8>>,
     pub(crate) packet_source: PacketSource,
     pub(crate) redirect: Option<XdpRedirect>,
+}
+
+struct PrintkSink<'a> {
+    output: &'a mut Vec<String>,
+    echo: bool,
 }
 
 /// Provider-neutral result of one execution environment.
@@ -93,6 +100,8 @@ pub(crate) struct EnvironmentSnapshot {
     packet_end: usize,
     packet_capabilities: XdpCapabilities,
     packet_source: PacketSource,
+    printk: Option<Vec<String>>,
+    printk_echo: bool,
     seq_output: Option<Vec<u8>>,
     redirect: Option<XdpRedirect>,
 }
@@ -103,6 +112,8 @@ impl<'a> ExecutionEnvironment<'a> {
             context: ContextStorage::Borrowed(context),
             model: ContextModel::Flat,
             packet: None,
+            kernel_memory: Vec::new(),
+            printk: None,
             seq_output: None,
             packet_source: PacketSource::None,
             redirect: None,
@@ -130,6 +141,8 @@ impl<'a> ExecutionEnvironment<'a> {
             context: ContextStorage::Borrowed(context),
             model,
             packet: None,
+            kernel_memory: Vec::new(),
+            printk: None,
             seq_output: None,
             packet_source,
             redirect: None,
@@ -158,6 +171,8 @@ impl<'a> ExecutionEnvironment<'a> {
                 capabilities,
                 bounds_target: Some((data_start, data_end)),
             }),
+            kernel_memory: Vec::new(),
+            printk: None,
             seq_output: None,
             packet_source: PacketSource::Window,
             redirect: None,
@@ -179,6 +194,8 @@ impl<'a> ExecutionEnvironment<'a> {
                 capabilities: XdpCapabilities::default(),
                 bounds_target: None,
             }),
+            kernel_memory: Vec::new(),
+            printk: None,
             seq_output: None,
             packet_source: PacketSource::Window,
             redirect: None,
@@ -206,6 +223,8 @@ impl<'a> ExecutionEnvironment<'a> {
                 capabilities: XdpCapabilities::default(),
                 bounds_target: None,
             }),
+            kernel_memory: Vec::new(),
+            printk: None,
             seq_output: None,
             packet_source: PacketSource::Window,
             redirect: None,
@@ -217,6 +236,8 @@ impl<'a> ExecutionEnvironment<'a> {
             context: ContextStorage::Borrowed(context),
             model,
             packet: None,
+            kernel_memory: Vec::new(),
+            printk: None,
             seq_output: None,
             packet_source: PacketSource::Owned(index),
             redirect: None,
@@ -246,6 +267,22 @@ impl<'a> ExecutionEnvironment<'a> {
         self
     }
 
+    /// Install a caller-owned trace output sink.
+    pub fn with_printk(mut self, output: &'a mut Vec<String>, echo: bool) -> Self {
+        self.printk = Some(PrintkSink { output, echo });
+        self
+    }
+
+    pub(crate) fn printk_mut(&mut self) -> Option<(&mut Vec<String>, bool)> {
+        let sink = self.printk.as_mut()?;
+        Some((sink.output, sink.echo))
+    }
+
+    pub(crate) fn set_echo_printk(&mut self, echo: bool) -> Option<bool> {
+        let sink = self.printk.as_mut()?;
+        Some(core::mem::replace(&mut sink.echo, echo))
+    }
+
     pub(crate) fn seq_output_mut(&mut self) -> Option<&mut Vec<u8>> {
         self.seq_output.as_deref_mut()
     }
@@ -269,13 +306,13 @@ impl<'a> ExecutionEnvironment<'a> {
         }
     }
 
-    pub(crate) fn memory_parts(&mut self) -> (&mut [u8], &mut [u8]) {
+    pub(crate) fn memory_parts(&mut self) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
         let context = self.context.as_mut_slice();
         let packet: &mut [u8] = match &mut self.packet {
             Some(packet) => packet.active_mut(),
             None => &mut [],
         };
-        (context, packet)
+        (context, packet, &mut self.kernel_memory)
     }
 
     pub(crate) fn snapshot(&self) -> EnvironmentSnapshot {
@@ -298,6 +335,8 @@ impl<'a> ExecutionEnvironment<'a> {
             packet_end,
             packet_capabilities,
             packet_source: self.packet_source,
+            printk: self.printk.as_ref().map(|sink| sink.output.clone()),
+            printk_echo: self.printk.as_ref().is_some_and(|sink| sink.echo),
             seq_output: self.seq_output.as_deref().cloned(),
             redirect: self.redirect,
         }
@@ -327,6 +366,14 @@ impl<'a> ExecutionEnvironment<'a> {
             (Some(output), Some(saved)) => output.clone_from(saved),
             (None, None) => {}
             _ => panic!("snapshot output topology mismatch"),
+        }
+        match (&mut self.printk, &snapshot.printk) {
+            (Some(sink), Some(saved)) => {
+                sink.output.clone_from(saved);
+                sink.echo = snapshot.printk_echo;
+            }
+            (None, None) => {}
+            _ => panic!("snapshot printk topology mismatch"),
         }
         self.redirect = snapshot.redirect;
     }

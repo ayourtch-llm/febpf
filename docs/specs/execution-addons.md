@@ -43,8 +43,10 @@ objects. Hot paths consult typed optional resource slots:
   head/tail capabilities;
 - `PacketSource`: selects that window, the context itself, or an owned region
   for deprecated absolute/indirect packet loads;
-- `OutputSinks`: optional sequence output today, with perf/diagnostic sinks as
-  candidates for the same boundary;
+- `KernelMemory`: per-invocation scratch for the deterministic zero-backed BTF
+  pointer model; it is never durable VM state;
+- `OutputSinks`: optional borrowed sequence and trace/diagnostic outputs, with
+  perf output as a candidate for the same boundary;
 - `Completion`: redirect intent and future program-family results.
 
 An add-on constructs a compatible typed environment. The environment has only
@@ -59,8 +61,8 @@ initial constructors/add-ons are:
 - `RawPacket`: flat context also selected as the legacy packet source;
 - `OwnedPacketMetadata`: caller context whose pointer fields name a registered
   owned region;
-- `SeqOutput`: a borrowed output sink, independently composable with any
-  compatible context/packet add-on.
+- `SeqOutput` and `PrintkOutput`: borrowed output sinks, independently
+  composable with any compatible context/packet add-on.
 
 The public convenience methods are deliberately thin constructors over this
 same environment. There is no privileged VM-owned packet adapter and no
@@ -118,6 +120,6 @@ first implementation must migrate multiple independent consumers:
 5. snapshots/replay across installed resources.
 
 Only after that matrix is green should AF_XDP or further XDP capability work
-resume. The initial implementation retains the existing VM-owned sequence
-buffer as the default convenience sink for API compatibility, while an
-explicit environment can override it with an independently borrowed sink.
+resume. The initial implementation retains the existing VM-owned sequence and
+printk buffers as default convenience sinks for API compatibility, while an
+explicit environment can override either with an independently borrowed sink.

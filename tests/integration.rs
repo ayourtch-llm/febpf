@@ -1,5 +1,5 @@
 use febpf::verifier::Config;
-use febpf::{asm, Program, Vm};
+use febpf::{asm, ExecutionEnvironment, Program, Vm};
 
 fn program(src: &str) -> Program {
     let a = asm::assemble(src).expect("assembly failed");
@@ -2423,6 +2423,31 @@ fn helper_trace_printk() {
     .unwrap();
     vm.run(&mut []).unwrap();
     assert_eq!(vm.printk, vec!["n=42".to_string()]);
+
+    vm.printk.clear();
+    let mut external = Vec::new();
+    let mut context = [];
+    {
+        let env = ExecutionEnvironment::plain(&mut context).with_printk(&mut external, false);
+        let mut machine = vm.machine_environment(env).unwrap();
+        let base = machine.snapshot();
+        while machine.step().unwrap().is_none() {}
+        let finished = machine.snapshot();
+        machine.restore(&base);
+        while machine.step().unwrap().is_none() {}
+        assert_eq!(machine.snapshot(), finished);
+    }
+    assert_eq!(external, ["n=42"]);
+    assert!(vm.printk.is_empty());
+
+    #[cfg(feature = "jit")]
+    {
+        external.clear();
+        let env = ExecutionEnvironment::plain(&mut context).with_printk(&mut external, false);
+        assert_eq!(vm.run_environment_jit(env).unwrap().return_value, 0);
+        assert_eq!(external, ["n=42"]);
+        assert!(vm.printk.is_empty());
+    }
 }
 
 #[test]
