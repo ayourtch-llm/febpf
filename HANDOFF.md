@@ -36,10 +36,10 @@ The corpus-first continuation is active. The prior checkpoint documentation
 was committed as `21047c5`, and the complete xvs production-lane batch was
 committed as `3f9bb65` (`xdp: cover xvs queue dataplane`). A tttt recurring
 job named `cron-1` injects the continuation plan every 30 minutes with
-`if_busy=wait`. At checkpoint writing HEAD is `3f9bb65`. The fully validated
-diagnostic/ALU32 continuation batch below is pending one clean commit in
-`src/verifier.rs`, `tests/integration.rs`, and this HANDOFF update. No
-test/build/scanner process or subagent is active.
+`if_busy=wait`. The fully validated diagnostic/ALU32 continuation batch below
+is committed as `34877b9` (`verifier: diagnose xvs complexity frontier`). At
+checkpoint writing HEAD is `34877b9` and the worktree is clean. No test/build/
+scanner process or subagent is active.
 
 Completed and committed in `3f9bb65`:
 
@@ -111,14 +111,13 @@ In-progress investigation after `3f9bb65` (not committed):
 
 Immediate resume order:
 
-1. Commit the fully validated diagnostic/ALU32 continuation batch cleanly.
-2. Implement conservative backward liveness/precision for prune comparisons,
+1. Implement conservative backward liveness/precision for prune comparisons,
    starting with registers and then fixed stack bytes. Never discard a fact
    that any continuation can read; model helpers and local calls conservatively.
-3. Use both xvs entries to measure convergence without raising the one-million
+2. Use both xvs entries to measure convergence without raising the one-million
    budget. Add adversarial dead/live register, stack-initialization, pointer,
    nullability, packet-range, and equality-correlation tests.
-4. Run the full matrix and 137-family scan, document exact results, and commit
+3. Run the full matrix and 137-family scan, document exact results, and commit
    the liveness/pruning batch cleanly. Then select the next production lane.
 
 Continuation batch completed after this checkpoint was written:
