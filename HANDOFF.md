@@ -30,17 +30,18 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 composable invocation add-ons landed; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 provider packet-window resizing landed; authoritative)
 
 The architecture redirection requested by the user is committed as `22ab9db`
 (`runtime: compose invocation add-ons`), with the non-packet proof follow-up in
-`08e6b5b` (`runtime: extract invocation host services`). At checkpoint writing
-HEAD is `08e6b5b`; only this HANDOFF update is intentionally uncommitted. The recurring
-tttt job `cron-1` was deleted at the user's request. No scanner or build started
-by this batch remains active. Several sleeping cargo test processes in the
-pre-existing `pty-2`/`pty-3`/`pty-4` terminal sessions predate this refactor;
-they were not used or killed, and own none of the changed files. No subagent
-was used.
+`08e6b5b` (`runtime: extract invocation host services`) and provider resize
+support in `445a159` (`xdp: resize provider packet windows`). At checkpoint
+writing HEAD is `445a159`; only this HANDOFF update is intentionally
+uncommitted. The recurring tttt job `cron-1` was deleted at the user's request.
+No scanner or build started by this batch remains active. Several sleeping
+cargo test processes in the pre-existing `pty-2`/`pty-3`/`pty-4` terminal
+sessions predate this refactor; they were not used or killed, and own none of
+the changed files. No subagent was used.
 
 The key correction is architectural rather than another XDP feature. `Vm` no
 longer owns or stages packet bytes, XDP/SKB booleans, or metadata-layout run
@@ -58,12 +59,23 @@ packet resolver, metadata selects an owned packet through the environment,
 and BTF iterator execution can compose an independently borrowed `seq_write`
 sink. External sink state participates in snapshot/restore and interpreter/JIT
 agreement. A verified XDP/SKB model without a packet-window add-on rejects
-before instruction zero. `XdpCapabilities` are present on provider frames but
-remain reserved: adjust-head/tail still return `-EOPNOTSUPP` for every adapter.
-Default VM-owned sequence/printk buffers remain compatibility sinks when an
-environment does not override them. Explicit environments do not route through
-those buffers; removing the public fallbacks later is API cleanup rather than
-a prerequisite for the execution boundary.
+before instruction zero. Default VM-owned sequence/printk buffers remain
+compatibility sinks when an environment does not override them. Explicit
+environments do not route through those buffers; removing the public fallbacks
+later is API cleanup rather than a prerequisite for the execution boundary.
+
+Provider frames can now opt independently into `adjust_head` and `adjust_tail`
+through `XdpCapabilities`. The helpers resize the active packet window owned by
+`ExecutionEnvironment`: positive head deltas consume data, negative head deltas
+expose provider headroom, positive tail deltas grow into tailroom and zero the
+new bytes, and negative tail deltas shrink data. Capacity failures return
+`-EINVAL` atomically, absent capability returns `-EOPNOTSUPP`, and a missing
+packet returns `-EFAULT`. The slice adapter deliberately advertises neither
+capability and therefore keeps its historical unsupported result. Provider
+completion observes changed bounds even after a later runtime error, while
+snapshot/restore captures and restores the logical window. The verifier's
+existing rule still invalidates all packet/data-end aliases after either helper
+regardless of the helper's runtime result.
 
 The follow-up audit removed deterministic BTF kernel-memory scratch from `Vm`
 and made it environment-owned. It also added an independently borrowed printk
@@ -75,10 +87,10 @@ intentionally durable/cross-invocation state rather than blindly moving every
 mutable field. Default VM-owned printk/sequence vectors remain compatibility
 sinks only when an explicit environment does not override them.
 
-Exact validation and measurement for `22ab9db` + `08e6b5b`:
+Exact validation and measurement through `445a159`:
 
-- Default all-target tests: **473 passed + 4 ignored**.
-- Std interpreter-only all-target tests: **455 passed + 4 ignored**.
+- Default all-target tests: **475 passed + 4 ignored**.
+- Std interpreter-only all-target tests: **457 passed + 4 ignored**.
 - Strict Clippy passed for default/all-targets and std-only/all-targets.
 - True `thumbv7em-none-eabihf` no-std check and strict Clippy passed.
 - Release build and complete corpus scan: **137 families**, 135 instantiate,
@@ -91,12 +103,13 @@ Exact validation and measurement for `22ab9db` + `08e6b5b`:
 
 Immediate resume order:
 
-1. Activate the already-reserved provider resize
-   capabilities through the shared packet window. Preserve slice
-   `-EOPNOTSUPP`, failure atomicity, stale-alias verifier rules, JIT parity, and
-   snapshots.
-2. Only then add Linux AF_XDP copy mode as a backend adapter. DPDK remains an
-   optional later adapter; neither transport belongs in `Vm`.
+1. Add Linux AF_XDP copy mode strictly as a backend adapter over
+   `ExecutionEnvironment`/`XdpProvider`; do not add transport state to `Vm`.
+   Keep target/feature gating and the environment/configuration-dependent veth
+   validation honest. Bind provider-owned sparse XSKMAP sockets during
+   completion and preserve owned-frame delivery semantics.
+2. Re-measure the complete pinned corpus after the coherent adapter batch.
+   DPDK remains an optional later adapter, not a VM feature.
 
 The checkpoint immediately below is historical and superseded by this one.
 
