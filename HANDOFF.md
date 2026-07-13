@@ -30,7 +30,50 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 provider boundary landed; redirect delivery next; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 redirect delivery landed; resize capability next; authoritative)
+
+The provider-neutral redirect batch is committed as `fb73fc7` (`xdp: deliver
+provider redirect destinations`). At checkpoint writing HEAD is `fb73fc7`;
+only this HANDOFF update is intentionally uncommitted. No test, build, scanner,
+subagent, or external terminal collaborator is active.
+
+`XdpVerdict` now carries an optional `XdpRedirect`. Successful direct redirects
+record interface index/flags; redirect-map helpers record loaded-map index,
+map kind, u32 key, and raw flags. The destination is exposed only when the
+final action is `XDP_REDIRECT`; a later failed helper clears an earlier choice.
+This is delivery intent only: febpf still never transmits or fabricates socket
+ownership. Interpreter/JIT agree, the legacy integer adapter remains unchanged,
+and `Machine` snapshots capture/restore the per-invocation redirect selection.
+
+Exact validation and measurement for `fb73fc7`:
+
+- Default all-target tests: **472 passed + 4 ignored**.
+- Std interpreter-only all-target tests: **454 passed + 4 ignored**.
+- Strict Clippy passed for default/all-targets and std-only/all-targets.
+- True `thumbv7em-none-eabihf` no-std check and strict Clippy passed.
+- Release build and complete corpus scan: **137 families**, 135 instantiate,
+  **835/835 entries load**, **126/137 families fully compatible**, and
+  **822/835 entries verify (98.4%)**: 673 strict + 149 privileged-uninitialized
+  stack. The only entry gaps remain six missing attach targets and seven
+  poisoned CO-RE relocations; two object-level flowtable families remain
+  missing-kfunc. Unsupported-map and unknown-helper histograms are empty.
+
+Immediate resume order:
+
+1. Add explicit resize capability to provider-owned frames. Refactor the VM
+   packet backing so adjust-head/tail can atomically move the active window,
+   update virtual `data`/`data_end`, and copy the resulting window back only
+   when the frame opts in and capacity suffices. Standalone `run_xdp` must
+   continue returning `-EOPNOTSUPP`; failed resize must not mutate anything.
+   Cover positive/negative deltas, headroom/tailroom exhaustion, direct access
+   after reloading invalidated pointers, interpreter/JIT, and snapshots/replay.
+2. Implement Linux AF_XDP copy mode behind target/feature gating with raw
+   syscalls and zero new dependencies. Validate on veth, bind provider-owned
+   sparse XSKMAP sockets during completion, and record the first mismatch as
+   `.febpf`. Zero-copy and DPDK remain later work.
+
+Older checkpoint text below remains useful history, but its resume lists are
+superseded by the two steps above.
 
 The first post-saturation packet-provider batch is committed as `6a6010e`
 (`xdp: add packet provider boundary`). At checkpoint writing, HEAD is
