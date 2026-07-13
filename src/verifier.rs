@@ -1574,12 +1574,24 @@ impl<'a> Verifier<'a> {
             let mut len = len;
             loop {
                 if self.stats.insns_processed >= self.cfg.insn_budget {
+                    let mut hot = self
+                        .seen
+                        .iter()
+                        .map(|(&join, list)| (list.arrivals, list.states.len(), join))
+                        .collect::<Vec<_>>();
+                    hot.sort_unstable_by(|a, b| b.cmp(a));
+                    let hot = hot
+                        .iter()
+                        .take(5)
+                        .map(|(arrivals, states, join)| format!("pc {join}: {arrivals} arrivals/{states} states"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     let e = self.err(
                         pc,
                         format!(
                             "program too complex: exceeded {} processed instructions \
-                             (unbounded loop?)",
-                            self.cfg.insn_budget
+                             (unbounded loop?); hottest joins: {hot}",
+                            self.cfg.insn_budget,
                         ),
                     );
                     return Err(self.attach_trace(e, node, len));
@@ -4031,7 +4043,8 @@ impl<'a> Verifier<'a> {
         if is32
             && op == alu::SUB
             && dst_scalar_id == PACKET_END32_ID
-            && src_scalar_id == PACKET32_ID
+            && (src_scalar_id == PACKET32_ID
+                || matches!(b, RegState::Ptr(Ptr { kind: PtrKind::Packet { .. }, .. })))
         {
             return self.write_reg(
                 state,

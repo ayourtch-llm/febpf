@@ -30,7 +30,116 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 AF_XDP corpus frontier; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 xvs pruning frontier; authoritative)
+
+The corpus-first continuation is active. The prior checkpoint documentation
+was committed as `21047c5`, and the complete xvs production-lane batch was
+committed as `3f9bb65` (`xdp: cover xvs queue dataplane`). A tttt recurring
+job named `cron-1` injects the continuation plan every 30 minutes with
+`if_busy=wait`. At checkpoint writing HEAD is `3f9bb65`. The fully validated
+diagnostic/ALU32 continuation batch below is pending one clean commit in
+`src/verifier.rs`, `tests/integration.rs`, and this HANDOFF update. No
+test/build/scanner process or subagent is active.
+
+Completed and committed in `3f9bb65`:
+
+- Added immutable production upstream `davidcoles/xvs` v0.2.10 at commit
+  `6b6011b2c9a7176de5490a8b1c6d829de26724d6`; its unchanged `bpf/layer3.c`
+  builds offline with upstream Makefile capacity defaults and explicit host
+  x86-64 glibc-header selection.
+- Added `BPF_MAP_TYPE_QUEUE`, FIFO/overwrite-on-`BPF_EXIST` semantics,
+  `bpf_map_push_elem` #87, assembler, additive replay-v1 kind 16, and kernel
+  translation. Added `xdp_adjust_head` #44 with exact XDP ctx signature,
+  unconditional verifier packet-alias invalidation, and honest standalone
+  `-EOPNOTSUPP` because no packet provider owns headroom yet.
+- Accepted exact 64-bit XDP `data_end - packet` and MOV32-mediated ALU32
+  differences while preserving rejection of all other truncated pointer
+  arithmetic. Packet provenance uses reserved scalar identity markers rather
+  than keeping a MOV32 result typed as a pointer; this preserved the existing
+  multi-entry fixture that legitimately truncates a packet pointer to scalar.
+- Documented the contracts in `docs/specs/queue-map-xvs.md`.
+
+Exact committed-batch validation and measurement:
+
+- Default all-target tests: **454 passed + 4 ignored**.
+- Std interpreter-only all-target tests: **436 passed + 4 ignored**.
+- Strict Clippy passes in default and std-only profiles.
+- True `thumbv7em-none-eabihf` no-std check and strict Clippy pass.
+- Offline corpus rebuild: **137 object families**.
+- Full scan: 135/137 instantiate on this host; **835/835 enumerable entries
+  load**; **125/137 families compatible** and **820/835 entries verify
+  (98.2%)**: 671 strict plus 149 privileged-uninitialized-stack. Remaining
+  entries are six missing-attach-target, seven poisoned CO-RE, and the two xvs
+  complexity-limit rejections. Two flowtable objects remain missing-kfunc.
+  Unsupported-map and unknown-helper histograms are empty.
+
+In-progress investigation after `3f9bb65` (not committed):
+
+- `src/verifier.rs` adds useful hottest-join diagnostics to the one-million
+  processed-instruction error. Keep this unless a cleaner equivalent replaces
+  it; it materially improves the rejection explainer.
+- It also closes one newly exposed mixed ALU32 form: truncated `data_end`
+  scalar marker minus an untruncated packet pointer. This is the same exact
+  XDP difference contract and must receive a focused test before commit.
+- With diagnostics, `xdp_forward_func` exhausts the budget with hottest joins
+  `pc 150: 15178 arrivals/3965 states`, `pc 3253: 8789/2705`, `pc 3195:
+  8789/389`, `pc 3194: 8785/389`, `pc 215: 7599/3717`.
+- After the mixed subtraction fix, `xdp_request_func` advances to the same
+  complexity class: hottest joins include `pc 4787: 39028/947`, `pc 3468:
+  16185/4096`, and pcs 3422/3424/3426 around 14k arrivals/~500 states.
+- Source/disassembly inspection shows major joins are shared post-parse and
+  metrics/counter blocks, not loops. This is acyclic path explosion.
+- A first structural-join prototype was tested and deliberately backed out.
+  Immediate joining made the existing 100-iteration bounded-loop regression
+  widen one step at a time until the instruction budget; delaying joins and
+  disabling them across static backward-edge regions fixed that part. However,
+  `xdp_request_func` then converged to a false rejection at pc 494: a widened
+  path retained only a 62-byte packet proof before a branch-specific access at
+  offset 70 size 2. The merge had erased the correlation between protocol
+  branches and packet-range proofs. Therefore dropping all equality/correlation
+  facts is too imprecise for xvs even though conservative. The prototype is no
+  longer in the worktree; do not recreate it unchanged. A viable design must
+  partition such states or retain the control facts that justify packet range.
+- A second, much narrower prototype merged only numerically identical states
+  while forgetting equality IDs. It preserved all 144 integration outcomes but
+  slowed that test binary to 37.77s and left `xdp_request_func`'s complexity
+  failure and hottest-join histogram exactly unchanged. It too was backed out.
+  Equality-ID duplication alone is not the source. The next promising direction
+  is conservative backward liveness/precision: ignore only register and stack
+  facts provably dead on every continuation, while keeping live branch and
+  packet-range correlations partitioned.
+
+Immediate resume order:
+
+1. Commit the fully validated diagnostic/ALU32 continuation batch cleanly.
+2. Implement conservative backward liveness/precision for prune comparisons,
+   starting with registers and then fixed stack bytes. Never discard a fact
+   that any continuation can read; model helpers and local calls conservatively.
+3. Use both xvs entries to measure convergence without raising the one-million
+   budget. Add adversarial dead/live register, stack-initialization, pointer,
+   nullability, packet-range, and equality-correlation tests.
+4. Run the full matrix and 137-family scan, document exact results, and commit
+   the liveness/pruning batch cleanly. Then select the next production lane.
+
+Continuation batch completed after this checkpoint was written:
+
+- Added and validated the focused mixed MOV32 `data_end` minus untruncated
+  packet-pointer regression. Preserved the existing shared-section multi-entry
+  fixture and the bounded-loop regression.
+- Kept hottest-join diagnostics on the one-million-instruction error and
+  documented two rejected pruning prototypes above. No unsound or materially
+  imprecise join remains in the tree.
+- Final default all-target matrix: **454 passed + 4 ignored**. Std-only:
+  **436 passed + 4 ignored**. Strict Clippy passed in default/all-features and
+  std-only profiles. True `thumbv7em-none-eabihf` check and strict Clippy passed.
+- Final release rebuild and complete scan reproduced the committed frontier:
+  **137 families**, 135 instantiate, **835/835 entries load**, **125/137
+  compatible families**, and **820/835 entries verify (98.2%)**: 671 strict +
+  149 privileged-uninitialized-stack. Remaining outcomes are the same six
+  attach-target gaps, seven poisoned CO-RE entries, and two xvs complexity
+  rejections; two object-level flowtable families remain missing-kfunc.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-13 AF_XDP corpus frontier; superseded by checkpoint above)
 
 The real-world coverage moonshot remains active. Two complete, measured
 xdp-tools batches landed after the prior checkpoint: `d19da69` (`xdp: cover

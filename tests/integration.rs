@@ -81,6 +81,7 @@ fn xdp_alu32_data_end_minus_data_is_a_u32_scalar() {
 
     for subtraction in [
         "r2 -= r1",
+        "w3 = w2\nw3 -= w1\nr2 = r3",
         "w3 = w2\nw4 = w1\nw3 -= w4\nr2 = r3",
     ] {
         let mut vm = Vm::new(program(&format!(
