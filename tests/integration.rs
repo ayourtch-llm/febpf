@@ -712,6 +712,41 @@ fn bounded_loop_verifies_and_runs() {
     assert_eq!(run_src(src), 5050);
 }
 
+#[test]
+fn branch_free_tail_pruning_keeps_live_stack_initialization() {
+    let error = verify_err_ctx(
+        "r2 = *(u64 *)(r1 + 0)\n\
+         if r2 == 0 goto init\n\
+         goto join\n\
+         init:\n\
+         *(u64 *)(r10 - 8) = 1\n\
+         join:\n\
+         r0 = *(u64 *)(r10 - 8)\n\
+         exit",
+        8,
+    );
+    assert!(error.contains("uninitialized stack"), "{error}");
+}
+
+#[test]
+fn branch_free_tail_pruning_ignores_only_overwritten_registers() {
+    let mut vm = Vm::new(program(
+        "r2 = *(u64 *)(r1 + 0)\n\
+         if r2 == 0 goto pointer\n\
+         r3 = 7\n\
+         goto join\n\
+         pointer:\n\
+         r3 = r10\n\
+         join:\n\
+         r3 = 0\n\
+         r0 = r3\n\
+         exit",
+    ))
+    .unwrap();
+    let ok = vm.verify(Config { ctx_size: 8, ..Default::default() }).unwrap();
+    assert!(ok.stats.states_pruned > 0, "tail projection should prune a dead r3 variant");
+}
+
 // ------------------------------------------------------------------ memory
 
 #[test]

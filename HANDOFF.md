@@ -131,15 +131,35 @@ In-progress investigation after `3f9bb65` (not committed):
   fall back to full-state comparison everywhere else. This should capture the
   observed 4096-state/terminal explosion without touching the earlier packet
   parser where global liveness caused the pc-494 false rejection.
+- The branch-free-tail projection is now implemented and validated in the
+  worktree. It follows only a unique acyclic path to EXIT; conditional branches,
+  local calls, unknown helpers, legacy loads, or ambiguous targets disable it.
+  Exact helper signatures identify used registers; possible memory arguments
+  conservatively keep all stack slots live. Equality IDs use the same projection.
+  Focused tests prove a live uninitialized stack slot still rejects while an
+  overwritten scalar/pointer register difference prunes safely.
+- Exact xvs effect under the unchanged one-million budget: request pc 3468
+  falls from 4096 remembered states to 1 and pc 4787 to 3. The entry still
+  rejects on earlier conditional joins (pcs 3422-3426); forward remains
+  effectively unchanged. This is a bounded improvement, not claimed xvs
+  compatibility.
+- Final validation for this incremental batch: default **456 passed + 4
+  ignored**, std-only **438 passed + 4 ignored**, both strict Clippy profiles,
+  and true thumb no-std check/strict Clippy pass. Full scan remains exactly 137
+  families, 835/835 loaded entries, 125 compatible families, and 820/835
+  verified (671 strict + 149 privileged); the honest remaining classifications
+  are unchanged.
 
 Immediate resume order:
 
-1. Implement and adversarially test branch-free acyclic-tail state projection
-   as described above. Do not reintroduce global syntactic liveness.
-2. Use both xvs entries to measure convergence without raising the one-million
+1. Commit the validated branch-free-tail projection batch cleanly.
+2. Implement real precision dependencies/relational partitioning for earlier
+   conditional joins; do not reintroduce global syntactic liveness or generic
+   widening.
+3. Use both xvs entries to measure convergence without raising the one-million
    budget. Add adversarial dead/live register, stack-initialization, pointer,
    nullability, packet-range, and equality-correlation tests.
-3. Run the full matrix and 137-family scan, document exact results, and commit
+4. Run the full matrix and 137-family scan, document exact results, and commit
    the liveness/pruning batch cleanly. Then select the next production lane.
 
 Continuation batch completed after this checkpoint was written:

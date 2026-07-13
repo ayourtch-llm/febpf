@@ -801,20 +801,28 @@ impl VState {
         self.frames.last_mut().unwrap()
     }
 
-    fn subsumed_by(&self, old: &VState) -> bool {
+    fn subsumed_by_projected(&self, old: &VState, projection: Option<(u16, u64)>) -> bool {
+        let (live_regs, live_stack) = projection.unwrap_or((u16::MAX, u64::MAX));
         if self.frames.len() != old.frames.len() || self.held_lock != old.held_lock {
             return false;
         }
-        for (nf, of) in self.frames.iter().zip(&old.frames) {
+        for (frame_index, (nf, of)) in self.frames.iter().zip(&old.frames).enumerate() {
             if nf.ret_pc != of.ret_pc {
                 return false;
             }
+            let current = frame_index + 1 == self.frames.len();
             for r in 0..NUM_REGS {
+                if current && live_regs & (1 << r) == 0 {
+                    continue;
+                }
                 if !nf.regs[r].subsumed_by(&of.regs[r]) {
                     return false;
                 }
             }
             for s in 0..SLOTS {
+                if current && live_stack & (1 << s) == 0 {
+                    continue;
+                }
                 if !nf.stack[s].subsumed_by(&of.stack[s]) {
                     return false;
                 }
@@ -826,9 +834,14 @@ impl VState {
         // induced equivalence pattern, not the numbers themselves.
         let ids = |state: &VState| {
             let mut out = Vec::new();
-            for frame in &state.frames {
-                out.extend_from_slice(&frame.scalar_ids);
-                out.extend_from_slice(&frame.spill_ids);
+            for (frame_index, frame) in state.frames.iter().enumerate() {
+                let current = frame_index + 1 == state.frames.len();
+                for (r, id) in frame.scalar_ids.iter().enumerate() {
+                    out.push(if current && live_regs & (1 << r) == 0 { 0 } else { *id });
+                }
+                for (s, id) in frame.spill_ids.iter().enumerate() {
+                    out.push(if current && live_stack & (1 << s) == 0 { 0 } else { *id });
+                }
             }
             out
         };
@@ -1468,6 +1481,7 @@ pub struct Verifier<'a> {
     /// Remembered states per prune point.
     seen: LookupMap<usize, PruneList>,
     prune_points: Vec<bool>,
+    tail_projection: Vec<Option<(u16, u64)>>,
     insn_state: Vec<Option<(String, usize)>>,
     /// Join-over-all-visits of the current frame's registers per insn (see
     /// [`VerifyOk::pc_regs`]).
@@ -1524,6 +1538,7 @@ impl<'a> Verifier<'a> {
             warnings: Vec::new(),
             seen: LookupMap::new(),
             prune_points: Vec::new(),
+            tail_projection: Vec::new(),
             insn_state: Vec::new(),
             pc_regs: Vec::new(),
             next_null_id: 1,
@@ -1559,6 +1574,7 @@ impl<'a> Verifier<'a> {
         }
         self.check_structure()?;
         self.compute_prune_points();
+        self.compute_tail_projections();
         self.insn_state = vec![None; self.insns.len()];
         self.pc_regs = vec![None; self.insns.len()];
         self.probe_mem = vec![false; self.insns.len()];
@@ -1608,7 +1624,8 @@ impl<'a> Verifier<'a> {
                     let backoff = pl.miss_streak >= MISS_STREAK_LIMIT
                         && !pl.arrivals.is_multiple_of(BACKOFF_SCAN_EVERY);
                     if !backoff {
-                        if pl.states.iter().any(|old| state.subsumed_by(old)) {
+                        let projection = self.tail_projection[pc];
+                        if pl.states.iter().any(|old| state.subsumed_by_projected(old, projection)) {
                             self.stats.states_pruned += 1;
                             pl.miss_streak = 0;
                             break;
@@ -2201,6 +2218,137 @@ impl<'a> Verifier<'a> {
             i += if ins.is_wide() { 2 } else { 1 };
         }
         self.prune_points = pts;
+    }
+
+    fn compute_tail_projections(&mut self) {
+        self.tail_projection = (0..self.insns.len())
+            .map(|pc| self.prune_points[pc].then(|| self.tail_projection_from(pc)).flatten())
+            .collect();
+    }
+
+    /// Exact incoming liveness for a unique, acyclic instruction path ending
+    /// at EXIT. Conditional branches and local calls are deliberately outside
+    /// this optimization: they require relational precision tracking.
+    fn tail_projection_from(&self, start: usize) -> Option<(u16, u64)> {
+        let n = self.insns.len();
+        let mut path = Vec::new();
+        let mut visited = vec![false; n];
+        let mut pc = start;
+        loop {
+            if pc >= n || visited[pc] {
+                return None;
+            }
+            visited[pc] = true;
+            path.push(pc);
+            let ins = self.insns[pc];
+            let width = if ins.is_wide() { 2 } else { 1 };
+            if matches!(ins.class(), class::JMP | class::JMP32) {
+                match ins.op() {
+                    jmp::EXIT => break,
+                    jmp::JA => {
+                        let rel = if ins.class() == class::JMP32 {
+                            ins.imm as i64
+                        } else {
+                            ins.off as i64
+                        };
+                        let target = pc as i64 + 1 + rel;
+                        pc = usize::try_from(target).ok()?;
+                        continue;
+                    }
+                    jmp::CALL if ins.src != call_kind::LOCAL => {}
+                    _ => return None,
+                }
+            }
+            pc = pc.checked_add(width)?;
+        }
+
+        let bit = |r: u8| 1u16 << r;
+        let mut live_regs = 0u16;
+        let mut live_stack = 0u64;
+        for &pc in path.iter().rev() {
+            let ins = self.insns[pc];
+            let mut uses = 0u16;
+            let mut defs = 0u16;
+            let mut stack_uses = 0u64;
+            let mut stack_defs = 0u64;
+            match ins.class() {
+                class::LD if ins.is_wide() => defs |= bit(ins.dst),
+                class::LD => return None,
+                class::LDX => {
+                    uses |= bit(ins.src);
+                    defs |= bit(ins.dst);
+                    if ins.src == REG_FP && ins.off < 0 {
+                        let byte = usize::try_from(STACK_SIZE as i64 + ins.off as i64).ok()?;
+                        let end = byte.checked_add(ins.mem_size())?;
+                        if end > STACK_SIZE {
+                            return None;
+                        }
+                        for slot in byte / 8..end.div_ceil(8) {
+                            stack_uses |= 1 << slot;
+                        }
+                    }
+                }
+                class::ST => {
+                    uses |= bit(ins.dst);
+                    if ins.dst == REG_FP && ins.mem_size() == 8 && ins.off < 0 {
+                        let byte = usize::try_from(STACK_SIZE as i64 + ins.off as i64).ok()?;
+                        if byte.is_multiple_of(8) && byte / 8 < SLOTS {
+                            stack_defs |= 1 << (byte / 8);
+                        }
+                    }
+                }
+                class::STX => {
+                    uses |= bit(ins.dst) | bit(ins.src);
+                    if ins.mem_mode() == mode::ATOMIC {
+                        uses |= bit(0);
+                    }
+                    if ins.dst == REG_FP && ins.mem_size() == 8 && ins.off < 0 {
+                        let byte = usize::try_from(STACK_SIZE as i64 + ins.off as i64).ok()?;
+                        if byte.is_multiple_of(8) && byte / 8 < SLOTS {
+                            stack_defs |= 1 << (byte / 8);
+                        }
+                    }
+                }
+                class::ALU | class::ALU64 => {
+                    if ins.op() != alu::MOV {
+                        uses |= bit(ins.dst);
+                    }
+                    if ins.is_src_reg() && ins.op() != alu::NEG && ins.op() != alu::END {
+                        uses |= bit(ins.src);
+                    }
+                    defs |= bit(ins.dst);
+                }
+                class::JMP | class::JMP32 => match ins.op() {
+                    jmp::EXIT => uses |= bit(0),
+                    jmp::CALL => {
+                        let sig = self.sig_for(ins.imm as u32)?;
+                        for (arg, kind) in sig.args.iter().enumerate() {
+                            if !matches!(kind, ArgKind::None) {
+                                uses |= bit((arg + 1) as u8);
+                            }
+                            if matches!(kind,
+                                ArgKind::MapKey
+                                | ArgKind::MapValue
+                                | ArgKind::MemRead { .. }
+                                | ArgKind::MemReadOrNull { .. }
+                                | ArgKind::MemWrite { .. }
+                                | ArgKind::MemReadWrite { .. }
+                                | ArgKind::Any
+                            ) {
+                                stack_uses = u64::MAX;
+                            }
+                        }
+                        defs |= bit(0) | bit(1) | bit(2) | bit(3) | bit(4) | bit(5);
+                    }
+                    jmp::JA => {}
+                    _ => return None,
+                },
+                _ => return None,
+            }
+            live_regs = uses | (live_regs & !defs);
+            live_stack = stack_uses | (live_stack & !stack_defs);
+        }
+        Some((live_regs, live_stack))
     }
 
     // -- reading/writing registers -----------------------------------------
