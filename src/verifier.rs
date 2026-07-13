@@ -819,6 +819,12 @@ struct WorkItem {
     history: Vec<usize>,
 }
 
+#[derive(Clone, Copy)]
+struct PrecisionContext<'a> {
+    parent: Option<usize>,
+    history: &'a [usize],
+}
+
 const MISS_STREAK_LIMIT: u32 = 256;
 const BACKOFF_SCAN_EVERY: u32 = 64;
 
@@ -1744,7 +1750,14 @@ impl<'a> Verifier<'a> {
                 }
                 history.push(pc);
 
-                match self.step(pc, state) {
+                match self.step(
+                    pc,
+                    state,
+                    Some(PrecisionContext {
+                        parent,
+                        history: &history,
+                    }),
+                ) {
                     Err(e) => return Err(self.attach_trace(e, node, len)),
                     Ok(StepOutcome::Done) => break,
                     Ok(StepOutcome::Next(mut succs)) => {
@@ -1889,7 +1902,7 @@ impl<'a> Verifier<'a> {
             let pre = state.render();
             let ins = self.insns[pc];
             let cur_pc = pc;
-            let succs = match self.step(pc, state) {
+            let succs = match self.step(pc, state, None) {
                 Ok(StepOutcome::Next(s)) => s,
                 _ => return None, // exit or error before the recorded point
             };
@@ -2489,6 +2502,144 @@ impl<'a> Verifier<'a> {
             self.scalar_expr_ids.insert(key, id);
             id
         }
+    }
+
+    fn force_checkpoint_chain_precise(&mut self, mut parent: Option<usize>) {
+        while let Some(index) = parent {
+            let checkpoint = &mut self.checkpoints[index];
+            for frame in &mut checkpoint.state.frames {
+                frame.precise_regs = u16::MAX;
+                frame.precise_spills = u64::MAX;
+            }
+            parent = checkpoint.parent;
+        }
+    }
+
+    /// Propagate scalar precision through the instructions executed since the
+    /// latest checkpoint and then through stable checkpoint parents. This is
+    /// deliberately limited to one frame for now; local calls and transfers
+    /// that cannot be inverted exactly force the whole ancestor chain precise.
+    fn mark_chain_precision(
+        &mut self,
+        context: PrecisionContext<'_>,
+        mut regs: u16,
+        mut spills: u64,
+    ) {
+        let mut parent = context.parent;
+        let mut history = context.history.to_vec();
+        loop {
+            if !self.backtrack_precision_history(&history, &mut regs, &mut spills) {
+                self.force_checkpoint_chain_precise(parent);
+                return;
+            }
+            if regs == 0 && spills == 0 {
+                return;
+            }
+            let Some(index) = parent else {
+                return;
+            };
+            let checkpoint = &mut self.checkpoints[index];
+            if checkpoint.state.frames.len() != 1 {
+                self.force_checkpoint_chain_precise(Some(index));
+                return;
+            }
+            let frame = checkpoint.state.cur_mut();
+
+            // Equality-linked copies are one relational value. If any member
+            // is precise, every register/spill in that class must backtrack.
+            let mut ids = Vec::new();
+            for (reg, &id) in frame.scalar_ids.iter().enumerate() {
+                if regs & (1 << reg) != 0 && id != 0 && !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            for (slot, &id) in frame.spill_ids.iter().enumerate() {
+                if spills & (1 << slot) != 0 && id != 0 && !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            for (reg, id) in frame.scalar_ids.iter().enumerate() {
+                if ids.contains(id) {
+                    regs |= 1 << reg;
+                }
+            }
+            for (slot, id) in frame.spill_ids.iter().enumerate() {
+                if ids.contains(id) {
+                    spills |= 1 << slot;
+                }
+            }
+            frame.precise_regs |= regs;
+            frame.precise_spills |= spills;
+            history = checkpoint.history.clone();
+            parent = checkpoint.parent;
+        }
+    }
+
+    fn backtrack_precision_history(
+        &self,
+        history: &[usize],
+        regs: &mut u16,
+        spills: &mut u64,
+    ) -> bool {
+        let bit = |reg: u8| 1u16 << reg;
+        for &pc in history.iter().rev() {
+            let ins = self.insns[pc];
+            match ins.class() {
+                class::LD if ins.is_wide() => *regs &= !bit(ins.dst),
+                class::LD => return false,
+                class::LDX => {
+                    if *regs & bit(ins.dst) == 0 {
+                        continue;
+                    }
+                    *regs &= !bit(ins.dst);
+                    if ins.src == REG_FP && ins.mem_size() == 8 && ins.off < 0 {
+                        let byte = match usize::try_from(STACK_SIZE as i64 + ins.off as i64) {
+                            Ok(byte) if byte.is_multiple_of(8) && byte < STACK_SIZE => byte,
+                            _ => return false,
+                        };
+                        *spills |= 1 << (byte / 8);
+                    }
+                }
+                class::ST | class::STX if ins.dst == REG_FP && ins.off < 0 => {
+                    let byte = match usize::try_from(STACK_SIZE as i64 + ins.off as i64) {
+                        Ok(byte) if byte < STACK_SIZE => byte,
+                        _ => return false,
+                    };
+                    let end = match byte.checked_add(ins.mem_size()) {
+                        Some(end) if end <= STACK_SIZE => end,
+                        _ => return false,
+                    };
+                    let touched = ((1u128 << end.div_ceil(8)) - 1)
+                        ^ ((1u128 << (byte / 8)) - 1);
+                    if (*spills as u128) & touched == 0 {
+                        continue;
+                    }
+                    if ins.mem_size() != 8 || !byte.is_multiple_of(8) {
+                        return false;
+                    }
+                    *spills &= !(1 << (byte / 8));
+                    if ins.class() == class::STX {
+                        *regs |= bit(ins.src);
+                    }
+                }
+                class::ALU | class::ALU64 if *regs & bit(ins.dst) != 0 => {
+                    if ins.op() == alu::MOV {
+                        *regs &= !bit(ins.dst);
+                    }
+                    if ins.is_src_reg() && ins.op() != alu::NEG && ins.op() != alu::END {
+                        *regs |= bit(ins.src);
+                    }
+                }
+                class::JMP | class::JMP32 if ins.op() == jmp::CALL => {
+                    if ins.src == call_kind::LOCAL {
+                        return false;
+                    }
+                    *regs &= !(bit(0) | bit(1) | bit(2) | bit(3) | bit(4) | bit(5));
+                }
+                _ => {}
+            }
+        }
+        true
     }
 
     fn scalar_meet(a: Scalar, b: Scalar) -> Option<Scalar> {
@@ -3959,7 +4110,12 @@ impl<'a> Verifier<'a> {
 
     // -- single-step ----------------------------------------------------------
 
-    fn step(&mut self, pc: usize, mut state: VState) -> Result<StepOutcome, VerifyError> {
+    fn step(
+        &mut self,
+        pc: usize,
+        mut state: VState,
+        precision: Option<PrecisionContext<'_>>,
+    ) -> Result<StepOutcome, VerifyError> {
         let ins = self.insns[pc];
         let cls = ins.class();
         if state.held_lock.is_some()
@@ -3970,7 +4126,7 @@ impl<'a> Verifier<'a> {
         }
         match cls {
             class::ALU | class::ALU64 => {
-                self.step_alu(pc, &mut state, ins)?;
+                self.step_alu(pc, &mut state, ins, precision)?;
                 Ok(StepOutcome::Next(vec![(pc + 1, state)]))
             }
             class::LD => {
@@ -4142,7 +4298,7 @@ impl<'a> Verifier<'a> {
                 }
                 Ok(StepOutcome::Next(vec![(pc + 1, state)]))
             }
-            class::JMP | class::JMP32 => self.step_jmp(pc, state, ins),
+            class::JMP | class::JMP32 => self.step_jmp(pc, state, ins, precision),
             _ => unreachable!(),
         }
     }
@@ -4190,7 +4346,13 @@ impl<'a> Verifier<'a> {
         Ok(StepOutcome::Next(vec![(pc + 1, state)]))
     }
 
-    fn step_alu(&mut self, pc: usize, state: &mut VState, ins: Insn) -> Result<(), VerifyError> {
+    fn step_alu(
+        &mut self,
+        pc: usize,
+        state: &mut VState,
+        ins: Insn,
+        precision: Option<PrecisionContext<'_>>,
+    ) -> Result<(), VerifyError> {
         const PACKET32_ID: u32 = u32::MAX - 1;
         const PACKET_END32_ID: u32 = u32::MAX;
         let is32 = ins.class() == class::ALU;
@@ -4296,6 +4458,18 @@ impl<'a> Verifier<'a> {
         let a_ptr = matches!(a, RegState::Ptr(_));
         let b_ptr = matches!(b, RegState::Ptr(_));
         if a_ptr || b_ptr {
+            if let Some(context) = precision {
+                let mut precise = 0u16;
+                if matches!(a, RegState::Scalar(_)) {
+                    precise |= 1 << ins.dst;
+                }
+                if ins.is_src_reg() && matches!(b, RegState::Scalar(_)) {
+                    precise |= 1 << ins.src;
+                }
+                if precise != 0 {
+                    self.mark_chain_precision(context, precise, 0);
+                }
+            }
             if is32 {
                 // XDP exposes data/data_end as 32-bit context fields, so clang
                 // computes packet length with an ALU32 subtraction.  This is
@@ -4452,6 +4626,7 @@ impl<'a> Verifier<'a> {
         pc: usize,
         mut state: VState,
         ins: Insn,
+        precision: Option<PrecisionContext<'_>>,
     ) -> Result<StepOutcome, VerifyError> {
         let is32 = ins.class() == class::JMP32;
         match ins.op() {
@@ -4602,6 +4777,13 @@ impl<'a> Verifier<'a> {
                         ]));
                     }
                 };
+                if let Some(context) = precision {
+                    let mut precise = 1 << ins.dst;
+                    if ins.is_src_reg() {
+                        precise |= 1 << ins.src;
+                    }
+                    self.mark_chain_precision(context, precise, 0);
+                }
                 let dst_scalar_id = state.cur().scalar_ids[ins.dst as usize];
                 let src_scalar_id = if ins.is_src_reg() {
                     state.cur().scalar_ids[ins.src as usize]
@@ -4717,4 +4899,80 @@ pub fn verify(
         }
     }
     Verifier::new(insns, maps, user_sigs, cfg).verify()
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+
+    fn verifier(source: &str) -> Verifier<'_> {
+        let insns = crate::asm::assemble(source).unwrap().insns;
+        let insns = Box::leak(insns.into_boxed_slice());
+        Verifier::new(insns, &[], &[], Config::default())
+    }
+
+    fn checkpoint(v: &mut Verifier<'_>) {
+        let mut frame = Frame::new(0);
+        frame.regs[1] = RegState::Scalar(Scalar::unknown());
+        frame.regs[3] = RegState::Scalar(Scalar::unknown());
+        frame.precise_regs = 0;
+        frame.precise_spills = 0;
+        v.checkpoints.push(Checkpoint {
+            state: VState {
+                frames: vec![frame],
+                held_lock: None,
+            },
+            parent: None,
+            history: Vec::new(),
+        });
+    }
+
+    #[test]
+    fn precision_backtracks_register_alu_chain() {
+        let mut v = verifier("r2 = r1\nr2 += 7\nr0 = 0\nexit\n");
+        checkpoint(&mut v);
+        v.mark_chain_precision(
+            PrecisionContext {
+                parent: Some(0),
+                history: &[0, 1],
+            },
+            1 << 2,
+            0,
+        );
+        assert_eq!(v.checkpoints[0].state.cur().precise_regs, 1 << 1);
+    }
+
+    #[test]
+    fn precision_backtracks_aligned_spill_and_reload() {
+        let mut v = verifier(
+            "*(u64 *)(r10 - 8) = r3\nr4 = *(u64 *)(r10 - 8)\nr4 += 1\nr0 = 0\nexit\n",
+        );
+        checkpoint(&mut v);
+        v.mark_chain_precision(
+            PrecisionContext {
+                parent: Some(0),
+                history: &[0, 1, 2],
+            },
+            1 << 4,
+            0,
+        );
+        assert_eq!(v.checkpoints[0].state.cur().precise_regs, 1 << 3);
+        assert_eq!(v.checkpoints[0].state.cur().precise_spills, 0);
+    }
+
+    #[test]
+    fn unsupported_precision_transfer_forces_ancestor_chain() {
+        let mut v = verifier("ldabsw 0\nr0 = 0\nexit\n");
+        checkpoint(&mut v);
+        v.mark_chain_precision(
+            PrecisionContext {
+                parent: Some(0),
+                history: &[0],
+            },
+            1,
+            0,
+        );
+        assert_eq!(v.checkpoints[0].state.cur().precise_regs, u16::MAX);
+        assert_eq!(v.checkpoints[0].state.cur().precise_spills, u64::MAX);
+    }
 }
