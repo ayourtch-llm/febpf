@@ -108,6 +108,19 @@ In-progress investigation after `3f9bb65` (not committed):
   is conservative backward liveness/precision: ignore only register and stack
   facts provably dead on every continuation, while keeping live branch and
   packet-range correlations partitioned.
+- A third prototype added conservative backward register and stack-slot
+  liveness to prune comparisons (local-call programs disabled; helpers first
+  treated as using r1-r5/all stack, then used exact non-None signature args;
+  only aligned full-slot stores killed stack facts). Register-only liveness did
+  not converge. Slot liveness collapsed pc 4787 from 947 remembered states to
+  3, while pc 3468 remained capped at 4096. Signature-aware helper uses then
+  exposed the same false rejection at pc 494 (62-byte proof before offset-70
+  access). All 144 integration tests and strict default Clippy passed, but the
+  xvs counterexample proves plain syntactic liveness is insufficiently precise.
+  The prototype was backed out. Do not ignore a state component merely because
+  its register/slot is syntactically dead: verifier precision/equality
+  dependencies require Linux-style precision backtracking or an equivalent
+  relational partition before such pruning is safe enough for this corpus.
 
 Immediate resume order:
 
