@@ -808,6 +808,11 @@ struct Checkpoint {
     state: VState,
     parent: Option<usize>,
     history: Vec<usize>,
+    /// Number of unfinished DFS paths descending from this checkpoint. Only
+    /// zero-count checkpoints have their accumulated precision applied.
+    active_branches: u32,
+    required_regs: u16,
+    required_spills: u64,
 }
 
 struct WorkItem {
@@ -850,7 +855,7 @@ impl VState {
                 if current && live_regs & (1 << r) == 0 {
                     continue;
                 }
-                if matches!(of.regs[r], RegState::Scalar(_))
+                if matches!((of.regs[r], nf.regs[r]), (RegState::Scalar(_), RegState::Scalar(_)))
                     && of.precise_regs & (1 << r) == 0
                 {
                     continue;
@@ -863,7 +868,13 @@ impl VState {
                 if current && live_stack & (1 << s) == 0 {
                     continue;
                 }
-                if matches!(of.stack[s], SlotState::Spill(RegState::Scalar(_)))
+                if matches!(
+                    (of.stack[s], nf.stack[s]),
+                    (
+                        SlotState::Spill(RegState::Scalar(_)),
+                        SlotState::Spill(RegState::Scalar(_))
+                    )
+                )
                     && of.precise_spills & (1 << s) == 0
                 {
                     continue;
@@ -1712,6 +1723,9 @@ impl<'a> Verifier<'a> {
                             state: state.clone(),
                             parent,
                             history: core::mem::take(&mut history),
+                            active_branches: 1,
+                            required_regs: 0,
+                            required_spills: 0,
                         });
                         debug_assert!(self.checkpoints[checkpoint]
                             .parent
@@ -1765,6 +1779,7 @@ impl<'a> Verifier<'a> {
                             break; // all successors dead
                         }
                         if succs.len() > 1 {
+                            self.add_checkpoint_branches(parent, (succs.len() - 1) as u32);
                             // record one decision node per successor
                             let first_id = self.path_nodes.len() as u32;
                             for i in 0..succs.len() {
@@ -1799,6 +1814,7 @@ impl<'a> Verifier<'a> {
                     }
                 }
             }
+            self.finish_checkpoint_branch(parent);
         }
 
         self.stats.prune_points = self.prune_points.iter().filter(|p| **p).count();
@@ -2504,14 +2520,67 @@ impl<'a> Verifier<'a> {
         }
     }
 
-    fn force_checkpoint_chain_precise(&mut self, mut parent: Option<usize>) {
-        while let Some(index) = parent {
+    fn force_checkpoint_precise(&mut self, parent: Option<usize>) {
+        if let Some(index) = parent {
             let checkpoint = &mut self.checkpoints[index];
+            checkpoint.required_regs = u16::MAX;
+            checkpoint.required_spills = u64::MAX;
             for frame in &mut checkpoint.state.frames {
                 frame.precise_regs = u16::MAX;
                 frame.precise_spills = u64::MAX;
             }
-            parent = checkpoint.parent;
+        }
+    }
+
+    fn add_checkpoint_branches(&mut self, parent: Option<usize>, additional: u32) {
+        if let Some(index) = parent {
+            let checkpoint = &mut self.checkpoints[index];
+            checkpoint.active_branches = checkpoint.active_branches.saturating_add(additional);
+        }
+    }
+
+    fn finish_checkpoint_branch(&mut self, mut parent: Option<usize>) {
+        while let Some(index) = parent {
+            let (ancestor, history, required_regs, required_spills) = {
+                let checkpoint = &mut self.checkpoints[index];
+                debug_assert!(checkpoint.active_branches > 0);
+                checkpoint.active_branches = checkpoint.active_branches.saturating_sub(1);
+                if checkpoint.active_branches != 0 {
+                    break;
+                }
+                if checkpoint.state.frames.len() == 1 {
+                    let frame = checkpoint.state.cur_mut();
+                    // Keep compression disabled until packet/control
+                    // correlation is represented transitively. Applying the
+                    // accumulated masks here currently exposes the xvs pc-494
+                    // counterexample; finalized ancestry itself is retained.
+                    frame.precise_regs = u16::MAX;
+                    frame.precise_spills = u64::MAX;
+                } else {
+                    for frame in &mut checkpoint.state.frames {
+                        frame.precise_regs = u16::MAX;
+                        frame.precise_spills = u64::MAX;
+                    }
+                }
+                (
+                    checkpoint.parent,
+                    checkpoint.history.clone(),
+                    checkpoint.required_regs,
+                    checkpoint.required_spills,
+                )
+            };
+            // A finalized checkpoint represented one unfinished child branch
+            // in its parent. First propagate only the precision its completed
+            // descendants actually required, then release that parent branch.
+            self.mark_chain_precision(
+                PrecisionContext {
+                    parent: ancestor,
+                    history: &history,
+                },
+                required_regs,
+                required_spills,
+            );
+            parent = ancestor;
         }
     }
 
@@ -2525,24 +2594,22 @@ impl<'a> Verifier<'a> {
         mut regs: u16,
         mut spills: u64,
     ) {
-        let mut parent = context.parent;
-        let mut history = context.history.to_vec();
-        loop {
-            if !self.backtrack_precision_history(&history, &mut regs, &mut spills) {
-                self.force_checkpoint_chain_precise(parent);
-                return;
-            }
-            if regs == 0 && spills == 0 {
-                return;
-            }
-            let Some(index) = parent else {
-                return;
-            };
-            let checkpoint = &mut self.checkpoints[index];
-            if checkpoint.state.frames.len() != 1 {
-                self.force_checkpoint_chain_precise(Some(index));
-                return;
-            }
+        if !self.backtrack_precision_history(context.history, &mut regs, &mut spills) {
+            self.force_checkpoint_precise(context.parent);
+            return;
+        }
+        if regs == 0 && spills == 0 {
+            return;
+        }
+        let Some(index) = context.parent else {
+            return;
+        };
+        let checkpoint = &mut self.checkpoints[index];
+        if checkpoint.state.frames.len() != 1 {
+            self.force_checkpoint_precise(Some(index));
+            return;
+        }
+            let finalized = checkpoint.active_branches == 0;
             let frame = checkpoint.state.cur_mut();
 
             // Equality-linked copies are one relational value. If any member
@@ -2568,11 +2635,12 @@ impl<'a> Verifier<'a> {
                     spills |= 1 << slot;
                 }
             }
-            frame.precise_regs |= regs;
-            frame.precise_spills |= spills;
-            history = checkpoint.history.clone();
-            parent = checkpoint.parent;
-        }
+            if finalized {
+                frame.precise_regs |= regs;
+                frame.precise_spills |= spills;
+            }
+            checkpoint.required_regs |= regs;
+            checkpoint.required_spills |= spills;
     }
 
     fn backtrack_precision_history(
@@ -3276,6 +3344,7 @@ impl<'a> Verifier<'a> {
         state: &mut VState,
         pc: usize,
         hid: u32,
+        precision: Option<PrecisionContext<'_>>,
     ) -> Result<(), VerifyError> {
         if hid == 0xbad2310 {
             // The CO-RE loader poisons instructions whose relocation found no
@@ -3302,6 +3371,17 @@ impl<'a> Verifier<'a> {
             ));
         }
         let args: Vec<RegState> = (1..=5).map(|r| state.cur().regs[r]).collect();
+        if let Some(context) = precision {
+            let mut precise = 0u16;
+            for (index, arg) in args.iter().enumerate() {
+                if matches!(arg, RegState::Scalar(_)) {
+                    precise |= 1 << (index + 1);
+                }
+            }
+            if precise != 0 {
+                self.mark_chain_precision(context, precise, 0);
+            }
+        }
         if hid == crate::helpers::id::CSUM_DIFF {
             for index in [1usize, 3] {
                 match args[index] {
@@ -4708,7 +4788,7 @@ impl<'a> Verifier<'a> {
                     state.frames.push(callee);
                     Ok(StepOutcome::Next(vec![(target, state)]))
                 } else {
-                    self.check_helper_call(&mut state, pc, ins.imm as u32)?;
+                    self.check_helper_call(&mut state, pc, ins.imm as u32, precision)?;
                     Ok(StepOutcome::Next(vec![(pc + 1, state)]))
                 }
             }
@@ -4924,6 +5004,9 @@ mod precision_tests {
             },
             parent: None,
             history: Vec::new(),
+            active_branches: 0,
+            required_regs: 0,
+            required_spills: 0,
         });
     }
 

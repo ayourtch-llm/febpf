@@ -98,6 +98,27 @@ Implement the febpf version as one coherent semantic change:
    with global location masks or branch-history hashes: both lose the
    transitive data dependencies the kernel algorithm preserves.
 
+Implementation update: stable checkpoint ancestry (`75e82fb`), scalar
+precision representation (`32bf4a8`), and register/ALU/aligned-spill
+backtracking (`98d9662`) are committed. The next incremental layer adds
+direct-child branch reference counts and bottom-up propagation of accumulated
+precision requirements when checkpoints finalize. Its initial activation was
+deliberately rejected: applying the accumulated masks made xvs request reach
+the known false packet rejection at pc 494 (62-byte proof before an offset-70
+access). Marking every scalar register and spill precise at packet-bound
+branches still produced the same counterexample, proving a transitive relation
+is lost elsewhere. The committed-safe form must keep finalized checkpoint
+comparison fully precise while retaining the finalization/requirement
+infrastructure; do not enable imprecise masks until that missing relation is
+identified. A live-uninitialized-stack adversarial test also caught and fixed
+an independent comparison rule: imprecision may ignore ranges only when both
+old and current locations are initialized scalar spills/registers, never the
+initialization/type distinction. With compression disabled, release xvs
+request exactly reproduces the honest pc-3472 complexity baseline and hottest
+joins. Bounded and unbounded loop regressions pass; branch accounting is
+direct-child and propagates upward only on a zero transition to avoid the
+rejected O(depth^2) implementation.
+
 Completed and committed in `3f9bb65`:
 
 - Added immutable production upstream `davidcoles/xvs` v0.2.10 at commit
