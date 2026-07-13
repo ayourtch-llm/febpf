@@ -30,7 +30,80 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 C log-filter host landed; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-13 C ELF/CO-RE loading landed; authoritative)
+
+Native production-plugin distribution is committed as `608224d` (`ffi: load
+ELF and CO-RE programs from C`), on top of the C ABI and application-host
+milestones. At checkpoint writing HEAD is `608224d`; only this HANDOFF update
+is intentionally uncommitted. The recurring tttt job remains deleted. No
+build, corpus scanner, subagent, or external terminal collaborator is active.
+
+The additive ABI-v1 function `febpf_vm_create_elf` takes copied object bytes
+and a versioned `febpf_elf_options_v1`. It selects an exact loaded-program name
+and accepts target BTF either as a raw blob or as a complete ELF containing a
+`.BTF` section. Multi-entry objects require an explicit selector. Objects with
+CO-RE relocations or BTF-typed contexts require target BTF rather than silently
+using compiler-local layout. Loader warnings fail closed because v1 has no
+warning sink, and static `PROG_ARRAY` initializers return unsupported because
+they require verification-time bundle linking. Application attach-target
+overrides remain deliberately outside this descriptor.
+
+The handle retains no object, selector, or target-BTF pointer/bytes. It owns the
+relocated `Vm`, the last verified model, and only the ELF section's derived
+context-model constraint. XDP entries must verify as XDP and skb-family entries
+as skb; raw/assembly constructors remain unconstrained. This prevents a caller
+from reinterpreting section-specific ctx accesses through an unrelated Flat
+ABI without introducing an ELF execution mode in `Vm`.
+
+`examples/c-elf-host` loads `core_probe.o`, passes the complete
+`core_target.o` as target BTF, frees both C input buffers immediately after
+construction, verifies a Flat context, and produces `core-result=123` from the
+relocated offsets. Rust boundary tests additionally cover ambiguous selector
+rejection, missing required target BTF, XDP model enforcement, durable ELF map
+state, and honest static-tail-call rejection. The shared library exports
+exactly eight `febpf_*` symbols.
+
+Exact validation and measurement for `608224d`:
+
+- Default all-target: **477 passed + 4 ignored**; std-only: **459 passed + 4
+  ignored**.
+- Default/JIT C API: **484 passed + 4 ignored**; std interpreter-only C API:
+  **466 passed + 4 ignored**.
+- Strict all-target Clippy passed for default, std-only, default/JIT C API, and
+  std-only C API. True `thumbv7em-none-eabihf` no-std check and strict Clippy
+  passed. Release build and C-API doctests passed.
+- Explicit cdylib and staticlib builds passed. All three C11 hosts compiled
+  with `-Wall -Wextra -Werror`; assembly output, log filtering, and exact CO-RE
+  result 123 passed.
+- Complete rebuilt-release corpus scan remains **137 families**, 135 loaded,
+  **126 fully compatible**, **835/835 entries loaded**, and **822/835 verified
+  (98.4%)**: 673 strict + 149 privileged-uninitialized. The remaining six
+  missing-attach-target entries, seven poisoned relocations, and two
+  object-level missing-kfunc families are unchanged; unsupported-map and
+  unknown-helper histograms remain empty.
+- `rustfmt --check`, `git diff --check`, and the eight-symbol `nm` audit passed.
+
+Immediate resume order:
+
+1. The next measured embedding gap is map configuration/control, not another
+   execution mode. Audit `Object::set_map_max_entries`, `Vm` map ownership,
+   preload/update/lookup APIs, frozen maps, per-CPU selection, and map-in-map
+   invariants. Separate pre-construction ELF configuration from post-construction
+   runtime map access; they have different lifetimes.
+2. Land the smallest versioned surface that unlocks a real host. Likely start
+   with exact-name ELF max-entry overrides for explicit-zero maps, then opaque
+   or index-stable runtime map access with copied keys/values and precise errno
+   diagnostics. Prove it with a C host configuring and reading durable state.
+   Do not expose `Map` layout or host pointers and do not combine this with
+   custom helper callbacks.
+3. Rank custom C helpers only after map control is exercised. Static tail-call
+   linking and attach-target overrides remain independently versioned future
+   surfaces. AF_XDP live traffic remains an honest provisioned-host gap;
+   zero-copy and DPDK remain optional later adapters.
+
+The checkpoint immediately below is historical and superseded by this one.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-13 C log-filter host landed; superseded)
 
 The first production-shaped application of the native ABI is committed as
 `7d26ad2` (`examples: add C log-filter host`), on top of the ABI baseline
