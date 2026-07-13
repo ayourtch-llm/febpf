@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-"$ROOT/../target/perf"}
+exec cargo bench --locked --manifest-path "$ROOT/Cargo.toml" --bench engine -- "$@"

@@ -107,6 +107,13 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo clippy --features c-api --all-targets -- -D warnings
 
+      # Criterion remains in a separately locked development crate. Compile
+      # the harness on both native Linux JIT architectures without turning
+      # noisy hosted-runner timings into a performance gate.
+      - name: Check performance harness
+        if: runner.os == 'Linux'
+        run: cargo check --locked --manifest-path perf/Cargo.toml --benches
+
       # The differential fuzzer is the real test of the JIT: it runs random
       # programs under the interpreter and the JIT and requires identical r0.
       # `cargo test` already runs 4k seeds; this adds a much wider sweep with a

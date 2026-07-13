@@ -14,10 +14,11 @@ $ febpf run examples/fib.s --ctx 0b
 r0 = 89 (0x59)   [interp, 1.9µs]
 
 $ febpf bench examples/sum_loop.s --iters 50000
-50000 iterations, 3003 insns/run [interp]  — 247 M insn/s
 $ febpf bench examples/sum_loop.s --iters 50000 --jit
-50000 iterations, 3003 insns/run [jit]     — 11018 M insn/s   # 45× faster
 ```
+
+For statistically sampled results rather than a one-off CLI timing, see
+[Benchmarks](#benchmarks).
 
 ## Features
 
@@ -61,13 +62,12 @@ $ febpf bench examples/sum_loop.s --iters 50000 --jit
   differential path. ELF `values[]` relocations are linked automatically, so
   a multi-section clang object can be verified and run directly with `--prog`.
 - **JIT compiler** (x86-64 Linux, aarch64 Linux and macOS; zero-dependency):
-  hand-rolled native codegen for the ALU + branch core (~45× on tight loops on
-  x86-64, ~26× on aarch64), with memory ops, calls and atomics deferred to the
-  interpreter — so the JIT keeps the interpreter's exact memory-safety
-  guarantee, it just removes dispatch overhead. Each deferred instruction pays
-  a trampoline round-trip, so the speedup scales with how much of a program is
-  arithmetic: ~25× for a tight ALU loop, ~1.2–1.6× for memory-saturated code.
-  The compiler is split into an
+  hand-rolled native codegen for the ALU + branch core, with memory ops, calls
+  and atomics deferred to the interpreter — so the JIT keeps the interpreter's
+  exact memory-safety guarantee while removing dispatch overhead from native
+  spans. Each deferred instruction pays a trampoline round-trip, so results
+  depend on program shape; the Criterion suite measures warm execution and
+  compilation separately. The compiler is split into an
   architecture-independent frontend and a `JitBackend` trait; adding **riscv64**
   means implementing that one trait (see `docs/specs/jit-backend.md`).
   Differentially tested against the interpreter.
@@ -129,6 +129,40 @@ febpf vfuzz    --iters 1000          # verifier-frontier differential fuzzer
 ELF inputs can select a section with `--prog`; CO-RE accepts `--target-btf`.
 For XDP, use `--packet <file>` or `--pcap <file>`. Kernel differential modes
 require Linux privileges and otherwise report that they were skipped.
+
+## Benchmarks
+
+The development-only Criterion harness measures public engine boundaries
+directly. Run the complete default-feature suite with:
+
+```sh
+./perf/run
+```
+
+It separates warm execution from construction costs: interpreter execution,
+precompiled JIT execution, JIT compilation, verification, and ELF/BTF/CO-RE
+loading. The `sum_loop` execution group reports both latency and executed eBPF
+instructions per second. Criterion is only a development dependency; febpf's
+library and binaries retain zero dependencies and the no-std build does not
+include the benchmark harness. The self-contained [`perf/`](perf/) crate keeps
+its own manifest and lockfile so the measured setup is reproducible without
+changing the engine's dependency graph.
+
+One complete run on 2026-07-13 with rustc 1.96.1, Linux x86-64, and an AMD
+Ryzen 9 3900X produced the following 95% confidence intervals:
+
+| Benchmark | Time | Throughput |
+|---|---:|---:|
+| `execution/sum_loop/interpreter` | 12.035–12.134 µs | 247.49–249.52 M insn/s |
+| `execution/sum_loop/jit_warm` | 289.02–292.36 ns | 10.272–10.390 G insn/s |
+| `jit/compile_sum_loop` | 8.134–8.328 µs | — |
+| `verifier/sum_loop` | 1.459–1.463 ms | — |
+| `elf/core_load_and_relocate` | 8.408–8.453 µs | — |
+
+These numbers characterize that host, not a portable performance promise.
+Use Criterion's saved baselines on the same quiet machine when judging a code
+change; the existing `febpf bench` command remains a convenient end-to-end
+smoke measurement.
 
 ## Assembly syntax
 

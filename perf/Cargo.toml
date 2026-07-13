@@ -1,0 +1,20 @@
+[package]
+name = "febpf-perf"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+febpf = { path = ".." }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "engine"
+harness = false
+
+[profile.bench]
+lto = true
+codegen-units = 1

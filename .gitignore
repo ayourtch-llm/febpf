@@ -1,5 +1,7 @@
 /target
 Cargo.lock
+!/perf/Cargo.lock
+/perf/target/
 *.bin
 out.bin
 .claude/
