@@ -784,10 +784,32 @@ struct VState {
 /// every iteration) stop paying the subsumption-scan cost.
 #[derive(Default)]
 struct PruneList {
-    states: Vec<VState>,
+    /// Stable indices into `Verifier::checkpoints`. Ring replacement removes
+    /// an index from this active prune list but never invalidates the arena
+    /// entry, because descendant paths may still name it as their parent.
+    states: Vec<usize>,
     cursor: usize,
     miss_streak: u32,
     arrivals: u32,
+}
+
+/// A stable verifier checkpoint. `history` is the instruction path executed
+/// since `parent` and will be used by scalar precision backtracking. Keeping
+/// this metadata outside `VState` ensures it never affects semantic state
+/// comparison.
+struct Checkpoint {
+    state: VState,
+    parent: Option<usize>,
+    history: Vec<usize>,
+}
+
+struct WorkItem {
+    pc: usize,
+    state: VState,
+    path_node: Option<u32>,
+    path_len: u32,
+    parent: Option<usize>,
+    history: Vec<usize>,
 }
 
 const MISS_STREAK_LIMIT: u32 = 256;
@@ -1480,6 +1502,8 @@ pub struct Verifier<'a> {
     warnings: Vec<String>,
     /// Remembered states per prune point.
     seen: LookupMap<usize, PruneList>,
+    /// Append-only storage backing stable checkpoint parent identities.
+    checkpoints: Vec<Checkpoint>,
     prune_points: Vec<bool>,
     tail_projection: Vec<Option<(u16, u64)>>,
     insn_state: Vec<Option<(String, usize)>>,
@@ -1537,6 +1561,7 @@ impl<'a> Verifier<'a> {
             stats: Stats::default(),
             warnings: Vec::new(),
             seen: LookupMap::new(),
+            checkpoints: Vec::new(),
             prune_points: Vec::new(),
             tail_projection: Vec::new(),
             insn_state: Vec::new(),
@@ -1580,14 +1605,23 @@ impl<'a> Verifier<'a> {
         self.probe_mem = vec![false; self.insns.len()];
         self.mem_class = vec![0u8; self.insns.len()];
 
-        // work items: (pc, state, last path node, steps taken from entry)
-        let mut pending: Vec<(usize, VState, Option<u32>, u32)> =
-            vec![(0, self.initial_state(), None, 0)];
-        while let Some((pc, state, node, len)) = pending.pop() {
-            let mut pc = pc;
-            let mut state = state;
-            let mut node = node;
-            let mut len = len;
+        // work items: (pc, state, last path node, steps taken from entry,
+        // parent checkpoint, instruction history since that checkpoint)
+        let mut pending = vec![WorkItem {
+            pc: 0,
+            state: self.initial_state(),
+            path_node: None,
+            path_len: 0,
+            parent: None,
+            history: Vec::new(),
+        }];
+        while let Some(work) = pending.pop() {
+            let mut pc = work.pc;
+            let mut state = work.state;
+            let mut node = work.path_node;
+            let mut len = work.path_len;
+            let mut parent = work.parent;
+            let mut history = work.history;
             loop {
                 if self.stats.insns_processed >= self.cfg.insn_budget {
                     let mut hot = self
@@ -1625,7 +1659,12 @@ impl<'a> Verifier<'a> {
                         && !pl.arrivals.is_multiple_of(BACKOFF_SCAN_EVERY);
                     if !backoff {
                         let projection = self.tail_projection[pc];
-                        if pl.states.iter().any(|old| state.subsumed_by_projected(old, projection)) {
+                        if pl.states.iter().any(|&old| {
+                            state.subsumed_by_projected(
+                                &self.checkpoints[old].state,
+                                projection,
+                            )
+                        }) {
                             self.stats.states_pruned += 1;
                             pl.miss_streak = 0;
                             break;
@@ -1633,10 +1672,24 @@ impl<'a> Verifier<'a> {
                         pl.miss_streak = pl.miss_streak.saturating_add(1);
                         // ring buffer: keep the most recent states so
                         // convergent forks of a loop iteration still prune
+                        let checkpoint = self.checkpoints.len();
+                        self.checkpoints.push(Checkpoint {
+                            state: state.clone(),
+                            parent,
+                            history: core::mem::take(&mut history),
+                        });
+                        debug_assert!(self.checkpoints[checkpoint]
+                            .parent
+                            .is_none_or(|ancestor| ancestor < checkpoint));
+                        debug_assert!(self.checkpoints[checkpoint]
+                            .history
+                            .iter()
+                            .all(|&visited| visited < self.insns.len()));
+                        parent = Some(checkpoint);
                         if pl.states.len() < cap {
-                            pl.states.push(state.clone());
+                            pl.states.push(checkpoint);
                         } else {
-                            pl.states[pl.cursor % cap] = state.clone();
+                            pl.states[pl.cursor % cap] = checkpoint;
                             pl.cursor = pl.cursor.wrapping_add(1);
                         }
                     }
@@ -1660,6 +1713,7 @@ impl<'a> Verifier<'a> {
                         slot @ None => *slot = Some(*regs),
                     }
                 }
+                history.push(pc);
 
                 match self.step(pc, state) {
                     Err(e) => return Err(self.attach_trace(e, node, len)),
@@ -1681,7 +1735,14 @@ impl<'a> Verifier<'a> {
                             let (npc, nstate) = succs.pop().unwrap();
                             for (i, (opc, ostate)) in succs.into_iter().enumerate() {
                                 self.stats.states_explored += 1;
-                                pending.push((opc, ostate, Some(first_id + i as u32), len + 1));
+                                pending.push(WorkItem {
+                                    pc: opc,
+                                    state: ostate,
+                                    path_node: Some(first_id + i as u32),
+                                    path_len: len + 1,
+                                    parent,
+                                    history: history.clone(),
+                                });
                             }
                             node = Some(first_id + cont as u32);
                             len += 1;
