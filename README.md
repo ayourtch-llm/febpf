@@ -276,7 +276,8 @@ including time-travel `rstep`.
 - **Native embedding**: `include/febpf.h` and `docs/specs/c-api.md` — an
   opt-in, versioned C ABI with opaque VM ownership, explicit verification,
   composable per-run resources, interpreter/JIT selection, and thread-local
-  diagnostics. `examples/c-host` is a complete dependency-free host.
+  diagnostics. `examples/c-host` is a minimal dependency-free host;
+  `examples/c-log-filter` is a streaming accept/drop/redaction application.
 - **CI**: `.github/workflows/ci.yml` runs the suite, clippy (`-D warnings`) and
   the differential fuzzer on all three JIT platforms — each runner executes
   machine code generated for that exact CPU.

@@ -72,11 +72,12 @@ the race explorer for concurrent plugin instances sharing maps.
 
 The packaging baseline now exists: the opt-in versioned C ABI has an opaque VM,
 explicit verifier/run descriptors, composable invocation output sinks, a
-hand-written header, cdylib/staticlib builds, and a compiled C smoke host while
-remaining zero-dependency. The next credibility step is a compelling host
-(HTTP request filters or an eBPF-scriptable log processor), followed only by
-measured additions such as ELF selection, C helper callbacks, map control, and
-`.febpf` capture handles.
+hand-written header, cdylib/staticlib builds, and compiled C hosts while
+remaining zero-dependency. The streaming log-filter host proves a non-packet
+application needs no new VM mode: a versioned inline Flat context supports
+bounded accept/drop and safe in-place redaction. Next additions remain
+independently measured: ELF selection, C helper callbacks, map control, and
+`.febpf` capture handles should not become one miscellaneous adapter.
 
 ### 2. The XDP story (packet access) — already on the roadmap's critical path
 

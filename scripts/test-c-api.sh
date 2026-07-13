@@ -39,3 +39,17 @@ cp "$LIBRARY" "target/c-api/$LIB_NAME"
     -o target/c-api-example
 
 target/c-api-example
+
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+    -I include examples/c-log-filter/main.c \
+    -L target/c-api -Wl,-rpath,"$RPATH" -lfebpf \
+    -o target/c-log-filter-example
+
+ACTUAL=$(printf 'INFO ready\nDEBUG noisy\nTOKEN=secret\n' | \
+    target/c-log-filter-example examples/c-log-filter/filter.s)
+EXPECTED=$'INFO ready\nTOKEN=*ecret'
+if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+    echo "C log-filter output did not match" >&2
+    printf 'expected:\n%s\nactual:\n%s\n' "$EXPECTED" "$ACTUAL" >&2
+    exit 1
+fi
