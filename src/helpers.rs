@@ -34,6 +34,7 @@ pub mod id {
     pub const PROBE_READ_STR: u32 = 45;
     pub const GET_SOCKET_COOKIE: u32 = 46;
     pub const REDIRECT_MAP: u32 = 51;
+    pub const XDP_ADJUST_TAIL: u32 = 65;
     pub const GET_STACK: u32 = 67;
     pub const FIB_LOOKUP: u32 = 69;
     pub const MAP_PUSH_ELEM: u32 = 87;
@@ -341,6 +342,11 @@ pub fn builtin_sig(hid: u32) -> Option<HelperSig> {
             args: [XdpCtxPtr, Scalar, None, None, None],
             ret: RetKind::Scalar,
         },
+        id::XDP_ADJUST_TAIL => HelperSig {
+            name: "xdp_adjust_tail",
+            args: [XdpCtxPtr, Scalar, None, None, None],
+            ret: RetKind::Scalar,
+        },
         id::PERF_EVENT_OUTPUT => HelperSig {
             name: "perf_event_output",
             // (ctx, map, flags, data, size); data is a readable region of `size`
@@ -477,6 +483,7 @@ pub fn helper_id(name: &str) -> Option<u32> {
         id::CURRENT_TASK_UNDER_CGROUP,
         id::SKB_PULL_DATA,
         id::XDP_ADJUST_HEAD,
+        id::XDP_ADJUST_TAIL,
         id::PERF_EVENT_OUTPUT,
         id::GET_FUNC_IP,
         id::TRACE_VPRINTK,

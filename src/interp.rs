@@ -2544,11 +2544,12 @@ impl<'a> Machine<'a> {
                     (-12i64) as u64 // -ENOMEM, matching skb_ensure_writable
                 }
             }
-            helpers::id::XDP_ADJUST_HEAD => {
-                // The standalone VM has no provider-owned XDP headroom and
-                // must not fabricate it. The verifier still invalidates all
-                // packet-pointer aliases, exactly as the kernel does across
-                // this call, regardless of its runtime result.
+            helpers::id::XDP_ADJUST_HEAD | helpers::id::XDP_ADJUST_TAIL => {
+                // The standalone VM has no provider-owned XDP headroom or
+                // resizing boundary and must not fabricate either. The
+                // verifier still invalidates all packet-pointer aliases,
+                // exactly as the kernel does across this call, regardless of
+                // its runtime result.
                 (-95i64) as u64 // -EOPNOTSUPP
             }
             helpers::id::GET_STACKID => {

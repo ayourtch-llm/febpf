@@ -15,12 +15,13 @@ a full queue returns `-E2BIG`, except `BPF_EXIST` discards the oldest value and
 appends the new one. Queue identity is additive replay-v1 map-kind tag 16 and
 kernel differential translation uses map type 22.
 
-The same production object requires `bpf_xdp_adjust_head`. Verification uses
-the exact XDP context signature and invalidates every prior packet/data-end
-alias after the call, regardless of the runtime result. Standalone execution
-returns `-EOPNOTSUPP`: febpf has no provider-owned packet headroom and does not
-invent it. A future packet-provider backend may supply real headroom semantics
-without changing the helper contract.
+The same production object requires `bpf_xdp_adjust_head` and
+`bpf_xdp_adjust_tail`. Verification uses their exact XDP context signatures
+and invalidates every prior packet/data-end alias after either call, regardless
+of the runtime result. Standalone execution returns `-EOPNOTSUPP`: febpf has no
+provider-owned packet headroom or resizing boundary and does not invent one. A
+future packet-provider backend may supply real resizing semantics without
+changing the helper contracts.
 
 Clang also emits both 64-bit and MOV32-mediated `data_end - data` forms in this
 dataplane. febpf retains packet provenance through a MOV32 only to recognize

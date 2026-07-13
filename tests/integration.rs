@@ -504,6 +504,38 @@ fn skb_pull_data_reports_unavailable_length_without_mutation() {
 }
 
 #[test]
+fn xdp_adjust_tail_invalidates_packet_aliases_and_is_honestly_unsupported() {
+    assert_eq!(febpf::helpers::helper_id("xdp_adjust_tail"), Some(65));
+    let stale = "r6 = r1
+        r7 = *(u32 *)(r1 + 0)
+        r8 = *(u32 *)(r1 + 4)
+        r2 = r7
+        r2 += 1
+        if r2 > r8 goto short
+        r1 = r6
+        r2 = 0
+        call xdp_adjust_tail
+        r0 = *(u8 *)(r7 + 0)
+        exit
+      short:
+        r0 = 0
+        exit";
+    let mut stale_vm = Vm::new(program(stale)).unwrap();
+    let error = stale_vm
+        .verify(xdp_config())
+        .err()
+        .expect("old packet pointer must be invalidated")
+        .to_string();
+    assert!(error.contains("loads need a pointer"), "{error}");
+
+    let mut vm = Vm::new(program("r2 = 0\ncall xdp_adjust_tail\nexit")).unwrap();
+    vm.verify(xdp_config()).unwrap();
+    let mut packet = [1, 2, 3, 4];
+    assert_eq!(vm.run_xdp(&mut packet).unwrap(), (-95i64) as u64);
+    assert_eq!(packet, [1, 2, 3, 4]);
+}
+
+#[test]
 fn replace_program_is_transactional_on_construction_failure() {
     let mut vm = Vm::new(program(
         ".map state array 4 8 1\n\

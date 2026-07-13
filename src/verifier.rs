@@ -662,7 +662,11 @@ impl RegState {
             (RegState::Uninit, _) => true, // old never read this reg
             (RegState::Scalar(o), RegState::Scalar(n)) => n.is_subset_of(o),
             (RegState::Ptr(o), RegState::Ptr(n)) => {
-                o.kind == n.kind && o.off == n.off && n.var.is_subset_of(&o.var)
+                let kind_covered = match (o.kind, n.kind) {
+                    (PtrKind::Packet { range: old }, PtrKind::Packet { range: new }) => old <= new,
+                    _ => o.kind == n.kind,
+                };
+                kind_covered && o.off == n.off && n.var.is_subset_of(&o.var)
             }
             _ => false,
         }
@@ -3903,7 +3907,9 @@ impl<'a> Verifier<'a> {
         }
         if matches!(
             hid,
-            crate::helpers::id::SKB_PULL_DATA | crate::helpers::id::XDP_ADJUST_HEAD
+            crate::helpers::id::SKB_PULL_DATA
+                | crate::helpers::id::XDP_ADJUST_HEAD
+                | crate::helpers::id::XDP_ADJUST_TAIL
         ) {
             Self::invalidate_packet_ptrs(state);
         }
@@ -5160,5 +5166,13 @@ mod precision_tests {
 
         assert!(!partially_initialized.subsumed_by(&fully_initialized));
         assert!(fully_initialized.subsumed_by(&partially_initialized));
+    }
+
+    #[test]
+    fn packet_range_subsumption_only_accepts_stronger_current_proof() {
+        let packet = |range| RegState::Ptr(Ptr::new(PtrKind::Packet { range }));
+
+        assert!(packet(20).subsumed_by(&packet(10)));
+        assert!(!packet(10).subsumed_by(&packet(20)));
     }
 }
