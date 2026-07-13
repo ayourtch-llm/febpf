@@ -33,8 +33,9 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
 ## ACTIVE RESUME CHECKPOINT (2026-07-13 composable invocation add-ons landed; authoritative)
 
 The architecture redirection requested by the user is committed as `22ab9db`
-(`runtime: compose invocation add-ons`). At checkpoint writing HEAD is
-`22ab9db`; only this HANDOFF update is intentionally uncommitted. The recurring
+(`runtime: compose invocation add-ons`), with the non-packet proof follow-up in
+`08e6b5b` (`runtime: extract invocation host services`). At checkpoint writing
+HEAD is `08e6b5b`; only this HANDOFF update is intentionally uncommitted. The recurring
 tttt job `cron-1` was deleted at the user's request. No scanner or build started
 by this batch remains active. Several sleeping cargo test processes in the
 pre-existing `pty-2`/`pty-3`/`pty-4` terminal sessions predate this refactor;
@@ -59,11 +60,22 @@ sink. External sink state participates in snapshot/restore and interpreter/JIT
 agreement. A verified XDP/SKB model without a packet-window add-on rejects
 before instruction zero. `XdpCapabilities` are present on provider frames but
 remain reserved: adjust-head/tail still return `-EOPNOTSUPP` for every adapter.
-The default VM-owned sequence buffer remains as a compatibility sink when an
-environment does not override it; this is an explicit remaining extraction,
-not claimed as completed purity.
+Default VM-owned sequence/printk buffers remain compatibility sinks when an
+environment does not override them. Explicit environments do not route through
+those buffers; removing the public fallbacks later is API cleanup rather than
+a prerequisite for the execution boundary.
 
-Exact validation and measurement for `22ab9db`:
+The follow-up audit removed deterministic BTF kernel-memory scratch from `Vm`
+and made it environment-owned. It also added an independently borrowed printk
+sink (including echo configuration), snapshot/restore, and interpreter/JIT
+tests under a Flat context. Together with the BTF sequence sink this proves two
+non-packet consumers across distinct context families. The audit classified
+maps, PRNG progression, profiling counters, and map-backed perf records as
+intentionally durable/cross-invocation state rather than blindly moving every
+mutable field. Default VM-owned printk/sequence vectors remain compatibility
+sinks only when an explicit environment does not override them.
+
+Exact validation and measurement for `22ab9db` + `08e6b5b`:
 
 - Default all-target tests: **473 passed + 4 ignored**.
 - Std interpreter-only all-target tests: **455 passed + 4 ignored**.
@@ -79,15 +91,11 @@ Exact validation and measurement for `22ab9db`:
 
 Immediate resume order:
 
-1. Audit and extract the remaining invocation-only services from `Vm`, starting
-   with synthetic BTF kernel memory and output/diagnostic sinks. Use typed
-   environment slots and prove composition with multiple context families;
-   do not invent a generic hook/builder until repeated consumers justify it.
-2. Once that boundary is stable, activate the already-reserved provider resize
+1. Activate the already-reserved provider resize
    capabilities through the shared packet window. Preserve slice
    `-EOPNOTSUPP`, failure atomicity, stale-alias verifier rules, JIT parity, and
    snapshots.
-3. Only then add Linux AF_XDP copy mode as a backend adapter. DPDK remains an
+2. Only then add Linux AF_XDP copy mode as a backend adapter. DPDK remains an
    optional later adapter; neither transport belongs in `Vm`.
 
 The checkpoint immediately below is historical and superseded by this one.
