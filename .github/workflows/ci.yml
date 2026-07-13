@@ -91,6 +91,17 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo clippy --features af-xdp --all-targets -- -D warnings
 
+      - name: Test native C embedding API
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --features c-api --lib c_api::tests
+          cargo rustc --lib --release --features c-api -- --crate-type=staticlib
+          ./scripts/test-c-api.sh
+
+      - name: Clippy native C embedding API
+        if: runner.os == 'Linux'
+        run: cargo clippy --features c-api --all-targets -- -D warnings
+
       # The differential fuzzer is the real test of the JIT: it runs random
       # programs under the interpreter and the JIT and requires identical r0.
       # `cargo test` already runs 4k seeds; this adds a much wider sweep with a

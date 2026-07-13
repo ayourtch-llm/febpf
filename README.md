@@ -273,6 +273,10 @@ including time-travel `rstep`.
   redirect destinations, capability-gated resizing, and identical
   interpreter/JIT adapters without exposing transport pointers to eBPF. The
   opt-in Linux `af-xdp` feature supplies a raw-UAPI copy-mode backend.
+- **Native embedding**: `include/febpf.h` and `docs/specs/c-api.md` — an
+  opt-in, versioned C ABI with opaque VM ownership, explicit verification,
+  composable per-run resources, interpreter/JIT selection, and thread-local
+  diagnostics. `examples/c-host` is a complete dependency-free host.
 - **CI**: `.github/workflows/ci.yml` runs the suite, clippy (`-D warnings`) and
   the differential fuzzer on all three JIT platforms — each runner executes
   machine code generated for that exact CPU.

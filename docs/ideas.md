@@ -70,9 +70,13 @@ plugin runs, the rejection explainer for plugin authors, misbehaving plugins
 shipped as `.febpf` replay files the host vendor can time-travel debug, and
 the race explorer for concurrent plugin instances sharing maps.
 
-Missing pieces are packaging: a stable embedding API, a hand-written C header
-+ cdylib build (still zero-dep), one compelling example host (HTTP server
-with eBPF request filters; eBPF-scriptable log processor), and a doc.
+The packaging baseline now exists: the opt-in versioned C ABI has an opaque VM,
+explicit verifier/run descriptors, composable invocation output sinks, a
+hand-written header, cdylib/staticlib builds, and a compiled C smoke host while
+remaining zero-dependency. The next credibility step is a compelling host
+(HTTP request filters or an eBPF-scriptable log processor), followed only by
+measured additions such as ELF selection, C helper callbacks, map control, and
+`.febpf` capture handles.
 
 ### 2. The XDP story (packet access) — already on the roadmap's critical path
 
