@@ -33,9 +33,9 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
 ## ACTIVE RESUME CHECKPOINT (2026-07-14 verified map effects; authoritative)
 
 The production consumer is the separate sibling project
-`/home/ayourtch/rust/febpf-graph` is committed through `e399fba` (`perf:
-measure worker generation preparation`). The graph measurements are
-48.830–49.952 us to prepare one two-node worker and 99.554–101.36 us for two,
+`/home/ayourtch/rust/febpf-graph`, committed through `c49883d` (`feat: enforce
+shared-map capabilities`). The graph measurements are 49.632–50.586 us to
+prepare one two-node worker and 98.822–100.42 us for two,
 starting from already-read ELF bytes. This is near-linear but not yet enough to
 justify a febpf code/state split solely for reload latency.
 
@@ -46,8 +46,12 @@ Direct accesses retain verifier-proven inclusive byte ranges. Known map helpers
 are attributed using their exact argument register. When the verifier's
 cross-path join erases one exact map identity, `MapEffects::complete` is false;
 consumers must reject or conservatively treat all shared maps as affected.
-`docs/specs/map-effects.md` records scope and honest limitations. No shared-map
-provider or graph concurrency policy is enabled yet.
+`docs/specs/map-effects.md` records scope and honest limitations. The sibling
+now retains `MapEffects` on every loaded node and implements the first policy
+for worker-local, shared-read-only, and shared-atomic bindings. It rejects
+incomplete summaries, ordinary writes/deletes on shared regions, and
+inconsistent capabilities. Its racy counter is rejected while the atomic
+counter is accepted. Shared storage remains disabled.
 
 The recurring tttt job remains deleted. No build,
 benchmark, scanner, subagent, or external terminal collaborator is active.
@@ -83,14 +87,11 @@ publication measured 1.8525–1.8571 us excluding preparation.
 
 Immediate work remains in `febpf-graph`:
 
-1. Add graph-level compatibility checking for complete effect summaries under
-   explicit worker-local, shared-read-only, and shared-atomic capabilities.
-   Ordinary shared writes remain rejected; shared maps remain disabled.
-2. Add conservative tests for conflicting programs, atomics, disjoint direct
-   byte ranges, and incomplete summaries.
-3. Then extend deterministic race exploration to heterogeneous programs and
+1. Extend deterministic race exploration to heterogeneous programs and
    preserve replayable schedules.
-4. Connect AF_XDP after deterministic lifecycle and concurrency semantics hold.
+2. Add key partitions or paired critical-section reasoning only with concrete
+   static/dynamic evidence; ordinary shared writes remain rejected by default.
+3. Connect AF_XDP after deterministic lifecycle and concurrency semantics hold.
 
 Read the sibling project's `HANDOFF.md` before continuing this direction.
 
