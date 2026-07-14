@@ -33,9 +33,9 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
 ## ACTIVE RESUME CHECKPOINT (2026-07-14 graph-runtime project pivot; authoritative)
 
 The production consumer is the separate sibling project
-`/home/ayourtch/rust/febpf-graph`, now committed through `099259c` (`feat:
-publish validated graph generations`). At checkpoint writing the febpf tree is
-otherwise clean at `a0fd5ae`. The recurring tttt job remains deleted. No build,
+`/home/ayourtch/rust/febpf-graph`, now committed through `e81a38c` (`fix:
+preserve frames across graph failures`). At checkpoint writing the febpf engine
+tree is unchanged since `a0fd5ae`. The recurring tttt job remains deleted. No build,
 benchmark, scanner, subagent, or external terminal collaborator is active.
 
 This corrects the prior C-parity momentum: do not continue versioning C
@@ -60,15 +60,17 @@ Prepared generations contain worker-local mutable VMs; the demo proves a
 transactional PASS-to-DROP replacement at a single-worker batch boundary and
 returns the retired generation. Its separately locked Criterion harness
 measures both generic scalar execution and prepared-generation publication.
+Runtime and unrouted-result failures are now per-frame completion states, so
+every input frame is returned in exactly one terminal or failure bucket while
+independent frames continue.
 
 Immediate work remains in `febpf-graph`:
 
-1. Make scheduler execution errors return every current and queued owned frame
-   with an explicit failure/terminal disposition instead of dropping them on
-   `Err`; this is the first real correctness blocker exposed by the graph.
-2. Only then add multi-worker generation publication and retirement. Keep
+1. Add deterministic multi-worker generation publication and retirement. Keep
    worker-local VMs and measure repeated preparation before claiming febpf
    needs immutable verified/JIT sharing or map-state separation.
+2. Prove partial publication cannot falsely retire an old generation and keep
+   the now-complete frame ownership accounting intact across replacement.
 3. Connect AF_XDP only after deterministic provider ownership and lifecycle
    semantics hold. Keep a vector node ABI measurement-led.
 4. Do not change febpf for this work unless the sibling demonstrates a generic
