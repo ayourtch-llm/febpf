@@ -47,7 +47,9 @@ For statistically sampled results rather than a one-off CLI timing, see
 - **Analysis**: basic-block CFG (Graphviz DOT export), instruction-mix
   stats, and a listing annotated with the verifier's abstract state at
   every instruction — watch ranges tighten as null checks and bounds
-  checks refine them.
+  checks refine them. Successful verification can also produce conservative
+  per-map lookup/read/write/atomic/delete/lock effects and proven direct-access
+  byte ranges for embedding-level concurrency policy.
 - **Interactive, source-aware debugger**: breakpoints, stepping, reverse
   stepping/continue, watchpoints, register/stack/memory inspection, map dumps,
   `trace_printk` capture, dataflow queries (`origin`/`when`/`who`), and C source

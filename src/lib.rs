@@ -41,6 +41,7 @@ pub mod disasm;
 #[cfg(feature = "std")]
 pub mod elf;
 pub mod execution;
+pub mod effects;
 #[cfg(feature = "std")]
 pub mod equiv;
 #[cfg(feature = "std")]

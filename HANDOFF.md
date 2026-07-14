@@ -30,12 +30,26 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-14 graph-runtime project pivot; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-14 verified map effects; authoritative)
 
 The production consumer is the separate sibling project
-`/home/ayourtch/rust/febpf-graph`, now committed through `224be3f` (`feat:
-coordinate worker generation publication`). At checkpoint writing the febpf engine
-tree is unchanged since `a0fd5ae`. The recurring tttt job remains deleted. No build,
+`/home/ayourtch/rust/febpf-graph` is committed through `e399fba` (`perf:
+measure worker generation preparation`). The graph measurements are
+48.830–49.952 us to prepare one two-node worker and 99.554–101.36 us for two,
+starting from already-read ELF bytes. This is near-linear but not yet enough to
+justify a febpf code/state split solely for reload latency.
+
+The first generic shared-state primitive is complete. `effects::summarize`
+turns a successful `VerifyOk` into reachable
+per-map lookup, direct read/write, atomic, delete, lock, and unlock effects.
+Direct accesses retain verifier-proven inclusive byte ranges. Known map helpers
+are attributed using their exact argument register. When the verifier's
+cross-path join erases one exact map identity, `MapEffects::complete` is false;
+consumers must reject or conservatively treat all shared maps as affected.
+`docs/specs/map-effects.md` records scope and honest limitations. No shared-map
+provider or graph concurrency policy is enabled yet.
+
+The recurring tttt job remains deleted. No build,
 benchmark, scanner, subagent, or external terminal collaborator is active.
 
 This corrects the prior C-parity momentum: do not continue versioning C
@@ -69,13 +83,13 @@ publication measured 1.8525–1.8571 us excluding preparation.
 
 Immediate work remains in `febpf-graph`:
 
-1. Measure complete repeated per-worker preparation before claiming febpf needs
-   immutable verified/JIT sharing or map-state separation.
-2. Prototype generic verified map-access effect summaries for direct map-value
-   reads/writes, atomics, and known helpers. The sibling's
-   `docs/shared-memory.md` records the capability model; shared maps remain off.
-3. Extend the existing deterministic race explorer to heterogeneous programs
-   only after the static summary boundary is concrete.
+1. Add graph-level compatibility checking for complete effect summaries under
+   explicit worker-local, shared-read-only, and shared-atomic capabilities.
+   Ordinary shared writes remain rejected; shared maps remain disabled.
+2. Add conservative tests for conflicting programs, atomics, disjoint direct
+   byte ranges, and incomplete summaries.
+3. Then extend deterministic race exploration to heterogeneous programs and
+   preserve replayable schedules.
 4. Connect AF_XDP after deterministic lifecycle and concurrency semantics hold.
 
 Read the sibling project's `HANDOFF.md` before continuing this direction.
