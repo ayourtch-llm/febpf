@@ -33,8 +33,8 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
 ## ACTIVE RESUME CHECKPOINT (2026-07-14 graph-runtime project pivot; authoritative)
 
 The production consumer is the separate sibling project
-`/home/ayourtch/rust/febpf-graph`, now committed through `e81a38c` (`fix:
-preserve frames across graph failures`). At checkpoint writing the febpf engine
+`/home/ayourtch/rust/febpf-graph`, now committed through `224be3f` (`feat:
+coordinate worker generation publication`). At checkpoint writing the febpf engine
 tree is unchanged since `a0fd5ae`. The recurring tttt job remains deleted. No build,
 benchmark, scanner, subagent, or external terminal collaborator is active.
 
@@ -62,19 +62,21 @@ returns the retired generation. Its separately locked Criterion harness
 measures both generic scalar execution and prepared-generation publication.
 Runtime and unrouted-result failures are now per-frame completion states, so
 every input frame is returned in exactly one terminal or failure bucket while
-independent frames continue.
+independent frames continue. A deterministic worker group now validates exact
+artifacts/plans, exposes partial publication explicitly, and withholds retired
+generations until all workers acknowledge the new ID. Two-worker coordinated
+publication measured 1.8525–1.8571 us excluding preparation.
 
 Immediate work remains in `febpf-graph`:
 
-1. Add deterministic multi-worker generation publication and retirement. Keep
-   worker-local VMs and measure repeated preparation before claiming febpf
-   needs immutable verified/JIT sharing or map-state separation.
-2. Prove partial publication cannot falsely retire an old generation and keep
-   the now-complete frame ownership accounting intact across replacement.
-3. Connect AF_XDP only after deterministic provider ownership and lifecycle
-   semantics hold. Keep a vector node ABI measurement-led.
-4. Do not change febpf for this work unless the sibling demonstrates a generic
-   engine blocker with a focused reproducer.
+1. Measure complete repeated per-worker preparation before claiming febpf needs
+   immutable verified/JIT sharing or map-state separation.
+2. Prototype generic verified map-access effect summaries for direct map-value
+   reads/writes, atomics, and known helpers. The sibling's
+   `docs/shared-memory.md` records the capability model; shared maps remain off.
+3. Extend the existing deterministic race explorer to heterogeneous programs
+   only after the static summary boundary is concrete.
+4. Connect AF_XDP after deterministic lifecycle and concurrency semantics hold.
 
 Read the sibling project's `HANDOFF.md` before continuing this direction.
 
