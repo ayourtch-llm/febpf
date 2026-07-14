@@ -30,7 +30,51 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-13 Criterion performance harness; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-14 graph-runtime project pivot; authoritative)
+
+The production consumer has moved to a separate sibling project,
+`/home/ayourtch/rust/febpf-graph`, committed there as `805edbe` (`feat: prove
+Rust eBPF nodes on febpf`). At checkpoint writing the febpf tree is otherwise
+clean at `288ff51`. The recurring tttt job remains deleted. No build,
+benchmark, scanner, subagent, or external terminal collaborator is active.
+
+This corrects the prior C-parity momentum: do not continue versioning C
+constructors merely because a Rust capability exists. febpf remains the
+general zero-dependency loader/verifier/VM/JIT. The sibling project owns graph
+scheduling, workers, node lifecycle, hot reload, packet adapters, control-plane
+policy, and their dependencies. Upstream only generic primitives proven useful
+by that real consumer. C static-tail-call construction is deferred until an
+actual C host measures the need.
+
+Rust node compilation was proven rather than designed speculatively. A pinned
+nightly-2026-07-13 `bpfel-unknown-none` build using `aya-ebpf` 0.2.1 and
+`bpf-linker` 0.10.3 emits an ordinary relocatable eBPF ELF. The sibling
+`./demo` loads it through febpf, requires warning-free loading, verifies it as
+XDP, JIT-compiles it, executes an owned frame, and prints exact PASS output.
+`bpf-script` was rejected as the primary node language because it is a small
+Rust-like runtime DSL/compiler, not Rust-to-eBPF, and still documents control
+flow/testing gaps. The current rustc CO-RE emission limitation does not block
+packet nodes using stable packet and graph-metadata ABIs.
+
+Immediate work now belongs in `febpf-graph`:
+
+1. Add one Rust Ethernet classifier node with bounded packet reads and
+   graph-local edge results.
+2. Implement the smallest scheduler that retains owned frames, buckets them by
+   edge, and invokes the next node. Measure it before designing vector or
+   generation APIs.
+3. Let that implementation identify the first real febpf blocker. Immutable
+   verified/JIT code sharing and map-state separation are hypotheses, not yet
+   authorized abstractions.
+4. Then add immutable graph generations and transactional node hot reload;
+   connect AF_XDP only after the deterministic provider path works.
+
+Read the sibling project's `HANDOFF.md` before continuing this direction.
+
+The Criterion checkpoint immediately below is historical and superseded by
+this one.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-13 Criterion performance harness; superseded)
 
 Reproducible performance infrastructure is committed as `c14aed0` (`perf: add
 reproducible Criterion harness`). At checkpoint writing HEAD is `c14aed0`; only
