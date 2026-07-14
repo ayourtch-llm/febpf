@@ -8,10 +8,11 @@
 //!       interleaving bit-for-bit, and a --schedule choice vector replays it.
 
 use febpf::race::{
-    explore, explore_programs, render_report, replay_programs, replay_schedule, ExploreConfig,
-    ExploreProgramsConfig, InstanceResult, RaceProgram,
+    explore, explore_programs, explore_xdp_programs, render_report, replay_programs,
+    replay_schedule, replay_xdp_programs, ExploreConfig, ExploreProgramsConfig, InstanceResult,
+    RaceProgram, RaceXdpProgram,
 };
-use febpf::{asm, Program};
+use febpf::{asm, Program, XdpFrame};
 
 fn prog(src: &str) -> Program {
     let a = asm::assemble(src).unwrap();
@@ -103,6 +104,59 @@ const ATOMIC_TEN: &str = r#"
         lock *(u64 *)(r0 + 0) += r1
 out:
         r0 = 0
+        exit
+"#;
+
+const XDP_PACKET_RMW: &str = r#"
+        .map counter array 4 8 1
+        r7 = *(u32 *)(r1 + 0)
+        r8 = *(u32 *)(r1 + 4)
+        r9 = r7
+        r9 += 1
+        if r9 > r8 goto out
+        r6 = *(u8 *)(r7 + 0)
+        r0 = 0
+        *(u32 *)(r10 - 4) = r0
+        r1 = map[counter]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        if r0 == 0 goto out
+        r8 = *(u64 *)(r0 + 0)
+        r8 += r6
+        *(u64 *)(r10 - 16) = r8
+        r1 = map[counter]
+        r2 = r10
+        r2 += -4
+        r3 = r10
+        r3 += -16
+        r4 = 0
+        call map_update_elem
+out:
+        r0 = 2
+        exit
+"#;
+
+const XDP_ATOMIC_OBSERVE: &str = r#"
+        .map counter array 4 8 1
+        r7 = *(u32 *)(r1 + 0)
+        r8 = *(u32 *)(r1 + 4)
+        r9 = r7
+        r9 += 1
+        if r9 > r8 goto out
+        r0 = 0
+        *(u32 *)(r10 - 4) = r0
+        r1 = map[counter]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        if r0 == 0 goto out
+        r1 = 1
+        lock *(u64 *)(r0 + 0) += r1
+        r6 = *(u64 *)(r0 + 0)
+        *(u8 *)(r7 + 0) = r6
+out:
+        r0 = 2
         exit
 "#;
 
@@ -395,4 +449,131 @@ fn heterogeneous_program_contract_is_strict() {
     ];
     let err = replay_programs(&incompatible_maps, vec![]).unwrap_err();
     assert!(err.contains("identical map definitions"));
+}
+
+#[test]
+fn xdp_frames_are_private_while_packet_driven_map_races_are_shared() {
+    let program = prog(XDP_PACKET_RMW);
+    let one = XdpFrame::new(&[1]);
+    let ten = XdpFrame::new(&[10]);
+    let programs = [
+        RaceXdpProgram {
+            name: "packet-one",
+            program: &program,
+            frame: &one,
+        },
+        RaceXdpProgram {
+            name: "packet-ten",
+            program: &program,
+            frame: &ten,
+        },
+    ];
+    let report = explore_xdp_programs(
+        &programs,
+        &ExploreProgramsConfig {
+            schedules: 10_000,
+            seed: None,
+        },
+    )
+    .unwrap();
+
+    assert!(report.is_race());
+    assert!(report.exhausted);
+    let finals: Vec<_> = report
+        .groups
+        .iter()
+        .map(|group| counter_value(&group.witness.outcome.maps[0].entries))
+        .collect();
+    assert!(finals.contains(&11));
+    assert!(finals.contains(&1) || finals.contains(&10));
+    for group in &report.groups {
+        assert_eq!(group.witness.outcome.invocations[0].packet.as_ref().unwrap().storage, [1]);
+        assert_eq!(group.witness.outcome.invocations[1].packet.as_ref().unwrap().storage, [10]);
+    }
+
+    let path = report.groups[0].witness.choices.clone();
+    let replay = replay_xdp_programs(&programs, path).unwrap();
+    assert_eq!(replay.outcome, report.groups[0].witness.outcome);
+}
+
+#[test]
+fn xdp_packet_outputs_are_part_of_schedule_outcomes() {
+    let program = prog(XDP_ATOMIC_OBSERVE);
+    let first = XdpFrame::new(&[0]);
+    let second = XdpFrame::new(&[0]);
+    let programs = [
+        RaceXdpProgram {
+            name: "observer-a",
+            program: &program,
+            frame: &first,
+        },
+        RaceXdpProgram {
+            name: "observer-b",
+            program: &program,
+            frame: &second,
+        },
+    ];
+    let report = explore_xdp_programs(
+        &programs,
+        &ExploreProgramsConfig {
+            schedules: 10_000,
+            seed: None,
+        },
+    )
+    .unwrap();
+
+    assert!(report.is_race());
+    assert!(report.exhausted);
+    assert!(report.lost_update_witness.is_none());
+    assert!(report.groups.len() > 1);
+    assert!(report.groups.iter().all(|group| {
+        counter_value(&group.witness.outcome.maps[0].entries) == 2
+            && group.witness.outcome.results == [InstanceResult::Exit(2), InstanceResult::Exit(2)]
+    }));
+    let packets: Vec<_> = report
+        .groups
+        .iter()
+        .map(|group| {
+            group
+                .witness
+                .outcome
+                .invocations
+                .iter()
+                .map(|state| state.packet.as_ref().unwrap().storage[0])
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(packets.iter().any(|values| values == &[1, 2]));
+    assert!(packets.iter().any(|values| values == &[2, 2]));
+}
+
+#[test]
+fn xdp_race_contract_rejects_capacity_mismatch_and_bad_programs() {
+    let valid = prog(XDP_PACKET_RMW);
+    let invalid = prog("r0 = *(u8 *)(r1 + 0)\nexit");
+    let short = XdpFrame::new(&[1]);
+    let long = XdpFrame::new(&[1, 2]);
+
+    let mismatch = [
+        RaceXdpProgram {
+            name: "short",
+            program: &valid,
+            frame: &short,
+        },
+        RaceXdpProgram {
+            name: "long",
+            program: &valid,
+            frame: &long,
+        },
+    ];
+    let error = replay_xdp_programs(&mismatch, vec![]).unwrap_err();
+    assert!(error.contains("equal storage capacities"));
+
+    let unverifiable = [RaceXdpProgram {
+        name: "invalid",
+        program: &invalid,
+        frame: &short,
+    }];
+    let error = replay_xdp_programs(&unverifiable, vec![]).unwrap_err();
+    assert!(error.contains("failed verification"));
 }

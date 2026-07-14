@@ -478,7 +478,11 @@ impl Vm {
     /// exploration. It does not create a tail-call edge or independently
     /// verify the image; callers validate programs before relying on results.
     #[cfg(feature = "std")]
-    pub(crate) fn register_race_program(&mut self, prog: &Program) -> Result<u32, String> {
+    pub(crate) fn register_race_program(
+        &mut self,
+        prog: &Program,
+        probe_mem: Vec<bool>,
+    ) -> Result<u32, String> {
         if prog.maps != self.map_defs {
             return Err("race programs must use identical map definitions".into());
         }
@@ -487,7 +491,7 @@ impl Vm {
         self.program_images.push(ProgramImage {
             insns: prog.insns.clone(),
             exec,
-            probe_mem: Vec::new(),
+            probe_mem,
             #[cfg(feature = "jit")]
             jit: None,
         });
@@ -1221,7 +1225,7 @@ impl Snapshot {
 /// Per-instance execution state for the race explorer (`src/race.rs`):
 /// everything that is private to one logical invocation of a program —
 /// registers, program counter, call frames, counters, and its own stack and
-/// context images. The shared map state, region table and prandom stream live
+/// invocation-environment image. The shared map state, region table and prandom stream live
 /// in the [`Vm`] and are deliberately *not* part of this. Only one instance is
 /// active in a [`Machine`] at a time; the scheduler swaps these in and out with
 /// [`Machine::activate`]/[`Machine::deactivate`].
@@ -1234,7 +1238,7 @@ pub struct InstanceState {
     nondet_calls: u64,
     logical_boot_ns: u64,
     stack: Vec<u8>,
-    ctx: Vec<u8>,
+    environment: crate::execution::EnvironmentSnapshot,
     active_program: u32,
     tail_call_count: u32,
 }
@@ -1244,9 +1248,18 @@ impl InstanceState {
     /// image and a zeroed stack — mirrors the register setup in
     /// [`Machine::new`].
     pub fn new(ctx: &[u8]) -> InstanceState {
+        let mut context = ctx.to_vec();
+        let environment = crate::execution::ExecutionEnvironment::plain(&mut context);
+        Self::new_for_environment(&environment, 0)
+    }
+
+    pub(crate) fn new_for_environment(
+        environment: &crate::execution::ExecutionEnvironment<'_>,
+        program: u32,
+    ) -> InstanceState {
         let mut regs = [0u64; NUM_REGS];
         regs[1] = mkaddr(CTX_HANDLE, 0);
-        regs[2] = ctx.len() as u64;
+        regs[2] = environment.context().len() as u64;
         regs[REG_FP as usize] = mkaddr(STACK0_HANDLE, STACK_SIZE as u32);
         InstanceState {
             regs,
@@ -1256,17 +1269,22 @@ impl InstanceState {
             nondet_calls: 0,
             logical_boot_ns: 0,
             stack: vec![0u8; MAX_CALL_FRAMES * STACK_SIZE],
-            ctx: ctx.to_vec(),
-            active_program: 0,
+            environment: environment.snapshot(),
+            active_program: program,
             tail_call_count: 0,
         }
     }
 
     #[cfg(feature = "std")]
     pub(crate) fn new_for_program(ctx: &[u8], program: u32) -> InstanceState {
-        let mut state = Self::new(ctx);
-        state.active_program = program;
-        state
+        let mut context = ctx.to_vec();
+        let environment = crate::execution::ExecutionEnvironment::plain(&mut context);
+        Self::new_for_environment(&environment, program)
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn invocation_state(&self) -> crate::execution::InvocationState {
+        self.environment.invocation_state()
     }
 
     /// Number of instructions this instance has retired so far.
@@ -1584,7 +1602,7 @@ impl<'a> Machine<'a> {
     // -- race explorer hooks (src/race.rs) ----------------------------------
 
     /// Load per-instance state into this machine, making `st`'s
-    /// registers/pc/frames/stack/ctx the live execution context. Shared map
+    /// registers/pc/frames/stack/environment the live execution context. Shared map
     /// state and the region table are left untouched. Assumes `st` was created
     /// for this machine's program and context length.
     pub fn activate(&mut self, st: &InstanceState) {
@@ -1597,7 +1615,7 @@ impl<'a> Machine<'a> {
         self.active_program = st.active_program;
         self.tail_call_count = st.tail_call_count;
         self.vm.stack.copy_from_slice(&st.stack);
-        self.env.context_mut().copy_from_slice(&st.ctx);
+        self.env.restore(&st.environment);
     }
 
     /// Save the live per-instance state back into `st` (inverse of
@@ -1612,7 +1630,7 @@ impl<'a> Machine<'a> {
         st.active_program = self.active_program;
         st.tail_call_count = self.tail_call_count;
         st.stack.copy_from_slice(&self.vm.stack);
-        st.ctx.copy_from_slice(self.env.context());
+        st.environment = self.env.snapshot();
     }
 
     /// Classify the instruction at the current pc as a map-visible operation,

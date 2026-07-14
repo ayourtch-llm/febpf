@@ -91,6 +91,26 @@ pub struct ExecutionOutcome {
     pub redirect: Option<XdpRedirect>,
 }
 
+/// Provider-visible state left by one invocation. Race exploration includes
+/// this alongside maps and return values when comparing schedule outcomes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvocationState {
+    pub context: Vec<u8>,
+    pub packet: Option<PacketState>,
+    pub printk: Option<Vec<String>>,
+    pub seq_output: Option<Vec<u8>>,
+    pub redirect: Option<XdpRedirect>,
+}
+
+/// Owned packet storage and active window after one invocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PacketState {
+    pub storage: Vec<u8>,
+    pub data_start: usize,
+    pub data_end: usize,
+    pub capabilities: XdpCapabilities,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EnvironmentSnapshot {
     context: Vec<u8>,
@@ -420,6 +440,24 @@ impl<'a> ExecutionEnvironment<'a> {
             _ => panic!("snapshot printk topology mismatch"),
         }
         self.redirect = snapshot.redirect;
+    }
+}
+
+impl EnvironmentSnapshot {
+    #[cfg(feature = "std")]
+    pub(crate) fn invocation_state(&self) -> InvocationState {
+        InvocationState {
+            context: self.context.clone(),
+            packet: self.packet_storage.as_ref().map(|storage| PacketState {
+                storage: storage.clone(),
+                data_start: self.packet_start,
+                data_end: self.packet_end,
+                capabilities: self.packet_capabilities,
+            }),
+            printk: self.printk.clone(),
+            seq_output: self.seq_output.clone(),
+            redirect: self.redirect,
+        }
     }
 }
 

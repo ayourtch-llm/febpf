@@ -30,7 +30,53 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-15 heterogeneous race exploration; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-15 packet-aware race exploration; authoritative)
+
+The heterogeneous race explorer now swaps complete private invocation
+environments rather than only context bytes. `InstanceState` retains an
+`EnvironmentSnapshot`; activation/restoration therefore includes context,
+packet storage and active bounds, resize capabilities, output sinks, and
+redirect state while maps and the map-region table remain shared. Observable
+race outcomes now include a public `InvocationState`/`PacketState` per
+instance, so schedule-dependent provider output is not hidden by convergent
+maps and return values.
+
+`RaceXdpProgram`, `explore_xdp_programs`, and `replay_xdp_programs` are the
+first packet-provider adapter. Every program is verified under the XDP model
+before execution. Frames may have different bytes, windows, metadata, and
+capabilities but require equal backing capacities so snapshots fit one live
+environment topology. Flat context APIs remain source-compatible wrappers.
+Program images still do not imply tail-call edges.
+
+Three new behavioral tests prove: packet bytes can drive a shared-map lost
+update while frames remain private; packet mutations alone create distinct
+outcomes even when maps and return values converge; replay, incompatible
+capacities, and XDP verification failures remain exact. `tests/race.rs` is now
+13/13. Complete default all-target validation is **487 passed + 4 ignored**;
+std interpreter-only is **469 + 4**. Strict hosted JIT/interpreter-only and
+true thumb no-std Clippy pass, as does the release all-target build. Current
+rustfmt still proposes pre-existing test/interpreter reflow; `src/race.rs` was
+formatted source-specifically and no unrelated whole-repository rewrite was
+accepted.
+
+The sibling graph consumer adds `ConcurrentXdpExecutable`, retains each loaded
+node's verified `Program`, and exposes `Node::concurrent_xdp` plus
+`validate_concurrent_xdp_executables`. Its test demonstrates dynamic rejection
+of schedule-dependent frame mutations after the shared-atomic static gate
+passes.
+
+The user selected a real ConnectX adapter as the next production target and
+pointed to `~/vpp/vpp`. Initial audit found VPP's Apache-2.0 `plugins/rdma`
+driver uses rdma-core/libibverbs for control-plane object creation and mlx5
+direct-verbs ring access for the datapath: raw-packet QPs, registered packet
+memory, 64-byte CQEs/WQEs, owner-bit CQ polling, big-endian doorbell records,
+and optional striding RQ/compressed CQEs. This host has libibverbs/libmlx5 and
+headers but no Mellanox PCI or infiniband device, so hardware execution remains
+an honest provisioned-host gap. The graph project, not febpf, owns this driver.
+
+The heterogeneous-only checkpoint below is historical and superseded.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-15 heterogeneous race exploration; superseded)
 
 Heterogeneous deterministic race exploration is implemented and ready to
 commit. `race::explore_programs` accepts an ordered set of `RaceProgram`

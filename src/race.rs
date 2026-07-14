@@ -11,8 +11,9 @@
 //! (map helper calls, atomics, and loads/stores through a looked-up pointer);
 //! between them an instance's purely instance-local work runs sequentially.
 
-use crate::interp::{InstanceState, MapOp, MapOpKind, MapStep, Vm};
-use crate::Program;
+use crate::execution::InvocationState;
+use crate::interp::{InstanceState, Machine, MapOp, MapOpKind, MapStep, Vm};
+use crate::{Program, XdpFrame};
 use std::collections::HashMap;
 
 /// Per-instance instruction cap for one schedule (guards against a program
@@ -35,6 +36,8 @@ pub enum InstanceResult {
 pub struct Outcome {
     pub maps: Vec<MapState>,
     pub results: Vec<InstanceResult>,
+    /// Final provider-visible context/packet/output state for each instance.
+    pub invocations: Vec<InvocationState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +71,13 @@ pub struct RaceProgram<'a> {
     pub name: &'a str,
     pub program: &'a Program,
     pub ctx: &'a [u8],
+}
+
+/// One verified XDP invocation in heterogeneous race exploration.
+pub struct RaceXdpProgram<'a> {
+    pub name: &'a str,
+    pub program: &'a Program,
+    pub frame: &'a XdpFrame,
 }
 
 /// A witnessed lost-update / stale read-modify-write: instance `reader` read a
@@ -256,16 +266,91 @@ fn run_program_schedule(
     let mut vm = Vm::new(first.program.clone())?;
     let mut program_ids = vec![0];
     for program in programs.iter().skip(1) {
-        program_ids.push(vm.register_race_program(program.program)?);
+        program_ids.push(vm.register_race_program(program.program, Vec::new())?);
     }
     vm.insn_limit = PER_INSTANCE_INSN_LIMIT;
-    let map_names: Vec<String> = vm.maps.iter().map(|m| m.def.name.clone()).collect();
-
-    let procs = programs.len();
-    let mut instances: Vec<InstanceState> = programs
+    let instances: Vec<InstanceState> = programs
         .iter()
         .zip(program_ids)
         .map(|(program, id)| InstanceState::new_for_program(program.ctx, id))
+        .collect();
+    let mut scratch = first.ctx.to_vec();
+    let machine = vm.machine(&mut scratch);
+    execute_schedule(machine, instances, chooser)
+}
+
+fn run_xdp_program_schedule(
+    programs: &[RaceXdpProgram<'_>],
+    chooser: &mut dyn Chooser,
+) -> Result<ScheduleRun, String> {
+    let first = programs.first().ok_or("race program set is empty")?;
+    let capacity = first.frame.capacity();
+    if programs
+        .iter()
+        .any(|program| program.frame.capacity() != capacity)
+    {
+        return Err("race XDP frames must use equal storage capacities".into());
+    }
+
+    let config = crate::verifier::Config {
+        ctx_size: 24,
+        ctx_writable: false,
+        xdp: true,
+        ..crate::verifier::Config::default()
+    };
+    let mut vm = Vm::new(first.program.clone())?;
+    vm.verify(config.clone()).map_err(|error| {
+        format!(
+            "race XDP program '{}' failed verification: {error}",
+            first.name
+        )
+    })?;
+    let mut program_ids = vec![0];
+    for program in programs.iter().skip(1) {
+        let verified = crate::verifier::verify(
+            &program.program.insns,
+            &program.program.maps,
+            &[],
+            config.clone(),
+        )
+        .map_err(|error| {
+            format!(
+                "race XDP program '{}' failed verification: {error}",
+                program.name
+            )
+        })?;
+        program_ids.push(
+            vm.register_race_program(program.program, verified.probe_mem)
+                .map_err(|error| format!("race XDP program '{}': {error}", program.name))?,
+        );
+    }
+    vm.insn_limit = PER_INSTANCE_INSN_LIMIT;
+
+    let mut instances = Vec::with_capacity(programs.len());
+    for (program, id) in programs.iter().zip(program_ids) {
+        let mut frame = program.frame.clone();
+        let environment = crate::execution::ExecutionEnvironment::xdp(&mut frame)?;
+        instances.push(InstanceState::new_for_environment(&environment, id));
+    }
+
+    let mut scratch = first.frame.clone();
+    let machine = vm
+        .machine_xdp(&mut scratch)
+        .map_err(|error| error.to_string())?;
+    execute_schedule(machine, instances, chooser)
+}
+
+fn execute_schedule(
+    mut m: Machine<'_>,
+    mut instances: Vec<InstanceState>,
+    chooser: &mut dyn Chooser,
+) -> Result<ScheduleRun, String> {
+    let procs = instances.len();
+    let map_names: Vec<String> = m
+        .vm_ref()
+        .maps
+        .iter()
+        .map(|map| map.def.name.clone())
         .collect();
     let mut pending: Vec<Option<MapOp>> = vec![None; procs];
     let mut results: Vec<Option<InstanceResult>> = vec![None; procs];
@@ -274,113 +359,114 @@ fn run_program_schedule(
     let mut choices: Vec<usize> = Vec::new();
     let mut hazards = HazardLog::new();
 
-    let mut scratch = first.ctx.to_vec();
-    {
-        let mut m = vm.machine(&mut scratch);
+    // Bring every instance up to its first map-visible op (or completion).
+    for i in 0..procs {
+        m.activate(&instances[i]);
+        match m.run_to_mapop() {
+            Ok(MapStep::Pending(op)) => pending[i] = Some(op),
+            Ok(MapStep::Exited(r0)) => results[i] = Some(InstanceResult::Exit(r0)),
+            Err(e) => results[i] = Some(InstanceResult::Error(e.to_string())),
+        }
+        m.deactivate(&mut instances[i]);
+    }
 
-        // Bring every instance up to its first map-visible op (or completion).
-        for i in 0..procs {
-            m.activate(&instances[i]);
-            match m.run_to_mapop() {
-                Ok(MapStep::Pending(op)) => pending[i] = Some(op),
+    // Interleave.
+    loop {
+        let runnable: Vec<usize> = (0..procs).filter(|&i| pending[i].is_some()).collect();
+        if runnable.is_empty() {
+            break;
+        }
+        let pos = chooser.choose(&runnable).min(runnable.len() - 1);
+        choices.push(pos);
+        let i = runnable[pos];
+        let op = pending[i].take().unwrap();
+
+        m.activate(&instances[i]);
+        let step_idx = trace.len();
+        let exec = m.step();
+
+        // Attribute this op to a (map, key) cell.
+        let cell = match op.kind {
+            MapOpKind::Lookup | MapOpKind::Update | MapOpKind::Delete => match (op.map, &op.key) {
+                (Some(mp), Some(k)) => Some((mp, k.clone())),
+                _ => None,
+            },
+            MapOpKind::ValueLoad | MapOpKind::ValueStore | MapOpKind::Atomic => {
+                op.region.and_then(|r| m.cell_of_region(r))
+            }
+        };
+
+        let detail = describe(&m, op.kind, cell.as_ref());
+        trace.push(TraceStep {
+            instance: i,
+            program: i,
+            op: op.kind,
+            pc: op.pc,
+            cell: cell.clone(),
+            detail,
+        });
+
+        // Feed the hazard detector.
+        if let Some(c) = cell.clone() {
+            let access = match op.kind {
+                MapOpKind::ValueLoad => Some(Access::Read),
+                MapOpKind::ValueStore | MapOpKind::Update | MapOpKind::Delete => {
+                    Some(Access::Write)
+                }
+                MapOpKind::Atomic => Some(Access::Atomic),
+                MapOpKind::Lookup => None, // fetches a pointer, not the value
+            };
+            if let Some(a) = access {
+                hazards.record(i, c, a, step_idx);
+            }
+        }
+
+        match exec {
+            Ok(_) => match m.run_to_mapop() {
+                Ok(MapStep::Pending(next)) => pending[i] = Some(next),
                 Ok(MapStep::Exited(r0)) => results[i] = Some(InstanceResult::Exit(r0)),
                 Err(e) => results[i] = Some(InstanceResult::Error(e.to_string())),
-            }
-            m.deactivate(&mut instances[i]);
+            },
+            Err(e) => results[i] = Some(InstanceResult::Error(e.to_string())),
         }
-
-        // Interleave.
-        loop {
-            let runnable: Vec<usize> = (0..procs).filter(|&i| pending[i].is_some()).collect();
-            if runnable.is_empty() {
-                break;
-            }
-            let pos = chooser.choose(&runnable).min(runnable.len() - 1);
-            choices.push(pos);
-            let i = runnable[pos];
-            let op = pending[i].take().unwrap();
-
-            m.activate(&instances[i]);
-            let step_idx = trace.len();
-            let exec = m.step();
-
-            // Attribute this op to a (map, key) cell.
-            let cell = match op.kind {
-                MapOpKind::Lookup | MapOpKind::Update | MapOpKind::Delete => {
-                    match (op.map, &op.key) {
-                        (Some(mp), Some(k)) => Some((mp, k.clone())),
-                        _ => None,
-                    }
-                }
-                MapOpKind::ValueLoad | MapOpKind::ValueStore | MapOpKind::Atomic => {
-                    op.region.and_then(|r| m.cell_of_region(r))
-                }
-            };
-
-            let detail = describe(&m, op.kind, cell.as_ref());
-            trace.push(TraceStep {
-                instance: i,
-                program: i,
-                op: op.kind,
-                pc: op.pc,
-                cell: cell.clone(),
-                detail,
-            });
-
-            // Feed the hazard detector.
-            if let Some(c) = cell.clone() {
-                let access = match op.kind {
-                    MapOpKind::ValueLoad => Some(Access::Read),
-                    MapOpKind::ValueStore | MapOpKind::Update | MapOpKind::Delete => {
-                        Some(Access::Write)
-                    }
-                    MapOpKind::Atomic => Some(Access::Atomic),
-                    MapOpKind::Lookup => None, // fetches a pointer, not the value
-                };
-                if let Some(a) = access {
-                    hazards.record(i, c, a, step_idx);
-                }
-            }
-
-            match exec {
-                Ok(_) => match m.run_to_mapop() {
-                    Ok(MapStep::Pending(next)) => pending[i] = Some(next),
-                    Ok(MapStep::Exited(r0)) => results[i] = Some(InstanceResult::Exit(r0)),
-                    Err(e) => results[i] = Some(InstanceResult::Error(e.to_string())),
-                },
-                Err(e) => results[i] = Some(InstanceResult::Error(e.to_string())),
-            }
-            m.deactivate(&mut instances[i]);
-        }
-
-        // Snapshot final map state.
-        let maps: Vec<MapState> = m
-            .vm_ref()
-            .maps
-            .iter()
-            .enumerate()
-            .map(|(idx, mm)| {
-                let mut entries = mm.iter_entries();
-                entries.sort();
-                MapState {
-                    name: map_names[idx].clone(),
-                    entries,
-                }
-            })
-            .collect();
-
-        let results = results
-            .into_iter()
-            .map(|r| r.unwrap_or(InstanceResult::Error("never scheduled".into())))
-            .collect();
-
-        Ok(ScheduleRun {
-            choices,
-            trace,
-            outcome: Outcome { maps, results },
-            lost_updates: hazards.found,
-        })
+        m.deactivate(&mut instances[i]);
     }
+
+    // Snapshot final map state.
+    let maps: Vec<MapState> = m
+        .vm_ref()
+        .maps
+        .iter()
+        .enumerate()
+        .map(|(idx, mm)| {
+            let mut entries = mm.iter_entries();
+            entries.sort();
+            MapState {
+                name: map_names[idx].clone(),
+                entries,
+            }
+        })
+        .collect();
+
+    let results = results
+        .into_iter()
+        .map(|r| r.unwrap_or(InstanceResult::Error("never scheduled".into())))
+        .collect();
+    let invocations = instances
+        .iter()
+        .map(InstanceState::invocation_state)
+        .collect();
+
+    Ok(ScheduleRun {
+        choices,
+        trace,
+        outcome: Outcome {
+            maps,
+            results,
+            invocations,
+        },
+        lost_updates: hazards.found,
+    })
 }
 
 fn run_schedule(
@@ -400,7 +486,11 @@ fn run_schedule(
 }
 
 /// Human-readable detail for a trace step (current cell value + r0).
-fn describe(m: &crate::interp::Machine, kind: MapOpKind, cell: Option<&(usize, Vec<u8>)>) -> String {
+fn describe(
+    m: &crate::interp::Machine,
+    kind: MapOpKind,
+    cell: Option<&(usize, Vec<u8>)>,
+) -> String {
     let cellval = cell.and_then(|(mp, k)| {
         let mm = m.vm_ref().maps.get(*mp)?;
         mm.lookup(k).map(|vr| mm.value(vr).to_vec())
@@ -511,6 +601,46 @@ fn next_path(taken: &[usize], fanout: &[usize]) -> Option<Vec<usize>> {
     None
 }
 
+fn explore_runs(
+    schedules: usize,
+    seed: Option<u64>,
+    mut execute: impl FnMut(&mut dyn Chooser) -> Result<ScheduleRun, String>,
+) -> Result<(Vec<OutcomeGroup>, Option<ScheduleRun>, usize, bool), String> {
+    let mut groups = Vec::new();
+    let mut lost = None;
+    let mut runs = 0usize;
+    let exhausted;
+
+    if let Some(seed) = seed {
+        for s in 0..schedules {
+            let mut chooser =
+                RandomChooser::new(seed.wrapping_add((s as u64).wrapping_mul(0x9e3779b1)));
+            let run = execute(&mut chooser)?;
+            runs += 1;
+            ingest(&mut groups, &mut lost, run);
+        }
+        exhausted = false;
+    } else {
+        let mut path = Vec::new();
+        exhausted = loop {
+            if runs >= schedules {
+                break false;
+            }
+            let mut chooser = PathChooser::new(path.clone());
+            let run = execute(&mut chooser)?;
+            runs += 1;
+            let taken = run.choices.clone();
+            let fanout = chooser.fanout.clone();
+            ingest(&mut groups, &mut lost, run);
+            match next_path(&taken, &fanout) {
+                Some(next) => path = next,
+                None => break true,
+            }
+        };
+    }
+    Ok((groups, lost, runs, exhausted))
+}
+
 fn explore_program_set(
     programs: &[RaceProgram<'_>],
     schedules: usize,
@@ -518,43 +648,40 @@ fn explore_program_set(
     heterogeneous: bool,
 ) -> Result<RaceReport, String> {
     let first = programs.first().ok_or("race program set is empty")?;
-    let mut groups: Vec<OutcomeGroup> = Vec::new();
-    let mut lost: Option<ScheduleRun> = None;
-    let mut runs = 0usize;
-    let exhausted;
-
-    if let Some(seed) = seed {
-        for s in 0..schedules {
-            let mut ch = RandomChooser::new(seed.wrapping_add((s as u64).wrapping_mul(0x9e3779b1)));
-            let run = run_program_schedule(programs, &mut ch)?;
-            runs += 1;
-            ingest(&mut groups, &mut lost, run);
-        }
-        exhausted = false;
-    } else {
-        let mut path: Vec<usize> = Vec::new();
-        exhausted = loop {
-            if runs >= schedules {
-                break false;
-            }
-            let mut ch = PathChooser::new(path.clone());
-            let run = run_program_schedule(programs, &mut ch)?;
-            runs += 1;
-            let taken = run.choices.clone();
-            let fanout = ch.fanout.clone();
-            ingest(&mut groups, &mut lost, run);
-            match next_path(&taken, &fanout) {
-                Some(p) => path = p,
-                None => break true,
-            }
-        };
-    }
+    let (groups, lost, runs, exhausted) = explore_runs(schedules, seed, |chooser| {
+        run_program_schedule(programs, chooser)
+    })?;
 
     Ok(RaceReport {
         procs: programs.len(),
         heterogeneous,
         programs: programs.iter().map(|p| p.name.to_string()).collect(),
         ctx_len: first.ctx.len(),
+        runs,
+        groups,
+        lost_update_witness: lost,
+        exhausted,
+        seed,
+    })
+}
+
+fn explore_xdp_program_set(
+    programs: &[RaceXdpProgram<'_>],
+    schedules: usize,
+    seed: Option<u64>,
+) -> Result<RaceReport, String> {
+    programs.first().ok_or("race program set is empty")?;
+    let (groups, lost, runs, exhausted) = explore_runs(schedules, seed, |chooser| {
+        run_xdp_program_schedule(programs, chooser)
+    })?;
+    Ok(RaceReport {
+        procs: programs.len(),
+        heterogeneous: true,
+        programs: programs
+            .iter()
+            .map(|program| program.name.to_string())
+            .collect(),
+        ctx_len: 24,
         runs,
         groups,
         lost_update_witness: lost,
@@ -583,6 +710,16 @@ pub fn explore_programs(
     explore_program_set(programs, cfg.schedules, cfg.seed, true)
 }
 
+/// Explore verified XDP invocations with private provider-owned frames and
+/// shared maps. Frame storage capacities must match so one machine environment
+/// can swap their complete invocation snapshots.
+pub fn explore_xdp_programs(
+    programs: &[RaceXdpProgram<'_>],
+    cfg: &ExploreProgramsConfig,
+) -> Result<RaceReport, String> {
+    explore_xdp_program_set(programs, cfg.schedules, cfg.seed)
+}
+
 /// Replay exactly one interleaving given as a choice vector.
 pub fn replay_schedule(
     prog: &Program,
@@ -603,6 +740,15 @@ pub fn replay_programs(
     run_program_schedule(programs, &mut ch)
 }
 
+/// Replay one interleaving across an explicit heterogeneous XDP program set.
+pub fn replay_xdp_programs(
+    programs: &[RaceXdpProgram<'_>],
+    path: Vec<usize>,
+) -> Result<ScheduleRun, String> {
+    let mut chooser = PathChooser::new(path);
+    run_xdp_program_schedule(programs, &mut chooser)
+}
+
 // -- reporting ---------------------------------------------------------------
 
 fn render_result(r: &InstanceResult) -> String {
@@ -621,6 +767,44 @@ fn render_maps(maps: &[MapState]) -> String {
             .map(|(k, v)| format!("{}={}", hex(k), hex(v)))
             .collect();
         out.push_str(&format!("      map '{}': {}\n", m.name, entries.join(" ")));
+    }
+    out
+}
+
+fn hex_preview(bytes: &[u8]) -> String {
+    const LIMIT: usize = 32;
+    if bytes.len() <= LIMIT {
+        hex(bytes)
+    } else {
+        format!("{}... ({}B)", hex(&bytes[..LIMIT]), bytes.len())
+    }
+}
+
+fn render_invocations(states: &[InvocationState]) -> String {
+    let mut out = String::new();
+    for (instance, state) in states.iter().enumerate() {
+        out.push_str(&format!(
+            "      inst{instance} context={} ",
+            hex_preview(&state.context)
+        ));
+        if let Some(packet) = &state.packet {
+            out.push_str(&format!(
+                "packet={}[{}..{}] ",
+                hex_preview(&packet.storage),
+                packet.data_start,
+                packet.data_end
+            ));
+        }
+        if let Some(redirect) = state.redirect {
+            out.push_str(&format!("redirect={redirect:?} "));
+        }
+        if let Some(printk) = &state.printk {
+            out.push_str(&format!("printk={printk:?} "));
+        }
+        if let Some(seq) = &state.seq_output {
+            out.push_str(&format!("seq={} ", hex_preview(seq)));
+        }
+        out.push('\n');
     }
     out
 }
@@ -717,6 +901,12 @@ pub fn render_report(rep: &RaceReport, file: &str, stats: bool) -> String {
     }
 
     if rep.groups.len() > 1 {
+        let invocation_divergence = rep.groups.first().is_some_and(|first| {
+            rep.groups
+                .iter()
+                .skip(1)
+                .any(|group| group.witness.outcome.invocations != first.witness.outcome.invocations)
+        });
         out.push_str(&format!(
             "\ndivergent outcomes: {} distinct committed states across schedules\n",
             rep.groups.len()
@@ -728,6 +918,10 @@ pub fn render_report(rep: &RaceReport, file: &str, stats: bool) -> String {
                 g.count
             ));
             out.push_str(&render_maps(&g.witness.outcome.maps));
+            if invocation_divergence {
+                out.push_str("      invocation state:\n");
+                out.push_str(&render_invocations(&g.witness.outcome.invocations));
+            }
             let rs: Vec<String> = g
                 .witness
                 .outcome
@@ -766,9 +960,7 @@ pub fn render_report(rep: &RaceReport, file: &str, stats: bool) -> String {
         out.push_str(&format!("  schedules explored: {}\n", rep.runs));
         out.push_str(&format!("  distinct outcomes:  {}\n", rep.groups.len()));
         let total_steps: usize = rep.groups.iter().map(|g| g.witness.trace.len()).sum();
-        out.push_str(&format!(
-            "  map ops in witness traces: {total_steps}\n"
-        ));
+        out.push_str(&format!("  map ops in witness traces: {total_steps}\n"));
         out.push_str(&format!(
             "  lost-update witnessed: {}\n",
             rep.lost_update_witness.is_some()

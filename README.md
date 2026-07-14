@@ -86,6 +86,9 @@ For statistically sampled results rather than a one-off CLI timing, see
   lost updates and other map-level races. The library API can assign a different
   verified program and fixed context to each instance, which lets graph runtimes
   test interactions between heterogeneous nodes rather than only self-races.
+  Packet-aware variants swap complete XDP invocation snapshots, so private
+  frame windows, mutations, metadata, capabilities, and redirects participate
+  in outcome comparison while maps remain shared.
 - **Equivalence checking and optimization**: compare observable behavior
   (return value, context/map mutations, output records and `trace_printk`) and
   apply verifier-guided rewrites that are reverified and equivalence-checked.
@@ -335,7 +338,7 @@ including time-travel `rstep`.
 
 ## Tests
 
-The current suite has **484 passing tests** with default features and **466**
+The current suite has **487 passing tests** with default features and **469**
 with the std interpreter-only profile, plus four intentionally ignored
 exhaustive soundness sweeps in each configuration. Coverage includes ISA semantics,
 verifier acceptance and rejection, abstract-operator soundness, maps/helpers,

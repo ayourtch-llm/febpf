@@ -71,6 +71,15 @@ is replayed with the same ordered `RaceProgram` set through `replay_programs`.
 An empty set, unequal context lengths, or non-identical map definitions is
 rejected before scheduling.
 
+`explore_xdp_programs` applies the same scheduler to `RaceXdpProgram` entries.
+Each entry owns a fixed `XdpFrame` snapshot. Instances share maps but retain
+private context, complete packet storage, active data bounds, resize
+capabilities, output sinks, and redirect state. Storage capacities must match
+because snapshots are swapped through one provider environment; packet bytes,
+active bounds, and metadata may differ. XDP programs are verified under the
+XDP context model before scheduling, and `replay_xdp_programs` preserves the
+same choice-vector contract.
+
 ## Scheduler granularity + rationale
 
 Preemption happens only at **map-visible operations**. Between two map-visible
@@ -110,8 +119,9 @@ sub-op tearing is out of scope.
 Two independent detectors, both reported:
 
 1. **Outcome divergence (general).** For fixed inputs, explore schedules and
-   record each schedule's *observable outcome* = (final committed state of every
-   map, canonicalised) + (per-instance `r0` / error). If two explored schedules
+record each schedule's *observable outcome* = (final committed state of every
+map, canonicalised) + (per-instance `r0` / error) + (provider-visible context,
+packet window, outputs, and redirect state). If two explored schedules
    yield **different** outcomes, the program is racy: the outcome depends on the
    interleaving. We report the two divergent outcomes and a witnessing
    interleaving for each.
@@ -185,6 +195,10 @@ misleading CLI reproduction command.
   replays exactly;
 - (v) incompatible maps, unequal context lengths, and empty program sets are
   rejected.
+- (vi) XDP frames remain instance-private while their packet bytes drive shared
+  map races; packet mutations alone distinguish schedule outcomes even when
+  maps and return values converge; incompatible frame capacities and invalid
+  XDP programs are rejected.
 
 Tests live in `tests/race.rs` and drive the library API (no TTY needed).
 </content>
