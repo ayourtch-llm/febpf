@@ -2,13 +2,15 @@
 
 `febpf race <prog> [--procs N] [--schedules M] [--seed S] [--schedule CSV] [--ctx ...] [--stats]`
 
-STATUS: complete (2026-07-11). `febpf race` ships with systematic + seeded
+STATUS: complete, including heterogeneous library exploration (2026-07-15).
+`febpf race` ships with systematic + seeded
 exploration, outcome-divergence and lost-update detection, `--schedule` replay,
 `--stats`, and `examples/race_{rmw,atomic}.s`. Behavioral tests in
-`tests/race.rs` cover the whole testing bar. Both build configs green, clippy
-clean. Follow-ups if extended: model `BPF_EXIST`/`BPF_NOEXIST` update flags
-explicitly, per-CPU maps, and full `.febpf` replay-file integration (the
-`--schedule` choice-vector is the current reproduction path).
+`tests/race.rs` cover both repeated and heterogeneous programs. The CLI remains
+the convenient single-program surface; embedders use `explore_programs` and
+`replay_programs`. Follow-ups if extended: model `BPF_EXIST`/`BPF_NOEXIST`
+update flags explicitly, per-CPU maps, and full `.febpf` replay-file
+integration (the choice vector is the current reproduction path).
 
 ## What it is
 
@@ -25,29 +27,49 @@ classic bugs are:
 
 febpf's interpreter is **fully deterministic and single-threaded-simulated**
 (handoff §7). That lets us do something a real kernel can't: model `N`
-concurrent invocations of one program sharing one map set, drive a
+concurrent invocations of one or several programs sharing one map set, drive a
 **deterministic scheduler** that interleaves them, systematically explore
 schedules, and flag when different schedules commit different map state — a
 race — reproducibly.
 
 ## Concurrency model
 
-- `N` logical **instances** of the same program (default 2). Each has its own
+- `N` logical **instances**. The CLI assigns the same program to all instances
+  (default 2); the library's `RaceProgram` API can assign a different program
+  and context to every instance. Each has its own
   registers, program counter, call frames, 512-B×frames stack, instruction
   counter and context buffer. **All instances share ONE set of maps**
   (`src/maps.rs`) — that shared, mutable map state is the only channel through
   which they interact, which mirrors real eBPF (per-CPU registers/stack, shared
   maps).
-- All instances run with the **same inputs** (same `--ctx`). That is
-  deliberate: to attribute a divergent outcome to the *schedule* we must hold
-  the inputs fixed. The schedule is then the only independent variable, so any
-  outcome difference is a race, not an input difference.
+- CLI instances run with the **same input** (`--ctx`). Heterogeneous library
+  instances may have different context bytes, but every instance's input is
+  fixed across all explored schedules. The schedule is therefore still the
+  only independent variable. Context lengths must be equal because instances
+  are swapped through one machine memory layout.
 - Reuses the existing `Machine`/`Vm` (handoff §1 virtual-address memory model
   is untouched, so every instance is still fully memory-safe). Only ONE instance
   is ever *actively* stepping at a time (cooperative), so a single `Machine`
   borrows the `Vm`; per-instance execution state is swapped in/out around each
   turn via a new opaque `interp::InstanceState`. The shared map state, region
   table and prandom stream live in the `Vm` and are **not** swapped.
+
+### Heterogeneous program boundary
+
+`explore_programs(&[RaceProgram { name, program, ctx }, ...], config)` installs
+one executable image per logical instance. The first program constructs the
+VM and map storage; every later program must declare an exactly identical map
+set. Alternate roots are internal scheduler images, not entries in a program
+array and not tail-call edges. Consequently this API explores interactions
+between flat program roots sharing maps; it does not model a different
+tail-call graph per root.
+
+The explorer is behavioral evidence, not a verifier entry point. Callers must
+verify every program under the intended execution environment first. Program
+labels are retained in `RaceReport` and heterogeneous traces. A choice vector
+is replayed with the same ordered `RaceProgram` set through `replay_programs`.
+An empty set, unequal context lengths, or non-identical map definitions is
+rejected before scheduling.
 
 ## Scheduler granularity + rationale
 
@@ -123,14 +145,20 @@ outcome and no lost-update pattern is seen.
 
 ## Reproducibility / replay
 
-The whole run is a pure function of `(program, ctx, procs, exploration
-choices)`. A witnessed racing interleaving is emitted as its **choice vector**;
+The whole run is a pure function of `(ordered programs, fixed per-instance
+contexts, exploration choices)`. A witnessed racing interleaving is emitted as
+its **choice vector**;
 re-running `febpf race <prog> --procs N --schedule <vector>` replays that exact
 interleaving bit-for-bit and prints the step-by-step trace. When `--seed` is
 used, the report also prints the seed and the offending schedule's index so the
 same command reproduces it. (Full `.febpf` replay-file integration is out of
 scope for this feature; the choice-vector replay is the deterministic
 reproduction path, and it points at the losing schedule reproducibly.)
+
+For heterogeneous runs, preserve the ordered program set and call
+`replay_programs` with the emitted vector. The single-file CLI cannot honestly
+reconstruct several program images, so heterogeneous reports do not print a
+misleading CLI reproduction command.
 
 ## Staged plan
 
@@ -152,6 +180,11 @@ reproduction path, and it points at the losing schedule reproducibly.)
   the same key is **RACE-FREE** across all explored schedules;
 - (iii) determinism: the same `--seed` (and the same `--schedule`) reproduces
   the identical racing interleaving bit-for-bit.
+- (iv) distinct `+1` and `+10` workers expose a cross-program lost update,
+  their atomic equivalents are race-free, and the heterogeneous choice vector
+  replays exactly;
+- (v) incompatible maps, unequal context lengths, and empty program sets are
+  rejected.
 
 Tests live in `tests/race.rs` and drive the library API (no TTY needed).
 </content>

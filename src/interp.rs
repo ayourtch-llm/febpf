@@ -231,10 +231,13 @@ pub struct Vm {
     context_model: crate::execution::ContextModel,
     legacy_packet: crate::verifier::LegacyPacketProfile,
     legacy_packet_used: bool,
-    tail_programs: Vec<TailProgram>,
+    program_images: Vec<ProgramImage>,
 }
 
-struct TailProgram {
+/// A non-entry executable image sharing this VM's maps. A program-array entry
+/// may select one as a tail-call target; internal schedulers may select one as
+/// an independent root without creating a tail-call edge.
+struct ProgramImage {
     insns: Vec<Insn>,
     exec: Vec<Insn>,
     probe_mem: Vec<bool>,
@@ -325,7 +328,7 @@ impl Vm {
             context_model: crate::execution::ContextModel::Flat,
             legacy_packet: crate::verifier::LegacyPacketProfile::Disabled,
             legacy_packet_used: false,
-            tail_programs: Vec::new(),
+            program_images: Vec::new(),
         };
 
         // Patch map-reference lddw instructions into plain 64-bit immediates.
@@ -446,7 +449,7 @@ impl Vm {
         let ok = crate::verifier::verify(&prog.insns, &prog.maps, self.user_helpers.sigs(), cfg)
             .map_err(|e| format!("tail-call target verification failed: {e}"))?;
         let exec = self.patch_bundle_program(&prog.insns)?;
-        let program_id = self.tail_programs.len() as u32 + 1;
+        let program_id = self.program_images.len() as u32 + 1;
         let map = self
             .maps
             .iter_mut()
@@ -458,7 +461,7 @@ impl Vm {
         map.set_program(index, program_id)
             .map_err(|e| format!("cannot set {map_name}[{index}]: errno {}", -e))?;
         let uses_legacy_packet = prog.insns.iter().any(is_legacy_packet_load);
-        self.tail_programs.push(TailProgram {
+        self.program_images.push(ProgramImage {
             insns: prog.insns,
             exec,
             probe_mem: ok.probe_mem,
@@ -466,6 +469,28 @@ impl Vm {
             jit: None,
         });
         self.legacy_packet_used |= uses_legacy_packet;
+        Ok(program_id)
+    }
+
+    /// Install another executable image that shares this VM's maps.
+    ///
+    /// This is the internal substrate for heterogeneous deterministic race
+    /// exploration. It does not create a tail-call edge or independently
+    /// verify the image; callers validate programs before relying on results.
+    #[cfg(feature = "std")]
+    pub(crate) fn register_race_program(&mut self, prog: &Program) -> Result<u32, String> {
+        if prog.maps != self.map_defs {
+            return Err("race programs must use identical map definitions".into());
+        }
+        let exec = self.patch_bundle_program(&prog.insns)?;
+        let program_id = self.program_images.len() as u32 + 1;
+        self.program_images.push(ProgramImage {
+            insns: prog.insns.clone(),
+            exec,
+            probe_mem: Vec::new(),
+            #[cfg(feature = "jit")]
+            jit: None,
+        });
         Ok(program_id)
     }
 
@@ -1019,7 +1044,7 @@ impl Vm {
         if self.jit.is_none() {
             self.jit = Some(crate::jit::compile(&self.exec)?);
         }
-        for target in &mut self.tail_programs {
+        for target in &mut self.program_images {
             if target.jit.is_none() {
                 target.jit = Some(crate::jit::compile(&target.exec)?);
             }
@@ -1061,8 +1086,8 @@ impl Vm {
             return Err(EbpfError { pc: 0, msg: e });
         }
         let jit = self.jit.take().unwrap();
-        let mut tail_jits: Vec<crate::jit::JitProgram> = self
-            .tail_programs
+        let mut image_jits: Vec<crate::jit::JitProgram> = self
+            .program_images
             .iter_mut()
             .map(|p| p.jit.take().unwrap())
             .collect();
@@ -1071,7 +1096,7 @@ impl Vm {
             let native = if m.active_program == 0 {
                 &jit
             } else {
-                &tail_jits[m.active_program as usize - 1]
+                &image_jits[m.active_program as usize - 1]
             };
             // Safety: same contract as Machine::run_native. A successful tail
             // call returns through STOP and the loop enters the target JIT.
@@ -1088,7 +1113,7 @@ impl Vm {
         let redirect = m.env.redirect;
         drop(m);
         self.jit = Some(jit);
-        for (target, native) in self.tail_programs.iter_mut().zip(tail_jits.drain(..)) {
+        for (target, native) in self.program_images.iter_mut().zip(image_jits.drain(..)) {
             target.jit = Some(native);
         }
         r.map(|return_value| crate::execution::ExecutionOutcome {
@@ -1235,6 +1260,13 @@ impl InstanceState {
             active_program: 0,
             tail_call_count: 0,
         }
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn new_for_program(ctx: &[u8], program: u32) -> InstanceState {
+        let mut state = Self::new(ctx);
+        state.active_program = program;
+        state
     }
 
     /// Number of instructions this instance has retired so far.
@@ -1427,7 +1459,7 @@ impl<'a> Machine<'a> {
         if self.active_program == 0 {
             &self.vm.exec
         } else {
-            &self.vm.tail_programs[self.active_program as usize - 1].exec
+            &self.vm.program_images[self.active_program as usize - 1].exec
         }
     }
 
@@ -1435,7 +1467,7 @@ impl<'a> Machine<'a> {
         if self.active_program == 0 {
             &self.vm.probe_mem
         } else {
-            &self.vm.tail_programs[self.active_program as usize - 1].probe_mem
+            &self.vm.program_images[self.active_program as usize - 1].probe_mem
         }
     }
 
@@ -1766,7 +1798,7 @@ impl<'a> Machine<'a> {
         if self.active_program == 0 {
             &self.vm.insns
         } else {
-            &self.vm.tail_programs[self.active_program as usize - 1].insns
+            &self.vm.program_images[self.active_program as usize - 1].insns
         }
     }
 
@@ -2352,7 +2384,7 @@ impl<'a> Machine<'a> {
             let Some(program) = self.vm.maps[map].program_at(args[2] as u32) else {
                 return Ok(self.tail_call_fallthrough());
             };
-            if program == 0 || program as usize > self.vm.tail_programs.len() {
+            if program == 0 || program as usize > self.vm.program_images.len() {
                 return Ok(self.tail_call_fallthrough());
             }
             self.tail_call_count += 1;

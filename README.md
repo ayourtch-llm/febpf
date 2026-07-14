@@ -83,7 +83,9 @@ For statistically sampled results rather than a one-off CLI timing, see
   captures preserve program graphs, maps, context or packet input, and debugger
   position for exact reproduction and time-travel debugging. `febpf race`
   explores concurrent instances sharing maps and emits replayable schedules for
-  lost updates and other map-level races.
+  lost updates and other map-level races. The library API can assign a different
+  verified program and fixed context to each instance, which lets graph runtimes
+  test interactions between heterogeneous nodes rather than only self-races.
 - **Equivalence checking and optimization**: compare observable behavior
   (return value, context/map mutations, output records and `trace_printk`) and
   apply verifier-guided rewrites that are reverified and equivalence-checked.
@@ -333,7 +335,7 @@ including time-travel `rstep`.
 
 ## Tests
 
-The current suite has **477 passing tests** with default features and **459**
+The current suite has **484 passing tests** with default features and **466**
 with the std interpreter-only profile, plus four intentionally ignored
 exhaustive soundness sweeps in each configuration. Coverage includes ISA semantics,
 verifier acceptance and rejection, abstract-operator soundness, maps/helpers,

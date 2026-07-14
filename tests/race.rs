@@ -7,7 +7,10 @@
 //! (iii) determinism: the same --seed reproduces the identical racing
 //!       interleaving bit-for-bit, and a --schedule choice vector replays it.
 
-use febpf::race::{explore, replay_schedule, ExploreConfig, InstanceResult};
+use febpf::race::{
+    explore, explore_programs, render_report, replay_programs, replay_schedule, ExploreConfig,
+    ExploreProgramsConfig, InstanceResult, RaceProgram,
+};
 use febpf::{asm, Program};
 
 fn prog(src: &str) -> Program {
@@ -55,6 +58,48 @@ const ATOMIC: &str = r#"
         call map_lookup_elem
         if r0 == 0 goto out
         r1 = 1
+        lock *(u64 *)(r0 + 0) += r1
+out:
+        r0 = 0
+        exit
+"#;
+
+/// A distinct non-atomic worker that adds ten to the same shared counter.
+const RMW_TEN: &str = r#"
+        .map counter array 4 8 1
+        r0 = 0
+        *(u32 *)(r10 - 4) = r0
+        r1 = map[counter]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        if r0 == 0 goto out
+        r6 = *(u64 *)(r0 + 0)
+        r6 += 10
+        *(u64 *)(r10 - 16) = r6
+        r1 = map[counter]
+        r2 = r10
+        r2 += -4
+        r3 = r10
+        r3 += -16
+        r4 = 0
+        call map_update_elem
+out:
+        r0 = 0
+        exit
+"#;
+
+/// A distinct atomic worker that adds ten to the same shared counter.
+const ATOMIC_TEN: &str = r#"
+        .map counter array 4 8 1
+        r0 = 0
+        *(u32 *)(r10 - 4) = r0
+        r1 = map[counter]
+        r2 = r10
+        r2 += -4
+        call map_lookup_elem
+        if r0 == 0 goto out
+        r1 = 10
         lock *(u64 *)(r0 + 0) += r1
 out:
         r0 = 0
@@ -191,4 +236,163 @@ fn serial_schedule_reaches_two() {
     let run = replay_schedule(&p, &[0u8; 16], 2, vec![0, 0, 0, 0, 0, 0]).unwrap();
     assert_eq!(counter_value(&run.outcome.maps[0].entries), 2);
     assert!(run.lost_updates.is_empty());
+}
+
+#[test]
+fn heterogeneous_workers_expose_a_cross_program_lost_update() {
+    let add_one = prog(RMW);
+    let add_ten = prog(RMW_TEN);
+    let ctx = [0u8; 16];
+    let programs = [
+        RaceProgram {
+            name: "add-one",
+            program: &add_one,
+            ctx: &ctx,
+        },
+        RaceProgram {
+            name: "add-ten",
+            program: &add_ten,
+            ctx: &ctx,
+        },
+    ];
+    let rep = explore_programs(
+        &programs,
+        &ExploreProgramsConfig {
+            schedules: 10_000,
+            seed: None,
+        },
+    )
+    .unwrap();
+
+    assert!(rep.is_race());
+    assert!(rep.exhausted);
+    assert_eq!(rep.programs, ["add-one", "add-ten"]);
+    let finals: Vec<u64> = rep
+        .groups
+        .iter()
+        .map(|g| counter_value(&g.witness.outcome.maps[0].entries))
+        .collect();
+    assert!(finals.contains(&11), "serial execution preserves both writes");
+    assert!(
+        finals.contains(&1) || finals.contains(&10),
+        "an interleaving must lose one heterogeneous write: {finals:?}"
+    );
+    let witness = rep.lost_update_witness.as_ref().unwrap();
+    assert!(witness.trace.iter().any(|step| step.program == 0));
+    assert!(witness.trace.iter().any(|step| step.program == 1));
+
+    let rendered = render_report(&rep, "not-a-single-program.s", false);
+    assert!(rendered.contains("inst0[add-one]"));
+    assert!(rendered.contains("inst1[add-ten]"));
+    assert!(rendered.contains("replay with race::replay_programs"));
+    assert!(!rendered.contains("febpf race not-a-single-program.s"));
+}
+
+#[test]
+fn heterogeneous_atomic_workers_are_race_free() {
+    let add_one = prog(ATOMIC);
+    let add_ten = prog(ATOMIC_TEN);
+    let ctx = [0u8; 16];
+    let programs = [
+        RaceProgram {
+            name: "atomic-one",
+            program: &add_one,
+            ctx: &ctx,
+        },
+        RaceProgram {
+            name: "atomic-ten",
+            program: &add_ten,
+            ctx: &ctx,
+        },
+    ];
+    let rep = explore_programs(
+        &programs,
+        &ExploreProgramsConfig {
+            schedules: 10_000,
+            seed: None,
+        },
+    )
+    .unwrap();
+
+    assert!(!rep.is_race());
+    assert!(rep.exhausted);
+    assert_eq!(rep.groups.len(), 1);
+    assert_eq!(counter_value(&rep.groups[0].witness.outcome.maps[0].entries), 11);
+}
+
+#[test]
+fn heterogeneous_schedule_replay_is_exact() {
+    let add_one = prog(RMW);
+    let add_ten = prog(RMW_TEN);
+    let ctx = [0u8; 16];
+    let programs = [
+        RaceProgram {
+            name: "add-one",
+            program: &add_one,
+            ctx: &ctx,
+        },
+        RaceProgram {
+            name: "add-ten",
+            program: &add_ten,
+            ctx: &ctx,
+        },
+    ];
+    let path = vec![0, 0, 1, 1, 0, 0];
+    let run = replay_programs(&programs, path.clone()).unwrap();
+    let again = replay_programs(&programs, path.clone()).unwrap();
+
+    assert_eq!(run.choices, path);
+    assert_eq!(run.trace, again.trace);
+    assert_eq!(run.outcome, again.outcome);
+    assert_eq!(run.lost_updates, again.lost_updates);
+    assert!(matches!(counter_value(&run.outcome.maps[0].entries), 1 | 10));
+}
+
+#[test]
+fn heterogeneous_program_contract_is_strict() {
+    let add_one = prog(RMW);
+    let different_map = prog(&RMW_TEN.replace("array 4 8 1", "array 4 8 2"));
+    let short_ctx = [0u8; 8];
+    let long_ctx = [0u8; 16];
+
+    let empty = explore_programs(
+        &[],
+        &ExploreProgramsConfig {
+            schedules: 1,
+            seed: None,
+        },
+    )
+    .err()
+    .expect("an empty program set must be rejected");
+    assert!(empty.contains("empty"));
+
+    let unequal_contexts = [
+        RaceProgram {
+            name: "short",
+            program: &add_one,
+            ctx: &short_ctx,
+        },
+        RaceProgram {
+            name: "long",
+            program: &add_one,
+            ctx: &long_ctx,
+        },
+    ];
+    let err = replay_programs(&unequal_contexts, vec![]).unwrap_err();
+    assert!(err.contains("equal context lengths"));
+
+    let incompatible_maps = [
+        RaceProgram {
+            name: "one-entry",
+            program: &add_one,
+            ctx: &long_ctx,
+        },
+        RaceProgram {
+            name: "two-entries",
+            program: &different_map,
+            ctx: &long_ctx,
+        },
+    ];
+    let err = replay_programs(&incompatible_maps, vec![]).unwrap_err();
+    assert!(err.contains("identical map definitions"));
 }

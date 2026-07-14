@@ -1,7 +1,7 @@
 //! Deterministic concurrency race explorer for eBPF programs that share maps.
 //!
 //! febpf's interpreter is fully deterministic and single-threaded-simulated, so
-//! we can model `N` concurrent invocations of one program sharing one map set,
+//! we can model concurrent invocations of one or more programs sharing one map set,
 //! drive a deterministic scheduler that interleaves them at map-visible
 //! operations, systematically (or seeded-randomly) explore schedules, and flag
 //! when different schedules commit different map state — a race.
@@ -49,11 +49,25 @@ pub struct MapState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TraceStep {
     pub instance: usize,
+    /// Index of the heterogeneous program assigned to this instance.
+    pub program: usize,
     pub op: MapOpKind,
     pub pc: usize,
     /// The `(map, key)` cell touched, when known.
     pub cell: Option<(usize, Vec<u8>)>,
     pub detail: String,
+}
+
+/// One logical invocation in a heterogeneous race exploration.
+///
+/// Programs must have identical map definitions and equally sized contexts.
+/// Context bytes may differ between instances. The explorer does not verify
+/// programs; callers should verify each program under the intended execution
+/// environment before treating exploration results as meaningful.
+pub struct RaceProgram<'a> {
+    pub name: &'a str,
+    pub program: &'a Program,
+    pub ctx: &'a [u8],
 }
 
 /// A witnessed lost-update / stale read-modify-write: instance `reader` read a
@@ -228,20 +242,31 @@ impl HazardLog {
 
 // -- single-schedule executor ------------------------------------------------
 
-/// Run one full schedule of `procs` instances of `prog` (all with the same
-/// `ctx`), letting `chooser` decide the interleaving at each map-visible op.
-fn run_schedule(
-    prog: &Program,
-    ctx: &[u8],
-    procs: usize,
+/// Run one full schedule of heterogeneous program instances, letting
+/// `chooser` decide the interleaving at each map-visible op.
+fn run_program_schedule(
+    programs: &[RaceProgram<'_>],
     chooser: &mut dyn Chooser,
 ) -> Result<ScheduleRun, String> {
-    let mut vm = Vm::new(prog.clone())?;
+    let first = programs.first().ok_or("race program set is empty")?;
+    let ctx_len = first.ctx.len();
+    if programs.iter().any(|program| program.ctx.len() != ctx_len) {
+        return Err("race programs must use equal context lengths".into());
+    }
+    let mut vm = Vm::new(first.program.clone())?;
+    let mut program_ids = vec![0];
+    for program in programs.iter().skip(1) {
+        program_ids.push(vm.register_race_program(program.program)?);
+    }
     vm.insn_limit = PER_INSTANCE_INSN_LIMIT;
     let map_names: Vec<String> = vm.maps.iter().map(|m| m.def.name.clone()).collect();
 
-    let mut instances: Vec<InstanceState> =
-        (0..procs).map(|_| InstanceState::new(ctx)).collect();
+    let procs = programs.len();
+    let mut instances: Vec<InstanceState> = programs
+        .iter()
+        .zip(program_ids)
+        .map(|(program, id)| InstanceState::new_for_program(program.ctx, id))
+        .collect();
     let mut pending: Vec<Option<MapOp>> = vec![None; procs];
     let mut results: Vec<Option<InstanceResult>> = vec![None; procs];
 
@@ -249,7 +274,7 @@ fn run_schedule(
     let mut choices: Vec<usize> = Vec::new();
     let mut hazards = HazardLog::new();
 
-    let mut scratch = ctx.to_vec();
+    let mut scratch = first.ctx.to_vec();
     {
         let mut m = vm.machine(&mut scratch);
 
@@ -295,6 +320,7 @@ fn run_schedule(
             let detail = describe(&m, op.kind, cell.as_ref());
             trace.push(TraceStep {
                 instance: i,
+                program: i,
                 op: op.kind,
                 pc: op.pc,
                 cell: cell.clone(),
@@ -357,6 +383,22 @@ fn run_schedule(
     }
 }
 
+fn run_schedule(
+    prog: &Program,
+    ctx: &[u8],
+    procs: usize,
+    chooser: &mut dyn Chooser,
+) -> Result<ScheduleRun, String> {
+    let programs: Vec<_> = (0..procs)
+        .map(|_| RaceProgram {
+            name: "program",
+            program: prog,
+            ctx,
+        })
+        .collect();
+    run_program_schedule(&programs, chooser)
+}
+
 /// Human-readable detail for a trace step (current cell value + r0).
 fn describe(m: &crate::interp::Machine, kind: MapOpKind, cell: Option<&(usize, Vec<u8>)>) -> String {
     let cellval = cell.and_then(|(mp, k)| {
@@ -404,6 +446,12 @@ pub struct ExploreConfig {
     pub seed: Option<u64>,
 }
 
+/// Exploration controls for an explicit heterogeneous program set.
+pub struct ExploreProgramsConfig {
+    pub schedules: usize,
+    pub seed: Option<u64>,
+}
+
 /// A distinct observed outcome plus a witnessing schedule and how many explored
 /// schedules produced it.
 pub struct OutcomeGroup {
@@ -413,6 +461,10 @@ pub struct OutcomeGroup {
 
 pub struct RaceReport {
     pub procs: usize,
+    /// Whether the report came from the explicit multi-program API.
+    pub heterogeneous: bool,
+    /// Program label for each instance, in instance order.
+    pub programs: Vec<String>,
     pub ctx_len: usize,
     pub runs: usize,
     /// Distinct outcomes, in first-seen order.
@@ -459,18 +511,22 @@ fn next_path(taken: &[usize], fanout: &[usize]) -> Option<Vec<usize>> {
     None
 }
 
-/// Explore schedules and build a race report.
-pub fn explore(prog: &Program, ctx: &[u8], cfg: &ExploreConfig) -> Result<RaceReport, String> {
-    let procs = cfg.procs.max(1);
+fn explore_program_set(
+    programs: &[RaceProgram<'_>],
+    schedules: usize,
+    seed: Option<u64>,
+    heterogeneous: bool,
+) -> Result<RaceReport, String> {
+    let first = programs.first().ok_or("race program set is empty")?;
     let mut groups: Vec<OutcomeGroup> = Vec::new();
     let mut lost: Option<ScheduleRun> = None;
     let mut runs = 0usize;
     let exhausted;
 
-    if let Some(seed) = cfg.seed {
-        for s in 0..cfg.schedules {
+    if let Some(seed) = seed {
+        for s in 0..schedules {
             let mut ch = RandomChooser::new(seed.wrapping_add((s as u64).wrapping_mul(0x9e3779b1)));
-            let run = run_schedule(prog, ctx, procs, &mut ch)?;
+            let run = run_program_schedule(programs, &mut ch)?;
             runs += 1;
             ingest(&mut groups, &mut lost, run);
         }
@@ -478,11 +534,11 @@ pub fn explore(prog: &Program, ctx: &[u8], cfg: &ExploreConfig) -> Result<RaceRe
     } else {
         let mut path: Vec<usize> = Vec::new();
         exhausted = loop {
-            if runs >= cfg.schedules {
+            if runs >= schedules {
                 break false;
             }
             let mut ch = PathChooser::new(path.clone());
-            let run = run_schedule(prog, ctx, procs, &mut ch)?;
+            let run = run_program_schedule(programs, &mut ch)?;
             runs += 1;
             let taken = run.choices.clone();
             let fanout = ch.fanout.clone();
@@ -495,14 +551,36 @@ pub fn explore(prog: &Program, ctx: &[u8], cfg: &ExploreConfig) -> Result<RaceRe
     }
 
     Ok(RaceReport {
-        procs,
-        ctx_len: ctx.len(),
+        procs: programs.len(),
+        heterogeneous,
+        programs: programs.iter().map(|p| p.name.to_string()).collect(),
+        ctx_len: first.ctx.len(),
         runs,
         groups,
         lost_update_witness: lost,
         exhausted,
-        seed: cfg.seed,
+        seed,
     })
+}
+
+/// Explore schedules for repeated invocations of one program.
+pub fn explore(prog: &Program, ctx: &[u8], cfg: &ExploreConfig) -> Result<RaceReport, String> {
+    let programs: Vec<_> = (0..cfg.procs.max(1))
+        .map(|_| RaceProgram {
+            name: "program",
+            program: prog,
+            ctx,
+        })
+        .collect();
+    explore_program_set(&programs, cfg.schedules, cfg.seed, false)
+}
+
+/// Explore schedules across an explicit set of program instances sharing maps.
+pub fn explore_programs(
+    programs: &[RaceProgram<'_>],
+    cfg: &ExploreProgramsConfig,
+) -> Result<RaceReport, String> {
+    explore_program_set(programs, cfg.schedules, cfg.seed, true)
 }
 
 /// Replay exactly one interleaving given as a choice vector.
@@ -514,6 +592,15 @@ pub fn replay_schedule(
 ) -> Result<ScheduleRun, String> {
     let mut ch = PathChooser::new(path);
     run_schedule(prog, ctx, procs.max(1), &mut ch)
+}
+
+/// Replay one interleaving across an explicit heterogeneous program set.
+pub fn replay_programs(
+    programs: &[RaceProgram<'_>],
+    path: Vec<usize>,
+) -> Result<ScheduleRun, String> {
+    let mut ch = PathChooser::new(path);
+    run_program_schedule(programs, &mut ch)
 }
 
 // -- reporting ---------------------------------------------------------------
@@ -538,15 +625,27 @@ fn render_maps(maps: &[MapState]) -> String {
     out
 }
 
-fn render_trace(trace: &[TraceStep], file: &str, procs: usize, choices: &[usize]) -> String {
+fn render_trace(
+    trace: &[TraceStep],
+    programs: &[String],
+    heterogeneous: bool,
+    file: &str,
+    procs: usize,
+    choices: &[usize],
+) -> String {
     let mut out = String::new();
     for (n, s) in trace.iter().enumerate() {
         let cell = match &s.cell {
             Some((mp, k)) => format!(" cell(map{mp},key={})", hex(k)),
             None => String::new(),
         };
+        let label = programs
+            .get(s.program)
+            .filter(|_| heterogeneous)
+            .map(|name| format!("[{}]", name))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "      #{n:<2} inst{}  {:<6}{}  {}\n",
+            "      #{n:<2} inst{}{label}  {:<6}{}  {}\n",
             s.instance,
             s.op.as_str(),
             cell,
@@ -554,10 +653,17 @@ fn render_trace(trace: &[TraceStep], file: &str, procs: usize, choices: &[usize]
         ));
     }
     let csv: Vec<String> = choices.iter().map(|c| c.to_string()).collect();
-    out.push_str(&format!(
-        "      reproduce: febpf race {file} --procs {procs} --schedule {}\n",
-        csv.join(",")
-    ));
+    if heterogeneous {
+        out.push_str(&format!(
+            "      replay with race::replay_programs, choices {}\n",
+            csv.join(",")
+        ));
+    } else {
+        out.push_str(&format!(
+            "      reproduce: febpf race {file} --procs {procs} --schedule {}\n",
+            csv.join(",")
+        ));
+    }
     out
 }
 
@@ -600,7 +706,14 @@ pub fn render_report(rep: &RaceReport, file: &str, stats: bool) -> String {
             ));
         }
         out.push_str("  witnessing interleaving:\n");
-        out.push_str(&render_trace(&run.trace, file, rep.procs, &run.choices));
+        out.push_str(&render_trace(
+            &run.trace,
+            &rep.programs,
+            rep.heterogeneous,
+            file,
+            rep.procs,
+            &run.choices,
+        ));
     }
 
     if rep.groups.len() > 1 {
@@ -627,6 +740,8 @@ pub fn render_report(rep: &RaceReport, file: &str, stats: bool) -> String {
             out.push_str("      witnessing interleaving:\n");
             out.push_str(&render_trace(
                 &g.witness.trace,
+                &rep.programs,
+                rep.heterogeneous,
                 file,
                 rep.procs,
                 &g.witness.choices,
@@ -667,7 +782,14 @@ pub fn render_report(rep: &RaceReport, file: &str, stats: bool) -> String {
 pub fn render_single(run: &ScheduleRun, file: &str, procs: usize) -> String {
     let mut out = String::new();
     out.push_str(&format!("replayed schedule ({procs} instances):\n"));
-    out.push_str(&render_trace(&run.trace, file, procs, &run.choices));
+    out.push_str(&render_trace(
+        &run.trace,
+        &[],
+        false,
+        file,
+        procs,
+        &run.choices,
+    ));
     out.push_str("committed state:\n");
     out.push_str(&render_maps(&run.outcome.maps));
     let rs: Vec<String> = run

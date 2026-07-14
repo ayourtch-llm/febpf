@@ -30,7 +30,52 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-14 verified map effects; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-15 heterogeneous race exploration; authoritative)
+
+Heterogeneous deterministic race exploration is implemented and ready to
+commit. `race::explore_programs` accepts an ordered set of `RaceProgram`
+instances, each with its own label, program, and fixed context. All instances
+retain private registers, PC, frames, stack, and context while sharing one VM's
+map storage. Map definitions must be exactly identical and context lengths
+must match; empty sets are rejected. `replay_programs` consumes the same
+ordered set and a recorded choice vector. Existing `explore` and
+`replay_schedule` remain source-compatible single-program wrappers.
+
+The VM's private `tail_programs` container was generalized to
+`program_images`: program-array edges and scheduler-selected roots are now
+separate ways to select a shared-map executable image, rather than pretending
+heterogeneous roots are tail calls. Alternate race roots do not create program
+array entries or tail-call edges. The current API deliberately models flat
+program roots and map-visible concurrency only; callers must verify every
+program under their intended execution environment before relying on the
+behavioral evidence. Per-instance program labels survive into reports/traces,
+and heterogeneous reports point to `replay_programs` rather than emitting an
+invalid single-file CLI reproduction command.
+
+Behavioral coverage uses distinct non-atomic `+1` and `+10` workers: exhaustive
+exploration finds serial 11 and a stale-write outcome of 1 or 10. Equivalent
+atomic workers always commit 11. Exact replay, labels, honest rendering, empty
+sets, unequal contexts, and incompatible maps are tested. `tests/race.rs` is
+now 10/10. Complete default all-target validation is **484 passed + 4
+ignored**; std interpreter-only is **466 + 4**. Strict Clippy passes both
+hosted profiles, AF_XDP all-targets, C-API all-targets, and true thumb no-std.
+Focused AF_XDP is 5 passed + 1 provisioned-host ignore; focused C API is 11
+passed. Release all-target build and `git diff --check` pass. Current rustfmt
+still proposes the previously documented unrelated repository reflow, so it
+was not applied.
+
+No corpus compatibility claim changed: this is a generic concurrency primitive
+for the real graph consumer, not an ELF/verifier parity change. The next
+production step is to integrate the heterogeneous API into
+`/home/ayourtch/rust/febpf-graph` as an explicit pre-publication shared-map
+validation tool, while retaining its conservative static policy as the gate.
+Key partitions or critical-section reasoning still require concrete evidence;
+AF_XDP follows deterministic lifecycle and concurrency semantics.
+
+The verified-map-effects checkpoint immediately below is historical and
+superseded by this one.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-14 verified map effects; superseded)
 
 The production consumer is the separate sibling project
 `/home/ayourtch/rust/febpf-graph`, committed through `c49883d` (`feat: enforce
