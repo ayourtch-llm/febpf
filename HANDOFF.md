@@ -30,7 +30,59 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-15 VPP-shaped node frames; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-15 validated XDP lanes; authoritative)
+
+febpf is committed through `4cc5b6e` (`feat: lower pure XDP programs into
+validated lanes`). The new std `lanes` module lowers a verified, map-free,
+forward-only XDP subset into architecture-independent operations. It accepts
+ALU32/64, forward branches, exact verifier-proven XDP data/data_end and packet
+loads, and root exit. Helpers, maps, stores/atomics, stacks, generic loads,
+calls, and backward edges reject normally to the scalar path. Quad execution
+uses exact 4/2/1 groups, so double lanes and the scalar remainder are explicit.
+
+Each lane owns registers, PC, packet, and result. Divergence is modeled with
+independent PCs. `XdpLaneProgram::validate` compares lane verdicts and complete
+frames against the ordinary scalar VM over a supplied corpus. This is empirical
+translation validation plus a conservative static soundness argument, **not**
+a formal equivalence proof. `docs/specs/xdp-lanes.md` records the boundary.
+
+The graph consumer is committed through `6bab76f` (`perf: execute tiny graph
+nodes in validated lanes`). Node loading preserves an explicit
+`LaneSelection`: unsupported with reason, validated but scalar-session, or
+validated scalar-interleaved. The loader corpus has 15 empty, truncated,
+minimum, patterned, IPv4/non-IPv4, 64/256/1514-byte frames. Any accepted-plan
+mismatch rejects loading. A static cost policy activates scalar lanes only for
+at most four reachable branchless operations with no context/packet loads;
+the 11-op divergent Ethernet plan is retained for future SIMD but uses its
+scalar JIT, while PASS/DROP use lanes.
+
+Final batch-256/5,000-sample forced scalar-session versus automatic p50 TSC
+ticks were PASS 151.26/75.55, classifier 159.72/157.64 (same scalar path),
+classifier-to-PASS 293.16/214.49, mixed 231.86/191.63, native control
+51.36/49.88. Mixed improves 17.4%. The 256-PASS-node chain at 2,000 samples
+fell from 36,253.04 to 16,959.28 ticks/packet, 53.2%. A forced lane Ethernet
+run was worse (214.05 versus 158.98), proving why validation and selection are
+separate. These are scalar host lanes, not SSE/AVX results.
+
+Validation passes: febpf default all-targets **490 passed + 4 ignored**,
+interpreter-only std **471 + 4**, strict default/interpreter/aarch64/thumb
+legs; graph runtime 14/14, memif 9/9, ConnectX default 4/4 and rdma 6 + one
+hardware ignore, strict runtime/adapters/perf, pinned Rust-to-eBPF builds and
+target Clippy, scripts, and exact demo. PMU and mlx5 hardware remain honest
+environment gaps.
+
+Next coherent batch: add an x86 lane backend without changing lane semantics.
+Start with explicit runtime CPU-feature capture and a feature-sensitive
+compiled-plan/cache identity, then SSE2 double and AVX2 quad lowering for the
+branchless ALU subset. Divergent Ethernet requires masked control flow and
+packet-load materialization; do not enable it from feature detection alone.
+Benchmark every backend against scalar-interleaved lanes and scalar JIT, and
+select only measured wins. Aarch64 keeps the reference scalar lowering until a
+separate NEON backend is justified.
+
+The VPP-shaped node-frame checkpoint below is historical and superseded.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-15 VPP-shaped node frames; superseded)
 
 febpf is committed through `b0958b9` (`perf: pin JIT images across XDP node
 frames`). `Vm::xdp_jit_session` returns a public `XdpJitSession` that compiles
