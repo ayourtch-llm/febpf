@@ -49,6 +49,8 @@ pub mod fuzz;
 pub mod helpers;
 pub mod insn;
 pub mod interp;
+#[cfg(feature = "std")]
+pub mod lanes;
 #[cfg(feature = "jit")]
 pub mod jit;
 #[cfg(feature = "std")]

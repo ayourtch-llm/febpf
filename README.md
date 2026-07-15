@@ -75,6 +75,11 @@ For statistically sampled results rather than a one-off CLI timing, see
   A reusable XDP JIT session pins compiled images across a provider or graph
   node-frame dispatch without changing independent per-packet XDP semantics.
   Differentially tested against the interpreter.
+- **Verified XDP lane plans**: a conservative architecture-independent 2x/4x
+  execution IR for pure, forward-only packet programs. Verifier-proven packet
+  loads are lowered into independent lanes and differentially validated against
+  scalar XDP; helpers, maps, stores, stacks, calls, and loops fall back. See
+  [`docs/specs/xdp-lanes.md`](docs/specs/xdp-lanes.md).
 - **Portable interpreter**: the VM, assembler, verifier, maps, helpers and
   replay tooling target x86-64 Windows with the JIT disabled; native Windows
   CI builds, runs the test suite and enforces strict clippy.
