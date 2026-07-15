@@ -30,52 +30,52 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-15 x86 SIMD lane backend; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-15 masked AVX2 packet lanes; authoritative)
 
-febpf is committed through `b8d36d1` (`perf: lower branchless XDP lanes with
-x86 SIMD`). `LaneCpuFeatures` detects SSE2/AVX2 at runtime. Verified branchless
-ALU64 lane plans support mov, add/sub, bitwise operations, and negation: four
-packets use AVX2, a two-packet group uses SSE2, and one remainder uses the
-portable scalar executor. SIMD eligibility additionally requires verifier
-scalar states for every read operand, so virtual context/packet pointers cannot
-silently enter host-vector arithmetic.
+febpf is committed through `414cc33` (`perf: execute forward XDP lanes with
+AVX2 masks`). The existing branchless SSE2/AVX2 lowering is joined by
+`X86Avx2Masked` for verified forward-only quad plans of at most 64 operations.
+It accepts data/data_end, constant packet loads, branches, exit, and the
+existing ALU64 subset. A fixed pending mask per PC tracks divergent lanes;
+register results are blended only into active lanes. Packet bytes are
+scalar-materialized only after an independent active-lane bounds check, then
+loaded into AVX2 registers, so inactive truncated lanes cannot be touched.
+Two- and one-packet remainders use the scalar reference executor.
 
-`LanePlanKey` contains a deterministic instruction fingerprint, requested
-width, selected backend, and CPU feature bits. `LaneValidation` records that
-key/backend. The selected SIMD executor is differentially checked against the
-ordinary scalar VM; `execute_scalar` remains the same-plan reference backend.
-On non-x86 and unsupported x86 hosts selection is scalar. AVX-512, NEON,
-packet loads, and masked divergence are not claimed. Objdump of the final
-release graph runner confirms `vpbroadcastq`, `vpaddq`, `vpsubq`, and `vpxor`.
+Branch operands are currently extracted and compared scalarly to construct
+masks. The honest claim is safe masked packet execution with AVX2 register
+operations, not fully vectorized predicates. Helpers, maps, stores, stacks,
+calls, loops, plans longer than 64 operations, AVX-512, and NEON retain normal
+fallback. `LanePlanKey` remains feature/backend-sensitive and the graph loader
+differentially validates the selected backend against scalar XDP over 79
+deterministic boundary and randomized frames.
 
-The graph consumer is committed through `ae23f52` (`perf: select validated x86
-lane backends`). `LaneSelection::LaneExecution` exposes the selected backend.
-Default execution uses it; `--lane-scalar` keeps the same automatic node
-selection but forces the portable lane backend, while `--scalar` forces pinned
-scalar JIT. Ethernet remains scalar JIT because its packet loads/divergence are
-not SIMD eligible; PASS/DROP select AVX2 on this Ryzen 9 3900X.
-
-Final isolated p50 TSC backend comparisons: PASS 56.26 AVX2 versus 73.48
-scalar lanes (23.4% lower); mixed 181.98 versus 189.85 at 10,000 samples (4.1%
-lower); classifier-to-PASS 187.33 versus 206.03 (9.1% lower). The 256-node
-PASS chain was 11,850.66 versus 15,999.93 at 2,000 samples, 25.9% backend-only
-and 67.3% below the preceding 36,253.04 forced scalar-JIT baseline. Classifier
-and native-scheduler variation remain controls, not SIMD claims.
+The graph consumer is committed through `c3af391` (`perf: activate masked AVX2
+packet nodes`). The real Ethernet classifier now selects masked AVX2 on this
+Ryzen 9 3900X; non-AVX2 hosts keep pinned scalar JIT. Isolated batch-256,
+10,000-sample p50 TSC reference ticks: classifier 130.18 masked versus 159.87
+scalar JIT and 206.18 scalar lanes; mixed 150.37 versus 223.55 scalar JIT;
+classifier-to-PASS 163.28 versus 336.66 scalar JIT and 269.56 scalar lanes.
+The final automatic 5,000-sample matrix is PASS 61.16, classifier 133.00,
+classifier-to-PASS 173.52, mixed 158.38, native scheduler 52.84. These are TSC
+reference ticks, not PMU core cycles. Release objdump confirms `vpblendvb`
+alongside AVX2 broadcast/arithmetic instructions.
 
 Validation passes: febpf default all-targets **491 passed + 4 ignored**,
 interpreter-only std **472 + 4**, strict default/interpreter/aarch64/thumb;
 graph runtime 14/14, memif 9/9, ConnectX default 4/4 and rdma 6 + one hardware
-ignore, strict runtime/adapters/locked perf, pinned Rust-to-eBPF nodes and
-target Clippy, scripts, and exact demo. Hardware PMU/mlx5 remain honest gaps.
+ignore, strict runtime/adapters/locked perf, pinned Rust-to-eBPF builds/target
+Clippy, scripts, and exact demo. Hardware PMU and provisioned mlx5 execution
+remain honest environment gaps.
 
-Next coherent blocker is masked SIMD for the real Ethernet production family:
-materialize four verifier-proven packet loads safely, represent divergent lanes
-with masks, and compare against scalar JIT before selection. Do not generalize
-to helpers/maps/stores until an effect-aware ordering model exists. If masked
-Ethernet does not beat scalar JIT, retain the current mixed scalar/SIMD graph
-and move to the packet-provider boundary rather than widening for its own sake.
+The production classifier family is now profitable and saturated for this
+slice. Do not keep widening SIMD opportunistically. Next design and implement
+the generic graph packet-provider boundary, then an AF_XDP provider; preserve
+the current scalar fallback and translation validation. Scalar-to-vector
+branch predicates are a later profile-driven micro-optimization. DPDK remains
+optional after AF_XDP.
 
-The validated scalar-lane checkpoint below is historical and superseded.
+The branchless x86 SIMD checkpoint below is historical and superseded.
 
 ## ACTIVE RESUME CHECKPOINT (2026-07-15 validated XDP lanes; superseded)
 
