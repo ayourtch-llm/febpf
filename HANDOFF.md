@@ -65,8 +65,12 @@ Validation passes: febpf default all-targets **491 passed + 4 ignored**,
 interpreter-only std **472 + 4**, strict default/interpreter/aarch64/thumb;
 graph runtime 14/14, memif 9/9, ConnectX default 4/4 and rdma 6 + one hardware
 ignore, strict runtime/adapters/locked perf, pinned Rust-to-eBPF builds/target
-Clippy, scripts, and exact demo. Hardware PMU and provisioned mlx5 execution
-remain honest environment gaps.
+Clippy, scripts, and exact demo. The graph host now permits thread-local
+userspace PMU events at `perf_event_paranoid=2`: automatic classifier, chain,
+and mixed p50s are 148.56, 196.19, and 174.39 hardware cycles versus scalar
+JIT 180.87, 337.68, and 264.67. Graph commit `8356d89` adds the documented
+`perf/pmu-access` helper. Provisioned mlx5 execution remains the honest
+hardware gap.
 
 The production classifier family is now profitable and saturated for this
 slice. Do not keep widening SIMD opportunistically. Next design and implement
