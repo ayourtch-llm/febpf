@@ -30,7 +30,54 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-15 validated XDP lanes; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-15 x86 SIMD lane backend; authoritative)
+
+febpf is committed through `b8d36d1` (`perf: lower branchless XDP lanes with
+x86 SIMD`). `LaneCpuFeatures` detects SSE2/AVX2 at runtime. Verified branchless
+ALU64 lane plans support mov, add/sub, bitwise operations, and negation: four
+packets use AVX2, a two-packet group uses SSE2, and one remainder uses the
+portable scalar executor. SIMD eligibility additionally requires verifier
+scalar states for every read operand, so virtual context/packet pointers cannot
+silently enter host-vector arithmetic.
+
+`LanePlanKey` contains a deterministic instruction fingerprint, requested
+width, selected backend, and CPU feature bits. `LaneValidation` records that
+key/backend. The selected SIMD executor is differentially checked against the
+ordinary scalar VM; `execute_scalar` remains the same-plan reference backend.
+On non-x86 and unsupported x86 hosts selection is scalar. AVX-512, NEON,
+packet loads, and masked divergence are not claimed. Objdump of the final
+release graph runner confirms `vpbroadcastq`, `vpaddq`, `vpsubq`, and `vpxor`.
+
+The graph consumer is committed through `ae23f52` (`perf: select validated x86
+lane backends`). `LaneSelection::LaneExecution` exposes the selected backend.
+Default execution uses it; `--lane-scalar` keeps the same automatic node
+selection but forces the portable lane backend, while `--scalar` forces pinned
+scalar JIT. Ethernet remains scalar JIT because its packet loads/divergence are
+not SIMD eligible; PASS/DROP select AVX2 on this Ryzen 9 3900X.
+
+Final isolated p50 TSC backend comparisons: PASS 56.26 AVX2 versus 73.48
+scalar lanes (23.4% lower); mixed 181.98 versus 189.85 at 10,000 samples (4.1%
+lower); classifier-to-PASS 187.33 versus 206.03 (9.1% lower). The 256-node
+PASS chain was 11,850.66 versus 15,999.93 at 2,000 samples, 25.9% backend-only
+and 67.3% below the preceding 36,253.04 forced scalar-JIT baseline. Classifier
+and native-scheduler variation remain controls, not SIMD claims.
+
+Validation passes: febpf default all-targets **491 passed + 4 ignored**,
+interpreter-only std **472 + 4**, strict default/interpreter/aarch64/thumb;
+graph runtime 14/14, memif 9/9, ConnectX default 4/4 and rdma 6 + one hardware
+ignore, strict runtime/adapters/locked perf, pinned Rust-to-eBPF nodes and
+target Clippy, scripts, and exact demo. Hardware PMU/mlx5 remain honest gaps.
+
+Next coherent blocker is masked SIMD for the real Ethernet production family:
+materialize four verifier-proven packet loads safely, represent divergent lanes
+with masks, and compare against scalar JIT before selection. Do not generalize
+to helpers/maps/stores until an effect-aware ordering model exists. If masked
+Ethernet does not beat scalar JIT, retain the current mixed scalar/SIMD graph
+and move to the packet-provider boundary rather than widening for its own sake.
+
+The validated scalar-lane checkpoint below is historical and superseded.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-15 validated XDP lanes; superseded)
 
 febpf is committed through `4cc5b6e` (`feat: lower pure XDP programs into
 validated lanes`). The new std `lanes` module lowers a verified, map-free,
