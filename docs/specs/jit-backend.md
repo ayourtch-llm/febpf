@@ -45,17 +45,23 @@ architecture-neutral operations (`AluOp::Add`, `Cc::Sgt`, register **indices**
 
 - **Native** (backend must emit code): 64/32-bit `ADD SUB MUL OR AND XOR MOV
   NEG`, immediate-count `LSH RSH ARSH`, unconditional `JA`, all conditional
-  jumps `JEQ JNE JGT JGE JLT JLE JSGT JSGE JSLT JSLE`, and `JSET`.
+  jumps `JEQ JNE JGT JGE JLT JLE JSGT JSGE JSLT JSLE`, `JSET`, and a root
+  `EXIT` when the image has no local calls.
+- **Verifier-promoted loads**: the frontend may call `verified_load` for a
+  context or packet `LDX` whose pointer kind and constant offset hold on every
+  path reaching that instruction. Backends may emit the load directly or use
+  the normal deferred sequence. No hint is produced for unverified programs.
 - **Deferred** (backend emits trampoline glue only): `DIV MOD` (incl. signed),
-  byte-swaps (`END`), sign-extending `MOVSX`, **register-count** shifts, every
-  load/store/atomic, `lddw`, helper calls, bpf-to-bpf calls, and `EXIT`.
+  byte-swaps (`END`), sign-extending `MOVSX`, **register-count** shifts,
+  stores/atomics, unproven loads, `lddw`, helper calls, bpf-to-bpf calls, and
+  framed `EXIT`.
 
 A backend therefore needs to encode only ~20 simple ALU/branch forms plus one
 trampoline-glue sequence. Deferred instructions run on the interpreter core, so
 their correctness and memory-safety are already guaranteed.
 
-A future backend *may* natively compile more (e.g. loads with inline bounds
-checks) as an optimization, but is never required to.
+A backend may defer `verified_load` and remain correct; x86-64 currently emits
+it directly while aarch64 uses the fallback.
 
 ---
 
@@ -120,20 +126,24 @@ compare only the low 32 bits.
 ## 4. Trampoline ABI (`src/jit/abi.rs`) — identical on every architecture
 
 ### Compiled function entry
-`extern "C" fn(regs_ptr: *mut u64, machine_ptr: *mut ())`
+`extern "C" fn(regs_ptr: *mut u64, machine_ptr: *mut (), memory: *const JitMemory)`
 
 - `regs_ptr` → the eBPF register file `[u64; 11]` (r0..r10). The prologue loads
   it into physical registers; deferred glue spills to / reloads from it.
 - `machine_ptr` → type-erased `*mut Machine`, passed unchanged to the
   trampoline.
+- `memory` → a per-invocation descriptor containing only the context and
+  active packet host buffers plus their virtual packet bounds. It exists so a
+  verifier-promoted load never converts an arbitrary guest address into a host
+  pointer.
 
 The prologue must: save the platform's callee-saved registers that the backend
-uses, stash `regs_ptr` and `machine_ptr` somewhere stable across calls
+uses, stash all three pointers somewhere stable across calls
 (native-stack slots), load the 11 eBPF registers, and fall through to pc 0.
 
 The epilogue restores callee-saved registers and returns. On a clean program
-exit, `r0` must already be in `regs[0]` in memory (the deferred `EXIT` glue
-spills before calling the trampoline, so this holds automatically).
+exit, `r0` must already be in `regs[0]` in memory. Both the native root-exit
+emitter and deferred framed-exit glue perform that spill.
 
 ### Trampoline
 `extern "C" fn(machine_ptr, pc: u64) -> u64` (frontend provides this;

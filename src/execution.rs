@@ -19,6 +19,7 @@ pub enum ContextModel {
 enum ContextStorage<'a> {
     Borrowed(&'a mut [u8]),
     Owned(Vec<u8>),
+    InlineXdp([u8; 24]),
 }
 
 impl ContextStorage<'_> {
@@ -26,6 +27,7 @@ impl ContextStorage<'_> {
         match self {
             Self::Borrowed(bytes) => bytes,
             Self::Owned(bytes) => bytes,
+            Self::InlineXdp(bytes) => bytes,
         }
     }
 
@@ -33,6 +35,7 @@ impl ContextStorage<'_> {
         match self {
             Self::Borrowed(bytes) => bytes,
             Self::Owned(bytes) => bytes,
+            Self::InlineXdp(bytes) => bytes,
         }
     }
 }
@@ -174,7 +177,7 @@ impl<'a> ExecutionEnvironment<'a> {
             return Err("XDP frame storage is too large for virtual packet offsets".into());
         }
         let metadata = frame.metadata();
-        let mut context = vec![0u8; 24];
+        let mut context = [0u8; 24];
         context[12..16].copy_from_slice(&metadata.ingress_ifindex.to_le_bytes());
         context[16..20].copy_from_slice(&metadata.rx_queue_index.to_le_bytes());
         context[20..24].copy_from_slice(&metadata.egress_ifindex.to_le_bytes());
@@ -182,7 +185,7 @@ impl<'a> ExecutionEnvironment<'a> {
         let start = *data_start;
         let end = *data_end;
         Ok(Self {
-            context: ContextStorage::Owned(context),
+            context: ContextStorage::InlineXdp(context),
             model: ContextModel::Xdp,
             packet: Some(PacketWindow {
                 storage,
@@ -205,7 +208,7 @@ impl<'a> ExecutionEnvironment<'a> {
         }
         let end = packet.len();
         Ok(Self {
-            context: ContextStorage::Owned(vec![0u8; 24]),
+            context: ContextStorage::InlineXdp([0u8; 24]),
             model: ContextModel::Xdp,
             packet: Some(PacketWindow {
                 storage: packet,
@@ -377,6 +380,19 @@ impl<'a> ExecutionEnvironment<'a> {
             None => &mut [],
         };
         (context, packet, &mut self.kernel_memory)
+    }
+
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_memory_parts(&mut self) -> (*mut u8, *mut u8, usize) {
+        let context = self.context.as_mut_slice().as_mut_ptr();
+        let (packet, packet_len) = match &mut self.packet {
+            Some(packet) => {
+                let active = packet.active_mut();
+                (active.as_mut_ptr(), active.len())
+            }
+            None => (core::ptr::null_mut(), 0),
+        };
+        (context, packet, packet_len)
     }
 
     pub(crate) fn snapshot(&self) -> EnvironmentSnapshot {

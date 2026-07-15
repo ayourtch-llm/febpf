@@ -64,12 +64,12 @@ For statistically sampled results rather than a one-off CLI timing, see
   differential path. ELF `values[]` relocations are linked automatically, so
   a multi-section clang object can be verified and run directly with `--prog`.
 - **JIT compiler** (x86-64 Linux, aarch64 Linux and macOS; zero-dependency):
-  hand-rolled native codegen for the ALU + branch core, with memory ops, calls
-  and atomics deferred to the interpreter — so the JIT keeps the interpreter's
-  exact memory-safety guarantee while removing dispatch overhead from native
-  spans. Each deferred instruction pays a trampoline round-trip, so results
-  depend on program shape; the Criterion suite measures warm execution and
-  compilation separately. The compiler is split into an
+  hand-rolled native codegen for the ALU + branch core and root exits. On
+  x86-64, verifier-proven context and packet loads are native too; every load
+  without an all-path pointer proof, plus calls, stores and atomics, remains on
+  the checked interpreter trampoline. Results therefore depend on program
+  shape; the Criterion suite measures warm execution and compilation
+  separately. The compiler is split into an
   architecture-independent frontend and a `JitBackend` trait; adding **riscv64**
   means implementing that one trait (see `docs/specs/jit-backend.md`).
   Differentially tested against the interpreter.

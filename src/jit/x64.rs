@@ -22,7 +22,10 @@
 //!
 //! Scratch: `r9`, `r11`. Stack slots hold `regs_ptr` and `machine_ptr`.
 
-use super::{AluOp, Cc, DeferredRegs, JitBackend, RegMask, RegOrImm, ShiftOp, Target, Width};
+use super::{
+    AluOp, Cc, DeferredRegs, JitBackend, LoadHint, RegMask, RegOrImm, ShiftOp, Target, Width,
+};
+use crate::insn::{mode, size, Insn};
 
 /// eBPF registers held in *caller-saved* x86-64 registers (r0..r5 → rax, rdi,
 /// rsi, rdx, rcx, r8). The trampoline call destroys these whatever the
@@ -147,6 +150,59 @@ impl X64Backend {
         self.bytes(&[0x4C, 0x8B, 0x1C, 0x24]);
     }
 
+    /// Load the per-invocation direct-memory descriptor into r11.
+    fn load_memory_ptr_r11(&mut self) {
+        // mov r11, [rsp+16]
+        self.bytes(&[0x4C, 0x8B, 0x5C, 0x24, 0x10]);
+    }
+
+    /// Load a qword from `[r11 + disp8]` into `dst`.
+    fn load_qword_disp8(&mut self, dst: u8, disp: u8) {
+        self.rex(true, dst, R11);
+        self.b(0x8B);
+        self.modrm(0b01, dst, R11);
+        self.b(disp);
+    }
+
+    /// Load an eBPF scalar from `[r11 + disp32]` into `dst`.
+    fn load_scalar_disp32(&mut self, dst: u8, ins: Insn, offset: i32) {
+        let signed = ins.mem_mode() == mode::MEMSX;
+        match (signed, ins.opcode & 0x18) {
+            (false, size::B) => {
+                self.rex(false, dst, R11);
+                self.bytes(&[0x0F, 0xB6]);
+            }
+            (false, size::H) => {
+                self.rex(false, dst, R11);
+                self.bytes(&[0x0F, 0xB7]);
+            }
+            (false, size::W) => {
+                self.rex(false, dst, R11);
+                self.b(0x8B);
+            }
+            (false, size::DW) => {
+                self.rex(true, dst, R11);
+                self.b(0x8B);
+            }
+            (true, size::B) => {
+                self.rex(true, dst, R11);
+                self.bytes(&[0x0F, 0xBE]);
+            }
+            (true, size::H) => {
+                self.rex(true, dst, R11);
+                self.bytes(&[0x0F, 0xBF]);
+            }
+            (true, size::W) => {
+                self.rex(true, dst, R11);
+                self.b(0x63);
+            }
+            (true, size::DW) => unreachable!("verifier rejects sign-extending qword loads"),
+            _ => unreachable!(),
+        }
+        self.modrm(0b10, dst, R11);
+        self.imm32(offset);
+    }
+
     fn spill(&mut self, mask: RegMask) {
         self.load_regs_ptr_r11();
         for (i, &h) in MAP.iter().enumerate() {
@@ -248,6 +304,8 @@ impl JitBackend for X64Backend {
         self.bytes(&[0x48, 0x89, 0x7C, 0x24, 0x00]);
         // mov [rsp+8], rsi   (machine_ptr)
         self.bytes(&[0x48, 0x89, 0x74, 0x24, 0x08]);
+        // mov [rsp+16], rdx  (JitMemory pointer)
+        self.bytes(&[0x48, 0x89, 0x54, 0x24, 0x10]);
         // load eBPF register file from regs_ptr into physical registers
         self.reload(super::ALL_REGS);
         // fall through into pc 0
@@ -371,6 +429,31 @@ impl JitBackend for X64Backend {
         self.jcc(0x5, target); // jnz — taken when (dst & rhs) != 0
     }
 
+    fn exit(&mut self) {
+        self.spill(1);
+        self.jump(Target::Epilogue);
+    }
+
+    fn verified_load(&mut self, _pc: usize, ins: Insn, hint: LoadHint) {
+        let dst = hreg(ins.dst);
+        self.load_memory_ptr_r11();
+        match hint {
+            LoadHint::XdpData => self.load_qword_disp8(dst, 16),
+            LoadHint::XdpDataEnd => self.load_qword_disp8(dst, 24),
+            LoadHint::Context(offset) | LoadHint::Packet(offset) => {
+                let base_offset = match hint {
+                    LoadHint::Context(_) => 0,
+                    LoadHint::Packet(_) => 8,
+                    _ => unreachable!(),
+                };
+                self.load_qword_disp8(R11, base_offset);
+                // This is the verifier's all-path effective offset, not an
+                // address reconstructed from guest-controlled register bits.
+                self.load_scalar_disp32(dst, ins, offset);
+            }
+        }
+    }
+
     fn deferred(&mut self, pc: usize, regs: DeferredRegs) {
         // r0..r5 live in caller-saved registers: the call destroys them, so
         // they ride along no matter what the interpreter reads or writes.
@@ -395,7 +478,7 @@ impl JitBackend for X64Backend {
             kind: AbsKind::Trampoline,
         });
         self.bytes(&[0xFF, 0xD0]); // call rax
-        // save trampoline return in r9 (r9 is not eBPF-mapped): mov r9, rax
+                                   // save trampoline return in r9 (r9 is not eBPF-mapped): mov r9, rax
         self.bytes(&[0x49, 0x89, 0xC1]);
         // reload the eBPF registers the interpreter may have written (r9 is
         // untouched — not an eBPF-mapped reg)

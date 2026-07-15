@@ -41,7 +41,10 @@
 //! literal pool after the epilogue, loaded with `LDR (literal)` and written by
 //! `patch_absolutes` once the code has its final address.
 
-use super::{AluOp, Cc, DeferredRegs, JitBackend, RegMask, RegOrImm, ShiftOp, Target, Width};
+use super::{
+    AluOp, Cc, DeferredRegs, JitBackend, LoadHint, RegMask, RegOrImm, ShiftOp, Target, Width,
+};
+use crate::insn::Insn;
 use crate::insn::REG_FP;
 
 /// eBPF register index → physical register. Only valid for r0..r9; r10 is
@@ -252,7 +255,11 @@ impl Aarch64Backend {
             Target::Pc(pc) => FixTarget::Pc(pc),
             Target::Epilogue => FixTarget::Epilogue,
         };
-        self.fixups.push(Fix { at: self.buf.len(), form, target });
+        self.fixups.push(Fix {
+            at: self.buf.len(),
+            form,
+            target,
+        });
     }
 
     /// `LDR xt, <literal>` with a pool fixup.
@@ -286,7 +293,10 @@ impl JitBackend for Aarch64Backend {
         // stp x29, x30, [sp, #-112]!   (imm7 = -112/8 = -14)
         self.w(0xA980_0000 | ((-14i32 as u32 & 0x7F) << 15) | (LR << 10) | (SP << 5) | FP);
         // stp x19..x28, [sp, #16..#80]
-        for (i, pair) in [(19, 20), (21, 22), (23, 24), (25, 26), (27, 28)].iter().enumerate() {
+        for (i, pair) in [(19, 20), (21, 22), (23, 24), (25, 26), (27, 28)]
+            .iter()
+            .enumerate()
+        {
             let off = 2 + 2 * i as u32; // in 8-byte units
             self.w(0xA900_0000 | (off << 15) | (pair.1 << 10) | (SP << 5) | pair.0);
         }
@@ -305,14 +315,17 @@ impl JitBackend for Aarch64Backend {
     fn epilogue(&mut self) {
         self.epilogue = self.buf.len();
         // ldp x19..x28
-        for (i, pair) in [(19, 20), (21, 22), (23, 24), (25, 26), (27, 28)].iter().enumerate() {
+        for (i, pair) in [(19, 20), (21, 22), (23, 24), (25, 26), (27, 28)]
+            .iter()
+            .enumerate()
+        {
             let off = 2 + 2 * i as u32;
             self.w(0xA940_0000 | (off << 15) | (pair.1 << 10) | (SP << 5) | pair.0);
         }
         // ldp x29, x30, [sp], #112   (post-index, imm7 = 14)
         self.w(0xA8C0_0000 | (14 << 15) | (LR << 10) | (SP << 5) | FP);
         self.w(0xD65F_03C0); // ret
-        // 8-byte-aligned literal pool: [trampoline u64][table u64]
+                             // 8-byte-aligned literal pool: [trampoline u64][table u64]
         if !self.buf.len().is_multiple_of(8) {
             self.w(NOP);
         }
@@ -410,6 +423,23 @@ impl JitBackend for Aarch64Backend {
         self.bcond(cond::NE, target);
     }
 
+    fn exit(&mut self) {
+        self.load_regs_ptr();
+        self.str_off(19, TMP, 0);
+        self.jump(Target::Epilogue);
+    }
+
+    fn verified_load(&mut self, pc: usize, ins: Insn, _hint: LoadHint) {
+        self.deferred(
+            pc,
+            DeferredRegs {
+                spill: 1 << ins.src,
+                reload: 1 << ins.dst,
+                falls_through: true,
+            },
+        );
+    }
+
     fn deferred(&mut self, pc: usize, regs: DeferredRegs) {
         // r0..r9 are callee-saved, so only what the interpreter actually reads
         // has to reach the register file. r10 needs nothing: it has no
@@ -431,7 +461,7 @@ impl JitBackend for Aarch64Backend {
         // Call the trampoline through the literal pool.
         self.ldr_lit(CALL_TGT, FixTarget::PoolTrampoline);
         self.w(0xD63F_0000 | (CALL_TGT << 5)); // blr x16
-        // Save next-pc/STOP before touching x0.
+                                               // Save next-pc/STOP before touching x0.
         self.mov_rr(Width::W64, RET_SAVE, 0);
         if reload != 0 {
             self.load_regs_ptr(); // x9 was caller-saved: reload it

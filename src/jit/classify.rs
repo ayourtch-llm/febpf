@@ -2,11 +2,10 @@
 //! instruction is compiled to native code or deferred to the interpreter,
 //! and if native, describe it in backend-neutral terms.
 //!
-//! The native set is deliberately the hot arithmetic/branch core. Everything
-//! with tricky encodings or memory/effect semantics (div/mod, byte swaps,
-//! sign-extending moves, variable-count shifts, loads, stores, atomics,
-//! calls, `lddw`, `exit`) is deferred — the interpreter already handles those
-//! correctly and safely, and they are rarely the JIT's bottleneck.
+//! The baseline native set is the hot arithmetic/branch core. The frontend
+//! separately promotes verifier-proven context/packet loads and safe root
+//! exits. Everything with trickier memory/effect semantics remains deferred
+//! to the interpreter.
 
 use crate::insn::*;
 
@@ -59,16 +58,57 @@ pub enum RegOrImm {
 pub enum Lowering {
     /// Not compiled natively — run on the interpreter via the trampoline.
     Deferred,
-    AluReg { op: AluOp, w: Width, dst: u8, src: u8 },
-    AluImm { op: AluOp, w: Width, dst: u8, imm: i32 },
-    MovReg { w: Width, dst: u8, src: u8 },
-    MovImm { w: Width, dst: u8, imm: i32 },
-    Neg { w: Width, dst: u8 },
-    ShiftImm { op: ShiftOp, w: Width, dst: u8, amount: u8 },
+    AluReg {
+        op: AluOp,
+        w: Width,
+        dst: u8,
+        src: u8,
+    },
+    AluImm {
+        op: AluOp,
+        w: Width,
+        dst: u8,
+        imm: i32,
+    },
+    MovReg {
+        w: Width,
+        dst: u8,
+        src: u8,
+    },
+    MovImm {
+        w: Width,
+        dst: u8,
+        imm: i32,
+    },
+    Neg {
+        w: Width,
+        dst: u8,
+    },
+    ShiftImm {
+        op: ShiftOp,
+        w: Width,
+        dst: u8,
+        amount: u8,
+    },
     /// Unconditional branch by `target` (relative offset).
-    Jump { target: i16 },
-    CondBranch { cc: Cc, w: Width, dst: u8, rhs: RegOrImm, off: i16 },
-    JsetBranch { w: Width, dst: u8, rhs: RegOrImm, off: i16 },
+    Jump {
+        target: i16,
+    },
+    CondBranch {
+        cc: Cc,
+        w: Width,
+        dst: u8,
+        rhs: RegOrImm,
+        off: i16,
+    },
+    JsetBranch {
+        w: Width,
+        dst: u8,
+        rhs: RegOrImm,
+        off: i16,
+    },
+    /// Root-program exit when the image contains no local calls.
+    Exit,
 }
 
 /// Bitmask of eBPF registers (bit *i* = r*i*).
@@ -130,7 +170,11 @@ impl DeferredRegs {
         }
     }
     const fn flow(spill: RegMask, reload: RegMask) -> Self {
-        DeferredRegs { spill, reload, falls_through: true }
+        DeferredRegs {
+            spill,
+            reload,
+            falls_through: true,
+        }
     }
 }
 
@@ -223,7 +267,7 @@ fn cond(op: u8) -> Option<Cc> {
     })
 }
 
-pub fn lower(ins: Insn) -> Lowering {
+pub fn lower(ins: Insn, native_root_exit: bool) -> Lowering {
     let cls = ins.class();
     match cls {
         // A native write to r10 is never emitted: the frame pointer is
@@ -234,7 +278,11 @@ pub fn lower(ins: Insn) -> Lowering {
         // program, where such a store would otherwise diverge.
         class::ALU | class::ALU64 if ins.dst == REG_FP => Lowering::Deferred,
         class::ALU | class::ALU64 => {
-            let w = if cls == class::ALU { Width::W32 } else { Width::W64 };
+            let w = if cls == class::ALU {
+                Width::W32
+            } else {
+                Width::W64
+            };
             let dst = ins.dst;
             let rhs = |ins: &Insn| {
                 if ins.is_src_reg() {
@@ -273,8 +321,13 @@ pub fn lower(ins: Insn) -> Lowering {
             }
         }
         class::JMP | class::JMP32 => {
-            let w = if cls == class::JMP32 { Width::W32 } else { Width::W64 };
+            let w = if cls == class::JMP32 {
+                Width::W32
+            } else {
+                Width::W64
+            };
             match ins.op() {
+                jmp::EXIT if native_root_exit => Lowering::Exit,
                 jmp::JA if cls == class::JMP => Lowering::Jump { target: ins.off },
                 jmp::JSET => Lowering::JsetBranch {
                     w,

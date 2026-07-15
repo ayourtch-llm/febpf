@@ -112,10 +112,16 @@ enum Region {
     Stack(u32),
     /// Map object pointer; only meaningful as a helper argument.
     MapObj(u32),
-    MapValue { map: u32, vref: ValueRef },
+    MapValue {
+        map: u32,
+        vref: ValueRef,
+    },
     /// A ringbuf record reserved by `ringbuf_reserve` (writable until it is
     /// submitted or discarded, which marks the reservation consumed).
-    RingReserved { map: u32, res: u32 },
+    RingReserved {
+        map: u32,
+        res: u32,
+    },
     /// Synthetic kernel memory for BTF-typed pointers (`tp_btf`/`fentry`
     /// ctx arguments): every read returns zeroes, every write faults. This is
     /// the deterministic stand-in for the kernel's fault-tolerant
@@ -147,19 +153,30 @@ pub struct MetadataLayout {
 
 impl MetadataLayout {
     pub fn new(data_offset: usize, data_end_offset: usize) -> Result<Self, String> {
-        let data_end = data_offset.checked_add(8)
+        let data_end = data_offset
+            .checked_add(8)
             .ok_or_else(|| "metadata data offset overflows address space".to_string())?;
-        let data_end_end = data_end_offset.checked_add(8)
+        let data_end_end = data_end_offset
+            .checked_add(8)
             .ok_or_else(|| "metadata data_end offset overflows address space".to_string())?;
         if data_offset < data_end_end && data_end_offset < data_end {
             return Err("metadata data and data_end fields overlap".into());
         }
-        Ok(Self { data_offset, data_end_offset })
+        Ok(Self {
+            data_offset,
+            data_end_offset,
+        })
     }
 
-    pub fn data_offset(self) -> usize { self.data_offset }
-    pub fn data_end_offset(self) -> usize { self.data_end_offset }
-    pub fn required_len(self) -> usize { self.data_offset.max(self.data_end_offset) + 8 }
+    pub fn data_offset(self) -> usize {
+        self.data_offset
+    }
+    pub fn data_end_offset(self) -> usize {
+        self.data_end_offset
+    }
+    pub fn required_len(self) -> usize {
+        self.data_offset.max(self.data_end_offset) + 8
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -215,6 +232,8 @@ pub struct Vm {
     /// execution (like `user_helpers`) to satisfy the borrow checker.
     #[cfg(feature = "jit")]
     pub jit: Option<crate::jit::JitProgram>,
+    #[cfg(feature = "jit")]
+    jit_load_hints: Vec<Option<crate::jit::LoadHint>>,
     /// Source-level debug info (from `.BTF.ext`/`.BTF`), when the program was
     /// loaded from a `-g` ELF object. Static across a run, so not snapshotted.
     debug: Option<crate::debuginfo::DebugInfo>,
@@ -228,6 +247,7 @@ pub struct Vm {
     /// reads as zero). Armed by [`Vm::verify`]; empty when unverified, in
     /// which case such loads fault cleanly instead. Static per program.
     probe_mem: Vec<bool>,
+    verified_stack_usage: Option<usize>,
     context_model: crate::execution::ContextModel,
     legacy_packet: crate::verifier::LegacyPacketProfile,
     legacy_packet_used: bool,
@@ -243,9 +263,102 @@ struct ProgramImage {
     probe_mem: Vec<bool>,
     #[cfg(feature = "jit")]
     jit: Option<crate::jit::JitProgram>,
+    #[cfg(feature = "jit")]
+    jit_load_hints: Vec<Option<crate::jit::LoadHint>>,
+}
+
+#[cfg(feature = "jit")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct JitMemory {
+    context: *mut u8,
+    packet: *mut u8,
+    packet_start: u64,
+    packet_end: u64,
+}
+
+#[cfg(feature = "jit")]
+fn verified_load_hints(
+    insns: &[Insn],
+    ok: &crate::verifier::VerifyOk,
+    context_model: crate::execution::ContextModel,
+) -> Vec<Option<crate::jit::LoadHint>> {
+    use crate::jit::LoadHint;
+    use crate::verifier::{PtrKind, RegState};
+
+    insns
+        .iter()
+        .enumerate()
+        .map(|(pc, ins)| {
+            if ins.class() != class::LDX
+                || !matches!(ins.mem_mode(), mode::MEM | mode::MEMSX)
+            {
+                return None;
+            }
+            let RegState::Ptr(ptr) = ok.regs_at(pc)?[ins.src as usize] else {
+                return None;
+            };
+            if !ptr.var.is_const() || ptr.var.umin != 0 {
+                return None;
+            }
+            let effective = ptr.off.checked_add(ins.off as i64)?;
+            if effective < 0 {
+                return None;
+            }
+            let direct_offset = i32::try_from(effective).ok()?;
+            match ptr.kind {
+                PtrKind::Packet { .. }
+                    if matches!(
+                        context_model,
+                        crate::execution::ContextModel::Xdp
+                            | crate::execution::ContextModel::Skb
+                    ) =>
+                {
+                    Some(LoadHint::Packet(direct_offset))
+                }
+                PtrKind::Ctx => {
+                    let packet_field = match context_model {
+                        crate::execution::ContextModel::Xdp => match effective {
+                            0 if ins.mem_size() == 4 => Some(LoadHint::XdpData),
+                            4 if ins.mem_size() == 4 => Some(LoadHint::XdpDataEnd),
+                            _ => None,
+                        },
+                        crate::execution::ContextModel::Skb => match effective {
+                            76 if ins.mem_size() == 4 => Some(LoadHint::XdpData),
+                            80 if ins.mem_size() == 4 => Some(LoadHint::XdpDataEnd),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    packet_field.or(Some(LoadHint::Context(direct_offset)))
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 impl Vm {
+    fn clear_stack_frame(&mut self, depth: usize) {
+        let usage = self.verified_stack_usage.unwrap_or(STACK_SIZE);
+        if usage == 0 {
+            return;
+        }
+        let end = (depth + 1) * STACK_SIZE;
+        self.stack[end - usage..end].fill(0);
+    }
+
+    fn clear_stack(&mut self) {
+        let usage = self.verified_stack_usage.unwrap_or(STACK_SIZE);
+        if usage == 0 {
+            return;
+        }
+        for depth in 0..MAX_CALL_FRAMES {
+            let end = (depth + 1) * STACK_SIZE;
+            self.stack[end - usage..end].fill(0);
+        }
+    }
+
     pub fn new(prog: Program) -> Result<Vm, String> {
         let mut regions = vec![Region::Invalid, Region::Ctx];
         for f in 0..MAX_CALL_FRAMES as u32 {
@@ -257,9 +370,10 @@ impl Vm {
             if !def.kind.is_map_of_maps() {
                 continue;
             }
-            let template = def.inner_map_idx.ok_or_else(|| {
-                format!("map-in-map '{}' has no inner-map template", def.name)
-            })? as usize;
+            let template = def
+                .inner_map_idx
+                .ok_or_else(|| format!("map-in-map '{}' has no inner-map template", def.name))?
+                as usize;
             let template_def = prog.maps.get(template).ok_or_else(|| {
                 format!(
                     "map-in-map '{}' references unknown template map {template}",
@@ -323,8 +437,11 @@ impl Vm {
             profile: None,
             #[cfg(feature = "jit")]
             jit: None,
+            #[cfg(feature = "jit")]
+            jit_load_hints: Vec::new(),
             debug: None,
             probe_mem: Vec::new(),
+            verified_stack_usage: None,
             context_model: crate::execution::ContextModel::Flat,
             legacy_packet: crate::verifier::LegacyPacketProfile::Disabled,
             legacy_packet_used: false,
@@ -444,11 +561,16 @@ impl Vm {
             cfg.btf_ctx = prog.btf_ctx.clone();
         }
         if cfg.legacy_packet != self.legacy_packet {
-            return Err("tail-call target legacy packet profile must match the entry program".into());
+            return Err(
+                "tail-call target legacy packet profile must match the entry program".into(),
+            );
         }
+        let target_context_model = context_model(&cfg);
         let ok = crate::verifier::verify(&prog.insns, &prog.maps, self.user_helpers.sigs(), cfg)
             .map_err(|e| format!("tail-call target verification failed: {e}"))?;
         let exec = self.patch_bundle_program(&prog.insns)?;
+        #[cfg(feature = "jit")]
+        let jit_load_hints = verified_load_hints(&prog.insns, &ok, target_context_model);
         let program_id = self.program_images.len() as u32 + 1;
         let map = self
             .maps
@@ -467,7 +589,14 @@ impl Vm {
             probe_mem: ok.probe_mem,
             #[cfg(feature = "jit")]
             jit: None,
+            #[cfg(feature = "jit")]
+            jit_load_hints,
         });
+        self.verified_stack_usage = Some(
+            self.verified_stack_usage
+                .unwrap_or(0)
+                .max(ok.stats.stack_usage),
+        );
         self.legacy_packet_used |= uses_legacy_packet;
         Ok(program_id)
     }
@@ -494,7 +623,10 @@ impl Vm {
             probe_mem,
             #[cfg(feature = "jit")]
             jit: None,
+            #[cfg(feature = "jit")]
+            jit_load_hints: Vec::new(),
         });
+        self.verified_stack_usage = None;
         Ok(program_id)
     }
 
@@ -526,9 +658,7 @@ impl Vm {
                 let index = u32::from_ne_bytes(key.try_into().map_err(|_| -22i64)?);
                 outer_map.set_inner_map(index, inner, mode)
             }
-            crate::maps::MapKind::HashOfMaps => {
-                outer_map.set_inner_map_key(key, inner, mode)
-            }
+            crate::maps::MapKind::HashOfMaps => outer_map.set_inner_map_key(key, inner, mode),
             _ => Err(-22),
         }
     }
@@ -627,6 +757,11 @@ impl Vm {
         self.legacy_packet = legacy_packet;
         self.legacy_packet_used = self.insns.iter().any(is_legacy_packet_load);
         self.probe_mem = ok.probe_mem.clone();
+        #[cfg(feature = "jit")]
+        {
+            self.jit_load_hints = verified_load_hints(&self.insns, &ok, self.context_model);
+        }
+        self.verified_stack_usage = Some(ok.stats.stack_usage);
         Ok(ok)
     }
 
@@ -651,13 +786,9 @@ impl Vm {
         }
         let context_model = context_model(&cfg);
         let legacy_packet = cfg.legacy_packet;
-        let ok = crate::verifier::verify(
-            &self.insns,
-            &self.map_defs,
-            self.user_helpers.sigs(),
-            cfg,
-        )
-        .map_err(VerifyWithPolicyError::Core)?;
+        let ok =
+            crate::verifier::verify(&self.insns, &self.map_defs, self.user_helpers.sigs(), cfg)
+                .map_err(VerifyWithPolicyError::Core)?;
         policy(&crate::verifier::PolicyView {
             insns: &self.insns,
             maps: &self.map_defs,
@@ -668,6 +799,11 @@ impl Vm {
         self.legacy_packet = legacy_packet;
         self.legacy_packet_used = self.insns.iter().any(is_legacy_packet_load);
         self.probe_mem = ok.probe_mem.clone();
+        #[cfg(feature = "jit")]
+        {
+            self.jit_load_hints = verified_load_hints(&self.insns, &ok, self.context_model);
+        }
+        self.verified_stack_usage = Some(ok.stats.stack_usage);
         Ok(ok)
     }
 
@@ -750,7 +886,8 @@ impl Vm {
             self.context_model,
             crate::execution::PacketSource::None,
         );
-        self.run_environment(env).map(|outcome| outcome.return_value)
+        self.run_environment(env)
+            .map(|outcome| outcome.return_value)
     }
 
     /// Execute with an explicitly composed invocation environment.
@@ -789,7 +926,8 @@ impl Vm {
             self.context_model,
             crate::execution::PacketSource::Context,
         );
-        self.run_environment(env).map(|outcome| outcome.return_value)
+        self.run_environment(env)
+            .map(|outcome| outcome.return_value)
     }
 
     fn prepare_metadata(&self, metadata: &mut [u8], packet_base: u64) -> Result<u32, EbpfError> {
@@ -800,23 +938,34 @@ impl Vm {
             ));
         };
         if metadata.len() < layout.required_len() {
-            return Err(fail(format!("metadata buffer is too short: need {} bytes, got {}",
-                layout.required_len(), metadata.len())));
+            return Err(fail(format!(
+                "metadata buffer is too short: need {} bytes, got {}",
+                layout.required_len(),
+                metadata.len()
+            )));
         }
         if packet_base as u32 != 0 {
             return Err(fail("packet address is not an owned-region base".into()));
         }
         let handle = (packet_base >> 32) as usize;
-        let Region::Owned(index) = self.regions.get(handle).copied().ok_or_else(|| fail(
-            "packet address does not name a registered owned region".into()))? else {
-            return Err(fail("packet address does not name a registered owned region".into()));
+        let Region::Owned(index) =
+            self.regions.get(handle).copied().ok_or_else(|| {
+                fail("packet address does not name a registered owned region".into())
+            })?
+        else {
+            return Err(fail(
+                "packet address does not name a registered owned region".into(),
+            ));
         };
-        let packet = self.owned_regions.get(index as usize)
+        let packet = self
+            .owned_regions
+            .get(index as usize)
             .ok_or_else(|| fail("packet address names a stale owned region".into()))?;
         if packet.access != RegionAccess::ReadWrite {
             return Err(fail("metadata packet region must be read-write".into()));
         }
-        let packet_end = packet_base.checked_add(packet.bytes.len() as u64)
+        let packet_end = packet_base
+            .checked_add(packet.bytes.len() as u64)
             .ok_or_else(|| fail("packet end virtual address overflows".into()))?;
         metadata[layout.data_offset()..layout.data_offset() + 8]
             .copy_from_slice(&packet_base.to_le_bytes());
@@ -828,21 +977,28 @@ impl Vm {
     /// Execute with caller metadata containing a registered owned packet's
     /// virtual start/end addresses. The layout must first be armed by a
     /// successful verification.
-    pub fn run_metadata(&mut self, metadata: &mut [u8], packet_base: u64) -> Result<u64, EbpfError> {
+    pub fn run_metadata(
+        &mut self,
+        metadata: &mut [u8],
+        packet_base: u64,
+    ) -> Result<u64, EbpfError> {
         let index = self.prepare_metadata(metadata, packet_base)?;
         let env = crate::execution::ExecutionEnvironment::owned_packet(
             metadata,
             self.context_model,
             index,
         );
-        self.run_environment(env).map(|outcome| outcome.return_value)
+        self.run_environment(env)
+            .map(|outcome| outcome.return_value)
     }
 
     /// Execute with a zero-filled fixed metadata buffer of the verified size.
     pub fn run_fixed_metadata(&mut self, packet_base: u64) -> Result<u64, EbpfError> {
         let crate::execution::ContextModel::Metadata(layout) = self.context_model else {
-            return Err(EbpfError { pc: 0, msg:
-                "metadata execution requires successful metadata-layout verification".into() });
+            return Err(EbpfError {
+                pc: 0,
+                msg: "metadata execution requires successful metadata-layout verification".into(),
+            });
         };
         self.run_metadata(&mut vec![0u8; layout.required_len()], packet_base)
     }
@@ -860,15 +1016,18 @@ impl Vm {
             self.context_model,
             index,
         );
-        self.run_environment_jit(env).map(|outcome| outcome.return_value)
+        self.run_environment_jit(env)
+            .map(|outcome| outcome.return_value)
     }
 
     /// JIT counterpart of [`Vm::run_fixed_metadata`].
     #[cfg(feature = "jit")]
     pub fn run_fixed_metadata_jit(&mut self, packet_base: u64) -> Result<u64, EbpfError> {
         let crate::execution::ContextModel::Metadata(layout) = self.context_model else {
-            return Err(EbpfError { pc: 0, msg:
-                "metadata execution requires successful metadata-layout verification".into() });
+            return Err(EbpfError {
+                pc: 0,
+                msg: "metadata execution requires successful metadata-layout verification".into(),
+            });
         };
         self.run_metadata_jit(&mut vec![0u8; layout.required_len()], packet_base)
     }
@@ -879,7 +1038,8 @@ impl Vm {
     pub fn run_xdp(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
         let env = crate::execution::ExecutionEnvironment::xdp_slice(packet)
             .map_err(|msg| EbpfError { pc: 0, msg })?;
-        self.run_environment(env).map(|outcome| outcome.return_value)
+        self.run_environment(env)
+            .map(|outcome| outcome.return_value)
     }
 
     /// Execute one provider-owned XDP frame.
@@ -935,7 +1095,8 @@ impl Vm {
     pub fn run_xdp_jit(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
         let env = crate::execution::ExecutionEnvironment::xdp_slice(packet)
             .map_err(|msg| EbpfError { pc: 0, msg })?;
-        self.run_environment_jit(env).map(|outcome| outcome.return_value)
+        self.run_environment_jit(env)
+            .map(|outcome| outcome.return_value)
     }
 
     /// JIT counterpart of [`Vm::run_xdp_frame`].
@@ -986,7 +1147,8 @@ impl Vm {
     pub fn run_skb(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
         let env = crate::execution::ExecutionEnvironment::skb(packet)
             .map_err(|msg| EbpfError { pc: 0, msg })?;
-        self.run_environment(env).map(|outcome| outcome.return_value)
+        self.run_environment(env)
+            .map(|outcome| outcome.return_value)
     }
 
     /// JIT counterpart of [`Vm::run_skb`].
@@ -994,7 +1156,8 @@ impl Vm {
     pub fn run_skb_jit(&mut self, packet: &mut [u8]) -> Result<u64, EbpfError> {
         let env = crate::execution::ExecutionEnvironment::skb(packet)
             .map_err(|msg| EbpfError { pc: 0, msg })?;
-        self.run_environment_jit(env).map(|outcome| outcome.return_value)
+        self.run_environment_jit(env)
+            .map(|outcome| outcome.return_value)
     }
 
     /// Create a single-stepping execution (for the debugger).
@@ -1010,10 +1173,7 @@ impl Vm {
     /// Create a single-stepping execution whose context is also the legacy
     /// packet input. This is the debugger/replay counterpart of
     /// [`Vm::run_raw`].
-    pub fn machine_raw<'a>(
-        &'a mut self,
-        buffer: &'a mut [u8],
-    ) -> Result<Machine<'a>, EbpfError> {
+    pub fn machine_raw<'a>(&'a mut self, buffer: &'a mut [u8]) -> Result<Machine<'a>, EbpfError> {
         let env = crate::execution::ExecutionEnvironment::borrowed(
             buffer,
             self.context_model,
@@ -1046,11 +1206,14 @@ impl Vm {
     #[cfg(feature = "jit")]
     pub fn compile(&mut self) -> Result<(), String> {
         if self.jit.is_none() {
-            self.jit = Some(crate::jit::compile(&self.exec)?);
+            self.jit = Some(crate::jit::compile_verified(&self.exec, &self.jit_load_hints)?);
         }
         for target in &mut self.program_images {
             if target.jit.is_none() {
-                target.jit = Some(crate::jit::compile(&target.exec)?);
+                target.jit = Some(crate::jit::compile_verified(
+                    &target.exec,
+                    &target.jit_load_hints,
+                )?);
             }
         }
         Ok(())
@@ -1065,7 +1228,8 @@ impl Vm {
             self.context_model,
             crate::execution::PacketSource::None,
         );
-        self.run_environment_jit(env).map(|outcome| outcome.return_value)
+        self.run_environment_jit(env)
+            .map(|outcome| outcome.return_value)
     }
 
     /// JIT counterpart of [`Vm::run_raw`].
@@ -1076,7 +1240,8 @@ impl Vm {
             self.context_model,
             crate::execution::PacketSource::Context,
         );
-        self.run_environment_jit(env).map(|outcome| outcome.return_value)
+        self.run_environment_jit(env)
+            .map(|outcome| outcome.return_value)
     }
 
     #[cfg(feature = "jit")]
@@ -1146,9 +1311,7 @@ impl Vm {
                 msg: "verified packet context requires a packet-window add-on".into(),
             });
         }
-        if self.legacy_packet_used
-            && env.packet_source == crate::execution::PacketSource::None
-        {
+        if self.legacy_packet_used && env.packet_source == crate::execution::PacketSource::None {
             Err(EbpfError {
                 pc: 0,
                 msg: "legacy packet input unavailable for this execution adapter".into(),
@@ -1369,6 +1532,8 @@ pub struct Machine<'a> {
     jit_fault: Option<EbpfError>,
     #[cfg(feature = "jit")]
     jit_switch_pending: bool,
+    #[cfg(feature = "jit")]
+    jit_memory: JitMemory,
     active_program: u32,
     tail_call_count: u32,
 }
@@ -1431,7 +1596,9 @@ fn resolve_slice<'s>(
         Region::Ctx => ctx,
         Region::Stack(f) => &mut stack[f as usize * STACK_SIZE..(f as usize + 1) * STACK_SIZE],
         Region::MapObj(_) => {
-            return Err(format!("map object pointer {addr:#x} is not dereferenceable"))
+            return Err(format!(
+                "map object pointer {addr:#x} is not dereferenceable"
+            ))
         }
         Region::MapValue { map, vref } => {
             let m = &mut maps[map as usize];
@@ -1445,9 +1612,7 @@ fn resolve_slice<'s>(
         }
         Region::RingReserved { map, res } => maps[map as usize]
             .ringbuf_reservation_mut(res)
-            .ok_or_else(|| {
-                format!("ringbuf record {addr:#x} was already submitted/discarded")
-            })?,
+            .ok_or_else(|| format!("ringbuf record {addr:#x} was already submitted/discarded"))?,
     };
     buf.get_mut(off..off + len)
         .ok_or_else(|| format!("access out of bounds: {addr:#x} len {len}"))
@@ -1456,16 +1621,32 @@ fn resolve_slice<'s>(
 impl MemBus for Bus<'_> {
     fn read(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), String> {
         let s = resolve_slice(
-            self.regions, self.maps, self.stack, self.ctx, self.kmem, self.packet,
-            self.owned_regions, addr, buf.len(), false,
+            self.regions,
+            self.maps,
+            self.stack,
+            self.ctx,
+            self.kmem,
+            self.packet,
+            self.owned_regions,
+            addr,
+            buf.len(),
+            false,
         )?;
         buf.copy_from_slice(s);
         Ok(())
     }
     fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), String> {
         let s = resolve_slice(
-            self.regions, self.maps, self.stack, self.ctx, self.kmem, self.packet,
-            self.owned_regions, addr, data.len(), true,
+            self.regions,
+            self.maps,
+            self.stack,
+            self.ctx,
+            self.kmem,
+            self.packet,
+            self.owned_regions,
+            addr,
+            data.len(),
+            true,
         )?;
         s.copy_from_slice(data);
         Ok(())
@@ -1473,6 +1654,23 @@ impl MemBus for Bus<'_> {
 }
 
 impl<'a> Machine<'a> {
+    #[cfg(feature = "jit")]
+    fn refresh_jit_memory(&mut self) {
+        let (context, packet, packet_len) = self.env.jit_memory_parts();
+        self.jit_memory = JitMemory {
+            context,
+            packet,
+            packet_start: mkaddr(PACKET_HANDLE, 0),
+            packet_end: mkaddr(PACKET_HANDLE, packet_len as u32),
+        };
+    }
+
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_memory(&mut self) -> *const JitMemory {
+        self.refresh_jit_memory();
+        &raw const self.jit_memory
+    }
+
     fn current_exec(&self) -> &[Insn] {
         if self.active_program == 0 {
             &self.vm.exec
@@ -1498,8 +1696,12 @@ impl<'a> Machine<'a> {
         vm: &'a mut Vm,
         mut env: crate::execution::ExecutionEnvironment<'a>,
     ) -> Machine<'a> {
-        assert_eq!(vm.context_model, env.model(), "execution context model mismatch");
-        vm.stack.iter_mut().for_each(|b| *b = 0);
+        assert_eq!(
+            vm.context_model,
+            env.model(),
+            "execution context model mismatch"
+        );
+        vm.clear_stack();
         // BTF-typed programs: the ctx is an array of 8-byte arguments, and
         // non-null pointer arguments must hold kernel-memory addresses.
         // Prefill each such pointer slot with a distinct deterministic address in the
@@ -1532,6 +1734,13 @@ impl<'a> Machine<'a> {
             jit_fault: None,
             #[cfg(feature = "jit")]
             jit_switch_pending: false,
+            #[cfg(feature = "jit")]
+            jit_memory: JitMemory {
+                context: core::ptr::null_mut(),
+                packet: core::ptr::null_mut(),
+                packet_start: 0,
+                packet_end: 0,
+            },
             active_program: 0,
             tail_call_count: 0,
         }
@@ -1640,9 +1849,7 @@ impl<'a> Machine<'a> {
     pub fn classify_mapop(&self) -> Option<MapOp> {
         let ins = *self.current_exec().get(self.pc)?;
         match ins.class() {
-            class::JMP | class::JMP32
-                if ins.op() == jmp::CALL && ins.src == call_kind::HELPER =>
-            {
+            class::JMP | class::JMP32 if ins.op() == jmp::CALL && ins.src == call_kind::HELPER => {
                 let kind = match ins.imm as u32 {
                     helpers::id::MAP_LOOKUP_ELEM => MapOpKind::Lookup,
                     helpers::id::MAP_UPDATE_ELEM => MapOpKind::Update,
@@ -1654,7 +1861,13 @@ impl<'a> Machine<'a> {
                     let ks = self.vm.maps[m].def.key_size as usize;
                     self.peek_bytes(self.regs[2], ks)
                 });
-                Some(MapOp { kind, pc: self.pc, map, key, region: None })
+                Some(MapOp {
+                    kind,
+                    pc: self.pc,
+                    map,
+                    key,
+                    region: None,
+                })
             }
             class::LDX => {
                 if ins.src as usize >= NUM_REGS {
@@ -1769,7 +1982,11 @@ impl<'a> Machine<'a> {
     pub fn jit_step_at(&mut self, pc: usize) -> u64 {
         self.pc = pc;
         let before = self.active_program;
-        match self.step() {
+        let result = self.step();
+        // Helpers such as adjust_head/adjust_tail can move the active packet
+        // window. Native loads resume against the refreshed host view.
+        self.refresh_jit_memory();
+        match result {
             Ok(Some(_r0)) => crate::jit::abi::STOP, // program finished; r0 in regs[0]
             Ok(None) if self.active_program != before => {
                 self.jit_switch_pending = true;
@@ -1845,10 +2062,16 @@ impl<'a> Machine<'a> {
                 format!("map '{}' object", self.vm.maps[*m as usize].def.name)
             }
             Some(Region::MapValue { map, .. }) => {
-                format!("map '{}' value +{off}", self.vm.maps[*map as usize].def.name)
+                format!(
+                    "map '{}' value +{off}",
+                    self.vm.maps[*map as usize].def.name
+                )
             }
             Some(Region::RingReserved { map, .. }) => {
-                format!("ringbuf '{}' record +{off}", self.vm.maps[*map as usize].def.name)
+                format!(
+                    "ringbuf '{}' record +{off}",
+                    self.vm.maps[*map as usize].def.name
+                )
             }
             Some(Region::KernelMem) => format!("kernel memory +{off} (reads as zero)"),
             Some(Region::Packet) => format!("packet+{off}"),
@@ -1916,10 +2139,7 @@ impl<'a> Machine<'a> {
     pub fn step(&mut self) -> Result<Option<u64>, EbpfError> {
         self.insn_count += 1;
         if self.insn_count > self.vm.insn_limit {
-            return Err(self.err(format!(
-                "instruction limit {} exceeded",
-                self.vm.insn_limit
-            )));
+            return Err(self.err(format!("instruction limit {} exceeded", self.vm.insn_limit)));
         }
         let ins = *self
             .current_exec()
@@ -1927,7 +2147,7 @@ impl<'a> Machine<'a> {
             .ok_or_else(|| self.err("program counter out of bounds"))?;
         if self.active_program == 0 {
             if let Some(prof) = &mut self.vm.profile {
-            prof[self.pc] += 1;
+                prof[self.pc] += 1;
             }
         }
         let dst = ins.dst as usize;
@@ -1955,7 +2175,11 @@ impl<'a> Machine<'a> {
                         alu::DIV => {
                             if ins.off == 1 {
                                 let (a, b) = (a as i32, b as i32);
-                                if b == 0 { 0 } else { a.wrapping_div(b) as u32 }
+                                if b == 0 {
+                                    0
+                                } else {
+                                    a.wrapping_div(b) as u32
+                                }
                             } else if b == 0 {
                                 0
                             } else {
@@ -1965,7 +2189,11 @@ impl<'a> Machine<'a> {
                         alu::MOD => {
                             if ins.off == 1 {
                                 let (a, b) = (a as i32, b as i32);
-                                if b == 0 { a as u32 } else { a.wrapping_rem(b) as u32 }
+                                if b == 0 {
+                                    a as u32
+                                } else {
+                                    a.wrapping_rem(b) as u32
+                                }
                             } else if b == 0 {
                                 a
                             } else {
@@ -2010,7 +2238,11 @@ impl<'a> Machine<'a> {
                         alu::DIV => {
                             if ins.off == 1 {
                                 let (a, b) = (a as i64, b as i64);
-                                if b == 0 { 0 } else { a.wrapping_div(b) as u64 }
+                                if b == 0 {
+                                    0
+                                } else {
+                                    a.wrapping_div(b) as u64
+                                }
                             } else if b == 0 {
                                 0
                             } else {
@@ -2020,7 +2252,11 @@ impl<'a> Machine<'a> {
                         alu::MOD => {
                             if ins.off == 1 {
                                 let (a, b) = (a as i64, b as i64);
-                                if b == 0 { a as u64 } else { a.wrapping_rem(b) as u64 }
+                                if b == 0 {
+                                    a as u64
+                                } else {
+                                    a.wrapping_rem(b) as u64
+                                }
                             } else if b == 0 {
                                 a
                             } else {
@@ -2211,9 +2447,8 @@ impl<'a> Machine<'a> {
                     jmp::CALL => {
                         if ins.src == call_kind::LOCAL {
                             if self.frames.len() + 1 >= MAX_CALL_FRAMES {
-                                return Err(self.err(format!(
-                                    "call depth exceeds {MAX_CALL_FRAMES} frames"
-                                )));
+                                return Err(self
+                                    .err(format!("call depth exceeds {MAX_CALL_FRAMES} frames")));
                             }
                             let mut regs6_9 = [0u64; 4];
                             regs6_9.copy_from_slice(&self.regs[6..10]);
@@ -2226,7 +2461,7 @@ impl<'a> Machine<'a> {
                             // zeroes, so a later callee reusing this depth must
                             // not observe an earlier callee's stale bytes.
                             let depth = self.frames.len();
-                            self.vm.stack[depth * STACK_SIZE..(depth + 1) * STACK_SIZE].fill(0);
+                            self.vm.clear_stack_frame(depth);
                             self.regs[REG_FP as usize] =
                                 mkaddr(STACK0_HANDLE + self.frames.len() as u32, STACK_SIZE as u32);
                             self.jump(ins.imm as i64)?;
@@ -2391,7 +2626,13 @@ impl<'a> Machine<'a> {
     }
 
     fn helper_call(&mut self, hid: u32) -> Result<bool, EbpfError> {
-        let args = [self.regs[1], self.regs[2], self.regs[3], self.regs[4], self.regs[5]];
+        let args = [
+            self.regs[1],
+            self.regs[2],
+            self.regs[3],
+            self.regs[4],
+            self.regs[5],
+        ];
         if hid == helpers::id::TAIL_CALL {
             let map = self.map_from_ptr(args[1])?;
             if self.vm.maps[map].def.kind != crate::maps::MapKind::ProgArray
@@ -2409,7 +2650,7 @@ impl<'a> Machine<'a> {
             self.active_program = program;
             self.pc = 0;
             self.frames.clear();
-            self.vm.stack.fill(0);
+            self.vm.clear_stack();
             self.regs.fill(0);
             self.regs[1] = args[0];
             self.regs[REG_FP as usize] = mkaddr(STACK0_HANDLE, STACK_SIZE as u32);
@@ -2420,9 +2661,7 @@ impl<'a> Machine<'a> {
                 let m = self.map_from_ptr(args[0])?;
                 let key = self.read_bytes(args[1], self.vm.maps[m].def.key_size as usize)?;
                 if self.vm.maps[m].def.kind.is_map_of_maps() {
-                    let inner = if self.vm.maps[m].def.kind
-                        == crate::maps::MapKind::ArrayOfMaps
-                    {
+                    let inner = if self.vm.maps[m].def.kind == crate::maps::MapKind::ArrayOfMaps {
                         let index = u32::from_ne_bytes(
                             key.as_slice()
                                 .try_into()
@@ -2434,11 +2673,10 @@ impl<'a> Machine<'a> {
                     };
                     match inner {
                         Some(inner) => {
-                            let handle = *self
-                                .vm
-                                .map_obj_handles
-                                .get(inner as usize)
-                                .ok_or_else(|| self.err("array_of_maps contains an invalid map"))?;
+                            let handle =
+                                *self.vm.map_obj_handles.get(inner as usize).ok_or_else(|| {
+                                    self.err("array_of_maps contains an invalid map")
+                                })?;
                             mkaddr(handle, 0)
                         }
                         None => 0,
@@ -2611,7 +2849,7 @@ impl<'a> Machine<'a> {
             // return fixed, documented constants (docs/specs/map-types-2.md).
             helpers::id::GET_CURRENT_PID_TGID => 0x0000_0001_0000_0001, // tgid=1, pid=1
             helpers::id::GET_CURRENT_UID_GID => 0,                      // uid=gid=0
-            helpers::id::GET_CURRENT_TASK => 0xffff_0000_0000_0001, // opaque, non-deref token
+            helpers::id::GET_CURRENT_TASK => 0xffff_0000_0000_0001,     // opaque, non-deref token
             helpers::id::GET_NS_CURRENT_PID_TGID => {
                 // No host PID namespace is imported into the standalone VM,
                 // so dev/inode cannot match. The kernel zeroes the caller's
@@ -2627,9 +2865,9 @@ impl<'a> Machine<'a> {
                 let m = self.map_from_ptr(args[0])?;
                 let key_value = args[1] as u32;
                 let key = key_value.to_ne_bytes();
-                let populated = self.vm.maps[m]
-                    .lookup(&key)
-                    .is_some_and(|value| self.vm.maps[m].value(value).iter().any(|&byte| byte != 0));
+                let populated = self.vm.maps[m].lookup(&key).is_some_and(|value| {
+                    self.vm.maps[m].value(value).iter().any(|&byte| byte != 0)
+                });
                 if populated {
                     self.env.redirect = Some(crate::packet::XdpRedirect::Map {
                         map_index: m as u32,
@@ -2705,7 +2943,11 @@ impl<'a> Machine<'a> {
                         0
                     } // XDP_REDIRECT / XDP_ABORTED
                 } else if self.vm.context_model == crate::execution::ContextModel::Skb {
-                    if args[1] & !1 == 0 { 7 } else { 2 } // TC_ACT_REDIRECT / SHOT
+                    if args[1] & !1 == 0 {
+                        7
+                    } else {
+                        2
+                    } // TC_ACT_REDIRECT / SHOT
                 } else {
                     0
                 }

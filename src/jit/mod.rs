@@ -20,14 +20,15 @@
 //!
 //! # Safety model
 //!
-//! Only ALU and branch instructions are compiled to native code. Every
-//! memory access, helper call, `lddw`, bpf-to-bpf call and `exit` is
-//! *deferred*: the native code spills the register file, calls back into
-//! [`crate::interp::Machine::jit_step_at`] (the same interpreter that runs
-//! un-JITed code, with the same bounds-checked memory model), and resumes at
-//! whatever pc the interpreter reports. The JIT therefore cannot introduce
-//! memory-unsafety that the interpreter doesn't already prevent — it only
-//! removes dispatch overhead from the arithmetic/control-flow core.
+//! ALU and branch instructions are compiled directly. A verified program may
+//! also use native context/packet loads when the verifier's all-path register
+//! join proves the pointer kind and constant offset; the native code receives
+//! only the corresponding invocation buffers. Unverified programs and loads
+//! without that proof remain *deferred*: native code calls back into
+//! [`crate::interp::Machine::jit_step_at`] and uses the interpreter's checked
+//! memory model. Helpers, stores, atomics and local calls are likewise
+//! deferred. Root-program `exit` is native when no local-call frame can be
+//! active.
 
 use crate::insn::*;
 
@@ -42,7 +43,18 @@ pub mod x64;
 #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 pub mod aarch64;
 
-pub use classify::{AluOp, Cc, DeferredRegs, Lowering, RegMask, RegOrImm, ShiftOp, Width, ALL_REGS};
+pub use classify::{
+    AluOp, Cc, DeferredRegs, Lowering, RegMask, RegOrImm, ShiftOp, Width, ALL_REGS,
+};
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadHint {
+    Context(i32),
+    Packet(i32),
+    XdpData,
+    XdpDataEnd,
+}
 
 /// Symbolic branch target used while emitting, resolved during finalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,9 +93,10 @@ pub trait JitBackend {
     /// slots).
     fn mark_label(&mut self, pc: usize);
 
-    /// Function entry: save callee-saved registers, stash the two incoming
-    /// arguments (`regs_ptr`, `machine_ptr`), and load the eBPF register file
-    /// into physical registers. Control then falls through into pc 0.
+    /// Function entry: save callee-saved registers, stash the three incoming
+    /// arguments (`regs_ptr`, `machine_ptr`, direct-memory descriptor), and
+    /// load the eBPF register file into physical registers. Control then
+    /// falls through into pc 0.
     fn prologue(&mut self);
 
     /// Function exit: restore callee-saved registers and return. The backend
@@ -104,6 +117,9 @@ pub trait JitBackend {
     fn cond_branch(&mut self, cc: Cc, w: Width, dst: u8, rhs: RegOrImm, target: Target);
     /// Branch to `target` when `(dst & rhs) != 0` (the `JSET` instruction).
     fn jset_branch(&mut self, w: Width, dst: u8, rhs: RegOrImm, target: Target);
+    /// Store r0 in the shared register file and branch to the epilogue.
+    fn exit(&mut self);
+    fn verified_load(&mut self, pc: usize, ins: Insn, hint: LoadHint);
 
     // ---- deferred instructions ----
     /// Emit the trampoline glue for the instruction at `pc`: spill the eBPF
@@ -149,19 +165,21 @@ impl JitProgram {
     /// instruction faults (both recorded in the [`Machine`](crate::interp::Machine)).
     ///
     /// # Safety
-    /// Executes JIT-generated machine code. The code only mutates `m`'s
-    /// register file and calls back through the trampoline; the caller must
-    /// keep `m` valid for the duration.
+    /// Executes JIT-generated machine code. Besides mutating `m`'s register
+    /// file and calling the trampoline, verifier-promoted loads may read the
+    /// context/packet buffers borrowed by `m`; the caller must keep the whole
+    /// machine valid and exclusively borrowed for the duration.
     pub unsafe fn enter(&self, m: &mut crate::interp::Machine) {
         let regs_ptr = m.regs_ptr();
         let machine_ptr = m as *mut crate::interp::Machine as *mut ();
+        let memory = m.jit_memory();
         let f: EnterFn = std::mem::transmute(self.mem.ptr.add(self.entry));
-        f(regs_ptr, machine_ptr);
+        f(regs_ptr, machine_ptr, memory);
     }
 }
 
-/// ABI of the compiled function: `(regs_ptr, machine_ptr)`.
-type EnterFn = unsafe extern "C" fn(*mut u64, *mut ());
+/// ABI of the compiled function: `(regs_ptr, machine_ptr, direct_memory)`.
+type EnterFn = unsafe extern "C" fn(*mut u64, *mut (), *const crate::interp::JitMemory);
 
 /// The C trampoline invoked by deferred glue. `machine` is a type-erased
 /// `*mut Machine`; the pointer is valid for the call's duration.
@@ -176,13 +194,29 @@ pub(crate) extern "C" fn trampoline(machine: *mut (), pc: u64) -> u64 {
 /// Compile `insns` for the host architecture.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub fn compile(insns: &[Insn]) -> Result<JitProgram, String> {
-    compile_with::<x64::X64Backend>(insns)
+    compile_verified(insns, &vec![None; insns.len()])
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(crate) fn compile_verified(
+    insns: &[Insn],
+    hints: &[Option<LoadHint>],
+) -> Result<JitProgram, String> {
+    compile_with::<x64::X64Backend>(insns, hints)
 }
 
 /// Compile `insns` for the host architecture.
 #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 pub fn compile(insns: &[Insn]) -> Result<JitProgram, String> {
-    compile_with::<aarch64::Aarch64Backend>(insns)
+    compile_verified(insns, &vec![None; insns.len()])
+}
+
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn compile_verified(
+    insns: &[Insn],
+    hints: &[Option<LoadHint>],
+) -> Result<JitProgram, String> {
+    compile_with::<aarch64::Aarch64Backend>(insns, hints)
 }
 
 #[cfg(not(any(
@@ -190,16 +224,35 @@ pub fn compile(insns: &[Insn]) -> Result<JitProgram, String> {
     all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))
 )))]
 pub fn compile(_insns: &[Insn]) -> Result<JitProgram, String> {
-    Err("JIT is only implemented for x86-64 Linux and aarch64 (macOS/Linux) — \
+    Err(
+        "JIT is only implemented for x86-64 Linux and aarch64 (macOS/Linux) — \
          see docs/specs/jit-backend.md to add another architecture"
-        .into())
+            .into(),
+    )
+}
+
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))
+)))]
+pub(crate) fn compile_verified(
+    insns: &[Insn],
+    _hints: &[Option<LoadHint>],
+) -> Result<JitProgram, String> {
+    compile(insns)
 }
 
 /// The architecture-independent compile pipeline, generic over the backend.
-pub fn compile_with<B: JitBackend>(insns: &[Insn]) -> Result<JitProgram, String> {
+pub fn compile_with<B: JitBackend>(
+    insns: &[Insn],
+    hints: &[Option<LoadHint>],
+) -> Result<JitProgram, String> {
     let n = insns.len();
     let mut b = B::new(n);
     let mut label_off = vec![usize::MAX; n];
+    let native_root_exit = !insns.iter().any(|ins| {
+        ins.class() == class::JMP && ins.op() == jmp::CALL && ins.src == call_kind::LOCAL
+    });
 
     b.prologue();
 
@@ -208,7 +261,12 @@ pub fn compile_with<B: JitBackend>(insns: &[Insn]) -> Result<JitProgram, String>
         b.mark_label(pc);
         label_off[pc] = b.code().len();
         let width = if insns[pc].is_wide() { 2 } else { 1 };
-        match classify::lower(insns[pc]) {
+        if let Some(hint) = hints.get(pc).copied().flatten() {
+            b.verified_load(pc, insns[pc], hint);
+            pc += width;
+            continue;
+        }
+        match classify::lower(insns[pc], native_root_exit) {
             Lowering::Deferred => b.deferred(pc, classify::deferred_regs(insns[pc])),
             Lowering::AluReg { op, w, dst, src } => b.alu_reg(op, w, dst, src),
             Lowering::AluImm { op, w, dst, imm } => b.alu_imm(op, w, dst, imm),
@@ -217,12 +275,17 @@ pub fn compile_with<B: JitBackend>(insns: &[Insn]) -> Result<JitProgram, String>
             Lowering::Neg { w, dst } => b.neg(w, dst),
             Lowering::ShiftImm { op, w, dst, amount } => b.shift_imm(op, w, dst, amount),
             Lowering::Jump { target } => b.jump(rel_target(pc, target)),
-            Lowering::CondBranch { cc, w, dst, rhs, off } => {
-                b.cond_branch(cc, w, dst, rhs, rel_target(pc, off))
-            }
+            Lowering::CondBranch {
+                cc,
+                w,
+                dst,
+                rhs,
+                off,
+            } => b.cond_branch(cc, w, dst, rhs, rel_target(pc, off)),
             Lowering::JsetBranch { w, dst, rhs, off } => {
                 b.jset_branch(w, dst, rhs, rel_target(pc, off))
             }
+            Lowering::Exit => b.exit(),
         }
         pc += width;
     }
@@ -261,7 +324,11 @@ pub fn compile_with<B: JitBackend>(insns: &[Insn]) -> Result<JitProgram, String>
 
     // Patch absolute pointers into the copied code, then seal it.
     let code_slice = unsafe { std::slice::from_raw_parts_mut(mem.ptr, mem.len) };
-    b.patch_absolutes(code_slice, trampoline as *const () as u64, table.as_ptr() as u64);
+    b.patch_absolutes(
+        code_slice,
+        trampoline as *const () as u64,
+        table.as_ptr() as u64,
+    );
     mem.make_executable()?;
 
     Ok(JitProgram {
@@ -364,7 +431,14 @@ mod arm_macos {
     use core::ffi::c_void;
 
     extern "C" {
-        fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
+        fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut c_void;
         fn munmap(addr: *mut c_void, len: usize) -> i32;
         fn pthread_jit_write_protect_np(enabled: i32);
         fn sys_icache_invalidate(start: *mut c_void, len: usize);
