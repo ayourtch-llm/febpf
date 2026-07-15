@@ -565,6 +565,7 @@ impl Vm {
                 "tail-call target legacy packet profile must match the entry program".into(),
             );
         }
+        #[cfg(feature = "jit")]
         let target_context_model = context_model(&cfg);
         let ok = crate::verifier::verify(&prog.insns, &prog.maps, self.user_helpers.sigs(), cfg)
             .map_err(|e| format!("tail-call target verification failed: {e}"))?;
@@ -1113,6 +1114,29 @@ impl Vm {
         })
     }
 
+    /// Pin compiled images while an embedding dispatches a frame/vector of
+    /// packets through this VM.
+    ///
+    /// This removes the compile check and JIT ownership transfer from each
+    /// packet while preserving one independent XDP invocation per packet.
+    /// It is intended for node-major graph schedulers and packet providers;
+    /// dropping the session restores the compiled images to the VM.
+    #[cfg(feature = "jit")]
+    pub fn xdp_jit_session(&mut self) -> Result<XdpJitSession<'_>, String> {
+        self.compile()?;
+        let jit = self.jit.take().expect("compile installed entry JIT");
+        let image_jits = self
+            .program_images
+            .iter_mut()
+            .map(|program| program.jit.take().expect("compile installed image JIT"))
+            .collect();
+        Ok(XdpJitSession {
+            vm: self,
+            jit: Some(jit),
+            image_jits,
+        })
+    }
+
     /// JIT counterpart of [`Vm::run_xdp_provider`].
     #[cfg(feature = "jit")]
     pub fn run_xdp_provider_jit<P: crate::packet::XdpProvider>(
@@ -1510,6 +1534,67 @@ pub enum MapStep {
     Pending(MapOp),
     /// The instance's program exited with this `r0`.
     Exited(u64),
+}
+
+/// A compiled VM borrowed for repeated node-major XDP dispatch.
+#[cfg(feature = "jit")]
+pub struct XdpJitSession<'a> {
+    vm: &'a mut Vm,
+    jit: Option<crate::jit::JitProgram>,
+    image_jits: Vec<crate::jit::JitProgram>,
+}
+
+#[cfg(feature = "jit")]
+impl XdpJitSession<'_> {
+    /// Execute one independent packet invocation without releasing the
+    /// session's compiled images.
+    #[inline]
+    pub fn run_xdp_frame(
+        &mut self,
+        frame: &mut crate::packet::XdpFrame,
+    ) -> Result<crate::packet::XdpVerdict, EbpfError> {
+        let env = crate::execution::ExecutionEnvironment::xdp(frame)
+            .map_err(|msg| EbpfError { pc: 0, msg })?;
+        self.vm.require_environment(&env)?;
+        let mut machine = Machine::new_with_environment(&mut *self.vm, env);
+        let result = loop {
+            let native = if machine.active_program == 0 {
+                self.jit.as_ref().expect("session owns entry JIT")
+            } else {
+                &self.image_jits[machine.active_program as usize - 1]
+            };
+            // Safety: the session pins the code and the machine exclusively
+            // borrows its VM, register file, and packet for this call.
+            unsafe { native.enter(&mut machine) };
+            if let Some(error) = machine.jit_fault.take() {
+                break Err(error);
+            }
+            if machine.jit_switch_pending {
+                machine.jit_switch_pending = false;
+                continue;
+            }
+            break Ok(crate::packet::XdpVerdict::with_redirect(
+                machine.regs[0],
+                machine.env.redirect,
+            ));
+        };
+        result
+    }
+}
+
+#[cfg(feature = "jit")]
+impl Drop for XdpJitSession<'_> {
+    fn drop(&mut self) {
+        self.vm.jit = self.jit.take();
+        for (program, native) in self
+            .vm
+            .program_images
+            .iter_mut()
+            .zip(self.image_jits.drain(..))
+        {
+            program.jit = Some(native);
+        }
+    }
 }
 
 /// One in-flight execution of a [`Vm`] program. Use [`Machine::step`] to

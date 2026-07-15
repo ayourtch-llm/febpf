@@ -72,6 +72,8 @@ For statistically sampled results rather than a one-off CLI timing, see
   separately. The compiler is split into an
   architecture-independent frontend and a `JitBackend` trait; adding **riscv64**
   means implementing that one trait (see `docs/specs/jit-backend.md`).
+  A reusable XDP JIT session pins compiled images across a provider or graph
+  node-frame dispatch without changing independent per-packet XDP semantics.
   Differentially tested against the interpreter.
 - **Portable interpreter**: the VM, assembler, verifier, maps, helpers and
   replay tooling target x86-64 Windows with the JIT disabled; native Windows

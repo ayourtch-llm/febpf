@@ -76,6 +76,8 @@ mod soundness;
 mod wasm;
 
 pub use interp::{EbpfError, Machine, MetadataLayout, Program, RegionAccess, Vm};
+#[cfg(feature = "jit")]
+pub use interp::XdpJitSession;
 pub use execution::{ContextModel, ExecutionEnvironment, ExecutionOutcome};
 pub use packet::{
     CompletedXdpFrame, XdpAction, XdpBatchStats, XdpCapabilities, XdpFrame, XdpMetadata,

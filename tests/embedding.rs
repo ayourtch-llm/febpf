@@ -28,6 +28,40 @@ fn instruction_program(insns: Vec<insn::Insn>) -> Program {
     }
 }
 
+#[cfg(feature = "jit")]
+#[test]
+fn xdp_jit_session_reuses_compiled_images_across_independent_frames() {
+    let mut vm = Vm::new(program(
+        "r2 = *(u32 *)(r1 + 4)\n\
+         r1 = *(u32 *)(r1 + 0)\n\
+         r3 = r1\n\
+         r3 += 1\n\
+         if r3 > r2 goto fail\n\
+         r0 = *(u8 *)(r1 + 0)\n\
+         exit\n\
+       fail:\n\
+         r0 = 0\n\
+         exit",
+    ))
+    .unwrap();
+    vm.verify(Config {
+        ctx_size: 24,
+        ctx_writable: false,
+        xdp: true,
+        ..Config::default()
+    })
+    .unwrap();
+
+    let mut first = XdpFrame::new(&[7]);
+    let mut second = XdpFrame::new(&[9]);
+    {
+        let mut session = vm.xdp_jit_session().unwrap();
+        assert_eq!(session.run_xdp_frame(&mut first).unwrap().return_value, 7);
+        assert_eq!(session.run_xdp_frame(&mut second).unwrap().return_value, 9);
+    }
+    assert_eq!(vm.run_xdp_frame_jit(&mut first).unwrap().return_value, 7);
+}
+
 #[test]
 fn no_data_adapter_executes_an_input_free_program() {
     let mut vm = Vm::new(program("r0 = 42\nexit")).unwrap();
