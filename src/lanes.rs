@@ -16,10 +16,51 @@ use crate::{
     Program, Vm,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LaneWidth {
     Two,
     Four,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LaneCpuFeatures {
+    pub sse2: bool,
+    pub avx2: bool,
+}
+
+impl LaneCpuFeatures {
+    pub fn detect() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            Self {
+                sse2: std::is_x86_feature_detected!("sse2"),
+                avx2: std::is_x86_feature_detected!("avx2"),
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Self::default()
+        }
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.sse2 as u8 | ((self.avx2 as u8) << 1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LaneBackend {
+    ScalarInterleaved,
+    X86Sse2,
+    X86Avx2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LanePlanKey {
+    pub program: u64,
+    pub width: LaneWidth,
+    pub backend: LaneBackend,
+    pub cpu_features: u8,
 }
 
 impl LaneWidth {
@@ -56,6 +97,9 @@ pub enum XdpLaneOp {
 pub struct XdpLaneProgram {
     width: LaneWidth,
     ops: Vec<XdpLaneOp>,
+    features: LaneCpuFeatures,
+    backend: LaneBackend,
+    program_key: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -85,6 +129,8 @@ impl std::error::Error for LaneRuntimeError {}
 pub struct LaneValidation {
     pub inputs: usize,
     pub width: LaneWidth,
+    pub backend: LaneBackend,
+    pub plan_key: LanePlanKey,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,7 +222,16 @@ impl XdpLaneProgram {
                 _ => return Err(format!("pc {pc}: unsupported instruction class")),
             };
         }
-        Ok(Self { width, ops })
+        let features = LaneCpuFeatures::detect();
+        let backend = select_backend(width, &ops, features, verified);
+        let program_key = program_fingerprint(&program.insns);
+        Ok(Self {
+            width,
+            ops,
+            features,
+            backend,
+            program_key,
+        })
     }
 
     pub fn width(&self) -> LaneWidth {
@@ -185,6 +240,23 @@ impl XdpLaneProgram {
 
     pub fn ops(&self) -> &[XdpLaneOp] {
         &self.ops
+    }
+
+    pub fn backend(&self) -> LaneBackend {
+        self.backend
+    }
+
+    pub fn cpu_features(&self) -> LaneCpuFeatures {
+        self.features
+    }
+
+    pub fn plan_key(&self) -> LanePlanKey {
+        LanePlanKey {
+            program: self.program_key,
+            width: self.width,
+            backend: self.backend,
+            cpu_features: self.features.bits(),
+        }
     }
 
     pub fn stats(&self) -> LanePlanStats {
@@ -204,25 +276,69 @@ impl XdpLaneProgram {
 
     /// Execute independent frames in lockstep groups with a scalar remainder.
     pub fn execute(&self, frames: &[XdpFrame]) -> Result<Vec<XdpVerdict>, LaneRuntimeError> {
+        self.execute_backend(frames, self.backend)
+    }
+
+    /// Execute through the portable reference backend even when SIMD is
+    /// available. Used for translation validation and same-binary benchmarks.
+    pub fn execute_scalar(&self, frames: &[XdpFrame]) -> Result<Vec<XdpVerdict>, LaneRuntimeError> {
+        self.execute_backend(frames, LaneBackend::ScalarInterleaved)
+    }
+
+    fn execute_backend(
+        &self,
+        frames: &[XdpFrame],
+        backend: LaneBackend,
+    ) -> Result<Vec<XdpVerdict>, LaneRuntimeError> {
         let mut verdicts = Vec::with_capacity(frames.len());
         while verdicts.len() < frames.len() {
             let base = verdicts.len();
             let remaining = frames.len() - base;
-            let group_len = if remaining >= self.width.lanes() {
-                self.width.lanes()
+            let backend_width = match backend {
+                LaneBackend::X86Avx2 => 4,
+                LaneBackend::X86Sse2 => 2,
+                LaneBackend::ScalarInterleaved => self.width.lanes(),
+            };
+            let group_len = if remaining >= backend_width {
+                backend_width
             } else if remaining >= 2 {
                 2
             } else {
                 1
             };
             let chunk = &frames[base..base + group_len];
-            let group = self.execute_group(chunk).map_err(|mut error| {
-                error.lane += base;
-                error
-            })?;
+            let group = self
+                .execute_group_backend(chunk, backend)
+                .map_err(|mut error| {
+                    error.lane += base;
+                    error
+                })?;
             verdicts.extend(group);
         }
         Ok(verdicts)
+    }
+
+    fn execute_group_backend(
+        &self,
+        frames: &[XdpFrame],
+        backend: LaneBackend,
+    ) -> Result<Vec<XdpVerdict>, LaneRuntimeError> {
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = backend;
+        #[cfg(target_arch = "x86_64")]
+        match (backend, frames.len()) {
+            (LaneBackend::X86Avx2, 4) => {
+                // SAFETY: the backend is selected only after runtime AVX2
+                // detection and the plan eligibility check.
+                return unsafe { x86::execute_avx2(&self.ops) };
+            }
+            (LaneBackend::X86Avx2 | LaneBackend::X86Sse2, 2) => {
+                // SAFETY: SSE2 is recorded in the selected plan features.
+                return unsafe { x86::execute_sse2(&self.ops) };
+            }
+            _ => {}
+        }
+        self.execute_group(frames)
     }
 
     /// Differentially validate this lane plan against ordinary scalar XDP.
@@ -271,6 +387,8 @@ impl XdpLaneProgram {
         Ok(LaneValidation {
             inputs: frames.len(),
             width: self.width,
+            backend: self.backend,
+            plan_key: self.plan_key(),
         })
     }
 
@@ -340,6 +458,157 @@ impl XdpLaneProgram {
             .copied()
             .map(XdpVerdict::new)
             .collect())
+    }
+}
+
+fn program_fingerprint(insns: &[Insn]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for insn in insns {
+        for byte in [insn.opcode, insn.dst, insn.src]
+            .into_iter()
+            .chain(insn.off.to_le_bytes())
+            .chain(insn.imm.to_le_bytes())
+        {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+fn select_backend(
+    width: LaneWidth,
+    ops: &[XdpLaneOp],
+    features: LaneCpuFeatures,
+    verified: &VerifyOk,
+) -> LaneBackend {
+    if !ops
+        .iter()
+        .enumerate()
+        .all(|(pc, op)| simd_supported(pc, op, verified))
+    {
+        return LaneBackend::ScalarInterleaved;
+    }
+    if width == LaneWidth::Four && features.avx2 {
+        LaneBackend::X86Avx2
+    } else if features.sse2 {
+        LaneBackend::X86Sse2
+    } else {
+        LaneBackend::ScalarInterleaved
+    }
+}
+
+fn simd_supported(pc: usize, op: &XdpLaneOp, verified: &VerifyOk) -> bool {
+    match op {
+        XdpLaneOp::Dead | XdpLaneOp::Exit => true,
+        XdpLaneOp::Alu(insn) if insn.class() == class::ALU64 => {
+            let Some(regs) = verified.regs_at(pc) else {
+                return false;
+            };
+            let scalar = |register: u8| matches!(regs[register as usize], RegState::Scalar(_));
+            match insn.op() {
+                alu::MOV if !insn.is_src_reg() => insn.off == 0,
+                alu::MOV => insn.off == 0 && scalar(insn.src),
+                alu::ADD | alu::SUB | alu::OR | alu::AND | alu::XOR => {
+                    scalar(insn.dst) && (!insn.is_src_reg() || scalar(insn.src))
+                }
+                alu::NEG => scalar(insn.dst),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use super::*;
+    use core::arch::x86_64::*;
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn execute_avx2(
+        ops: &[XdpLaneOp],
+    ) -> Result<Vec<XdpVerdict>, LaneRuntimeError> {
+        let zero = _mm256_setzero_si256();
+        let mut regs = [zero; NUM_REGS];
+        for (pc, op) in ops.iter().copied().enumerate() {
+            match op {
+                XdpLaneOp::Dead => {}
+                XdpLaneOp::Alu(insn) => {
+                    let dst = insn.dst as usize;
+                    let a = regs[dst];
+                    let b = if insn.is_src_reg() {
+                        regs[insn.src as usize]
+                    } else {
+                        _mm256_set1_epi64x(insn.imm as i64)
+                    };
+                    regs[dst] = match insn.op() {
+                        alu::MOV => b,
+                        alu::ADD => _mm256_add_epi64(a, b),
+                        alu::SUB => _mm256_sub_epi64(a, b),
+                        alu::OR => _mm256_or_si256(a, b),
+                        alu::AND => _mm256_and_si256(a, b),
+                        alu::XOR => _mm256_xor_si256(a, b),
+                        alu::NEG => _mm256_sub_epi64(zero, a),
+                        _ => return Err(runtime_error(0, pc, "unsupported AVX2 lane operation")),
+                    };
+                }
+                XdpLaneOp::Exit => {
+                    let mut values = [0u64; 4];
+                    // SAFETY: values has exactly 32 writable bytes and an
+                    // unaligned store accepts its alignment.
+                    unsafe {
+                        _mm256_storeu_si256(values.as_mut_ptr().cast::<__m256i>(), regs[0]);
+                    }
+                    return Ok(values.into_iter().map(XdpVerdict::new).collect());
+                }
+                _ => return Err(runtime_error(0, pc, "non-AVX2 operation entered AVX2 plan")),
+            }
+        }
+        Err(runtime_error(0, ops.len(), "AVX2 lane plan has no exit"))
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn execute_sse2(
+        ops: &[XdpLaneOp],
+    ) -> Result<Vec<XdpVerdict>, LaneRuntimeError> {
+        let zero = _mm_setzero_si128();
+        let mut regs = [zero; NUM_REGS];
+        for (pc, op) in ops.iter().copied().enumerate() {
+            match op {
+                XdpLaneOp::Dead => {}
+                XdpLaneOp::Alu(insn) => {
+                    let dst = insn.dst as usize;
+                    let a = regs[dst];
+                    let b = if insn.is_src_reg() {
+                        regs[insn.src as usize]
+                    } else {
+                        _mm_set1_epi64x(insn.imm as i64)
+                    };
+                    regs[dst] = match insn.op() {
+                        alu::MOV => b,
+                        alu::ADD => _mm_add_epi64(a, b),
+                        alu::SUB => _mm_sub_epi64(a, b),
+                        alu::OR => _mm_or_si128(a, b),
+                        alu::AND => _mm_and_si128(a, b),
+                        alu::XOR => _mm_xor_si128(a, b),
+                        alu::NEG => _mm_sub_epi64(zero, a),
+                        _ => return Err(runtime_error(0, pc, "unsupported SSE2 lane operation")),
+                    };
+                }
+                XdpLaneOp::Exit => {
+                    let mut values = [0u64; 2];
+                    // SAFETY: values has exactly 16 writable bytes and an
+                    // unaligned store accepts its alignment.
+                    unsafe {
+                        _mm_storeu_si128(values.as_mut_ptr().cast::<__m128i>(), regs[0]);
+                    }
+                    return Ok(values.into_iter().map(XdpVerdict::new).collect());
+                }
+                _ => return Err(runtime_error(0, pc, "non-SSE2 operation entered SSE2 plan")),
+            }
+        }
+        Err(runtime_error(0, ops.len(), "SSE2 lane plan has no exit"))
     }
 }
 
@@ -678,5 +947,30 @@ mod tests {
         assert!(XdpLaneProgram::compile(&program, &verified, LaneWidth::Two)
             .unwrap_err()
             .contains("backward"));
+    }
+
+    #[test]
+    fn branchless_plan_selects_host_simd_and_matches_scalar_lanes() {
+        let (program, lanes) = compile("r0 = 5\nr0 += 3\nexit");
+        let frames = vec![XdpFrame::new(&[]); 7];
+        assert_eq!(
+            lanes.execute(&frames).unwrap(),
+            lanes.execute_scalar(&frames).unwrap()
+        );
+        assert_eq!(lanes.validate(&program, &frames).unwrap().inputs, 7);
+        assert_eq!(
+            lanes.plan_key().cpu_features,
+            LaneCpuFeatures::detect().bits()
+        );
+        let (_, other) = compile("r0 = 9\nexit");
+        assert_ne!(lanes.plan_key().program, other.plan_key().program);
+        let features = LaneCpuFeatures::detect();
+        if features.avx2 {
+            assert_eq!(lanes.backend(), LaneBackend::X86Avx2);
+        } else if features.sse2 {
+            assert_eq!(lanes.backend(), LaneBackend::X86Sse2);
+        } else {
+            assert_eq!(lanes.backend(), LaneBackend::ScalarInterleaved);
+        }
     }
 }

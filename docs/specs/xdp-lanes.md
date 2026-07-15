@@ -2,8 +2,8 @@
 
 `lanes::XdpLaneProgram` is an architecture-independent execution plan for
 running one verified scalar XDP program over independent packet lanes. It is
-the semantic input for scalar interleaving today and optional SIMD JIT lowering
-later; it is not a new Linux eBPF program type.
+the common semantic input for scalar interleaving and architecture-specific
+SIMD lowering; it is not a new Linux eBPF program type.
 
 ## Accepted subset
 
@@ -51,8 +51,22 @@ loading rather than silently selecting scalar execution.
 
 ## SIMD lowering
 
-The x86 backend may lower the same lane operations to SSE2, AVX2, or AVX-512
-after runtime feature detection. CPU features must participate in the compiled
-image cache key. Divergent branches require masks; helpers and observable
-effects remain scalarization boundaries when later subsets admit them. Every
-backend must retain scalar-interleaved lowering as the reference implementation.
+`LaneCpuFeatures::detect` records SSE2 and AVX2 availability. A branchless
+ALU64 subset (`mov`, add/sub, bitwise operations, and negation) selects SSE2 for
+two lanes and AVX2 for four lanes. The final scalar packet still uses the
+reference executor. `LanePlanKey` contains a deterministic program fingerprint,
+the requested width, selected backend, and feature bits, so a compiled-plan
+cache cannot reuse code for another program or an AVX2 plan under a different
+feature set.
+
+The selected SIMD executor is differentially validated against the scalar VM;
+`execute_scalar` runs the same lane plan through the portable reference backend
+for same-binary tests and benchmarks. The release binary is checked to contain
+the expected SSE2/AVX2 integer instructions rather than relying on presumed
+autovectorization.
+
+Divergent branches and packet loads are not yet SIMD-lowered. They require
+explicit masks and packet-lane materialization; helpers and observable effects
+remain scalarization boundaries when later subsets admit them. AVX-512 and
+NEON are not claimed. Every backend retains scalar interleaving as its semantic
+reference.
