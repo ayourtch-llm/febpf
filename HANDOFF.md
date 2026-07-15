@@ -30,7 +30,56 @@ wait for the user to request a refresh. Perform this exact protocol yourself:
    newest active checkpoint. Do not redo completed work or trust superseded
    measurements from older sections.
 
-## ACTIVE RESUME CHECKPOINT (2026-07-15 packet-aware race exploration; authoritative)
+## ACTIVE RESUME CHECKPOINT (2026-07-15 VPP-shaped node frames; authoritative)
+
+febpf is committed through `b0958b9` (`perf: pin JIT images across XDP node
+frames`). `Vm::xdp_jit_session` returns a public `XdpJitSession` that compiles
+once, pins the entry and tail-call-bundle images, executes independent XDP
+frames without per-packet JIT ownership transfer, and restores every image on
+drop. The embedding test executes two different frames through one session and
+then proves the ordinary JIT API still owns usable code. A pre-existing
+interpreter-only unused local is now correctly JIT-gated.
+
+The real consumer `/home/ayourtch/rust/febpf-graph` is committed through
+`5c1b558` (`perf: dispatch VPP-shaped pending node frames`). Inspection of
+`~/vpp/vpp/src/vlib/node.h`, `main.c`, and `punt_node.c` established the model:
+node-major dispatch, worker-local node runtime, per-next-node pending work, and
+bounded 256-packet frames. The graph drains contiguous per-node queues in
+bounded 256-packet views while one node JIT session is pinned. It remains an
+honest scalar XDP invocation per packet inside that view.
+
+An eBPF scheduler tail-called between nodes was rejected: only `r1` survives,
+the stack is reset, and node/scheduler alternation exhausts the 33-call limit
+after roughly 16 nodes. The graph stress workload now constructs 256 nodes.
+The stable 256-packet/5,000-sample matrix compared legacy versus pinned p50 TSC
+reference ticks: PASS 158.38/150.07, classifier 169.66/160.91,
+classifier-to-PASS 316.02/304.00, and mixed 264.07/242.25 (3.8-8.3% lower).
+The native scheduler control was 49.88/48.69 noise. The 256-image chain was
+not stable enough to claim a win: repeated unpinned p50s were 38,706-40,596
+pinned and 40,150-40,423 legacy, with run order affecting the result.
+
+Full validation passes: febpf default all-targets is **488 passed + 4
+ignored**, interpreter-only std is **469 + 4**, and strict default,
+interpreter-only, aarch64, and true thumb no-std Clippy/check legs pass. Graph
+runtime is 12/12; memif 9/9; ConnectX default 4/4 and rdma 6 + one honest
+hardware ignore. Strict host/aarch64 runtime, adapters, locked perf, all three
+pinned Rust-to-eBPF builds/target Clippy, shell syntax, and exact demo pass.
+Hardware PMU access and provisioned mlx5 execution remain configuration gaps.
+
+Next execution slice belongs primarily in febpf-graph: define a vector node
+ABI for at most 256 packet descriptors, then lower one verified scalar loop to
+2x/4x architecture-neutral lane IR plus a scalar remainder. Today's verifier
+proves safety, not semantic equivalence; widening needs translation validation
+covering packet results/mutations, ordering, aliasing, and map/helper effects,
+with scalar differential execution as another guard. febpf should provide only
+generic multi-window/effect/JIT primitives. The x86 backend can subsequently
+lower the same lane IR to SSE2/AVX2/AVX-512 according to runtime features and a
+feature-sensitive JIT cache key; scalar interleaving remains the portable
+lowering and unsafe/divergent operations are scalarization points.
+
+The packet-aware checkpoint immediately below is historical and superseded.
+
+## ACTIVE RESUME CHECKPOINT (2026-07-15 packet-aware race exploration; superseded)
 
 The heterogeneous race explorer now swaps complete private invocation
 environments rather than only context bytes. `InstanceState` retains an
