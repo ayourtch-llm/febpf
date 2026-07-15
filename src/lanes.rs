@@ -53,6 +53,7 @@ pub enum LaneBackend {
     ScalarInterleaved,
     X86Sse2,
     X86Avx2,
+    X86Avx2Masked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -295,7 +296,7 @@ impl XdpLaneProgram {
             let base = verdicts.len();
             let remaining = frames.len() - base;
             let backend_width = match backend {
-                LaneBackend::X86Avx2 => 4,
+                LaneBackend::X86Avx2 | LaneBackend::X86Avx2Masked => 4,
                 LaneBackend::X86Sse2 => 2,
                 LaneBackend::ScalarInterleaved => self.width.lanes(),
             };
@@ -331,6 +332,11 @@ impl XdpLaneProgram {
                 // SAFETY: the backend is selected only after runtime AVX2
                 // detection and the plan eligibility check.
                 return unsafe { x86::execute_avx2(&self.ops) };
+            }
+            (LaneBackend::X86Avx2Masked, 4) => {
+                // SAFETY: masked plans are selected only after AVX2 runtime
+                // detection; active masks guard every packet materialization.
+                return unsafe { x86::execute_avx2_masked(&self.ops, frames) };
             }
             (LaneBackend::X86Avx2 | LaneBackend::X86Sse2, 2) => {
                 // SAFETY: SSE2 is recorded in the selected plan features.
@@ -482,19 +488,39 @@ fn select_backend(
     features: LaneCpuFeatures,
     verified: &VerifyOk,
 ) -> LaneBackend {
-    if !ops
+    let branchless = ops
         .iter()
         .enumerate()
-        .all(|(pc, op)| simd_supported(pc, op, verified))
-    {
-        return LaneBackend::ScalarInterleaved;
-    }
-    if width == LaneWidth::Four && features.avx2 {
+        .all(|(pc, op)| simd_supported(pc, op, verified));
+    if branchless && width == LaneWidth::Four && features.avx2 {
         LaneBackend::X86Avx2
-    } else if features.sse2 {
+    } else if branchless && features.sse2 {
         LaneBackend::X86Sse2
+    } else if width == LaneWidth::Four
+        && features.avx2
+        && ops.len() <= 64
+        && ops.iter().all(masked_simd_supported)
+    {
+        LaneBackend::X86Avx2Masked
     } else {
         LaneBackend::ScalarInterleaved
+    }
+}
+
+fn masked_simd_supported(op: &XdpLaneOp) -> bool {
+    match op {
+        XdpLaneOp::Dead
+        | XdpLaneOp::Data { .. }
+        | XdpLaneOp::DataEnd { .. }
+        | XdpLaneOp::PacketLoad { .. }
+        | XdpLaneOp::Branch(_)
+        | XdpLaneOp::Exit => true,
+        XdpLaneOp::Alu(insn) if insn.class() == class::ALU64 => match insn.op() {
+            alu::MOV => insn.off == 0,
+            alu::ADD | alu::SUB | alu::OR | alu::AND | alu::XOR | alu::NEG => true,
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -566,6 +592,202 @@ mod x86 {
             }
         }
         Err(runtime_error(0, ops.len(), "AVX2 lane plan has no exit"))
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn execute_avx2_masked(
+        ops: &[XdpLaneOp],
+        frames: &[XdpFrame],
+    ) -> Result<Vec<XdpVerdict>, LaneRuntimeError> {
+        debug_assert_eq!(frames.len(), 4);
+        debug_assert!(ops.len() <= 64);
+        let zero = _mm256_setzero_si256();
+        let mut regs = [zero; NUM_REGS];
+        let mut pending = [0u8; 64];
+        pending[0] = 0x0f;
+        let mut completed = 0u8;
+        let mut results = [0u64; 4];
+
+        for (pc, op) in ops.iter().copied().enumerate() {
+            let active = pending[pc];
+            if active == 0 {
+                continue;
+            }
+            let mask = lane_mask(active);
+            match op {
+                XdpLaneOp::Dead => {
+                    return Err(runtime_error(0, pc, "active mask entered dead code"))
+                }
+                XdpLaneOp::Alu(insn) => {
+                    let dst = insn.dst as usize;
+                    let old = regs[dst];
+                    let b = if insn.is_src_reg() {
+                        regs[insn.src as usize]
+                    } else {
+                        _mm256_set1_epi64x(insn.imm as i64)
+                    };
+                    let value = match insn.op() {
+                        alu::MOV => b,
+                        alu::ADD => _mm256_add_epi64(old, b),
+                        alu::SUB => _mm256_sub_epi64(old, b),
+                        alu::OR => _mm256_or_si256(old, b),
+                        alu::AND => _mm256_and_si256(old, b),
+                        alu::XOR => _mm256_xor_si256(old, b),
+                        alu::NEG => _mm256_sub_epi64(zero, old),
+                        _ => {
+                            return Err(runtime_error(
+                                0,
+                                pc,
+                                "unsupported masked AVX2 ALU operation",
+                            ))
+                        }
+                    };
+                    regs[dst] = _mm256_blendv_epi8(old, value, mask);
+                    schedule(&mut pending, pc + 1, active, pc)?;
+                }
+                XdpLaneOp::Data { dst } => {
+                    regs[dst as usize] = _mm256_blendv_epi8(regs[dst as usize], zero, mask);
+                    schedule(&mut pending, pc + 1, active, pc)?;
+                }
+                XdpLaneOp::DataEnd { dst } => {
+                    let lengths = [
+                        frames[0].data().len() as u64,
+                        frames[1].data().len() as u64,
+                        frames[2].data().len() as u64,
+                        frames[3].data().len() as u64,
+                    ];
+                    // SAFETY: lengths is exactly one 256-bit vector.
+                    let value = unsafe { _mm256_loadu_si256(lengths.as_ptr().cast::<__m256i>()) };
+                    regs[dst as usize] = _mm256_blendv_epi8(regs[dst as usize], value, mask);
+                    schedule(&mut pending, pc + 1, active, pc)?;
+                }
+                XdpLaneOp::PacketLoad {
+                    dst,
+                    offset,
+                    size,
+                    signed,
+                } => {
+                    let mut values = [0u64; 4];
+                    for lane in 0..4 {
+                        if active & (1 << lane) == 0 {
+                            continue;
+                        }
+                        let bytes =
+                            frames[lane]
+                                .data()
+                                .get(offset..offset + size)
+                                .ok_or_else(|| {
+                                    runtime_error(lane, pc, "active packet load is out of bounds")
+                                })?;
+                        values[lane] = load_le(bytes, signed);
+                    }
+                    // SAFETY: values is exactly one 256-bit vector.
+                    let value = unsafe { _mm256_loadu_si256(values.as_ptr().cast::<__m256i>()) };
+                    regs[dst as usize] = _mm256_blendv_epi8(regs[dst as usize], value, mask);
+                    schedule(&mut pending, pc + 1, active, pc)?;
+                }
+                XdpLaneOp::Branch(insn) => {
+                    let relative = if insn.class() == class::JMP32 && insn.op() == jmp::JA {
+                        insn.imm as i64
+                    } else {
+                        insn.off as i64
+                    };
+                    let target = (pc as i64 + 1 + relative) as usize;
+                    if insn.op() == jmp::JA {
+                        schedule(&mut pending, target, active, pc)?;
+                        continue;
+                    }
+                    let mut left = [0u64; 4];
+                    let mut right = [0u64; 4];
+                    // SAFETY: both arrays are exactly one 256-bit vector.
+                    unsafe {
+                        _mm256_storeu_si256(
+                            left.as_mut_ptr().cast::<__m256i>(),
+                            regs[insn.dst as usize],
+                        );
+                    }
+                    if insn.is_src_reg() {
+                        // SAFETY: right is exactly one 256-bit vector.
+                        unsafe {
+                            _mm256_storeu_si256(
+                                right.as_mut_ptr().cast::<__m256i>(),
+                                regs[insn.src as usize],
+                            );
+                        }
+                    } else {
+                        right.fill(insn.imm as i64 as u64);
+                    }
+                    let mut taken = 0u8;
+                    for lane in 0..4 {
+                        if active & (1 << lane) == 0 {
+                            continue;
+                        }
+                        let yes = if insn.class() == class::JMP32 {
+                            compare32(insn.op(), left[lane] as u32, right[lane] as u32)
+                        } else {
+                            compare64(insn.op(), left[lane], right[lane])
+                        }
+                        .map_err(|message| runtime_error(lane, pc, message))?;
+                        if yes {
+                            taken |= 1 << lane;
+                        }
+                    }
+                    schedule(&mut pending, target, active & taken, pc)?;
+                    schedule(&mut pending, pc + 1, active & !taken, pc)?;
+                }
+                XdpLaneOp::Exit => {
+                    let mut values = [0u64; 4];
+                    // SAFETY: values is exactly one 256-bit vector.
+                    unsafe {
+                        _mm256_storeu_si256(values.as_mut_ptr().cast::<__m256i>(), regs[0]);
+                    }
+                    for lane in 0..4 {
+                        if active & (1 << lane) != 0 {
+                            results[lane] = values[lane];
+                        }
+                    }
+                    completed |= active;
+                }
+            }
+        }
+        if completed != 0x0f {
+            return Err(runtime_error(
+                0,
+                ops.len(),
+                "masked AVX2 plan did not exit every lane",
+            ));
+        }
+        Ok(results.into_iter().map(XdpVerdict::new).collect())
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn lane_mask(bits: u8) -> __m256i {
+        _mm256_set_epi64x(
+            if bits & 8 != 0 { -1 } else { 0 },
+            if bits & 4 != 0 { -1 } else { 0 },
+            if bits & 2 != 0 { -1 } else { 0 },
+            if bits & 1 != 0 { -1 } else { 0 },
+        )
+    }
+
+    fn schedule(
+        pending: &mut [u8; 64],
+        target: usize,
+        lanes: u8,
+        pc: usize,
+    ) -> Result<(), LaneRuntimeError> {
+        if lanes == 0 {
+            return Ok(());
+        }
+        let Some(slot) = pending.get_mut(target) else {
+            return Err(runtime_error(
+                0,
+                pc,
+                "masked branch target is outside the plan",
+            ));
+        };
+        *slot |= lanes;
+        Ok(())
     }
 
     #[target_feature(enable = "sse2")]
@@ -902,6 +1124,13 @@ mod tests {
             XdpFrame::new(&ipv4),
         ];
         assert_eq!(lanes.validate(&program, &frames).unwrap().inputs, 7);
+        if LaneCpuFeatures::detect().avx2 {
+            assert_eq!(lanes.backend(), LaneBackend::X86Avx2Masked);
+            assert_eq!(
+                lanes.execute(&frames).unwrap(),
+                lanes.execute_scalar(&frames).unwrap()
+            );
+        }
         let results: Vec<_> = lanes
             .execute(&frames)
             .unwrap()

@@ -65,8 +65,17 @@ for same-binary tests and benchmarks. The release binary is checked to contain
 the expected SSE2/AVX2 integer instructions rather than relying on presumed
 autovectorization.
 
-Divergent branches and packet loads are not yet SIMD-lowered. They require
-explicit masks and packet-lane materialization; helpers and observable effects
-remain scalarization boundaries when later subsets admit them. AVX-512 and
-NEON are not claimed. Every backend retains scalar interleaving as its semantic
-reference.
+Forward-only AVX2 plans of at most 64 operations may also contain data/data_end,
+constant packet loads, and branches. Four-lane execution keeps a pending mask
+per program counter. ALU and load results update only active lanes; a branch
+splits its mask between the target and fallthrough. Packet bytes are copied
+into a vector only for active lanes, after an independent bounds check, so a
+truncated inactive lane never performs the load. Two- and one-packet remainders
+use the reference executor.
+
+Branch predicates are currently extracted and compared scalarly to construct
+the masks; register operations and packed values use AVX2. Turning comparisons
+into vector masks is a later backend optimization, not part of the current
+claim. Helpers and observable effects remain scalarization boundaries. AVX-512
+and NEON are not claimed. Every backend retains scalar interleaving as its
+semantic reference.

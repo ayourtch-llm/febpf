@@ -78,8 +78,9 @@ For statistically sampled results rather than a one-off CLI timing, see
 - **Verified XDP lane plans**: a conservative architecture-independent 2x/4x
   execution IR for pure, forward-only packet programs. Verifier-proven packet
   loads are lowered into independent lanes and differentially validated against
-  scalar XDP. Branchless ALU64 plans use runtime-selected SSE2/AVX2 backends on
-  x86; helpers, maps, stores, stacks, calls, and loops fall back. See
+  scalar XDP. Branchless ALU64 and bounded forward packet plans use
+  runtime-selected SSE2/AVX2 backends on x86; helpers, maps, stores, stacks,
+  calls, and loops fall back. See
   [`docs/specs/xdp-lanes.md`](docs/specs/xdp-lanes.md).
 - **Portable interpreter**: the VM, assembler, verifier, maps, helpers and
   replay tooling target x86-64 Windows with the JIT disabled; native Windows
